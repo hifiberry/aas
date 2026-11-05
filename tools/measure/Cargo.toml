@@ -22,5 +22,8 @@ alsa-probes = ["dep:alsa"]
 name = "dsp-bench"
 
 [[bin]]
+name = "handoff-probe"
+
+[[bin]]
 name = "period-probe"
 required-features = ["alsa-probes"]
