@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 const CHANNELS: usize = 2;
 const WARMUP: usize = 1000;
 const MAX_SOURCES: usize = 8;
-const BUDGET_RATE: f64 = 48_000.0;
+const MIX_RATES: [u32; 2] = [48_000, 192_000];
 
 #[derive(Parser)]
 struct Args {
@@ -89,8 +89,9 @@ fn resample_case<T: Sample>(
     (stats.summary(), resampler.output_delay())
 }
 
-fn print_row(label: &str, frames: usize, s: &Summary, extra: &str) {
-    let budget = frames as f64 / BUDGET_RATE * 1e9;
+/// `rate` is the rate `frames` are at, which sets the time available.
+fn print_row(label: &str, frames: usize, rate: u32, s: &Summary, extra: &str) {
+    let budget = frames as f64 / f64::from(rate) * 1e9;
     println!(
         "{label:<34} {frames:>5} {:>9} {:>9} {:>9} {:>7.1}% {:>7.1}% {extra}",
         s.mean,
@@ -108,12 +109,15 @@ fn main() {
         "{:<34} {:>5} {:>9} {:>9} {:>9} {:>8} {:>8}",
         "case", "frames", "mean ns", "p99.9 ns", "max ns", "p99.9", "max"
     );
-    for frames in [32, 64, 128, 256] {
+    for (frames, rate) in [32, 64, 128, 256]
+        .into_iter()
+        .flat_map(|f| MIX_RATES.map(|r| (f, r)))
+    {
         for sources in [2, 4, 8] {
             let s = mix_case(s32_to_f32, f32_to_s32, sources, frames, args.cycles);
-            print_row(&format!("mix f32 x{sources}"), frames, &s, "");
+            print_row(&format!("mix f32 x{sources} @{rate}"), frames, rate, &s, "");
             let s = mix_case(s32_to_f64, f64_to_s32, sources, frames, args.cycles);
-            print_row(&format!("mix f64 x{sources}"), frames, &s, "");
+            print_row(&format!("mix f64 x{sources} @{rate}"), frames, rate, &s, "");
         }
     }
     let high = SincInterpolationParameters::new(128, WindowFunction::Blackman2)
@@ -123,13 +127,19 @@ fn main() {
         .oversampling_factor(128)
         .interpolation(SincInterpolationType::Linear);
     for frames in [64, 128, 256] {
-        for (from, to) in [(44_100, 48_000), (48_000, 96_000)] {
+        for (from, to) in [
+            (44_100, 48_000),
+            (48_000, 96_000),
+            (48_000, 192_000),
+            (96_000, 192_000),
+        ] {
             for (quality, params) in [("high", &high), ("medium", &medium)] {
                 let (s, delay) = resample_case::<f32>(from, to, params, frames, args.cycles);
                 let extra = format!("delay {delay} frames");
                 print_row(
                     &format!("resample f32 {quality} {from}>{to}"),
                     frames,
+                    from as u32,
                     &s,
                     &extra,
                 );
@@ -138,6 +148,7 @@ fn main() {
                 print_row(
                     &format!("resample f64 {quality} {from}>{to}"),
                     frames,
+                    from as u32,
                     &s,
                     &extra,
                 );
