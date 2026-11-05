@@ -8,4 +8,8 @@ license = "MIT"
 publish = false
 
 [dependencies]
+audioadapter-buffers = "4.0"
+clap = { version = "4.6.7", features = ["derive"] }
 libc = "0.2"
+num-traits = "0.2.19"
+rubato = "4.0.0"
