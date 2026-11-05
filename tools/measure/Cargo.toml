@@ -27,3 +27,7 @@ name = "handoff-probe"
 [[bin]]
 name = "period-probe"
 required-features = ["alsa-probes"]
+
+[[bin]]
+name = "loopback-latency"
+required-features = ["alsa-probes"]
