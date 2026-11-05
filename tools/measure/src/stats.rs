@@ -112,6 +112,15 @@ impl Stats {
 
 /// The first line of a result. A run that ended early says so, because its
 /// figures do not meet the time the measurement was planned for.
+pub fn report_cases(done: usize, planned: usize) -> String {
+    let state = if done < planned {
+        "INCOMPLETE"
+    } else {
+        "complete"
+    };
+    format!("run {state}: {done} of {planned} cases")
+}
+
 pub fn report_header(planned: Duration, actual: Duration) -> String {
     let state = if actual < planned {
         "INCOMPLETE"
@@ -128,6 +137,16 @@ pub fn report_header(planned: Duration, actual: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_run_stopped_early_says_how_many_cases_it_reached() {
+        assert_eq!(report_cases(12, 96), "run INCOMPLETE: 12 of 96 cases");
+    }
+
+    #[test]
+    fn a_full_run_reports_every_case() {
+        assert_eq!(report_cases(96, 96), "run complete: 96 of 96 cases");
+    }
 
     #[test]
     fn warmup_samples_are_discarded() {

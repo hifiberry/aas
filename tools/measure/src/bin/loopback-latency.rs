@@ -7,7 +7,7 @@
 use alsa::Direction;
 use alsa::pcm::PCM;
 use clap::Parser;
-use measure::correlate::{find_delay, peak_dbfs, test_chirp, write_to_capture_frames};
+use measure::correlate::{chirp_level_dbfs, find_delay, test_chirp, write_to_capture_frames};
 use measure::hw::{self, CHANNELS};
 use measure::rt;
 use measure::sample::{f64_to_s32, s32_to_f64};
@@ -92,14 +92,14 @@ fn run(args: &Args) -> Result<(), String> {
     let mut delays = Vec::with_capacity(args.repeats);
     for repeat in 0..args.repeats {
         let captured = capture_once(args, &chirp)?;
-        let level = peak_dbfs(&captured);
+        let found = find_delay(&chirp, &captured, MIN_PEAK_RATIO)
+            .ok_or("no signal: check the cable and input level")?;
+        let level = chirp_level_dbfs(&captured, found, CHIRP_FRAMES);
         if level < MIN_LEVEL_DBFS {
             return Err(format!(
                 "no signal: peak {level:.1} dBFS, check the cable and input level"
             ));
         }
-        let found = find_delay(&chirp, &captured, MIN_PEAK_RATIO)
-            .ok_or("no signal: check the cable and input level")?;
         let delay = found as i64 - CHIRP_START as i64;
         let ms = delay as f64 / f64::from(args.rate) * 1000.0;
         println!("repeat {repeat}: converters {delay} frames, {ms:.3} ms, peak {level:.1} dBFS");

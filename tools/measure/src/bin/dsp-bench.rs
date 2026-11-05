@@ -3,25 +3,55 @@
 use audioadapter_buffers::direct::InterleavedSlice;
 use clap::Parser;
 use measure::sample::{f32_to_s32, f64_to_s32, mix_gain, s32_to_f32, s32_to_f64};
-use measure::stats::{Stats, Summary, report_header};
+use measure::stats::{Stats, Summary, report_cases};
+use measure::{rt, stop};
 use num_traits::Float;
 use rubato::{
     Async, FixedAsync, Resampler, Sample, SincInterpolationParameters, SincInterpolationType,
     WindowFunction,
 };
 use std::hint::black_box;
-use std::time::{Duration, Instant};
+use std::process::ExitCode;
+use std::time::Instant;
 
 const CHANNELS: usize = 2;
 const WARMUP: usize = 1000;
 const MAX_SOURCES: usize = 8;
 const MIX_RATES: [u32; 2] = [48_000, 192_000];
+const MIX_FRAMES: [usize; 4] = [32, 64, 128, 256];
+const MIX_SOURCES: [usize; 3] = [2, 4, 8];
+const RESAMPLE_FRAMES: [usize; 3] = [64, 128, 256];
+const RESAMPLE_PAIRS: [(usize, usize); 4] = [
+    (44_100, 48_000),
+    (48_000, 96_000),
+    (48_000, 192_000),
+    (96_000, 192_000),
+];
+const FORMATS: usize = 2;
+const QUALITIES: usize = 2;
+const PLANNED_CASES: usize = MIX_FRAMES.len() * MIX_RATES.len() * MIX_SOURCES.len() * FORMATS
+    + RESAMPLE_FRAMES.len() * RESAMPLE_PAIRS.len() * QUALITIES * FORMATS;
+const FIFO_PRIORITY: i32 = 70;
 
 #[derive(Parser)]
 struct Args {
     /// Cycles timed for each combination.
     #[arg(long, default_value_t = 100_000)]
     cycles: usize,
+    /// Run without real-time rights. The worst cases then mean little.
+    #[arg(long)]
+    no_rt: bool,
+}
+
+fn setup_rt(no_rt: bool) -> Result<(), String> {
+    let result = rt::lock_memory().and_then(|()| rt::set_fifo(FIFO_PRIORITY));
+    match result {
+        Err(e) if no_rt => {
+            eprintln!("continuing without real-time rights: {e}");
+            Ok(())
+        }
+        other => other,
+    }
 }
 
 fn mix_case<T: Float>(
@@ -102,22 +132,21 @@ fn print_row(label: &str, frames: usize, rate: u32, s: &Summary, extra: &str) {
     );
 }
 
-fn main() {
-    let args = Args::parse();
-    let started = Instant::now();
-    println!(
-        "{:<34} {:>5} {:>9} {:>9} {:>9} {:>8} {:>8}",
-        "case", "frames", "mean ns", "p99.9 ns", "max ns", "p99.9", "max"
-    );
-    for (frames, rate) in [32, 64, 128, 256]
+fn run_cases(cycles: usize) -> usize {
+    let mut done = 0;
+    for (frames, rate) in MIX_FRAMES
         .into_iter()
         .flat_map(|f| MIX_RATES.map(|r| (f, r)))
     {
-        for sources in [2, 4, 8] {
-            let s = mix_case(s32_to_f32, f32_to_s32, sources, frames, args.cycles);
+        for sources in MIX_SOURCES {
+            if stop::requested() {
+                return done;
+            }
+            let s = mix_case(s32_to_f32, f32_to_s32, sources, frames, cycles);
             print_row(&format!("mix f32 x{sources} @{rate}"), frames, rate, &s, "");
-            let s = mix_case(s32_to_f64, f64_to_s32, sources, frames, args.cycles);
+            let s = mix_case(s32_to_f64, f64_to_s32, sources, frames, cycles);
             print_row(&format!("mix f64 x{sources} @{rate}"), frames, rate, &s, "");
+            done += FORMATS;
         }
     }
     let high = SincInterpolationParameters::new(128, WindowFunction::Blackman2)
@@ -126,15 +155,13 @@ fn main() {
     let medium = SincInterpolationParameters::new(64, WindowFunction::Blackman2)
         .oversampling_factor(128)
         .interpolation(SincInterpolationType::Linear);
-    for frames in [64, 128, 256] {
-        for (from, to) in [
-            (44_100, 48_000),
-            (48_000, 96_000),
-            (48_000, 192_000),
-            (96_000, 192_000),
-        ] {
+    for frames in RESAMPLE_FRAMES {
+        for (from, to) in RESAMPLE_PAIRS {
             for (quality, params) in [("high", &high), ("medium", &medium)] {
-                let (s, delay) = resample_case::<f32>(from, to, params, frames, args.cycles);
+                if stop::requested() {
+                    return done;
+                }
+                let (s, delay) = resample_case::<f32>(from, to, params, frames, cycles);
                 let extra = format!("delay {delay} frames");
                 print_row(
                     &format!("resample f32 {quality} {from}>{to}"),
@@ -143,7 +170,7 @@ fn main() {
                     &s,
                     &extra,
                 );
-                let (s, delay) = resample_case::<f64>(from, to, params, frames, args.cycles);
+                let (s, delay) = resample_case::<f64>(from, to, params, frames, cycles);
                 let extra = format!("delay {delay} frames");
                 print_row(
                     &format!("resample f64 {quality} {from}>{to}"),
@@ -152,9 +179,37 @@ fn main() {
                     &s,
                     &extra,
                 );
+                done += FORMATS;
             }
         }
     }
-    let actual = started.elapsed();
-    println!("{}", report_header(Duration::ZERO, actual));
+    done
+}
+
+fn run(args: &Args) -> Result<(), String> {
+    stop::install();
+    setup_rt(args.no_rt)?;
+    let started = Instant::now();
+    println!(
+        "{:<34} {:>5} {:>9} {:>9} {:>9} {:>8} {:>8}",
+        "case", "frames", "mean ns", "p99.9 ns", "max ns", "p99.9", "max"
+    );
+    let done = run_cases(args.cycles);
+    println!("{}", report_cases(done, PLANNED_CASES));
+    println!(
+        "took {:.1} s, rt {}",
+        started.elapsed().as_secs_f64(),
+        !args.no_rt
+    );
+    Ok(())
+}
+
+fn main() -> ExitCode {
+    match run(&Args::parse()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }

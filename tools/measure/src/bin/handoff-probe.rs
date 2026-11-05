@@ -2,6 +2,7 @@
 //! The parent stands in for the daemon and the child for a client.
 
 use clap::Parser;
+use measure::handoff::{RING, Tracker};
 use measure::stats::{Stats, report_header};
 use measure::{rt, stop};
 use std::process::ExitCode;
@@ -28,7 +29,7 @@ struct Args {
 
 #[repr(C)]
 struct Shared {
-    sent_at: AtomicU64,
+    sent_at: [AtomicU64; RING as usize],
     sequence: AtomicU64,
     done: AtomicBool,
 }
@@ -92,8 +93,7 @@ fn signal(fd: i32) {
 fn child(shared: &Shared, fd: i32, args: &Args) -> Result<(), String> {
     set_priority(CHILD_PRIORITY, args.no_rt)?;
     let mut latency = Stats::with_warmup(WARMUP);
-    let mut gaps = 0u64;
-    let mut last = 0u64;
+    let mut tracker = Tracker::default();
     let started = Instant::now();
     loop {
         let mut count = 0u64;
@@ -106,12 +106,10 @@ fn child(shared: &Shared, fd: i32, args: &Args) -> Result<(), String> {
         if n != 8 {
             continue;
         }
-        let sequence = shared.sequence.load(Ordering::Acquire);
-        if sequence != last + 1 {
-            gaps += 1;
+        for sequence in tracker.on_wake(shared.sequence.load(Ordering::Acquire)) {
+            let sent = shared.sent_at[(sequence % RING) as usize].load(Ordering::Acquire);
+            latency.record(woke.saturating_sub(sent));
         }
-        last = sequence;
-        latency.record(woke.saturating_sub(shared.sent_at.load(Ordering::Acquire)));
     }
     let s = latency.summary();
     println!(
@@ -119,7 +117,7 @@ fn child(shared: &Shared, fd: i32, args: &Args) -> Result<(), String> {
         report_header(Duration::from_secs(args.seconds), started.elapsed())
     );
     println!("period {} us rt {}", args.period_us, !args.no_rt);
-    println!("sequence gaps {gaps}");
+    println!("missed wake-ups {}", tracker.missed());
     println!(
         "wake-up latency ns: count {} min {} mean {} p99 {} p99.9 {} max {}",
         s.count, s.min, s.mean, s.p99, s.p999, s.max
@@ -150,7 +148,7 @@ fn parent(shared: &Shared, fd: i32, args: &Args) -> Result<(), String> {
             )
         };
         sequence += 1;
-        shared.sent_at.store(nanos(now()), Ordering::Release);
+        shared.sent_at[(sequence % RING) as usize].store(nanos(now()), Ordering::Release);
         shared.sequence.store(sequence, Ordering::Release);
         signal(fd);
     }

@@ -51,6 +51,12 @@ pub fn find_delay(reference: &[f64], captured: &[f64], min_peak_ratio: f64) -> O
 }
 
 /// The loudest sample, in dB relative to full scale.
+/// The level of the chirp alone, so that a start-up click cannot pass for a cable.
+pub fn chirp_level_dbfs(captured: &[f64], found: usize, chirp_frames: usize) -> f64 {
+    let end = captured.len().min(found.saturating_add(chirp_frames));
+    peak_dbfs(captured.get(found..end).unwrap_or(&[]))
+}
+
 pub fn peak_dbfs(samples: &[f64]) -> f64 {
     let peak = samples.iter().fold(0.0, |m: f64, s| m.max(s.abs()));
     20.0 * peak.log10()
@@ -66,6 +72,29 @@ pub fn write_to_capture_frames(converter_frames: i64, period: usize, periods: u3
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_click_outside_the_chirp_does_not_count_as_level() {
+        let mut captured = vec![0.0; 4096];
+        captured[100] = 0.0316;
+        captured[2000..2004].fill(0.0001);
+        assert!(chirp_level_dbfs(&captured, 1000, 2048) > -90.0);
+        assert!(chirp_level_dbfs(&captured, 1000, 2048) < -40.0);
+    }
+
+    #[test]
+    fn the_level_is_the_peak_inside_the_chirp() {
+        let mut captured = vec![0.0; 4096];
+        captured[1500] = 0.5;
+        let level = chirp_level_dbfs(&captured, 1000, 2048);
+        assert!((level - -6.02).abs() < 0.01);
+    }
+
+    #[test]
+    fn a_chirp_past_the_end_of_the_capture_has_no_level() {
+        let captured = vec![0.5; 100];
+        assert_eq!(chirp_level_dbfs(&captured, 200, 2048), f64::NEG_INFINITY);
+    }
 
     fn seeded_noise(len: usize) -> Vec<f64> {
         let mut state = 0x2545_F491_4F6C_DD1Du64;
