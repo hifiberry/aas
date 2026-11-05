@@ -60,12 +60,12 @@ The project has failed, even if it works, if any of these become true:
 - Written in Rust. `rust-version` is declared in `Cargo.toml`; no nightly.
 - The target is Debian trixie on a 64-bit Raspberry Pi. The first shipped version
   supports Pi 3, 4 and 5 and all HiFiBerry cards.
-- The 4 ms target holds on Pi 4 and Pi 5. More latency is fine on a Pi 3, so the
-  default latency depends on the board. The Pi 3 figure comes from measurement
-  *(call)*.
-- The kernel on the test board is 6.18 with standard `PREEMPT`, not
-  `PREEMPT_RT`. The latency target must be met on that kernel, or the need for a
-  different kernel must be shown by measurement.
+- The 4 ms target holds on Pi 5, measured on a Compute Module 5, and is still to
+  be confirmed on the Pi 4. More latency is fine on a Pi 3, so the default latency
+  depends on the board. See [Latency](#latency) and `doc/measurements.md`.
+- The kernel on the test boards is 6.18 with standard `PREEMPT`, not
+  `PREEMPT_RT`. Measurement shows the defaults hold on that kernel under full load,
+  so `PREEMPT_RT` is not needed.
 - `squeezelite` plays to the ALSA `default` device, but its volume control goes
   straight to the card's mixer (`-V <control> -O hw:N`), not through `default`.
 - MPD uses `type "alsa"` with `mixer_type "hardware"` on `default`, so `aas` must
@@ -187,11 +187,16 @@ resampled if needed, processed, mixed, then written to the card as S32. Audio is
 never dithered, and the conversion scales by an exact power of two.
 
 64-bit float was chosen because it holds every S32 value exactly. So audio at
-0 dB with no plugins comes out with the same bits it went in with. The cost of
-64-bit float must be measured on a Pi 3, the slowest supported board, especially
-for resampling. The owner left the final choice open until that measurement.
-Since plugins work in the same format, this measurement comes before the plugin
-interface is fixed *(call)*.
+0 dB with no plugins comes out with the same bits it went in with. Measurement on
+a Pi 3, the slowest supported board, supports keeping it, pending the owner's
+approval *(call)*. Mixing costs about 1% of a period at 48 kHz. Resampling costs up
+to 1.85 times as much as in 32-bit, and the quality setting controls that cost far
+more than the float format does.
+
+Resampling has two quality settings *(call)*. `high` is the default on the Pi 5.
+`medium` is the default on the Pi 3, where `high` to 192 kHz uses about 80% of a
+period and can overrun it. The Pi 4 default waits for its measurement. Either can
+be set in the config.
 
 Input volumes are calculated on this path. So is the output volume on cards
 without a hardware volume (see Volume).
@@ -261,13 +266,28 @@ The 4 ms budget covers what `aas` adds, from the plugin receiving audio to the
 audio leaving the card *(call)*. A player's own ALSA buffer is outside it. At
 48 kHz, 4 ms is 192 frames.
 
+Default periods, with 2 periods buffered *(call)*:
+
+| Rate | Pi 5 | Pi 3 |
+|---|---|---|
+| 44.1 and 48 kHz | 64 frames | 256 frames |
+| 96 kHz | 128 frames | 512 frames |
+| 192 kHz | 256 frames | 1024 frames |
+
+So the Pi 3 default is about 11 to 12 ms. It held for an hour under full load with
+the board throttled. Its 64 frame period did not hold under that load. The Pi 4
+default waits for its measurement.
+
 Resampling adds roughly 1 to 2 ms. A resampled client may exceed 4 ms, in
-preference to reducing resampling quality *(call)*.
+preference to reducing resampling quality *(call)*. The Pi 3 is the exception: it
+reduces quality because of CPU cost, not latency.
 
 Latency added by a plugin counts on top of the budget, and `aas` reports it.
 
 The target counts as met when one hour of playback at 44.1 kHz and at 96 kHz runs
-on the test board with no xruns, on an otherwise idle system *(call)*.
+on the test board with no xruns and no wake-up gap longer than the buffer, on an
+otherwise idle system *(call)*. The xrun count alone is not enough, because ALSA can
+miss an underrun when the interrupt itself is late.
 
 ## Analog input
 
@@ -371,7 +391,8 @@ Details *(call)*:
 - **Timing:** time spent per audio cycle, average and worst case, in total and per
   plugin, against the time available. This shows how close the system is to a
   dropout.
-- **Dropouts:** xruns per output and underruns per client, with timestamps.
+- **Dropouts:** xruns per output and underruns per client, with timestamps, and
+  wake-up gaps longer than the buffer, which ALSA may not report as xruns.
 - **Latency:** the real current latency per client and output.
 - **Buffers:** fill level per client and per output.
 - **Resampling:** which clients and outputs are resampled, and the current
@@ -461,10 +482,11 @@ Development starts in a local VM with a virtual sound card. `snd-aloop` and
 `snd-dummy` are available. The VM proves logic and behaviour. Its timing is not
 real, so it cannot prove the latency target.
 
-The test board is a Compute Module 5 with a DAC+ ADC Pro, and it may be
-reinstalled freely. It needs the ADC Pro overlay before capture is available,
-and real-time rights for the daemon. Latency is proven there. A Pi 3 and a Pi 4 are
-still needed as test systems, to set the Pi 3 default and confirm 4 ms on the Pi 4.
+The main test board is a Compute Module 5 with a DAC+ ADC Pro and a heatsink, and
+it may be reinstalled freely. It needs the `hifiberry-dacplusadcpro,slave` overlay
+before any sound card appears, and real-time rights for the daemon. Latency is
+proven there. A Pi 3 with a DAC+ ADC is the second test board. A Pi 4 is still
+needed, to confirm 4 ms and set its defaults.
 
 Bit-exactness is tested automatically by comparing samples through `snd-aloop`.
 Real latency is measured on the test board with a cable from the DAC output to the
@@ -479,6 +501,8 @@ and a Lyrion server.
 
 ## Not yet known
 
+- Whether a Pi 5 class board stays cool enough in the product's case. Without a
+  heatsink, a Compute Module 5 throttled on one busy core.
 - How `librespot`, `shairport-sync`, `raat` and `sendspin` connect to audio
   today. Their configuration is not in the `hifiberry-os` repository. Check this
   before relying on "ALSA clients need no changes" for them.
