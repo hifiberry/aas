@@ -1,0 +1,11 @@
+[package]
+name = "measure"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Probes that measure what the hardware can do for aas"
+license = "MIT"
+publish = false
+
+[dependencies]
+libc = "0.2"
