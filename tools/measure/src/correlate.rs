@@ -50,6 +50,19 @@ pub fn find_delay(reference: &[f64], captured: &[f64], min_peak_ratio: f64) -> O
     (peak >= next * min_peak_ratio).then_some(best)
 }
 
+/// The loudest sample, in dB relative to full scale.
+pub fn peak_dbfs(samples: &[f64]) -> f64 {
+    let peak = samples.iter().fold(0.0, |m: f64, s| m.max(s.abs()));
+    20.0 * peak.log10()
+}
+
+/// Linked streams share a sample clock, so `converter_frames` is only the delay
+/// through the DAC and ADC. Audio also waits in the output queue, which is full
+/// when a block is written.
+pub fn write_to_capture_frames(converter_frames: i64, period: usize, periods: u32) -> i64 {
+    converter_frames + (period as i64) * i64::from(periods)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -64,6 +77,22 @@ mod tests {
                 state as f64 / u64::MAX as f64 * 2.0 - 1.0
             })
             .collect()
+    }
+
+    #[test]
+    fn peak_level_of_half_scale_is_minus_six_db() {
+        let level = peak_dbfs(&[0.0, -0.5, 0.25]);
+        assert!((level + 6.02).abs() < 0.01, "got {level}");
+    }
+
+    #[test]
+    fn peak_level_of_silence_is_minus_infinity() {
+        assert_eq!(peak_dbfs(&[0.0; 8]), f64::NEG_INFINITY);
+    }
+
+    #[test]
+    fn write_to_output_adds_the_queue_to_the_converter_delay() {
+        assert_eq!(write_to_capture_frames(50, 64, 2), 178);
     }
 
     #[test]

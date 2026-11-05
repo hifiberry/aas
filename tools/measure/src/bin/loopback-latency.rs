@@ -1,10 +1,13 @@
-//! The real delay from writing a sample to capturing it through a cable from
-//! the DAC output to the ADC input. Includes the converters on both sides.
+//! The real delay through a cable from the DAC output to the ADC input.
+//!
+//! Playback and capture are linked, so they share a sample clock and the delay
+//! found is the converters alone. The output queue is added separately to give
+//! the time from writing a sample to capturing it.
 
 use alsa::Direction;
 use alsa::pcm::PCM;
 use clap::Parser;
-use measure::correlate::{find_delay, test_chirp};
+use measure::correlate::{find_delay, peak_dbfs, test_chirp, write_to_capture_frames};
 use measure::hw::{self, CHANNELS};
 use measure::rt;
 use measure::sample::{f64_to_s32, s32_to_f64};
@@ -15,6 +18,8 @@ const CHIRP_FRAMES: usize = 2048;
 const CHIRP_START: usize = 4096;
 const TOTAL_FRAMES: usize = 24_000;
 const MIN_PEAK_RATIO: f64 = 2.0;
+/// Below this, the correlation has found crosstalk on the board, not a cable.
+const MIN_LEVEL_DBFS: f64 = -40.0;
 const FIFO_PRIORITY: i32 = 70;
 
 #[derive(Parser)]
@@ -87,22 +92,31 @@ fn run(args: &Args) -> Result<(), String> {
     let mut delays = Vec::with_capacity(args.repeats);
     for repeat in 0..args.repeats {
         let captured = capture_once(args, &chirp)?;
+        let level = peak_dbfs(&captured);
+        if level < MIN_LEVEL_DBFS {
+            return Err(format!(
+                "no signal: peak {level:.1} dBFS, check the cable and input level"
+            ));
+        }
         let found = find_delay(&chirp, &captured, MIN_PEAK_RATIO)
             .ok_or("no signal: check the cable and input level")?;
         let delay = found as i64 - CHIRP_START as i64;
         let ms = delay as f64 / f64::from(args.rate) * 1000.0;
-        println!("repeat {repeat}: {delay} frames, {ms:.3} ms");
+        println!("repeat {repeat}: converters {delay} frames, {ms:.3} ms, peak {level:.1} dBFS");
         delays.push(delay);
     }
     let min = delays.iter().min().copied().unwrap_or(0);
     let max = delays.iter().max().copied().unwrap_or(0);
     let mean = delays.iter().sum::<i64>() as f64 / delays.len().max(1) as f64;
+    let total = write_to_capture_frames(mean.round() as i64, args.period, args.periods);
     println!(
-        "rate {} period {} periods {}: min {min} mean {mean:.1} max {max} frames, mean {:.3} ms",
+        "rate {} period {} periods {}: converters min {min} mean {mean:.1} max {max} frames, \
+         mean {:.3} ms; write to capture {total} frames, {:.3} ms",
         args.rate,
         args.period,
         args.periods,
-        mean / f64::from(args.rate) * 1000.0
+        mean / f64::from(args.rate) * 1000.0,
+        total as f64 / f64::from(args.rate) * 1000.0
     );
     Ok(())
 }
