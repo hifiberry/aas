@@ -65,11 +65,12 @@ where
         }
     }
 
-    /// Takes what the resampler wants from `ring`, up to what is there. The
-    /// rest counts as silence. Returns how many frames were missing.
-    fn run(&mut self, ring: &Ring, out: &mut [[i32; 2]]) -> usize {
+    /// Takes what the resampler wants from `ring`, up to `limit` frames and
+    /// what is there. The rest counts as silence. Returns the frames taken
+    /// and the frames missing.
+    fn run(&mut self, ring: &Ring, out: &mut [[i32; 2]], limit: usize) -> (usize, usize) {
         let need = self.inner.input_frames_next();
-        let got = ring.read(&mut self.frames[..need]);
+        let got = ring.read(&mut self.frames[..need.min(limit)]);
         for (frame, floats) in self.frames[..got]
             .iter()
             .zip(self.input.chunks_exact_mut(CHANNELS))
@@ -93,7 +94,7 @@ where
         for (frame, floats) in out.iter_mut().zip(self.output.chunks_exact(CHANNELS)) {
             *frame = [P::finish(floats[0]), P::finish(floats[1])];
         }
-        need - got
+        (got, need - got)
     }
 }
 
@@ -116,8 +117,10 @@ pub struct Resampler {
     period: usize,
     /// Input frames of silence that push the last audio out of the filter.
     tail: usize,
-    /// Input frames of silence fed in since the last full input.
+    /// Input frames of silence fed in since the last audio.
     padded: usize,
+    /// Audio has gone in.
+    primed: bool,
 }
 
 impl Resampler {
@@ -133,13 +136,16 @@ impl Resampler {
             period: frames,
             tail: 0,
             padded: 0,
+            primed: false,
         };
         resampler.tail = (f64::from(resampler.delay_frames()) / ratio).ceil() as usize + 1;
+        // An empty filter has nothing left to push out.
+        resampler.padded = resampler.tail;
         resampler
     }
 
     /// Input frames the next call takes. It varies by a frame from call to
-    /// call, and the first call takes more, to fill the filter.
+    /// call.
     pub fn input_frames_next(&self) -> usize {
         match &self.precision {
             Precision::Single(s) => s.inner.input_frames_next(),
@@ -160,8 +166,15 @@ impl Resampler {
     pub fn ready(&self, ring: &Ring) -> bool {
         // The flag comes first: a client sets it after its last frames.
         let draining = ring.header().draining.load(Ordering::Acquire) != 0;
-        let enough = ring.available() >= self.input_frames_next();
-        enough || (draining && !self.flushed())
+        let available = ring.available();
+        let enough = available >= self.input_frames_next();
+        enough || (draining && (available > 0 || !self.flushed()))
+    }
+
+    /// Whether audio has gone in yet. Before that, a client short of input is
+    /// starting up rather than late.
+    pub fn primed(&self) -> bool {
+        self.primed
     }
 
     /// Whether all the audio fed in so far has come out again.
@@ -178,19 +191,28 @@ impl Resampler {
     /// consumes nothing when the ring holds too little. A draining ring is
     /// padded with silence instead, so its last frames still come out.
     pub fn process(&mut self, ring: &Ring, out: &mut [[i32; 2]]) -> usize {
-        if !self.ready(ring) {
+        self.process_up_to(ring, out, usize::MAX)
+    }
+
+    /// As `process`, but takes at most `limit` frames from the ring, even if
+    /// it wanted more. A limit that cuts the input short gives a full period
+    /// with silence in place of the frames left out.
+    pub fn process_up_to(&mut self, ring: &Ring, out: &mut [[i32; 2]], limit: usize) -> usize {
+        let cut_short = limit < self.input_frames_next().min(ring.available());
+        if !cut_short && !self.ready(ring) {
             return 0;
         }
         let n = self.period.min(out.len());
-        let missing = match &mut self.precision {
-            Precision::Single(s) => s.run(ring, &mut out[..n]),
-            Precision::Double(s) => s.run(ring, &mut out[..n]),
+        let (got, missing) = match &mut self.precision {
+            Precision::Single(s) => s.run(ring, &mut out[..n], limit),
+            Precision::Double(s) => s.run(ring, &mut out[..n], limit),
         };
-        self.padded = if missing == 0 {
-            0
+        if got > 0 {
+            self.primed = true;
+            self.padded = missing;
         } else {
-            self.padded + missing
-        };
+            self.padded += missing;
+        }
         n
     }
 }
@@ -323,6 +345,38 @@ mod tests {
         // 200 input frames are 217 at the output rate. All of them must appear.
         let loud = all.iter().filter(|f| f[0] > 500_000_000).count();
         assert!((215..=220).contains(&loud), "{loud}");
+    }
+
+    #[test]
+    fn a_limit_keeps_the_rest_of_the_ring_out_of_the_filter() {
+        let ring = ring();
+        ring.write(&[[1_000_000_000; 2]; 2000]);
+        let mut r = resampler(Format::F32);
+        let before = ring.available();
+        assert_eq!(r.process_up_to(&ring, &mut [[0; 2]; PERIOD], 30), PERIOD);
+        assert_eq!(before - ring.available(), 30);
+    }
+
+    #[test]
+    fn a_new_resampler_is_flushed_and_not_primed() {
+        let ring = ring();
+        let mut r = resampler(Format::F32);
+        assert!(r.flushed());
+        assert!(!r.primed());
+        ring.write(&tone(1000));
+        r.process(&ring, &mut [[0; 2]; PERIOD]);
+        assert!(!r.flushed());
+        assert!(r.primed());
+    }
+
+    #[test]
+    fn a_short_remainder_can_always_be_read_while_draining() {
+        let ring = ring();
+        let r = resampler(Format::F32);
+        ring.write(&tone(3));
+        assert!(!r.ready(&ring));
+        ring.header().draining.store(1, Ordering::Release);
+        assert!(r.ready(&ring));
     }
 
     #[test]
