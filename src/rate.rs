@@ -48,14 +48,39 @@ impl RatePolicy {
         self.clients.iter().find(|c| c.id == id).map(|c| c.rate)
     }
 
-    /// A client starts or resumes playing at `rate`.
-    pub fn client_started(&mut self, id: ClientId, rate: u32, _now: Duration) {
-        self.clients.retain(|c| c.id != id);
-        if self.clients.is_empty() {
-            self.base = self.nearest(rate);
+    /// The rate a settle switch would move to, if one is needed.
+    ///
+    /// A switch is needed when no active client is at the output rate. It
+    /// then goes to the nearest rate of the oldest active client.
+    fn settle_target(&self) -> Option<u32> {
+        if self.clients.iter().any(|c| c.rate == self.base) {
+            return None;
         }
-        self.clients.push(Active { id, rate });
-        self.switch_at = None;
+        let target = self.nearest(self.clients.first()?.rate);
+        (target != self.base).then_some(target)
+    }
+
+    /// Keeps a pending switch only while it is still needed.
+    fn drop_unneeded_switch(&mut self) {
+        if self.settle_target().is_none() {
+            self.switch_at = None;
+        }
+    }
+
+    /// A client starts or resumes playing at `rate`.
+    ///
+    /// A start for an id that is already active only updates its rate. It
+    /// keeps its place in the order.
+    pub fn client_started(&mut self, id: ClientId, rate: u32, _now: Duration) {
+        if let Some(c) = self.clients.iter_mut().find(|c| c.id == id) {
+            c.rate = rate;
+        } else {
+            if self.clients.is_empty() {
+                self.base = self.nearest(rate);
+            }
+            self.clients.push(Active { id, rate });
+        }
+        self.drop_unneeded_switch();
     }
 
     /// A client stops or pauses.
@@ -68,20 +93,26 @@ impl RatePolicy {
         if self.clients.len() == before {
             return;
         }
-        match self.clients.as_slice() {
-            [] => self.switch_at = None,
-            [only] if self.nearest(only.rate) != self.base => {
-                self.switch_at = Some(now + SETTLE);
-            }
-            _ => self.switch_at = None,
+        if self.settle_target().is_some() {
+            self.switch_at.get_or_insert(now + SETTLE);
+        } else {
+            self.switch_at = None;
         }
     }
 
     /// The client's stream is DoP. The output runs at its rate until it stops.
+    ///
+    /// A DoP stream at a rate the card does not support does not take effect.
+    /// The output rate stays as it was, so the engine keeps that stream muted
+    /// because its rate does not match.
     pub fn dop_started(&mut self, id: ClientId) {
-        if self.rate_of(id).is_some() {
+        if self.rate_of(id).is_some_and(|r| self.is_supported(r)) {
             self.dop = Some(id);
         }
+    }
+
+    fn is_supported(&self, rate: u32) -> bool {
+        self.supported.is_empty() || self.supported.contains(&rate)
     }
 
     pub fn dop_stopped(&mut self, id: ClientId) {
@@ -97,20 +128,22 @@ impl RatePolicy {
             return;
         }
         self.switch_at = None;
-        if let [only] = self.clients.as_slice() {
-            self.base = self.nearest(only.rate);
+        if let Some(target) = self.settle_target() {
+            self.base = target;
         }
     }
 
     pub fn set_supported(&mut self, rates: Vec<u32>) {
         self.supported = rates;
         self.base = self.nearest(self.base);
+        self.drop_unneeded_switch();
     }
 
     /// The output rate.
     pub fn current(&self) -> u32 {
         self.dop
             .and_then(|id| self.rate_of(id))
+            .filter(|r| self.is_supported(*r))
             .unwrap_or(self.base)
     }
 
@@ -194,17 +227,6 @@ mod tests {
     }
 
     #[test]
-    fn a_client_arriving_during_settle_cancels_the_switch() {
-        let mut p = policy();
-        p.client_started(1, 44100, T0);
-        p.client_started(2, 96000, T0);
-        p.client_stopped(1, T0);
-        p.client_started(3, 48000, T0 + ms(100));
-        p.tick(T0 + ms(600));
-        assert_eq!(p.current(), 44100);
-    }
-
-    #[test]
     fn an_unsupported_rate_uses_the_nearest_and_resamples() {
         let mut p = policy();
         p.client_started(1, 88200, T0);
@@ -256,5 +278,109 @@ mod tests {
         assert_eq!(p.current(), 44100);
         assert!(!p.needs_resampling(1));
         assert!(p.needs_resampling(2));
+    }
+
+    #[test]
+    fn three_clients_first_stops_and_the_others_share_their_rate() {
+        let mut p = policy();
+        p.client_started(1, 44100, T0);
+        p.client_started(2, 96000, T0);
+        p.client_started(3, 96000, T0);
+        p.client_stopped(1, T0);
+        p.tick(T0 + ms(499));
+        assert_eq!(p.current(), 44100);
+        p.tick(T0 + ms(500));
+        assert_eq!(p.current(), 96000);
+        assert!(!p.needs_resampling(2));
+        assert!(!p.needs_resampling(3));
+    }
+
+    #[test]
+    fn the_oldest_remaining_client_sets_the_rate() {
+        let mut p = policy();
+        p.client_started(1, 44100, T0);
+        p.client_started(2, 96000, T0);
+        p.client_started(3, 48000, T0);
+        p.client_stopped(1, T0);
+        p.tick(T0 + ms(500));
+        assert_eq!(p.current(), 96000);
+        assert!(!p.needs_resampling(2));
+        assert!(p.needs_resampling(3));
+    }
+
+    #[test]
+    fn a_remaining_client_at_the_output_rate_schedules_no_switch() {
+        let mut p = policy();
+        p.client_started(1, 44100, T0);
+        p.client_started(2, 96000, T0);
+        p.client_started(3, 44100, T0);
+        p.client_stopped(2, T0);
+        p.tick(T0 + ms(5000));
+        assert_eq!(p.current(), 44100);
+    }
+
+    #[test]
+    fn a_client_at_the_output_rate_arriving_during_settle_cancels_the_switch() {
+        let mut p = policy();
+        p.client_started(1, 44100, T0);
+        p.client_started(2, 96000, T0);
+        p.client_stopped(1, T0);
+        p.client_started(3, 44100, T0 + ms(100));
+        p.tick(T0 + ms(600));
+        assert_eq!(p.current(), 44100);
+    }
+
+    #[test]
+    fn a_duplicate_start_does_not_skip_the_settle_time() {
+        let mut p = policy();
+        p.client_started(1, 44100, T0);
+        p.client_started(2, 96000, T0);
+        p.client_stopped(1, T0);
+        p.client_started(2, 96000, T0 + ms(100));
+        assert_eq!(p.current(), 44100);
+        p.tick(T0 + ms(500));
+        assert_eq!(p.current(), 96000);
+    }
+
+    #[test]
+    fn dop_at_an_unsupported_rate_leaves_the_rate_alone() {
+        let mut p = policy();
+        p.client_started(1, 44100, T0);
+        p.client_started(2, 88200, T0);
+        p.dop_started(2);
+        assert_eq!(p.current(), 44100);
+    }
+
+    #[test]
+    fn a_stop_for_an_unknown_id_changes_nothing() {
+        let mut p = policy();
+        p.client_started(1, 44100, T0);
+        p.client_started(2, 96000, T0);
+        p.client_stopped(9, T0);
+        p.tick(T0 + ms(5000));
+        assert_eq!(p.current(), 44100);
+        assert!(p.needs_resampling(2));
+    }
+
+    #[test]
+    fn the_lone_client_stopping_during_settle_leaves_the_rate_unchanged() {
+        let mut p = policy();
+        p.client_started(1, 44100, T0);
+        p.client_started(2, 96000, T0);
+        p.client_stopped(1, T0);
+        p.client_stopped(2, T0 + ms(100));
+        p.tick(T0 + ms(5000));
+        assert_eq!(p.current(), 44100);
+    }
+
+    #[test]
+    fn the_dop_client_stopping_while_others_remain_restores_the_normal_rules() {
+        let mut p = policy();
+        p.client_started(1, 44100, T0);
+        p.client_started(2, 192000, T0);
+        p.dop_started(2);
+        p.client_stopped(2, T0);
+        assert_eq!(p.current(), 44100);
+        assert!(!p.needs_resampling(1));
     }
 }
