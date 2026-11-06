@@ -430,7 +430,7 @@ mod tests {
 
     #[test]
     fn fallback_returns_to_the_inner_sink_at_the_next_retry() {
-        let (mut sink, log) = fallback(Duration::from_millis(5));
+        let (mut sink, log) = fallback(RETRY);
         sink.open(48000, 48).unwrap();
         log.fail(Some(SinkError::Gone));
         sink.write(&[[1; 2]; 48]).unwrap();
@@ -438,7 +438,7 @@ mod tests {
         // Too early: the retry is not due, so this goes to the null sink.
         sink.write(&[[2; 2]; 48]).unwrap();
         assert!(log.frames().is_empty());
-        std::thread::sleep(Duration::from_millis(6));
+        sink.retry_at = Instant::now();
         sink.write(&[[3; 2]; 48]).unwrap();
         assert_eq!(log.frames(), [[3; 2]; 48]);
         assert_eq!(log.opens(), [(48000, 48), (48000, 48)]);

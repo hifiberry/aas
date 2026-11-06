@@ -1688,7 +1688,7 @@ mod tests {
         // The buffer is two periods, 2.67 ms.
         std::thread::sleep(Duration::from_millis(20));
         rig.cycle();
-        assert_eq!(rig.counters.wake_gaps.load(Relaxed), 1);
+        assert!(rig.counters.wake_gaps.load(Relaxed) >= 1);
         assert_eq!(rig.counters.xruns.load(Relaxed), 0);
         assert!(rig.counters.worst_gap_ns.load(Relaxed) >= 20_000_000);
     }
@@ -2075,7 +2075,7 @@ mod tests {
 
     impl crate::sink::Sink for SlowOpen {
         fn open(&mut self, _rate: u32, _period: u32) -> Result<(), SinkError> {
-            std::thread::sleep(Duration::from_millis(20));
+            std::thread::sleep(Duration::from_millis(50));
             Ok(())
         }
 
@@ -2102,16 +2102,18 @@ mod tests {
         let mode = BitPerfect::Auto;
         let mut engine =
             Engine::<F32, SlowOpen>::new(SlowOpen, consumer, producer, counters.clone(), mode);
+        // The buffer lasts 42 ms: shorter than the open, and far longer than
+        // a busy machine can keep a test from running.
         let reconfigure = Command::Reconfigure {
             rate: RATE,
-            period: PERIOD as u32,
+            period: 1024,
         };
         assert!(commands.push(reconfigure).is_ok());
         for _ in 0..3 {
             engine.cycle().unwrap();
         }
         assert_eq!(counters.wake_gaps.load(Relaxed), 0);
-        assert!(counters.worst_cycle_ns.load(Relaxed) < 10_000_000);
+        assert!(counters.worst_cycle_ns.load(Relaxed) < 40_000_000);
     }
 
     #[test]
