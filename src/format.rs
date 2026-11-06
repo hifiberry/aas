@@ -120,17 +120,32 @@ pub fn mix<P: Processing>(
     out: &mut [[i32; 2]],
 ) {
     let n = out.len().min(acc.len());
-    for frame in acc[..n].iter_mut() {
-        *frame = [P::zero(), P::zero()];
-    }
+    mix_clear::<P>(&mut acc[..n]);
     for (samples, ramp) in sources {
-        for (i, (a, s)) in acc[..n].iter_mut().zip(samples.iter()).enumerate() {
-            let g = ramp.at(i, n);
-            P::accumulate(&mut a[0], s[0], g);
-            P::accumulate(&mut a[1], s[1], g);
-        }
+        mix_add::<P>(samples, *ramp, &mut acc[..n]);
     }
-    for (o, a) in out[..n].iter_mut().zip(acc.iter()) {
+    mix_finish::<P>(&acc[..n], &mut out[..n]);
+}
+
+/// Starts a mix. The engine uses these three steps directly, because it has
+/// no list of sources to hand to `mix` without allocating one.
+pub fn mix_clear<P: Processing>(acc: &mut [[P::Acc; 2]]) {
+    acc.fill([P::zero(), P::zero()]);
+}
+
+/// Adds one source. The ramp spans all of `acc`.
+pub fn mix_add<P: Processing>(samples: &[[i32; 2]], ramp: Ramp, acc: &mut [[P::Acc; 2]]) {
+    let n = acc.len();
+    for (i, (a, s)) in acc.iter_mut().zip(samples.iter()).enumerate() {
+        let g = ramp.at(i, n);
+        P::accumulate(&mut a[0], s[0], g);
+        P::accumulate(&mut a[1], s[1], g);
+    }
+}
+
+/// Ends a mix by converting to S32.
+pub fn mix_finish<P: Processing>(acc: &[[P::Acc; 2]], out: &mut [[i32; 2]]) {
+    for (o, a) in out.iter_mut().zip(acc.iter()) {
         *o = [P::finish(a[0]), P::finish(a[1])];
     }
 }

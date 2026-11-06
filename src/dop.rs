@@ -1,7 +1,8 @@
 //! DoP (DSD over PCM) detection.
 
 const MARKERS: [u8; 2] = [0x05, 0xFA];
-const MIN_FRAMES: usize = 16;
+/// Fewer frames than this cannot be told from PCM.
+pub const MIN_FRAMES: usize = 16;
 
 /// True when the frames carry alternating DoP markers in the top byte of
 /// both channels. The block may start on either marker.
