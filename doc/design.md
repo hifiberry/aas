@@ -73,6 +73,8 @@ The project has failed, even if it works, if any of these become true:
 - On Digi cards, opening capture slaves the card clock to S/PDIF in and breaks
   playback. So `aas` needs a table of card capabilities, and it opens capture only
   on cards marked as having an ADC *(call)*.
+- There is no minimum cooling requirement. A Compute Module 5 without a heatsink
+  throttled to 1 GHz under full load and still had no xruns.
 - `aas` detects the card itself, so normal use needs no card in the config. The
   config can override it *(call)*.
 
@@ -301,7 +303,7 @@ The 4 ms budget covers what `aas` adds, from the plugin receiving audio to the
 audio leaving the card *(call)*. A player's own ALSA buffer is outside it. At
 48 kHz, 4 ms is 192 frames.
 
-Default periods, with 2 periods buffered *(call)*:
+Default periods, with 2 periods buffered:
 
 | Rate | Pi 5 | Pi 3 |
 |---|---|---|
@@ -543,8 +545,6 @@ and a Lyrion server.
 
 - What `i32` costs. It has not been measured. Since mixing already costs about 1%
   of a period, it is not expected to save much CPU.
-- Whether a Pi 5 class board stays cool enough in the product's case. Without a
-  heatsink, a Compute Module 5 throttled on one busy core.
 - How `librespot`, `shairport-sync`, `raat` and `sendspin` connect to audio
   today. Their configuration is not in the `hifiberry-os` repository. Check this
   before relying on "ALSA clients need no changes" for them.

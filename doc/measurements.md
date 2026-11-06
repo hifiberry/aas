@@ -41,7 +41,8 @@ synchronous disk writes.
   the Pi 4.
 - **`PREEMPT_RT` is not needed.** The standard kernel holds every default on both
   boards, under full load.
-- **A Pi 5 class board needs a heatsink.** See [Heat](#heat).
+- **A heatsink is not required, but it keeps the speed.** Without one, a CM5 throttled
+  and still had no xruns. See [Heat](#heat).
 
 ## What these figures do not show
 
@@ -164,8 +165,8 @@ full load it reached 84 °C and held 2.2 to 2.3 GHz, touching the soft temperatu
 limit.
 
 The first CM5 `dsp-bench` runs were discarded for this reason: resampling read up
-to 50% slower late in a run. Heat matters for the design, because a Pi 5 class board
-in a closed case can throttle during normal use.
+to 50% slower late in a run. A Pi 5 class board in a closed case can throttle during
+normal use, so processing figures from such a board can read higher.
 
 The Pi 3 had no throttling at idle or under one busy core. It throttled only under
 full load.

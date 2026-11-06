@@ -13,11 +13,6 @@ ALSA can miss an underrun when the interrupt is late, so it is unknown whether a
 broke. Write a probe that plays a steady tone through the cable and reports breaks
 in the capture. Both test boards have the cable connected.
 
-## Check heat in a real case
-
-A CM5 without a heatsink throttles on one busy core. Measure a Pi 5 class board in
-the actual product enclosure, then decide on a minimum cooling requirement.
-
 ## Measure the sound of medium resampling
 
 `medium` is no longer a default, but it is the fallback for a Pi 3 in `f64` or with
