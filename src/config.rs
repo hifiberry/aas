@@ -116,8 +116,9 @@ impl Config {
             Err(e) => return Err(format!("{}: {e}", path.display())),
         };
         let raw: Raw = toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
-        if let Some(ms) = raw.latency_ms
-            && !(ms.is_finite() && ms > 0.0)
+        if raw
+            .latency_ms
+            .is_some_and(|ms| !(ms.is_finite() && ms > 0.0))
         {
             return Err(format!(
                 "{}: latency_ms must be a positive number",
