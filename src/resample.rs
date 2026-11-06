@@ -191,17 +191,16 @@ impl Resampler {
     /// consumes nothing when the ring holds too little. A draining ring is
     /// padded with silence instead, so its last frames still come out.
     pub fn process(&mut self, ring: &Ring, out: &mut [[i32; 2]]) -> usize {
+        if !self.ready(ring) {
+            return 0;
+        }
         self.process_up_to(ring, out, usize::MAX)
     }
 
-    /// As `process`, but takes at most `limit` frames from the ring, even if
-    /// it wanted more. A limit that cuts the input short gives a full period
-    /// with silence in place of the frames left out.
+    /// Writes one period whatever the ring holds, and takes at most `limit`
+    /// frames from it, with silence in place of the rest. The caller has
+    /// decided the period should play. Returns its length.
     pub fn process_up_to(&mut self, ring: &Ring, out: &mut [[i32; 2]], limit: usize) -> usize {
-        let cut_short = limit < self.input_frames_next().min(ring.available());
-        if !cut_short && !self.ready(ring) {
-            return 0;
-        }
         let n = self.period.min(out.len());
         let (got, missing) = match &mut self.precision {
             Precision::Single(s) => s.run(ring, &mut out[..n], limit),

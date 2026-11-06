@@ -66,8 +66,11 @@ pub struct Source {
     ready: usize,
     /// Frames seen in the ring this cycle, up to a period.
     seen: usize,
-    /// Frames follow `ready` that must not be read with them.
-    cut_short: bool,
+    /// This source goes into the mix this cycle. Decided from what was seen,
+    /// so frames written since then change nothing.
+    plays: bool,
+    /// Frames seen but held back, as they might be DoP.
+    held: usize,
     /// The stream was under way before this cycle.
     settled: bool,
     /// The marker that continues the DoP stream.
@@ -94,7 +97,8 @@ impl Source {
             stream: Stream::Unknown,
             ready: 0,
             seen: 0,
-            cut_short: false,
+            plays: false,
+            held: 0,
             settled: false,
             next_marker: 0x05,
             dop_dry_frames: 0,
@@ -122,16 +126,6 @@ impl Source {
         self.stream == Stream::Dop && self.rate != output_rate
     }
 
-    /// Whether this source can contribute audio this cycle.
-    fn has_input(&self) -> bool {
-        match &self.resampler {
-            Some(r) => {
-                (self.ready > 0 || self.draining()) && (self.cut_short || r.ready(&self.ring))
-            }
-            None => self.ready > 0,
-        }
-    }
-
     /// Input frames one period takes.
     fn period_input(&self, period: usize) -> usize {
         self.resampler
@@ -142,19 +136,19 @@ impl Source {
     /// Decides what may be read this cycle from `window`, the start of what
     /// the ring holds. No DoP frame may reach the mix or a resampler, so PCM
     /// stops short of it and DoP stops short of whatever follows it. Each
-    /// kind then starts on a cycle of its own.
+    /// kind then starts on a cycle of its own. Later reads go no further than
+    /// this decision, whatever the client has written since.
     fn judge(&mut self, window: &[[i32; 2]], period: usize, draining: bool) {
         let input = self.period_input(period);
         self.settled = self.stream != Stream::Unknown;
         self.seen = window.len().min(period);
         self.ready = 0;
-        self.cut_short = false;
-        if window.is_empty() {
-            return;
-        }
+        self.held = 0;
+        self.plays = false;
         if self.stream == Stream::Dop {
             self.ready = dop::marked_run(&window[..self.seen]);
-            if self.ready > 0 {
+            if self.ready > 0 || window.is_empty() {
+                self.plays = self.flush_due(draining);
                 return;
             }
             self.stream = Stream::Pcm;
@@ -167,15 +161,36 @@ impl Source {
                 return;
             }
             dop::Found::At(start) => start,
-            // At the end of a drain nothing more will come to judge it by.
-            dop::Found::Unclear(start) if !draining => start,
-            _ => head,
+            dop::Found::Unclear(0) if draining => {
+                // Nothing more will come to judge it by, so it is not played.
+                self.ring.consume(window.len());
+                self.plays = self.flush_due(draining);
+                return;
+            }
+            dop::Found::Unclear(start) => {
+                if self.settled && !draining {
+                    self.held = head.saturating_sub(start);
+                }
+                start
+            }
+            dop::Found::Nothing => head,
         };
         if pcm > 0 {
             self.stream = Stream::Pcm;
         }
         self.ready = pcm.min(head);
-        self.cut_short = self.ready < head && window.len() >= input;
+        self.plays = match self.resampler {
+            None => self.ready > 0,
+            // A block cut short by DoP plays, with silence for the rest.
+            Some(_) if self.ready > 0 => window.len() >= input || draining,
+            Some(_) => window.is_empty() && self.flush_due(draining),
+        };
+    }
+
+    /// The filter still holds audio that only silence can push out.
+    fn flush_due(&self, draining: bool) -> bool {
+        let filled = self.resampler.as_ref().is_some_and(|r| !r.flushed());
+        draining && filled && self.ready == 0
     }
 
     /// Counts an underrun if `got` falls short of `want`. Running out at the
@@ -200,12 +215,7 @@ impl Source {
         let Some(resampler) = self.resampler.as_mut() else {
             return self.read_raw(into);
         };
-        let limit = if self.cut_short {
-            self.ready
-        } else {
-            usize::MAX
-        };
-        let n = resampler.process_up_to(&self.ring, into, limit);
+        let n = resampler.process_up_to(&self.ring, into, self.ready);
         into[n..].fill([0; 2]);
         self.note_shortfall(n, into.len());
     }
@@ -643,7 +653,7 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         let rate = self.rate;
         let audible = || {
             let sources = self.table.iter();
-            sources.filter(move |s| s.running && !s.muted(rate) && s.has_input())
+            sources.filter(move |s| s.running && !s.muted(rate) && s.plays)
         };
         Situation {
             mode: self.mode,
@@ -672,9 +682,13 @@ impl<P: Processing, S: Sink> Engine<P, S> {
             mix_clear::<P>(acc);
         }
         for source in self.table.iter_mut().filter(|s| s.running) {
+            if source.held > 0 {
+                let held = &self.counters.held_frames;
+                held.fetch_add(source.held as u64, Ordering::Relaxed);
+            }
             if source.muted(rate) {
                 source.discard(period, rate);
-            } else if !source.has_input() {
+            } else if !source.plays {
                 source.note_shortfall(0, 1);
             } else if copy {
                 source.read_raw(out);
@@ -1104,8 +1118,13 @@ mod tests {
     }
 
     fn dop_paths_do_not_allocate<P: Processing>(format: Format) {
+        const OUTPUT: u32 = 96000;
         let mut rig = Rig::<P>::new(BitPerfect::Auto);
-        let (mut a, mut b, mut c) = (client(1), client(2), resampled(3, format));
+        // The DoP stream runs at the rate the output is about to move to.
+        let (mut a, mut b) = (client_at(1, OUTPUT), client_at(2, OUTPUT));
+        let mut c = client_at(3, 44100);
+        let r = Resampler::new(44100, OUTPUT, PERIOD as u32, Quality::High, format);
+        c.source.as_mut().unwrap().resampler = Some(Box::new(r));
         let mut wrong = client_at(4, 176400);
         rig.add(&mut a);
         rig.add(&mut b);
@@ -1117,13 +1136,15 @@ mod tests {
         let prefix: Vec<[i32; 2]> = pcm[..20].iter().chain(&dop[..44]).copied().collect();
         let tail: Vec<[i32; 2]> = dop[..40].iter().chain(&pcm[..24]).copied().collect();
         rig.send(Command::Reconfigure {
-            rate: 96000,
+            rate: OUTPUT,
             period: PERIOD as u32,
         });
+        let start = rig.log.frames().len();
         let engine = &mut rig.engine;
         assert_no_alloc(|| {
-            // Joins, tails, short periods, an underrun and the release after it.
-            for round in 0..200 {
+            // Joins, tails and short periods. Then the stream runs dry for
+            // longer than the grace time, 150 periods here, and lets go.
+            for round in 0..300 {
                 let block = match round % 8 {
                     0 => &prefix[..],
                     1 | 2 => &dop[..],
@@ -1131,7 +1152,7 @@ mod tests {
                     4 => &dop[..10],
                     _ => &pcm[..],
                 };
-                if round < 100 {
+                if round < 99 {
                     a.ring.write(block);
                 }
                 wrong.ring.write(&dop);
@@ -1140,6 +1161,16 @@ mod tests {
                 engine.cycle().unwrap();
             }
         });
+        // Show that each path ran.
+        let log = rig.log.frames();
+        let periods = || log[start..].chunks(PERIOD);
+        assert_eq!(rig.log.opens().last(), Some(&(OUTPUT, PERIOD as u32)));
+        assert!(periods().any(|p| p == dop), "a whole DoP period");
+        let silence = dop_silence(0x05, PERIOD);
+        assert!(periods().any(|p| p == silence), "the grace time");
+        let released = log.last().unwrap();
+        assert!(released[0].abs() >= 1000, "output after the release");
+        assert!(matches!(rig.events()[..], [Event::DopStarted(_), ..]));
     }
 
     #[test]
@@ -1147,6 +1178,36 @@ mod tests {
         dop_paths_do_not_allocate::<I32>(Format::I32);
         dop_paths_do_not_allocate::<F32>(Format::F32);
         dop_paths_do_not_allocate::<F64>(Format::F64);
+    }
+
+    #[test]
+    fn copying_holding_and_draining_do_not_allocate() {
+        let mut rig = Rig::<F32>::new(BitPerfect::Auto);
+        let mut a = client(1);
+        rig.add(&mut a);
+        a.ring.write(&frames(ODD, PERIOD));
+        rig.cycle();
+        let mut held = frames(ODD, PERIOD);
+        held[PERIOD - 1] = [0x0512_3400; 2];
+        let (pcm, tail) = (frames(ODD, PERIOD - 1), dop_frames(10));
+        let start = rig.log.frames().len();
+        let engine = &mut rig.engine;
+        assert_no_alloc(|| {
+            a.ring.write(&pcm);
+            engine.cycle().unwrap();
+            a.ring.write(&held);
+            engine.cycle().unwrap();
+            a.ring.write(&pcm);
+            engine.cycle().unwrap();
+            a.ring.write(&tail);
+            a.ring.header().draining.store(1, Release);
+            engine.cycle().unwrap();
+            engine.cycle().unwrap();
+        });
+        assert_eq!(rig.log.frames()[start], [ODD, -ODD]);
+        assert!(rig.counters.held_frames.load(Relaxed) > 0);
+        assert_eq!(a.ring.available(), 0);
+        assert!(matches!(rig.events()[..], [Event::Drained(1)]));
     }
 
     #[test]
@@ -2252,5 +2313,233 @@ mod tests {
         let got = rig.last_periods(1);
         assert_eq!(got[0][0], 1 << 24);
         assert!(got[PERIOD - 1][0] < (1 << 24) / 32);
+    }
+
+    /// A small repeatable random number source.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self, n: usize) -> usize {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((self.0 >> 33) as usize) % n
+        }
+    }
+
+    /// Silence or an untouched frame of `dop_frames` or DoP silence.
+    fn is_clean_dop_output(f: &[i32; 2]) -> bool {
+        let (left, right) = (f[0] as u32, f[1] as u32);
+        let marked = matches!(left >> 24, 0x05 | 0xFA);
+        let raw = left & 0xFF_FFFF == 0x12_3456 && right == left ^ 0xFF00;
+        let silent = left & 0xFF_FFFF == 0x69_6900 && left == right;
+        *f == [0, 0] || (marked && (raw || silent))
+    }
+
+    /// Writes silent PCM and DoP runs of 16 frames or more in random sizes at
+    /// a gain of 0.1. Any frame scaled or filtered from DoP shows at the sink.
+    /// Returns how many frames did.
+    fn altered_frames(seed: u64, resampled_source: bool, drain: bool) -> usize {
+        let mut random = Lcg(seed);
+        let mut rig = rig_at_gain::<F32>(0.1);
+        let start = rig.log.frames().len();
+        let mut a = if resampled_source {
+            resampled(1, Format::F32)
+        } else {
+            client(1)
+        };
+        rig.add(&mut a);
+        let mut phase = 0;
+        for _ in 0..200 {
+            let n = match random.next(4) {
+                0 => random.next(10),
+                1 => random.next(70),
+                _ => random.next(300),
+            };
+            if random.next(2) == 0 {
+                a.ring.write(&frames(0, n));
+            } else {
+                let n = n.max(dop::MIN_FRAMES);
+                a.ring.write(&dop_frames(n + 2)[phase..phase + n]);
+                phase = (phase + n) % 2;
+            }
+            for _ in 0..random.next(4) {
+                rig.cycle();
+            }
+        }
+        if drain {
+            a.ring.header().draining.store(1, Release);
+        }
+        for _ in 0..3000 {
+            rig.cycle();
+            if a.ring.available() == 0 && !drain {
+                break;
+            }
+        }
+        let log = rig.log.frames();
+        let output = log[start..].iter();
+        if resampled_source {
+            output.filter(|f| **f != [0, 0]).count()
+        } else {
+            output.filter(|f| !is_clean_dop_output(f)).count()
+        }
+    }
+
+    fn fuzz_seeds(resampled_source: bool, drain: bool) {
+        let bad: Vec<u64> = (0..150)
+            .filter(|&seed| altered_frames(seed, resampled_source, drain) > 0)
+            .collect();
+        assert!(bad.is_empty(), "seeds {bad:?}");
+    }
+
+    #[test]
+    fn random_pcm_and_dop_stay_apart_in_a_plain_source() {
+        fuzz_seeds(false, false);
+    }
+
+    #[test]
+    fn random_pcm_and_dop_stay_apart_in_a_draining_plain_source() {
+        fuzz_seeds(false, true);
+    }
+
+    #[test]
+    fn random_pcm_and_dop_stay_apart_in_a_resampled_source() {
+        fuzz_seeds(true, false);
+    }
+
+    #[test]
+    fn random_pcm_and_dop_stay_apart_in_a_draining_resampled_source() {
+        fuzz_seeds(true, true);
+    }
+
+    #[test]
+    fn a_short_drain_does_not_push_dop_into_a_resampler() {
+        let mut rig = Rig::<F32>::new(BitPerfect::Auto);
+        let mut a = resampled(1, Format::F32);
+        rig.add(&mut a);
+        let mut block = frames(0, 20);
+        block.extend(dop_frames(20));
+        a.ring.write(&block);
+        a.ring.header().draining.store(1, Release);
+        for _ in 0..20 {
+            rig.cycle();
+        }
+        assert!(rig.log.frames().iter().all(|f| *f == [0, 0]));
+        let events = rig.events();
+        assert_eq!(count(&events, |e| matches!(e, Event::DopStarted(1))), 1);
+        assert_eq!(count(&events, |e| matches!(e, Event::Drained(1))), 1);
+    }
+
+    /// A resampled source judged on 30 silent frames, with 30 DoP frames
+    /// written straight after the judgement.
+    fn judged_before_a_write() -> (Client, Box<Source>) {
+        let mut a = resampled(1, Format::F32);
+        let mut source = a.source.take().unwrap();
+        a.ring.write(&frames(0, 30));
+        let mut window = [[0; 2]; 30];
+        assert_eq!(source.ring.peek(&mut window), 30);
+        source.judge(&window, PERIOD, false);
+        a.ring.write(&dop_frames(30));
+        (a, source)
+    }
+
+    #[test]
+    fn frames_written_after_the_scan_are_not_read() {
+        let (a, mut source) = judged_before_a_write();
+        let mut out = [[0; 2]; PERIOD];
+        source.read_resampled(&mut out);
+        assert!(a.ring.available() >= 30);
+    }
+
+    #[test]
+    fn frames_written_after_the_scan_do_not_count_as_input() {
+        let (_a, source) = judged_before_a_write();
+        assert!(!source.plays);
+    }
+
+    #[test]
+    fn a_tail_too_short_to_judge_with_markers_is_replaced_by_silence() {
+        fn check(mut a: Client) {
+            let mut rig = rig_at_gain::<F32>(0.1);
+            rig.add(&mut a);
+            a.ring.write(&frames(0, 200));
+            rig.cycle();
+            rig.cycle();
+            a.ring.write(&dop_frames(10));
+            a.ring.header().draining.store(1, Release);
+            for _ in 0..12 {
+                rig.cycle();
+            }
+            assert_eq!(a.ring.available(), 0);
+            assert!(rig.log.frames().iter().all(|f| *f == [0, 0]));
+            assert_eq!(count(&rig.events(), |e| matches!(e, Event::Drained(1))), 1);
+        }
+        check(client(1));
+        check(resampled(1, Format::F32));
+    }
+
+    #[test]
+    fn pcm_before_a_short_tail_with_markers_still_plays() {
+        let mut rig = Rig::<I32>::new(BitPerfect::Auto);
+        let mut a = client(1);
+        rig.add(&mut a);
+        a.ring.write(&frames(ODD, PERIOD));
+        rig.cycle();
+        let mut block = frames(ODD, 20);
+        block.extend(dop_frames(10));
+        a.ring.write(&block);
+        a.ring.header().draining.store(1, Release);
+        rig.cycle();
+        let mut want = frames(ODD, 20);
+        want.extend(frames(0, PERIOD - 20));
+        assert_eq!(rig.last_periods(1), want);
+        rig.cycle();
+        assert_eq!(rig.last_periods(1), frames(0, PERIOD));
+        assert_eq!(a.ring.available(), 0);
+    }
+
+    #[test]
+    fn a_short_tail_without_markers_plays_normally() {
+        let mut rig = Rig::<I32>::new(BitPerfect::Auto);
+        let mut a = client(1);
+        rig.add(&mut a);
+        a.ring.write(&frames(ODD, PERIOD));
+        rig.cycle();
+        a.ring.write(&frames(ODD, 10));
+        a.ring.header().draining.store(1, Release);
+        rig.cycle();
+        assert_eq!(rig.last_periods(1)[..10], frames(ODD, 10));
+    }
+
+    #[test]
+    fn a_held_frame_is_counted_and_is_not_an_underrun() {
+        let mut rig = Rig::<F32>::new(BitPerfect::Auto);
+        let mut a = client(1);
+        rig.add(&mut a);
+        let mut block = frames(1 << 24, PERIOD);
+        a.ring.write(&block);
+        rig.cycle();
+        assert_eq!(rig.counters.held_frames.load(Relaxed), 0);
+        block[PERIOD - 1] = [0x0512_3400; 2];
+        a.ring.write(&block);
+        rig.cycle();
+        assert_eq!(rig.counters.held_frames.load(Relaxed), 1);
+        assert_eq!(underruns(&a), 0);
+        assert_eq!(a.ring.available(), 1);
+        // The frame is delayed, not lost.
+        a.ring.write(&frames(1 << 24, PERIOD));
+        rig.cycle();
+        assert_eq!(rig.last_periods(1)[0], block[PERIOD - 1]);
+    }
+
+    #[test]
+    fn waiting_to_judge_a_new_stream_is_not_counted_as_held() {
+        let mut rig = Rig::<F32>::new(BitPerfect::Auto);
+        let mut a = client(1);
+        rig.add(&mut a);
+        a.ring.write(&dop_frames(10));
+        rig.cycle();
+        assert_eq!(rig.counters.held_frames.load(Relaxed), 0);
     }
 }

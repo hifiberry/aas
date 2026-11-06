@@ -11,6 +11,11 @@ pub struct Counters {
     pub worst_gap_ns: AtomicU64,
     pub worst_cycle_ns: AtomicU64,
     pub cycles: AtomicU64,
+    /// Frames held back a cycle because they might be DoP, each time it left
+    /// a gap in a running stream. They play later. A client that keeps less
+    /// than a period and 16 frames in its ring can cause this with PCM whose
+    /// last frame looks like a marker.
+    pub held_frames: AtomicU64,
 }
 
 impl Counters {
