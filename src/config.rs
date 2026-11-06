@@ -116,6 +116,14 @@ impl Config {
             Err(e) => return Err(format!("{}: {e}", path.display())),
         };
         let raw: Raw = toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+        if let Some(ms) = raw.latency_ms
+            && !(ms.is_finite() && ms > 0.0)
+        {
+            return Err(format!(
+                "{}: latency_ms must be a positive number",
+                path.display()
+            ));
+        }
         let d = Config::default();
         let idle = match (raw.idle, raw.idle_delay_s) {
             (Some(IdleKind::Zeros), Some(_)) => {
@@ -172,6 +180,13 @@ mod tests {
     #[test]
     fn an_unknown_key_is_an_error() {
         assert!(load_str("lateny_ms = 4.0\n").is_err());
+    }
+
+    #[test]
+    fn a_latency_that_is_not_positive_and_finite_is_an_error() {
+        for v in ["nan", "inf", "-inf", "0.0", "-1.0"] {
+            assert!(load_str(&format!("latency_ms = {v}\n")).is_err(), "{v}");
+        }
     }
 
     #[test]

@@ -9,8 +9,12 @@ const MIN_PERIOD: u32 = 32;
 /// Frames per period for a target buffer latency, as a power of two.
 ///
 /// The target is split over `PERIODS` periods and rounded down, so the buffer
-/// never exceeds the target. The result is at least 32 frames.
+/// never exceeds the target. The result is at least 32 frames, which is also
+/// the answer for a target that is not a positive finite number.
 pub fn period_frames(rate: u32, target_ms: f32) -> u32 {
+    if !(target_ms.is_finite() && target_ms > 0.0) {
+        return MIN_PERIOD;
+    }
     let total = rate as f64 * target_ms as f64 / 1000.0;
     let per_period = (total / PERIODS as f64).floor();
     if per_period < MIN_PERIOD as f64 {
@@ -35,6 +39,13 @@ mod tests {
     fn twelve_ms_gives_the_pi3_periods() {
         for (rate, frames) in [(44100, 256), (48000, 256), (96000, 512), (192000, 1024)] {
             assert_eq!(period_frames(rate, 12.0), frames);
+        }
+    }
+
+    #[test]
+    fn a_target_that_is_not_positive_and_finite_gives_the_minimum() {
+        for t in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.0, -4.0] {
+            assert_eq!(period_frames(48000, t), 32, "{t}");
         }
     }
 
