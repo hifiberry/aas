@@ -25,11 +25,13 @@ synchronous disk writes.
 
 ## Conclusions
 
-- **Float format: keep 64-bit.** Mixing costs little on any board, about 1% of a period on the Pi 3 at 48 kHz.
-  Resampling costs 1.4 to 1.85 times as much as in 32-bit, but on the Pi 3 the
-  quality setting matters far more than the float format.
-- **Resampling quality:** `high` on the CM5. `medium` by default on the Pi 3, where
-  `high` to 192 kHz uses about 80% of a period and can overrun it.
+- **Processing format: 32-bit float as the default, 64-bit still supported.** The
+  format can be set in the config, and `i32` is not yet measured. Mixing costs little
+  on any board, about 1% of a period on the Pi 3 at 48 kHz. Resampling costs 1.4 to
+  1.85 times as much in 64-bit.
+- **Resampling quality:** `high` by default. On the Pi 3, `high` to 192 kHz uses
+  about 44% of a period in 32-bit, 62% in the worst cycle. In 64-bit it uses about
+  80% and can overrun, so a Pi 3 set to 64-bit should also use `medium`.
 - **Default period on CM5:** 64 frames at 44.1 and 48 kHz, 128 at 96 kHz, 256 at
   192 kHz, with 2 periods.
 - **Default period on Pi 3:** 256 frames at 44.1 and 48 kHz, 512 at 96 kHz, 1024
@@ -141,7 +143,8 @@ period, except for the max column at small periods.
 | Medium, 48 to 192 kHz | 1.4%, 1.7% | 2.0%, 2.5% | 12.9%, 14.8% | 19.7%, 22.1% |
 
 Across all period sizes the worst single cycle in 64-bit on the Pi 3 was 102.9% of
-a period with `high` and 39.2% with `medium`, both 96 to 192 kHz at 64 frames. The
+a period with `high` and 39.2% with `medium`, both 96 to 192 kHz at 64 frames. In
+32-bit the same cases reached 61.9% and 29.9%. The
 worst in 64-bit on the CM5 was 8.9%. `medium` in 64-bit costs less than `high` in
 32-bit, so lowering the quality saves more than lowering the float format. The
 Pi 3 is about 10.6 times slower than the CM5 at resampling.
