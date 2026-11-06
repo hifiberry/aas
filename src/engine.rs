@@ -73,8 +73,8 @@ pub struct Source {
     held: usize,
     /// The stream was under way before this cycle.
     settled: bool,
-    /// The ring may start inside a DoP run. It was cut by a discard, or left
-    /// when the stream stopped. What remains can be too short to recognise.
+    /// The ring starts inside a DoP run that was left when the stream
+    /// stopped. What remains can be too short to recognise.
     in_dop_run: bool,
     /// The marker that continues the DoP stream.
     next_marker: u8,
@@ -265,13 +265,25 @@ impl Source {
         let want = (total / output_rate) as usize;
         self.discard_remainder = total % output_rate;
         let n = self.ring.available().min(want);
-        if n > 0 {
-            let mut last = [[0; 2]];
-            self.ring.consume(n - 1);
-            self.ring.read(&mut last);
-            self.in_dop_run = dop::marked_run(&last) > 0;
+        self.ring.consume(n);
+        if self.stream != Stream::Dop {
+            self.drop_cut_run();
         }
         self.note_shortfall(n, want);
+    }
+
+    /// Drops marked frames left at the head of the ring when they are too
+    /// few to be judged a DoP run. They may be the rest of a run the discard
+    /// cut, and must not be mixed. Being marked is not enough to call the
+    /// stream DoP, since ordinary PCM crosses the marker band too, so a run
+    /// long enough is left for `judge` to decide.
+    fn drop_cut_run(&mut self) {
+        let mut head = [[0; 2]; dop::MIN_FRAMES];
+        let n = self.ring.peek(&mut head);
+        let run = dop::marked_run(&head[..n]);
+        if run < dop::MIN_FRAMES {
+            self.ring.consume(run);
+        }
     }
 
     /// Tells the client how much plays after its ring, and that it has moved.
@@ -482,15 +494,7 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         match command {
             Command::Add(source) => self.add(source),
             Command::Remove(id) => self.remove(id),
-            Command::SetRunning(id, running) => {
-                if let Some(source) = self.find(id) {
-                    source.running = running;
-                    if !running {
-                        source.in_dop_run |= source.stream == Stream::Dop;
-                        source.stream = Stream::Unknown;
-                    }
-                }
-            }
+            Command::SetRunning(id, running) => self.set_running(id, running),
             Command::SetResampler(id, resampler) => {
                 let replaced = match self.find(id) {
                     Some(source) => std::mem::replace(&mut source.resampler, resampler),
@@ -519,6 +523,23 @@ impl<P: Processing, S: Sink> Engine<P, S> {
     fn find(&mut self, id: ClientId) -> Option<&mut Source> {
         let found = self.table.iter_mut().find(|s| s.id == id);
         found.map(|s| s.as_mut())
+    }
+
+    /// A stop ends a DoP stream's claim at once, so that a restart in the
+    /// same cycle makes it again. The stream resumes as DoP all the same.
+    fn set_running(&mut self, id: ClientId, running: bool) {
+        let Some(source) = self.find(id) else {
+            return;
+        };
+        source.running = running;
+        if running {
+            return;
+        }
+        source.in_dop_run |= source.stream == Stream::Dop;
+        source.stream = Stream::Unknown;
+        if std::mem::take(&mut source.dop_reported) {
+            self.emit(Event::DopStopped(id));
+        }
     }
 
     fn add(&mut self, source: Box<Source>) {
@@ -2342,14 +2363,41 @@ mod tests {
         }
     }
 
-    /// Silence or an untouched frame of `dop_frames` or DoP silence.
-    fn is_clean_dop_output(f: &[i32; 2]) -> bool {
+    /// Silence or an untouched frame of `dop_frames` or DoP silence. With
+    /// `tones`, PCM is a tone that is the same on both channels, and at a
+    /// gain of 0.1 it stays well under the marker band. Scaled DoP differs
+    /// between the channels, so it is never taken for a tone.
+    fn is_clean_output(f: &[i32; 2], tones: bool) -> bool {
         let (left, right) = (f[0] as u32, f[1] as u32);
         let marked = matches!(left >> 24, 0x05 | 0xFA);
         let raw = left & 0xFF_FFFF == 0x12_3456 && right == left ^ 0xFF00;
         let silent = left & 0xFF_FFFF == 0x69_6900 && left == right;
-        *f == [0, 0] || (marked && (raw || silent))
+        let pcm = if tones {
+            left == right && f[0].unsigned_abs() < 0x0500_0000
+        } else {
+            *f == [0, 0]
+        };
+        (marked && (raw || silent)) || (!marked && pcm)
     }
+
+    /// A mono tone, the same on both channels, at `amp` of full scale.
+    fn tone(i: usize, rate: f64, hz: f64, amp: f64) -> [i32; 2] {
+        let t = i as f64 / rate;
+        let v = (amp * (2.0 * std::f64::consts::PI * hz * t).sin() * 2_147_483_647.0) as i32;
+        [v, v]
+    }
+
+    /// One cycle each of two tones at 48 kHz. The slow one peaks inside the
+    /// marker band, so a third of its frames carry a marker-like top byte.
+    /// The fast one crosses the band on its way to a tenth of full scale.
+    static TONES: std::sync::LazyLock<[Vec<[i32; 2]>; 2]> = std::sync::LazyLock::new(|| {
+        let table = |n: usize, hz: f64, amp: f64| {
+            (0..n)
+                .map(|i| tone(i, RATE as f64, hz, amp))
+                .collect::<Vec<_>>()
+        };
+        [table(1600, 30.0, 0.045), table(200, 240.0, 0.1)]
+    });
 
     /// What a fuzz run does besides writing to client 1.
     #[derive(Clone, Copy, Default)]
@@ -2358,32 +2406,71 @@ mod tests {
         wrong_rate_first: bool,
         second: bool,
         resampled_second: bool,
+        /// Client 2 writes only PCM: silence and tones through the marker
+        /// band. It must never be taken for DoP, and never play raw.
+        tone_second: bool,
         stops: bool,
         drains: bool,
         reconfigures: bool,
         final_drain: bool,
     }
 
-    /// Writes silent PCM or an in-phase DoP run of 16 frames or more, in a
-    /// random size. Shorter runs are PCM by ruling, so they are not written.
-    fn write_randomly(random: &mut Lcg, client: &Client, phase: &mut usize) {
-        let n = match random.next(4) {
-            0 => random.next(10),
-            1 => random.next(70),
-            _ => random.next(300),
-        };
-        if random.next(2) == 0 {
-            client.ring.write(&frames(0, n));
-        } else {
-            let n = n.max(dop::MIN_FRAMES);
-            client.ring.write(&dop_frames(n + 2)[*phase..*phase + n]);
-            *phase = (*phase + n) % 2;
+    /// What one fuzz client writes.
+    struct Writer<'a> {
+        client: &'a Client,
+        pcm_only: bool,
+        dop_phase: usize,
+        /// Where each tone continues.
+        tone_at: [usize; 2],
+    }
+
+    impl<'a> Writer<'a> {
+        fn new(client: &'a Client, pcm_only: bool) -> Self {
+            Writer {
+                client,
+                pcm_only,
+                dop_phase: 0,
+                tone_at: [0; 2],
+            }
+        }
+
+        /// Writes silent PCM or an in-phase DoP run of 16 frames or more, in
+        /// a random size. Shorter runs are PCM by ruling, so they are not
+        /// written. A PCM-only client writes silence or one of the tones.
+        fn write_randomly(&mut self, random: &mut Lcg) {
+            let n = match random.next(4) {
+                0 => random.next(10),
+                1 => random.next(70),
+                _ => random.next(300),
+            };
+            if self.pcm_only {
+                if random.next(3) == 0 {
+                    self.client.ring.write(&frames(0, n));
+                } else {
+                    let which = random.next(2);
+                    let table = &TONES[which];
+                    let at = &mut self.tone_at[which];
+                    let block: Vec<[i32; 2]> =
+                        (0..n).map(|k| table[(*at + k) % table.len()]).collect();
+                    *at = (*at + n) % table.len();
+                    self.client.ring.write(&block);
+                }
+            } else if random.next(2) == 0 {
+                self.client.ring.write(&frames(0, n));
+            } else {
+                let n = n.max(dop::MIN_FRAMES);
+                let phase = self.dop_phase;
+                self.client.ring.write(&dop_frames(n + 2)[phase..phase + n]);
+                self.dop_phase = (phase + n) % 2;
+            }
         }
     }
 
     /// Plays random writes at a gain of 0.1. Any frame scaled or filtered
-    /// from DoP shows at the sink. Returns how many frames did.
-    fn altered_frames(seed: u64, fuzz: Fuzz) -> usize {
+    /// from DoP shows at the sink, and so does raw PCM from the tone client.
+    /// Returns how many frames did, and how many times the tone client was
+    /// reported as DoP.
+    fn fuzz_run(seed: u64, fuzz: Fuzz) -> (usize, usize) {
         let mut random = Lcg(seed);
         let mut rig = rig_at_gain::<F32>(0.1);
         let start = rig.log.frames().len();
@@ -2401,15 +2488,21 @@ mod tests {
         if fuzz.second {
             rig.add(&mut b);
         }
-        let (mut phase_a, mut phase_b) = (0, 0);
+        let mut writer_a = Writer::new(&a, false);
+        let mut writer_b = Writer::new(&b, fuzz.tone_second);
         let (mut running_a, mut running_b) = (true, true);
+        let mut false_starts = 0;
         for _ in 0..200 {
-            write_randomly(&mut random, &a, &mut phase_a);
+            writer_a.write_randomly(&mut random);
             if fuzz.second {
-                write_randomly(&mut random, &b, &mut phase_b);
+                writer_b.write_randomly(&mut random);
             }
             for _ in 0..random.next(4) {
                 rig.cycle();
+            }
+            let events = rig.events();
+            if fuzz.tone_second {
+                false_starts += count(&events, |e| matches!(e, Event::DopStarted(2)));
             }
             if fuzz.stops && random.next(4) == 0 {
                 if random.next(2) == 0 {
@@ -2448,16 +2541,34 @@ mod tests {
         for _ in 0..1000 {
             rig.cycle();
         }
+        if fuzz.tone_second {
+            false_starts += count(&rig.events(), |e| matches!(e, Event::DopStarted(2)));
+        }
         let log = rig.log.frames();
         let output = log[start..].iter();
-        output.filter(|f| !is_clean_dop_output(f)).count()
+        let altered = output
+            .filter(|f| !is_clean_output(f, fuzz.tone_second))
+            .count();
+        (altered, false_starts)
     }
 
     fn fuzz_seeds(fuzz: Fuzz) {
-        let bad: Vec<u64> = (0..FUZZ_SEEDS)
-            .filter(|&seed| altered_frames(seed, fuzz) > 0)
-            .collect();
-        assert!(bad.is_empty(), "{} seeds: {bad:?}", bad.len());
+        let (mut altered, mut reported) = (Vec::new(), Vec::new());
+        for seed in 0..FUZZ_SEEDS {
+            let (frames, starts) = fuzz_run(seed, fuzz);
+            if frames > 0 {
+                altered.push(seed);
+            }
+            if starts > 0 {
+                reported.push(seed);
+            }
+        }
+        assert!(
+            altered.is_empty() && reported.is_empty(),
+            "{} seeds with altered frames: {altered:?}, {} with a false DopStarted: {reported:?}",
+            altered.len(),
+            reported.len()
+        );
     }
 
     const FUZZ_SEEDS: u64 = 100;
@@ -2466,6 +2577,7 @@ mod tests {
         wrong_rate_first: false,
         second: true,
         resampled_second: false,
+        tone_second: false,
         stops: false,
         drains: false,
         reconfigures: false,
@@ -2601,6 +2713,54 @@ mod tests {
         });
     }
 
+    /// Client 2 only ever writes PCM, through the marker band.
+    const TONE: Fuzz = Fuzz {
+        tone_second: true,
+        ..TWO
+    };
+
+    #[test]
+    fn fuzz_a_pcm_tone_beside_dop() {
+        fuzz_seeds(TONE);
+    }
+
+    #[test]
+    fn fuzz_a_resampled_pcm_tone_beside_dop() {
+        fuzz_seeds(Fuzz {
+            resampled_second: true,
+            ..TONE
+        });
+    }
+
+    #[test]
+    fn fuzz_a_pcm_tone_beside_dop_with_stops() {
+        fuzz_seeds(Fuzz {
+            stops: true,
+            ..TONE
+        });
+    }
+
+    #[test]
+    fn fuzz_a_pcm_tone_beside_dop_with_drains() {
+        fuzz_seeds(Fuzz {
+            drains: true,
+            final_drain: true,
+            ..TONE
+        });
+    }
+
+    #[test]
+    fn fuzz_a_pcm_tone_beside_dop_with_everything() {
+        fuzz_seeds(Fuzz {
+            resampled_second: true,
+            stops: true,
+            drains: true,
+            reconfigures: true,
+            final_drain: true,
+            ..TONE
+        });
+    }
+
     #[test]
     fn a_short_drain_does_not_push_dop_into_a_resampler() {
         let mut rig = Rig::<F32>::new(BitPerfect::Auto);
@@ -2732,10 +2892,12 @@ mod tests {
     }
 
     /// Client 1 plays a DoP period while client 2 holds PCM with a DoP run
-    /// that the discard cuts, leaving under 16 frames of it before more PCM.
+    /// of `dop_frames` that the discard cuts, leaving part of it before more
+    /// PCM.
     fn a_run_cut_by_a_discard(
         second: Client,
         pcm_frames: usize,
+        dop_run: usize,
     ) -> (Rig<F32>, Client, Client, usize) {
         let mut rig = rig_at_gain::<F32>(0.1);
         let start = rig.log.frames().len();
@@ -2745,7 +2907,7 @@ mod tests {
         rig.cycle();
         a.ring.write(&dop_frames(PERIOD));
         let mut block = frames(0, pcm_frames);
-        block.extend(dop_frames(18));
+        block.extend(dop_frames(dop_run));
         block.extend(frames(0, 500));
         b.ring.write(&block);
         (rig, a, b, start)
@@ -2753,13 +2915,13 @@ mod tests {
 
     fn assert_clean(rig: &Rig<F32>, start: usize) {
         let log = rig.log.frames();
-        let altered = log[start..].iter().filter(|f| !is_clean_dop_output(f));
+        let altered = log[start..].iter().filter(|f| !is_clean_output(f, false));
         assert_eq!(altered.count(), 0);
     }
 
     #[test]
-    fn a_run_cut_by_a_discard_stays_dop_when_the_owner_stops() {
-        let (mut rig, _a, _b, start) = a_run_cut_by_a_discard(client(2), 60);
+    fn a_run_cut_by_a_discard_is_not_mixed_when_the_owner_stops() {
+        let (mut rig, _a, _b, start) = a_run_cut_by_a_discard(client(2), 60, 18);
         rig.cycle();
         rig.send(Command::SetRunning(1, false));
         rig.cycle();
@@ -2768,8 +2930,8 @@ mod tests {
     }
 
     #[test]
-    fn a_run_cut_by_a_discard_stays_dop_when_the_owner_drains() {
-        let (mut rig, a, _b, start) = a_run_cut_by_a_discard(client(2), 60);
+    fn a_run_cut_by_a_discard_is_not_mixed_when_the_owner_drains() {
+        let (mut rig, a, _b, start) = a_run_cut_by_a_discard(client(2), 60, 18);
         a.ring.header().draining.store(1, Release);
         for _ in 0..3 {
             rig.cycle();
@@ -2781,7 +2943,7 @@ mod tests {
     fn a_run_cut_by_a_discard_does_not_reach_a_resampler() {
         // A resampled source loses 58 or 59 frames of input in a period.
         let source = resampled(2, Format::F32);
-        let (mut rig, _a, _b, start) = a_run_cut_by_a_discard(source, 50);
+        let (mut rig, _a, _b, start) = a_run_cut_by_a_discard(source, 50, 18);
         rig.cycle();
         rig.send(Command::SetRunning(1, false));
         for _ in 0..4 {
@@ -2791,8 +2953,21 @@ mod tests {
     }
 
     #[test]
+    fn a_cut_run_long_enough_to_judge_plays_as_dop() {
+        // The discard of 64 leaves 16 of the run, enough for `find`.
+        let (mut rig, _a, _b, start) = a_run_cut_by_a_discard(client(2), 60, 20);
+        rig.cycle();
+        rig.send(Command::SetRunning(1, false));
+        rig.cycle();
+        assert_clean(&rig, start);
+        let mut want = dop_frames(20)[4..].to_vec();
+        want.extend(dop_silence(0x05, PERIOD - 16));
+        assert_eq!(rig.last_periods(1), want);
+    }
+
+    #[test]
     fn a_discard_ending_on_pcm_leaves_the_source_pcm() {
-        let (mut rig, _a, b, _start) = a_run_cut_by_a_discard(client(2), 60);
+        let (mut rig, _a, b, _start) = a_run_cut_by_a_discard(client(2), 60, 18);
         rig.cycle();
         assert!(matches!(rig.events()[..], [Event::DopStarted(1)]));
         // Past the run, and with nothing marked left to find.
@@ -2856,5 +3031,156 @@ mod tests {
         assert_eq!(rig.last_periods(1), frames(1000, PERIOD));
         assert!(rig.events().is_empty());
         assert_eq!(underruns(&a), 0);
+    }
+
+    /// Where two outputs first differ, with the frames there.
+    fn first_difference(got: &[[i32; 2]], want: &[[i32; 2]]) -> Option<String> {
+        if got.len() != want.len() {
+            return Some(format!("{} frames, wanted {}", got.len(), want.len()));
+        }
+        let differing = got.iter().zip(want).filter(|(g, w)| g != w).count();
+        let at = got.iter().zip(want).position(|(g, w)| g != w)?;
+        Some(format!(
+            "{differing} frames differ, the first at {at} in period {}: {:08x} for {:08x}",
+            at / PERIOD,
+            got[at][0] as u32,
+            want[at][0] as u32
+        ))
+    }
+
+    /// Client 2, PCM at the output rate, was added first, so it comes first
+    /// in the table. Client 1 plays DoP, and nothing of client 2 may show.
+    #[test]
+    fn a_pcm_client_added_first_does_not_take_the_output_from_dop() {
+        let mut rig = rig_at_gain::<F32>(0.1);
+        let (mut a, mut b) = (client(1), client(2));
+        rig.add(&mut b);
+        rig.add(&mut a);
+        let start = rig.log.frames().len();
+        let cycles = 2000;
+        let dop = dop_frames(cycles * PERIOD);
+        for c in 0..cycles {
+            let period = c * PERIOD..(c + 1) * PERIOD;
+            a.ring.write(&dop[period.clone()]);
+            let block: Vec<[i32; 2]> = period.map(|i| tone(i, RATE as f64, 220.0, 0.1)).collect();
+            b.ring.write(&block);
+            rig.cycle();
+        }
+        // Every frame is client 1's, in order, with the markers unbroken.
+        let log = rig.log.frames();
+        assert_eq!(first_difference(&log[start..], &dop), None);
+        let events = rig.events();
+        assert_eq!(count(&events, |e| matches!(e, Event::DopStarted(2))), 0);
+        assert_eq!(count(&events, |e| matches!(e, Event::DopStarted(1))), 1);
+    }
+
+    /// An engine at a gain of 0.1 and this format.
+    fn rig_at(rate: u32, period: usize) -> Rig<F32> {
+        let mut rig = Rig::<F32>::closed(BitPerfect::Auto, 1024);
+        rig.send(Command::Reconfigure {
+            rate,
+            period: period as u32,
+        });
+        rig.send(Command::SetGain(0.1));
+        rig.cycle();
+        rig.events();
+        rig
+    }
+
+    /// `DopStarted` events for a PCM client that was added first, playing a
+    /// 220 Hz tone at `amp` beside a DoP client, over `seconds` of output.
+    fn false_dop_starts(
+        pcm_rate: u32,
+        dop_rate: u32,
+        period: usize,
+        amp: f64,
+        seconds: usize,
+    ) -> usize {
+        let mut rig = rig_at(dop_rate, period);
+        let (mut a, mut b) = (client_at(1, dop_rate), client_at(2, pcm_rate));
+        if pcm_rate != dop_rate {
+            let r = Resampler::new(
+                pcm_rate,
+                dop_rate,
+                period as u32,
+                Quality::High,
+                Format::F32,
+            );
+            b.source.as_mut().unwrap().resampler = Some(Box::new(r));
+        }
+        rig.add(&mut b);
+        rig.add(&mut a);
+        let cycles = dop_rate as usize * seconds / period;
+        let dop = dop_frames(period + 2);
+        let (mut written_a, mut written_b) = (0usize, 0usize);
+        let mut starts = 0;
+        for c in 0..cycles {
+            let phase = written_a % 2;
+            a.ring.write(&dop[phase..phase + period]);
+            written_a += period;
+            // Keeps the PCM client about 400 frames ahead of the output.
+            let taken = (c + 1) * period * pcm_rate as usize / dop_rate as usize;
+            let want = taken + 400 - written_b;
+            let block: Vec<[i32; 2]> = (written_b..written_b + want)
+                .map(|i| tone(i, f64::from(pcm_rate), 220.0, amp))
+                .collect();
+            b.ring.write(&block);
+            written_b += want;
+            rig.cycle();
+            starts += count(&rig.events(), |e| matches!(e, Event::DopStarted(2)));
+        }
+        starts
+    }
+
+    /// The three rows measured before the fix: 319, 64 and 531 in 10 s.
+    #[test]
+    fn a_pcm_client_beside_dop_is_never_reported_as_dop() {
+        let rows = [
+            false_dop_starts(48000, 176400, 1024, 0.05, 2),
+            false_dop_starts(48000, 176400, 1024, 0.1, 2),
+            false_dop_starts(48000, 48000, 64, 0.1, 2),
+        ];
+        assert_eq!(rows, [0, 0, 0]);
+    }
+
+    /// The rate policy drops a stopped client's claim, so a restart has to
+    /// make it again, even when both happen between two cycles.
+    #[test]
+    fn a_dop_stream_restarted_within_one_cycle_resends_dop_started() {
+        let mut rig = Rig::<F32>::new(BitPerfect::Auto);
+        let mut a = client(1);
+        rig.add(&mut a);
+        let dop = dop_frames(3 * PERIOD);
+        a.ring.write(&dop);
+        rig.cycle();
+        assert!(matches!(rig.events()[..], [Event::DopStarted(1)]));
+        rig.send(Command::SetRunning(1, false));
+        rig.send(Command::SetRunning(1, true));
+        rig.cycle();
+        assert!(matches!(
+            rig.events()[..],
+            [Event::DopStopped(1), Event::DopStarted(1)]
+        ));
+        assert_eq!(rig.last_periods(1), dop[PERIOD..2 * PERIOD]);
+    }
+
+    /// A stream known as DoP keeps what a discard leaves of its run, however
+    /// short, because it is DoP by that knowledge and not by the frames.
+    #[test]
+    fn a_second_dop_stream_keeps_its_cut_run_while_discarded() {
+        let mut rig = rig_at_gain::<F32>(0.1);
+        let (mut a, mut b) = (client(1), client(2));
+        rig.add(&mut a);
+        rig.add(&mut b);
+        let dop = dop_frames(PERIOD + 10);
+        a.ring.write(&dop[..PERIOD]);
+        b.ring.write(&dop);
+        rig.cycle();
+        assert_eq!(rig.last_periods(1), dop[..PERIOD]);
+        rig.send(Command::SetRunning(1, false));
+        rig.cycle();
+        let mut want = dop[PERIOD..].to_vec();
+        want.extend(dop_silence(0x05, PERIOD - 10));
+        assert_eq!(rig.last_periods(1), want);
     }
 }
