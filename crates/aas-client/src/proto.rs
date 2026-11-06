@@ -7,6 +7,8 @@ use std::path::PathBuf;
 
 pub const REQUEST_LEN: usize = 20;
 pub const REPLY_LEN: usize = 8;
+/// Largest buffer a client may ask for. Bounds the ring memory.
+pub const MAX_BUFFER_FRAMES: u32 = 1 << 20;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Request {
@@ -106,7 +108,7 @@ pub fn decode_request(b: &[u8]) -> Option<Request> {
             rate: word(b, 1),
             format: format_from_code(word(b, 2))?,
             channels: u8::try_from(word(b, 3)).ok()?,
-            buffer_frames: word(b, 4),
+            buffer_frames: Some(word(b, 4)).filter(|&n| n <= MAX_BUFFER_FRAMES)?,
         },
         3 => Request::Start,
         4 => Request::Stop,
@@ -219,6 +221,12 @@ mod tests {
         assert_eq!(decode_request(&pack(2, [48000, 9, 2, 64])), None);
         assert_eq!(decode_request(&pack(2, [48000, 0, 256, 64])), None);
         assert_eq!(decode_request(&pack(7, [300, 0, 0, 0])), None);
+        let at = pack(2, [48000, 0, 2, MAX_BUFFER_FRAMES]);
+        assert!(decode_request(&at).is_some());
+        assert_eq!(
+            decode_request(&pack(2, [48000, 0, 2, MAX_BUFFER_FRAMES + 1])),
+            None
+        );
         let reply = encode_reply(&Reply::Ok);
         assert_eq!(decode_reply(&reply[..REPLY_LEN - 1]), None);
         assert_eq!(decode_reply(&[9, 0, 0, 0, 0, 0, 0, 0]), None);

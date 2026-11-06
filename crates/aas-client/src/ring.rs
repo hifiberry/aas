@@ -5,7 +5,9 @@
 //! trusted. The capacity is read once at map time and kept in the `Ring`.
 //! Positions are taken modulo that capacity and a fill level above the
 //! capacity is treated as an empty ring. None of the data path methods
-//! allocate or block.
+//! allocate or block. The mapping is populated and locked when it is made,
+//! so they do not page fault either, as long as mlock is permitted and the
+//! peer calls `seal_writes` before it can punch holes.
 
 use std::io;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
@@ -133,7 +135,7 @@ impl Ring {
                 std::ptr::null_mut(),
                 len,
                 libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
+                libc::MAP_SHARED | libc::MAP_POPULATE,
                 fd,
                 0,
             )
@@ -141,6 +143,8 @@ impl Ring {
         if p == libc::MAP_FAILED {
             return Err(io::Error::last_os_error());
         }
+        // Keep the pages resident. A refused mlock only costs latency.
+        unsafe { libc::mlock(p, len) };
         NonNull::new(p as *mut u8).ok_or_else(|| io::Error::from(io::ErrorKind::OutOfMemory))
     }
 
@@ -239,6 +243,21 @@ impl Ring {
         self.consume(n);
         n
     }
+}
+
+/// Stops any further writable mapping of the ring and any hole punching
+/// under existing mappings. Mappings made before the call stay writable.
+///
+/// Call this after the client has mapped the ring, and not earlier, because
+/// a later writable `Ring::map` is refused. `Ring::map` is therefore only for
+/// clients mapping rings the daemon created. Without this seal a client could
+/// punch holes under the daemon's mapping and make the audio thread fault.
+pub fn seal_writes(fd: BorrowedFd) -> io::Result<()> {
+    // SAFETY: plain fcntl on a descriptor we borrow.
+    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_ADD_SEALS, libc::F_SEAL_FUTURE_WRITE) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 impl Drop for Ring {
@@ -359,5 +378,139 @@ mod tests {
         }
         assert!(Ring::map(small.as_fd()).is_err());
         assert!(Ring::map(fd.as_fd()).is_ok());
+    }
+
+    fn fake(len: usize, magic: u32, version: u32, capacity: u32) -> OwnedFd {
+        let fd = memfd(len);
+        let mut head = Vec::new();
+        for w in [magic, version, capacity] {
+            head.extend_from_slice(&w.to_ne_bytes());
+        }
+        let n = unsafe { libc::pwrite(fd.as_raw_fd(), head.as_ptr().cast(), head.len(), 0) };
+        assert_eq!(n, head.len() as isize);
+        fd
+    }
+
+    fn errno() -> i32 {
+        io::Error::last_os_error().raw_os_error().unwrap()
+    }
+
+    #[test]
+    fn map_checks_version_and_capacity_one_by_one() {
+        use std::os::fd::AsFd;
+        let ok = fake(4096, MAGIC, VERSION, 8);
+        assert!(Ring::map(ok.as_fd()).is_ok());
+        let version = fake(4096, MAGIC, VERSION + 1, 8);
+        assert!(Ring::map(version.as_fd()).is_err());
+        let zero = fake(4096, MAGIC, VERSION, 0);
+        assert!(Ring::map(zero.as_fd()).is_err());
+    }
+
+    #[test]
+    fn the_memfd_cannot_be_resized() {
+        let (_ring, fd) = Ring::create(1024).unwrap();
+        assert_eq!(unsafe { libc::ftruncate(fd.as_raw_fd(), 64) }, -1);
+        assert_eq!(errno(), libc::EPERM);
+        assert_eq!(unsafe { libc::ftruncate(fd.as_raw_fd(), 1 << 24) }, -1);
+        assert_eq!(errno(), libc::EPERM);
+    }
+
+    #[test]
+    fn consume_is_clamped_to_what_is_available() {
+        let (ring, _fd) = Ring::create(8).unwrap();
+        ring.write(&frames(0..4));
+        ring.consume(100);
+        assert_eq!(ring.header().read_pos.load(Ordering::Relaxed), 4);
+        assert_eq!(ring.write(&frames(10..18)), 8);
+        let mut out = [[0; 2]; 8];
+        assert_eq!(ring.read(&mut out), 8);
+        assert_eq!(out.to_vec(), frames(10..18));
+    }
+
+    #[test]
+    fn seal_writes_stops_hole_punching_and_new_writable_maps() {
+        use std::os::fd::AsFd;
+        let (ring, fd) = Ring::create(4096).unwrap();
+        let punch = libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE;
+        // Before the seal a peer can punch a hole under a live mapping.
+        assert_eq!(
+            unsafe { libc::fallocate(fd.as_raw_fd(), punch, 4096, 4096) },
+            0
+        );
+        seal_writes(fd.as_fd()).unwrap();
+        assert_eq!(
+            unsafe { libc::fallocate(fd.as_raw_fd(), punch, 4096, 4096) },
+            -1
+        );
+        assert_eq!(errno(), libc::EPERM);
+        assert!(Ring::map(fd.as_fd()).is_err());
+        // The mapping made before the seal keeps working.
+        assert_eq!(ring.write(&frames(0..100)), 100);
+        let mut out = [[0; 2]; 100];
+        assert_eq!(ring.read(&mut out), 100);
+        assert_eq!(out.to_vec(), frames(0..100));
+    }
+
+    fn thread_minflt() -> i64 {
+        let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::getrusage(libc::RUSAGE_THREAD, &mut ru) }, 0);
+        ru.ru_minflt
+    }
+
+    #[test]
+    fn a_fresh_ring_does_not_fault_on_a_first_full_pass() {
+        // Run on its own thread so other tests do not count.
+        std::thread::spawn(|| {
+            let (ring, _fd) = Ring::create(16384).unwrap();
+            let input = frames(0..16384);
+            // Non-zero so the allocator cannot hand out lazily zeroed pages.
+            let mut out = vec![[1; 2]; 16384];
+            let before = thread_minflt();
+            assert_eq!(ring.write(&input), 16384);
+            assert_eq!(ring.read(&mut out), 16384);
+            assert_eq!(thread_minflt() - before, 0);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn two_threads_see_every_frame_in_order() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        const TOTAL: i32 = 1_000_000;
+        let (ring, _fd) = Ring::create(512).unwrap();
+        let ring = Arc::new(ring);
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let (ring, stop) = (ring.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let mut next = 0;
+                while next < TOTAL && !stop.load(Ordering::Relaxed) {
+                    let end = (next + 100).min(TOTAL);
+                    let n = ring.write(&frames(next..end));
+                    next += n as i32;
+                    if n == 0 {
+                        std::hint::spin_loop();
+                    }
+                }
+            })
+        };
+        let mut expect = 0;
+        let mut out = [[0; 2]; 64];
+        let mut ok = true;
+        while expect < TOTAL && ok {
+            let n = ring.read(&mut out);
+            if n == 0 {
+                std::hint::spin_loop();
+            }
+            for f in &out[..n] {
+                ok &= *f == [expect, -expect];
+                expect += 1;
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        writer.join().unwrap();
+        assert!(ok, "frame out of order near {expect}");
     }
 }
