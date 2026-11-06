@@ -73,6 +73,8 @@ The project has failed, even if it works, if any of these become true:
 - On Digi cards, opening capture slaves the card clock to S/PDIF in and breaks
   playback. So `aas` needs a table of card capabilities, and it opens capture only
   on cards marked as having an ADC *(call)*.
+- There is no minimum cooling requirement. A Compute Module 5 without a heatsink
+  throttled to 1 GHz under full load and still had no xruns.
 - `aas` detects the card itself, so normal use needs no card in the config. The
   config can override it *(call)*.
 
@@ -182,21 +184,55 @@ Further rules *(call)*:
 
 ## Audio processing
 
-There is one processing path *(call)*. Audio is converted to 64-bit float,
-resampled if needed, processed, mixed, then written to the card as S32. Audio is
-never dithered, and the conversion scales by an exact power of two.
+There is one processing path *(call)*. Audio is converted to the processing
+format, resampled if needed, processed, mixed, then written to the card as S32.
+Audio is never dithered, and float conversion scales by an exact power of two.
 
-64-bit float was chosen because it holds every S32 value exactly. So audio at
-0 dB with no plugins comes out with the same bits it went in with. Measurement on
-a Pi 3, the slowest supported board, supports keeping it, pending the owner's
-approval *(call)*. Mixing costs about 1% of a period at 48 kHz. Resampling costs up
-to 1.85 times as much as in 32-bit, and the quality setting controls that cost far
-more than the float format does.
+### Processing format
 
-Resampling has two quality settings *(call)*. `high` is the default on the Pi 5.
-`medium` is the default on the Pi 3, where `high` to 192 kHz uses about 80% of a
-period and can overrun it. The Pi 4 default waits for its measurement. Either can
-be set in the config.
+The processing format is set in the config. It applies to the whole daemon and
+takes effect at startup *(call)*.
+
+| Format | Holds S32 exactly | Good for |
+|---|---|---|
+| `i32` | Yes | Simple mixing and volume |
+| `f32` | No, S16 and S24 only | Everything, the default |
+| `f64` | Yes | Anyone who wants the extra precision |
+
+Losing bits 25 to 32 in `f32` does not matter for sound. Real audio data has at most
+24 bits, and converters resolve less: the PCM5122 is rated at 112 dB and the PCM186x
+ADCs at 110 dB, against 144 dB for 24 bits. In a numeric check, `f32` error from an
+8-source mix with volume was -164 dBFS, and from 20 gain stages -162 dBFS. Both are
+below the rounding noise of 24-bit audio itself, about -149 dBFS. Only bit-perfect
+needs every bit, and it does not use the processing format.
+
+`f32` is the default on every board. `f64` stays fully supported. Mixing costs about
+1% of a period on a Pi 3, the slowest supported board, in either format. Resampling
+costs up to 1.85 times as much in `f64` as in `f32`.
+
+`i32` is 32-bit signed integer, the same format the card uses:
+
+- Mixing sums in a 64-bit accumulator and saturates once at the end, so a sum that
+  briefly goes over full scale in the middle of the mix does not clip *(call)*.
+- Volume multiplies in 64 bits and rounds once per stage *(call)*. The rounding
+  error is near -194 dBFS, far below the noise of any DAC.
+- It has no headroom between stages, unlike float. A stage that goes over full
+  scale clips there.
+- The resampler only works on float, so a resampled client is resampled in `f32`
+  and converted back *(call)*. That client is never bit-perfect anyway.
+
+### Resampling
+
+Resampling has two quality settings *(call)*. `high` is the default on every board.
+`medium` can be set in the config.
+
+On the Pi 3, one stream at `high` to 192 kHz uses about 44% of a period in `f32`,
+and 62% in the worst cycle. In `f64` it uses about 80% and can overrun, so a Pi 3
+set to `f64` should also use `medium`. Several resampled streams add up: two at
+`high` to 192 kHz come close to a full period on a Pi 3 even in `f32`, and `medium`
+leaves room for them. The Pi 4 is still to be measured.
+
+### Volume and clipping
 
 Input volumes are calculated on this path. So is the output volume on cards
 without a hardware volume (see Volume).
@@ -209,9 +245,10 @@ plugin is in the chain. There is no built-in limiter.
 
 ### Bit-perfect
 
-Bit-perfect means nothing alters the samples. It is not a separate path: it is
-what the path above does when no volume, plugin or resampling applies. There are
-two ways to get it:
+Bit-perfect means nothing alters the samples. When no volume, plugin or resampling
+applies, samples are copied to the card as S32 without entering the processing
+format. This is the same for all three formats, and `f32` needs it because it
+cannot hold every S32 value *(call)*. There are two ways to get it:
 
 - **Automatic:** applies when one source is active, all volumes that `aas`
   calculates are at 0 dB and no plugin is active. A hardware output volume does
@@ -266,7 +303,7 @@ The 4 ms budget covers what `aas` adds, from the plugin receiving audio to the
 audio leaving the card *(call)*. A player's own ALSA buffer is outside it. At
 48 kHz, 4 ms is 192 frames.
 
-Default periods, with 2 periods buffered *(call)*:
+Default periods, with 2 periods buffered:
 
 | Rate | Pi 5 | Pi 3 |
 |---|---|---|
@@ -279,8 +316,7 @@ the board throttled. Its 64 frame period did not hold under that load. The Pi 4
 default waits for its measurement.
 
 Resampling adds roughly 1 to 2 ms. A resampled client may exceed 4 ms, in
-preference to reducing resampling quality *(call)*. The Pi 3 is the exception: it
-reduces quality because of CPU cost, not latency.
+preference to reducing resampling quality *(call)*.
 
 Latency added by a plugin counts on top of the budget, and `aas` reports it.
 
@@ -357,11 +393,17 @@ filtering. The interface is native to `aas`. LADSPA is not supported, and
 
 Details *(call)*:
 
-- Plugins work on 64-bit float.
+- A plugin declares which processing formats it supports. Where it does not
+  support the configured one, `aas` converts around it and shows this in the graph
+  export *(call)*.
 - A plugin runs at one of three places: on one input, on the mix, or just before
   the output.
 - Plugins form an ordered chain defined in the config. Nothing rewires them on
   its own.
+- Recursive filters keep their state and coefficients in 64-bit float, whatever the
+  processing format *(call)*. A 20 Hz high-pass computed entirely in `f32` had an
+  error of -90 dBFS at 48 kHz and -73 dBFS at 192 kHz, which is above the DAC's noise
+  floor. This matters for the input processor and `speakereq`.
 - A plugin can have different numbers of input and output channels.
 - A plugin can report "no signal" for its input.
 - Plugins run in-process on the audio thread, so a slow plugin causes dropouts.
@@ -433,7 +475,7 @@ confirmed.
 ## Configuration
 
 One plain TOML file *(call)* holds the output card, the latency target, the
-default rate, the bit-perfect mode and the plugin chain.
+default rate, the processing format, the bit-perfect mode and the plugin chain.
 
 Volumes and other values changed at runtime are state, not configuration. They
 are kept in a separate state file owned by the daemon and restored at startup
@@ -501,8 +543,8 @@ and a Lyrion server.
 
 ## Not yet known
 
-- Whether a Pi 5 class board stays cool enough in the product's case. Without a
-  heatsink, a Compute Module 5 throttled on one busy core.
+- What `i32` costs. It has not been measured. Since mixing already costs about 1%
+  of a period, it is not expected to save much CPU.
 - How `librespot`, `shairport-sync`, `raat` and `sendspin` connect to audio
   today. Their configuration is not in the `hifiberry-os` repository. Check this
   before relying on "ALSA clients need no changes" for them.
