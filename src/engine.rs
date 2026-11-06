@@ -73,6 +73,9 @@ pub struct Source {
     held: usize,
     /// The stream was under way before this cycle.
     settled: bool,
+    /// The ring may start inside a DoP run. It was cut by a discard, or left
+    /// when the stream stopped. What remains can be too short to recognise.
+    in_dop_run: bool,
     /// The marker that continues the DoP stream.
     next_marker: u8,
     /// Output frames since a DoP stream last had any of its own.
@@ -100,6 +103,7 @@ impl Source {
             plays: false,
             held: 0,
             settled: false,
+            in_dop_run: false,
             next_marker: 0x05,
             dop_dry_frames: 0,
             discard_remainder: 0,
@@ -145,6 +149,10 @@ impl Source {
         self.ready = 0;
         self.held = 0;
         self.plays = false;
+        if self.in_dop_run && !window.is_empty() {
+            self.in_dop_run = false;
+            self.stream = Stream::Dop;
+        }
         if self.stream == Stream::Dop {
             self.ready = dop::marked_run(&window[..self.seen]);
             if self.ready > 0 || window.is_empty() {
@@ -257,7 +265,12 @@ impl Source {
         let want = (total / output_rate) as usize;
         self.discard_remainder = total % output_rate;
         let n = self.ring.available().min(want);
-        self.ring.consume(n);
+        if n > 0 {
+            let mut last = [[0; 2]];
+            self.ring.consume(n - 1);
+            self.ring.read(&mut last);
+            self.in_dop_run = dop::marked_run(&last) > 0;
+        }
         self.note_shortfall(n, want);
     }
 
@@ -473,6 +486,7 @@ impl<P: Processing, S: Sink> Engine<P, S> {
                 if let Some(source) = self.find(id) {
                     source.running = running;
                     if !running {
+                        source.in_dop_run |= source.stream == Stream::Dop;
                         source.stream = Stream::Unknown;
                     }
                 }
@@ -2337,80 +2351,254 @@ mod tests {
         *f == [0, 0] || (marked && (raw || silent))
     }
 
-    /// Writes silent PCM and DoP runs of 16 frames or more in random sizes at
-    /// a gain of 0.1. Any frame scaled or filtered from DoP shows at the sink.
-    /// Returns how many frames did.
-    fn altered_frames(seed: u64, resampled_source: bool, drain: bool) -> usize {
+    /// What a fuzz run does besides writing to client 1.
+    #[derive(Clone, Copy, Default)]
+    struct Fuzz {
+        resampled_first: bool,
+        wrong_rate_first: bool,
+        second: bool,
+        resampled_second: bool,
+        stops: bool,
+        drains: bool,
+        reconfigures: bool,
+        final_drain: bool,
+    }
+
+    /// Writes silent PCM or an in-phase DoP run of 16 frames or more, in a
+    /// random size. Shorter runs are PCM by ruling, so they are not written.
+    fn write_randomly(random: &mut Lcg, client: &Client, phase: &mut usize) {
+        let n = match random.next(4) {
+            0 => random.next(10),
+            1 => random.next(70),
+            _ => random.next(300),
+        };
+        if random.next(2) == 0 {
+            client.ring.write(&frames(0, n));
+        } else {
+            let n = n.max(dop::MIN_FRAMES);
+            client.ring.write(&dop_frames(n + 2)[*phase..*phase + n]);
+            *phase = (*phase + n) % 2;
+        }
+    }
+
+    /// Plays random writes at a gain of 0.1. Any frame scaled or filtered
+    /// from DoP shows at the sink. Returns how many frames did.
+    fn altered_frames(seed: u64, fuzz: Fuzz) -> usize {
         let mut random = Lcg(seed);
         let mut rig = rig_at_gain::<F32>(0.1);
         let start = rig.log.frames().len();
-        let mut a = if resampled_source {
-            resampled(1, Format::F32)
+        let mut a = match (fuzz.resampled_first, fuzz.wrong_rate_first) {
+            (true, _) => resampled(1, Format::F32),
+            (_, true) => client_at(1, 96000),
+            _ => client(1),
+        };
+        let mut b = if fuzz.resampled_second {
+            resampled(2, Format::F32)
         } else {
-            client(1)
+            client(2)
         };
         rig.add(&mut a);
-        let mut phase = 0;
+        if fuzz.second {
+            rig.add(&mut b);
+        }
+        let (mut phase_a, mut phase_b) = (0, 0);
+        let (mut running_a, mut running_b) = (true, true);
         for _ in 0..200 {
-            let n = match random.next(4) {
-                0 => random.next(10),
-                1 => random.next(70),
-                _ => random.next(300),
-            };
-            if random.next(2) == 0 {
-                a.ring.write(&frames(0, n));
-            } else {
-                let n = n.max(dop::MIN_FRAMES);
-                a.ring.write(&dop_frames(n + 2)[phase..phase + n]);
-                phase = (phase + n) % 2;
+            write_randomly(&mut random, &a, &mut phase_a);
+            if fuzz.second {
+                write_randomly(&mut random, &b, &mut phase_b);
             }
             for _ in 0..random.next(4) {
                 rig.cycle();
             }
-        }
-        if drain {
-            a.ring.header().draining.store(1, Release);
-        }
-        for _ in 0..3000 {
-            rig.cycle();
-            if a.ring.available() == 0 && !drain {
-                break;
+            if fuzz.stops && random.next(4) == 0 {
+                if random.next(2) == 0 {
+                    running_a = !running_a;
+                    rig.send(Command::SetRunning(1, running_a));
+                } else if fuzz.second {
+                    running_b = !running_b;
+                    rig.send(Command::SetRunning(2, running_b));
+                }
             }
+            if fuzz.drains && random.next(6) == 0 {
+                let client = if random.next(2) == 0 || !fuzz.second {
+                    &a
+                } else {
+                    &b
+                };
+                client.ring.header().draining.store(1, Release);
+                for _ in 0..80 {
+                    rig.cycle();
+                    if client.ring.available() == 0 && random.next(3) == 0 {
+                        break;
+                    }
+                }
+                client.ring.header().draining.store(0, Release);
+            }
+            if fuzz.reconfigures && random.next(8) == 0 {
+                let rate = if random.next(2) == 0 { RATE } else { 96000 };
+                let period = [32, 64, 128][random.next(3)];
+                rig.send(Command::Reconfigure { rate, period });
+            }
+        }
+        if fuzz.final_drain {
+            a.ring.header().draining.store(1, Release);
+            b.ring.header().draining.store(1, Release);
+        }
+        for _ in 0..1000 {
+            rig.cycle();
         }
         let log = rig.log.frames();
         let output = log[start..].iter();
-        if resampled_source {
-            output.filter(|f| **f != [0, 0]).count()
-        } else {
-            output.filter(|f| !is_clean_dop_output(f)).count()
-        }
+        output.filter(|f| !is_clean_dop_output(f)).count()
     }
 
-    fn fuzz_seeds(resampled_source: bool, drain: bool) {
-        let bad: Vec<u64> = (0..150)
-            .filter(|&seed| altered_frames(seed, resampled_source, drain) > 0)
+    fn fuzz_seeds(fuzz: Fuzz) {
+        let bad: Vec<u64> = (0..FUZZ_SEEDS)
+            .filter(|&seed| altered_frames(seed, fuzz) > 0)
             .collect();
-        assert!(bad.is_empty(), "seeds {bad:?}");
+        assert!(bad.is_empty(), "{} seeds: {bad:?}", bad.len());
+    }
+
+    const FUZZ_SEEDS: u64 = 100;
+    const TWO: Fuzz = Fuzz {
+        resampled_first: false,
+        wrong_rate_first: false,
+        second: true,
+        resampled_second: false,
+        stops: false,
+        drains: false,
+        reconfigures: false,
+        final_drain: false,
+    };
+    const ONE: Fuzz = Fuzz {
+        second: false,
+        ..TWO
+    };
+
+    #[test]
+    fn fuzz_one_source() {
+        fuzz_seeds(ONE);
     }
 
     #[test]
-    fn random_pcm_and_dop_stay_apart_in_a_plain_source() {
-        fuzz_seeds(false, false);
+    fn fuzz_one_source_with_a_final_drain() {
+        fuzz_seeds(Fuzz {
+            final_drain: true,
+            ..ONE
+        });
     }
 
     #[test]
-    fn random_pcm_and_dop_stay_apart_in_a_draining_plain_source() {
-        fuzz_seeds(false, true);
+    fn fuzz_one_resampled_source() {
+        fuzz_seeds(Fuzz {
+            resampled_first: true,
+            ..ONE
+        });
     }
 
     #[test]
-    fn random_pcm_and_dop_stay_apart_in_a_resampled_source() {
-        fuzz_seeds(true, false);
+    fn fuzz_one_resampled_source_with_a_final_drain() {
+        fuzz_seeds(Fuzz {
+            resampled_first: true,
+            final_drain: true,
+            ..ONE
+        });
     }
 
     #[test]
-    fn random_pcm_and_dop_stay_apart_in_a_draining_resampled_source() {
-        fuzz_seeds(true, true);
+    fn fuzz_one_source_with_drains() {
+        fuzz_seeds(Fuzz {
+            drains: true,
+            ..ONE
+        });
+    }
+
+    #[test]
+    fn fuzz_one_source_with_stops() {
+        fuzz_seeds(Fuzz { stops: true, ..ONE });
+    }
+
+    #[test]
+    fn fuzz_one_source_with_reconfigures() {
+        fuzz_seeds(Fuzz {
+            reconfigures: true,
+            ..ONE
+        });
+    }
+
+    #[test]
+    fn fuzz_a_source_at_the_wrong_rate() {
+        fuzz_seeds(Fuzz {
+            wrong_rate_first: true,
+            ..ONE
+        });
+    }
+
+    #[test]
+    fn fuzz_a_source_at_the_wrong_rate_with_reconfigures_and_drains() {
+        fuzz_seeds(Fuzz {
+            wrong_rate_first: true,
+            reconfigures: true,
+            drains: true,
+            ..ONE
+        });
+    }
+
+    #[test]
+    fn fuzz_two_sources() {
+        fuzz_seeds(TWO);
+    }
+
+    #[test]
+    fn fuzz_two_sources_one_resampled() {
+        fuzz_seeds(Fuzz {
+            resampled_second: true,
+            ..TWO
+        });
+    }
+
+    #[test]
+    fn fuzz_two_sources_with_drains() {
+        fuzz_seeds(Fuzz {
+            drains: true,
+            ..TWO
+        });
+    }
+
+    #[test]
+    fn fuzz_two_sources_one_resampled_with_drains() {
+        fuzz_seeds(Fuzz {
+            resampled_second: true,
+            drains: true,
+            ..TWO
+        });
+    }
+
+    #[test]
+    fn fuzz_two_sources_with_stops() {
+        fuzz_seeds(Fuzz { stops: true, ..TWO });
+    }
+
+    #[test]
+    fn fuzz_two_sources_one_resampled_with_stops() {
+        fuzz_seeds(Fuzz {
+            resampled_second: true,
+            stops: true,
+            ..TWO
+        });
+    }
+
+    #[test]
+    fn fuzz_everything_at_once() {
+        fuzz_seeds(Fuzz {
+            resampled_second: true,
+            stops: true,
+            drains: true,
+            reconfigures: true,
+            final_drain: true,
+            ..TWO
+        });
     }
 
     #[test]
@@ -2541,5 +2729,132 @@ mod tests {
         a.ring.write(&dop_frames(10));
         rig.cycle();
         assert_eq!(rig.counters.held_frames.load(Relaxed), 0);
+    }
+
+    /// Client 1 plays a DoP period while client 2 holds PCM with a DoP run
+    /// that the discard cuts, leaving under 16 frames of it before more PCM.
+    fn a_run_cut_by_a_discard(
+        second: Client,
+        pcm_frames: usize,
+    ) -> (Rig<F32>, Client, Client, usize) {
+        let mut rig = rig_at_gain::<F32>(0.1);
+        let start = rig.log.frames().len();
+        let (mut a, mut b) = (client(1), second);
+        rig.add(&mut a);
+        rig.add(&mut b);
+        rig.cycle();
+        a.ring.write(&dop_frames(PERIOD));
+        let mut block = frames(0, pcm_frames);
+        block.extend(dop_frames(18));
+        block.extend(frames(0, 500));
+        b.ring.write(&block);
+        (rig, a, b, start)
+    }
+
+    fn assert_clean(rig: &Rig<F32>, start: usize) {
+        let log = rig.log.frames();
+        let altered = log[start..].iter().filter(|f| !is_clean_dop_output(f));
+        assert_eq!(altered.count(), 0);
+    }
+
+    #[test]
+    fn a_run_cut_by_a_discard_stays_dop_when_the_owner_stops() {
+        let (mut rig, _a, _b, start) = a_run_cut_by_a_discard(client(2), 60);
+        rig.cycle();
+        rig.send(Command::SetRunning(1, false));
+        rig.cycle();
+        rig.cycle();
+        assert_clean(&rig, start);
+    }
+
+    #[test]
+    fn a_run_cut_by_a_discard_stays_dop_when_the_owner_drains() {
+        let (mut rig, a, _b, start) = a_run_cut_by_a_discard(client(2), 60);
+        a.ring.header().draining.store(1, Release);
+        for _ in 0..3 {
+            rig.cycle();
+        }
+        assert_clean(&rig, start);
+    }
+
+    #[test]
+    fn a_run_cut_by_a_discard_does_not_reach_a_resampler() {
+        // A resampled source loses 58 or 59 frames of input in a period.
+        let source = resampled(2, Format::F32);
+        let (mut rig, _a, _b, start) = a_run_cut_by_a_discard(source, 50);
+        rig.cycle();
+        rig.send(Command::SetRunning(1, false));
+        for _ in 0..4 {
+            rig.cycle();
+        }
+        assert_clean(&rig, start);
+    }
+
+    #[test]
+    fn a_discard_ending_on_pcm_leaves_the_source_pcm() {
+        let (mut rig, _a, b, _start) = a_run_cut_by_a_discard(client(2), 60);
+        rig.cycle();
+        assert!(matches!(rig.events()[..], [Event::DopStarted(1)]));
+        // Past the run, and with nothing marked left to find.
+        b.ring.consume(b.ring.available());
+        b.ring.write(&frames(1000, PERIOD));
+        rig.send(Command::SetRunning(1, false));
+        rig.cycle();
+        assert!(matches!(rig.events()[..], [Event::DopStopped(1)]));
+    }
+
+    /// A DoP stream stopped with 10 frames of its run still in the ring.
+    fn a_stopped_dop_stream() -> (Rig<F32>, Client, usize) {
+        let mut rig = rig_at_gain::<F32>(0.1);
+        let start = rig.log.frames().len();
+        let mut a = client(1);
+        rig.add(&mut a);
+        a.ring.write(&dop_frames(PERIOD + 10));
+        rig.cycle();
+        rig.send(Command::SetRunning(1, false));
+        rig.cycle();
+        (rig, a, start)
+    }
+
+    #[test]
+    fn a_stopped_dop_stream_resumes_as_dop() {
+        let (mut rig, a, start) = a_stopped_dop_stream();
+        a.ring.write(&frames(0, 500));
+        rig.send(Command::SetRunning(1, true));
+        rig.cycle();
+        assert_clean(&rig, start);
+        let mut want = dop_frames(PERIOD + 10)[PERIOD..].to_vec();
+        want.extend(dop_silence(0x05, PERIOD - 10));
+        assert_eq!(rig.last_periods(1), want);
+        assert_eq!(underruns(&a), 0);
+        let events = rig.events();
+        assert!(matches!(
+            events[..],
+            [
+                Event::DopStarted(1),
+                Event::DopStopped(1),
+                Event::DopStarted(1)
+            ]
+        ));
+    }
+
+    #[test]
+    fn a_dop_stream_restarted_with_an_empty_ring_is_a_new_start() {
+        let mut rig = Rig::<I32>::new(BitPerfect::Auto);
+        let (mut a, mut b) = (client(1), client(2));
+        rig.add(&mut a);
+        rig.add(&mut b);
+        a.ring.write(&dop_frames(PERIOD));
+        rig.cycle();
+        rig.send(Command::SetRunning(1, false));
+        rig.cycle();
+        rig.events();
+        rig.send(Command::SetRunning(1, true));
+        b.ring.write(&frames(1000, PERIOD));
+        rig.cycle();
+        // It claims nothing until it has something to play.
+        assert_eq!(rig.last_periods(1), frames(1000, PERIOD));
+        assert!(rig.events().is_empty());
+        assert_eq!(underruns(&a), 0);
     }
 }
