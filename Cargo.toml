@@ -1,5 +1,6 @@
 [workspace]
-members = [".", "tools/measure"]
+members = [".", "crates/aas-client", "tools/measure"]
+default-members = [".", "crates/aas-client", "tools/measure"]
 
 [package]
 name = "aas"
