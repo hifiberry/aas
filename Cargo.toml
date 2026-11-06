@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "tools/measure"]
+
 [package]
 name = "aas"
 version = "0.1.0"

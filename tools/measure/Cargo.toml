@@ -1,0 +1,33 @@
+[package]
+name = "measure"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Probes that measure what the hardware can do for aas"
+license = "MIT"
+publish = false
+
+[dependencies]
+alsa = { version = "0.12.1", optional = true }
+audioadapter-buffers = "4.0"
+clap = { version = "4.6.7", features = ["derive"] }
+libc = "0.2"
+num-traits = "0.2.19"
+rubato = "4.0.0"
+
+[features]
+alsa-probes = ["dep:alsa"]
+
+[[bin]]
+name = "dsp-bench"
+
+[[bin]]
+name = "handoff-probe"
+
+[[bin]]
+name = "period-probe"
+required-features = ["alsa-probes"]
+
+[[bin]]
+name = "loopback-latency"
+required-features = ["alsa-probes"]
