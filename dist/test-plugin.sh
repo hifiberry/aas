@@ -1,10 +1,13 @@
 #!/bin/sh
 # Board tests for the aas ALSA plugin. Runs on the test board, as a member
 # of group audio that may sudo, with the daemon running as aas.service and
-# the plugin installed by dist/install-plugin.sh. Needs aplay, cc and
-# libasound2-dev. Each case prints PASS or FAIL and its name. The exit
-# status is the number of cases that failed.
+# the plugin installed by dist/install-plugin.sh. Needs aplay, amixer,
+# alsactl, cc and libasound2-dev, and for the mixer case mpd, mpc and
+# python3. Each case prints PASS or FAIL and its name. The exit status is
+# the number of cases that failed.
 set -u
+# alsactl is in sbin.
+PATH=$PATH:/usr/sbin
 
 rate=48000
 work=$(mktemp -d)
@@ -392,6 +395,53 @@ if ! cc -O2 -o "$work/pcmtest" "$work/pcmtest.c" -lasound; then
 	echo "FAIL setup: cannot build the helper"
 	exit 1
 fi
+
+# A helper that watches the default control as mixers do: it polls the
+# descriptors, asks what they mean and reads events, until a read fails.
+cat >"$work/ctlwatch.c" <<'EOF'
+#include <alsa/asoundlib.h>
+#include <poll.h>
+#include <stdio.h>
+
+int main(void)
+{
+	snd_ctl_t *ctl;
+	snd_ctl_event_t *event;
+	struct pollfd pfd[4];
+	int n, err, events = 0, wakes;
+
+	snd_ctl_event_alloca(&event);
+	if ((err = snd_ctl_open(&ctl, "default", 0)) < 0 ||
+	    (err = snd_ctl_subscribe_events(ctl, 1)) < 0) {
+		printf("open: %s\n", snd_strerror(err));
+		return 2;
+	}
+	n = snd_ctl_poll_descriptors(ctl, pfd, 4);
+	printf("ready\n");
+	fflush(stdout);
+	for (wakes = 1; wakes <= 1000; wakes++) {
+		unsigned short revents = 0;
+		if (poll(pfd, n, 5000) <= 0) {
+			printf("no wake-up within 5 s\n");
+			return 1;
+		}
+		snd_ctl_poll_descriptors_revents(ctl, pfd, n, &revents);
+		while ((err = snd_ctl_read(ctl, event)) > 0)
+			events++;
+		if (err < 0 && err != -EAGAIN) {
+			printf("%d events, then poll gave%s POLLERR and the read %s, wake-up %d\n",
+			       events, revents & POLLERR ? "" : " no", snd_strerror(err), wakes);
+			return !(revents & POLLERR) || events < 1;
+		}
+	}
+	printf("no error after 1000 wake-ups\n");
+	return 1;
+}
+EOF
+if ! cc -O2 -o "$work/ctlwatch" "$work/ctlwatch.c" -lasound; then
+	echo "FAIL setup: cannot build the control helper"
+	exit 1
+fi
 if ! wait_daemon; then
 	echo "FAIL setup: aas.service is not running"
 	exit 1
@@ -548,6 +598,178 @@ case_player_killed_keeps_daemon_up() {
 	fi
 }
 
+# The daemon's volume in percent, read through the control.
+master() {
+	amixer -D default sget Master | sed -n 's/.*Playback [0-9]* \[\([0-9]*\)%\].*/\1/p' | head -n1
+}
+
+case_amixer_reads_and_sets_master() {
+	name=amixer_reads_and_sets_master
+	if ! amixer -q -D default sset Master 50% 2>"$work/err"; then
+		fail $name "sset failed: $(cat "$work/err")"
+		return
+	fi
+	line=$(amixer -D default sget Master | grep '\[[0-9]*%\]')
+	if [ "$(master)" = 50 ] && echo "$line" | grep -q -- '-30.00dB'; then
+		pass $name "sget after sset 50%:$line"
+	else
+		fail $name "sget after sset 50%:$line"
+	fi
+}
+
+# A client watching the control is told of a change another one makes.
+case_second_client_sees_the_change() {
+	name=second_client_sees_the_change
+	stdbuf -oL alsactl monitor default >"$work/monitor" 2>&1 &
+	monitor=$!
+	sleep 0.5
+	amixer -q -D default sset Master 30%
+	i=0
+	while [ $i -lt 20 ] && ! grep -q 'Master Playback Volume' "$work/monitor"; do
+		sleep 0.1
+		i=$((i + 1))
+	done
+	kill $monitor 2>/dev/null
+	wait $monitor 2>/dev/null
+	line=$(grep 'Master Playback Volume' "$work/monitor" | head -n1)
+	if [ -n "$line" ]; then
+		pass $name "alsactl monitor: $line"
+	else
+		fail $name "alsactl monitor saw nothing: $(tr '\n' ' ' <"$work/monitor")"
+	fi
+}
+
+# mpd's hardware mixer on the control. mpd opens its mixer with the
+# output, so it plays silence meanwhile.
+case_mpd_mixer_works() {
+	name=mpd_mixer_works
+	for tool in mpd mpc python3; do
+		if ! command -v $tool >/dev/null; then
+			fail $name "$tool is not installed"
+			return
+		fi
+	done
+	mkdir -p "$work/music"
+	python3 -c '
+import sys, wave
+w = wave.open(sys.argv[1], "wb")
+w.setnchannels(2)
+w.setsampwidth(2)
+w.setframerate(48000)
+w.writeframes(bytes(4 * 48000 * 10))
+' "$work/music/silence.wav"
+	cat >"$work/mpd.conf" <<-CONF
+	music_directory "$work/music"
+	db_file "$work/mpd.db"
+	log_file "$work/mpd.log"
+	pid_file "$work/mpd.pid"
+	bind_to_address "$work/mpd.sock"
+	audio_output {
+		type "alsa"
+		name "aas"
+		device "default"
+		mixer_type "hardware"
+		mixer_device "default"
+		mixer_control "Master"
+	}
+	CONF
+	amixer -q -D default sset Master 50%
+	mpd --no-daemon "$work/mpd.conf" 2>"$work/err" &
+	mpd=$!
+	i=0
+	while [ $i -lt 50 ] && [ ! -S "$work/mpd.sock" ]; do
+		sleep 0.1
+		i=$((i + 1))
+	done
+	export MPD_HOST="$work/mpd.sock"
+	mpc -q update --wait && mpc -q add silence.wav && mpc -q repeat on && mpc -q play
+	sleep 1
+	mpc -q volume 40
+	sleep 0.3
+	reported=$(mpc volume)
+	daemon=$(master)
+	mpc -q stop
+	unset MPD_HOST
+	kill $mpd 2>/dev/null
+	wait $mpd 2>/dev/null
+	if [ "$reported" = "volume: 40%" ] && [ -n "$daemon" ] && [ "$daemon" != 50 ]; then
+		pass $name "mpc volume 40 moved the daemon from 50% to $daemon%; mpc reads $reported"
+	else
+		log=$(tail -n3 "$work/mpd.log" 2>/dev/null | tr '\n' ' ')
+		fail $name "mpc reads '$reported', daemon at '$daemon%': $(tr '\n' ' ' <"$work/err") $log"
+	fi
+}
+
+case_volume_survives_a_restart() {
+	name=volume_survives_a_restart
+	amixer -q -D default sset Master 50%
+	daemon=$(main_pid)
+	sudo systemctl restart aas
+	if ! wait_daemon; then
+		fail $name "the daemon did not come back"
+		return
+	fi
+	if [ "$(master)" = 50 ] && [ "$(main_pid)" != "$daemon" ]; then
+		pass $name "50% after the restart, pid $daemon then $(main_pid)"
+	else
+		fail $name "$(master)% after the restart, pid $daemon then $(main_pid)"
+	fi
+}
+
+# With the daemon gone, the control fails at once instead of hanging.
+case_amixer_fails_without_the_daemon() {
+	name=amixer_fails_without_the_daemon
+	sudo systemctl stop aas
+	start=$(now_ms)
+	timeout 5 amixer -D default sget Master >"$work/out" 2>&1
+	status=$?
+	took=$(($(now_ms) - start))
+	sudo systemctl start aas
+	why=$(head -n2 "$work/out" | tr '\n' ' ')
+	if ! wait_daemon; then
+		fail $name "the daemon did not come back"
+	elif [ $status -ne 0 ] && [ $status -ne 124 ] && [ $took -le 1000 ]; then
+		pass $name "amixer exited $status after $took ms: $why"
+	else
+		fail $name "amixer exited $status after $took ms: $why"
+	fi
+}
+
+# A client watching the control hears when the daemon goes: poll reports
+# POLLERR and reading an event fails, as for a card that is unplugged.
+case_watcher_hears_the_daemon_go() {
+	name=watcher_hears_the_daemon_go
+	"$work/ctlwatch" >"$work/watch" 2>&1 &
+	watcher=$!
+	i=0
+	while [ $i -lt 50 ] && ! grep -q ready "$work/watch"; do
+		sleep 0.1
+		i=$((i + 1))
+	done
+	amixer -q -D default sset Master 40%
+	sleep 0.3
+	start=$(now_ms)
+	sudo systemctl kill -s KILL aas
+	if ! wait_gone $watcher 3000; then
+		kill -9 $watcher
+		wait $watcher 2>/dev/null
+		fail $name "the watcher still waits 3 s after the daemon was killed"
+		wait_daemon
+		return
+	fi
+	took=$(($(now_ms) - start))
+	wait $watcher
+	status=$?
+	why=$(tr '\n' ' ' <"$work/watch")
+	if ! wait_daemon; then
+		fail $name "the daemon did not come back"
+	elif [ $status -eq 0 ] && [ $took -le 1000 ]; then
+		pass $name "after $took ms: $why"
+	else
+		fail $name "exited $status after $took ms: $why"
+	fi
+}
+
 case_aplay_plays_each_format
 case_drain_returns
 case_pause_and_resume
@@ -559,4 +781,12 @@ case_small_buffer_rounds_up_or_is_refused
 case_daemon_killed_during_write_returns_an_error
 case_client_reconnects_after_restart
 case_player_killed_keeps_daemon_up
+case_amixer_reads_and_sets_master
+case_second_client_sees_the_change
+case_mpd_mixer_works
+case_volume_survives_a_restart
+case_amixer_fails_without_the_daemon
+case_watcher_hears_the_daemon_go
+# Full volume again, for whatever plays next.
+amixer -q -D default sset Master 100%
 exit $failed

@@ -1,11 +1,12 @@
-//! The parts of libasound's external plugin SDK this plugin uses, declared
-//! by hand from `alsa/pcm_ioplug.h`, `alsa/pcm.h` and `alsa/conf.h`.
-//! `alsa-sys` does not cover the ioplug SDK. `tests/layout.rs` compares
+//! The parts of libasound's external plugin SDKs this plugin uses, declared
+//! by hand from `alsa/pcm_ioplug.h`, `alsa/control_external.h`,
+//! `alsa/pcm.h`, `alsa/control.h` and `alsa/conf.h`. `alsa-sys` covers
+//! neither the ioplug nor the ctl_ext SDK. `tests/layout.rs` compares
 //! every size, offset and constant here with the installed headers.
 
 #![allow(non_camel_case_types)]
 
-use std::ffi::{c_char, c_int, c_long, c_uint, c_ulong, c_ushort, c_void};
+use std::ffi::{c_char, c_int, c_long, c_uchar, c_uint, c_ulong, c_ushort, c_void};
 
 pub type snd_pcm_uframes_t = c_ulong;
 pub type snd_pcm_sframes_t = c_long;
@@ -151,6 +152,106 @@ pub struct snd_pcm_ioplug_callback_t {
     pub set_chmap: Option<unsafe extern "C" fn(Io, *const snd_pcm_chmap_t) -> c_int>,
 }
 
+pub type snd_ctl_ext_key_t = c_ulong;
+pub type snd_ctl_elem_type_t = c_int;
+pub type snd_ctl_elem_iface_t = c_int;
+
+#[repr(C)]
+pub struct snd_ctl_t {
+    _private: [u8; 0],
+}
+#[repr(C)]
+pub struct snd_ctl_elem_id_t {
+    _private: [u8; 0],
+}
+#[repr(C)]
+pub struct snd_aes_iec958_t {
+    _private: [u8; 0],
+}
+
+/// Protocol 1.0.1, the first with TLV data.
+pub const SND_CTL_EXT_VERSION: c_uint = 0x010001;
+pub const SND_CTL_EXT_ACCESS_READ: c_uint = 1 << 0;
+pub const SND_CTL_EXT_ACCESS_WRITE: c_uint = 1 << 1;
+pub const SND_CTL_EXT_ACCESS_READWRITE: c_uint = 3;
+pub const SND_CTL_EXT_ACCESS_TLV_READ: c_uint = 1 << 4;
+/// What `find_elem` returns for an element the plugin does not have.
+pub const SND_CTL_EXT_KEY_NOT_FOUND: snd_ctl_ext_key_t = !0;
+
+pub const SND_CTL_ELEM_TYPE_INTEGER: snd_ctl_elem_type_t = 2;
+pub const SND_CTL_ELEM_IFACE_MIXER: snd_ctl_elem_iface_t = 2;
+pub const SND_CTL_EVENT_MASK_VALUE: c_uint = 1 << 0;
+/// A dB range from a minimum to a maximum, linear in between, whose
+/// lowest value mutes. In 0.01 dB.
+pub const SND_CTL_TLVT_DB_MINMAX_MUTE: c_uint = 5;
+
+type Ext = *mut snd_ctl_ext_t;
+
+/// The TLV data of the plugin's elements: a callback or fixed data.
+#[repr(C)]
+pub union snd_ctl_ext_tlv {
+    pub c: Option<
+        unsafe extern "C" fn(Ext, snd_ctl_ext_key_t, c_int, c_uint, *mut c_uint, c_uint) -> c_int,
+    >,
+    pub p: *const c_uint,
+}
+
+/// The control plugin's handle. The plugin fills it before
+/// `snd_ctl_ext_create`, which sets `handle`.
+#[repr(C)]
+pub struct snd_ctl_ext_t {
+    pub version: c_uint,
+    pub card_idx: c_int,
+    pub id: [c_char; 16],
+    pub driver: [c_char; 16],
+    pub name: [c_char; 32],
+    pub longname: [c_char; 80],
+    pub mixername: [c_char; 80],
+    pub poll_fd: c_int,
+    pub callback: *const snd_ctl_ext_callback_t,
+    pub private_data: *mut c_void,
+    pub handle: *mut snd_ctl_t,
+    pub nonblock: c_int,
+    pub subscribed: c_int,
+    pub tlv: snd_ctl_ext_tlv,
+}
+
+type Key = snd_ctl_ext_key_t;
+
+#[repr(C)]
+pub struct snd_ctl_ext_callback_t {
+    pub close: Option<unsafe extern "C" fn(Ext)>,
+    pub elem_count: Option<unsafe extern "C" fn(Ext) -> c_int>,
+    pub elem_list: Option<unsafe extern "C" fn(Ext, c_uint, *mut snd_ctl_elem_id_t) -> c_int>,
+    pub find_elem: Option<unsafe extern "C" fn(Ext, *const snd_ctl_elem_id_t) -> Key>,
+    pub free_key: Option<unsafe extern "C" fn(Ext, Key)>,
+    pub get_attribute:
+        Option<unsafe extern "C" fn(Ext, Key, *mut c_int, *mut c_uint, *mut c_uint) -> c_int>,
+    pub get_integer_info:
+        Option<unsafe extern "C" fn(Ext, Key, *mut c_long, *mut c_long, *mut c_long) -> c_int>,
+    pub get_integer64_info:
+        Option<unsafe extern "C" fn(Ext, Key, *mut i64, *mut i64, *mut i64) -> c_int>,
+    pub get_enumerated_info: Option<unsafe extern "C" fn(Ext, Key, *mut c_uint) -> c_int>,
+    pub get_enumerated_name:
+        Option<unsafe extern "C" fn(Ext, Key, c_uint, *mut c_char, usize) -> c_int>,
+    pub read_integer: Option<unsafe extern "C" fn(Ext, Key, *mut c_long) -> c_int>,
+    pub read_integer64: Option<unsafe extern "C" fn(Ext, Key, *mut i64) -> c_int>,
+    pub read_enumerated: Option<unsafe extern "C" fn(Ext, Key, *mut c_uint) -> c_int>,
+    pub read_bytes: Option<unsafe extern "C" fn(Ext, Key, *mut c_uchar, usize) -> c_int>,
+    pub read_iec958: Option<unsafe extern "C" fn(Ext, Key, *mut snd_aes_iec958_t) -> c_int>,
+    pub write_integer: Option<unsafe extern "C" fn(Ext, Key, *mut c_long) -> c_int>,
+    pub write_integer64: Option<unsafe extern "C" fn(Ext, Key, *mut i64) -> c_int>,
+    pub write_enumerated: Option<unsafe extern "C" fn(Ext, Key, *mut c_uint) -> c_int>,
+    pub write_bytes: Option<unsafe extern "C" fn(Ext, Key, *mut c_uchar, usize) -> c_int>,
+    pub write_iec958: Option<unsafe extern "C" fn(Ext, Key, *mut snd_aes_iec958_t) -> c_int>,
+    pub subscribe_events: Option<unsafe extern "C" fn(Ext, c_int)>,
+    pub read_event: Option<unsafe extern "C" fn(Ext, *mut snd_ctl_elem_id_t, *mut c_uint) -> c_int>,
+    pub poll_descriptors_count: Option<unsafe extern "C" fn(Ext) -> c_int>,
+    pub poll_descriptors: Option<unsafe extern "C" fn(Ext, *mut libc::pollfd, c_uint) -> c_int>,
+    pub poll_revents:
+        Option<unsafe extern "C" fn(Ext, *mut libc::pollfd, c_uint, *mut c_ushort) -> c_int>,
+}
+
 #[link(name = "asound")]
 unsafe extern "C" {
     pub fn snd_pcm_ioplug_create(
@@ -179,6 +280,15 @@ unsafe extern "C" {
         params: *const snd_pcm_sw_params_t,
         val: *mut snd_pcm_uframes_t,
     ) -> c_int;
+
+    pub fn snd_ctl_ext_create(ext: Ext, name: *const c_char, mode: c_int) -> c_int;
+    pub fn snd_ctl_ext_delete(ext: Ext) -> c_int;
+    pub fn snd_ctl_elem_id_get_interface(id: *const snd_ctl_elem_id_t) -> snd_ctl_elem_iface_t;
+    pub fn snd_ctl_elem_id_get_name(id: *const snd_ctl_elem_id_t) -> *const c_char;
+    pub fn snd_ctl_elem_id_get_index(id: *const snd_ctl_elem_id_t) -> c_uint;
+    pub fn snd_ctl_elem_id_set_interface(id: *mut snd_ctl_elem_id_t, iface: snd_ctl_elem_iface_t);
+    pub fn snd_ctl_elem_id_set_name(id: *mut snd_ctl_elem_id_t, name: *const c_char);
+    pub fn snd_ctl_elem_id_set_numid(id: *mut snd_ctl_elem_id_t, numid: c_uint);
 
     pub fn snd_config_iterator_first(node: *const snd_config_t) -> snd_config_iterator_t;
     pub fn snd_config_iterator_next(iterator: snd_config_iterator_t) -> snd_config_iterator_t;

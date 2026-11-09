@@ -1,6 +1,7 @@
 #!/bin/sh
-# Builds the aas ALSA plugin and installs it, with dist/asound.conf as
-# /etc/asound.conf, so that ALSA's default device plays through the daemon.
+# Builds the aas ALSA plugin and installs it, as a PCM and as a control,
+# with dist/asound.conf as /etc/asound.conf, so that ALSA's default device
+# plays through the daemon and its mixer sets the daemon's volume.
 # Run from the repository root as a user that may sudo. Needs
 # libasound2-dev. An /etc/asound.conf that is not ours is kept as
 # /etc/asound.conf.before-aas.
@@ -15,6 +16,9 @@ dir=/usr/lib/${arch:-aarch64-linux-gnu}/alsa-lib
 sudo install -d "$dir"
 sudo install -m 0644 "$target" "$dir/libasound_module_pcm_aas.so"
 echo "installed $dir/libasound_module_pcm_aas.so"
+# The same library is the control plugin.
+sudo ln -sf libasound_module_pcm_aas.so "$dir/libasound_module_ctl_aas.so"
+echo "installed $dir/libasound_module_ctl_aas.so"
 
 conf=/etc/asound.conf
 if [ -e "$conf" ] && ! cmp -s "$conf" dist/asound.conf; then

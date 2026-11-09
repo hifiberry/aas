@@ -116,6 +116,70 @@ fn rust_layout() -> BTreeMap<String, i64> {
         SND_PCM_FORMAT_S32_LE,
         SND_PCM_FORMAT_FLOAT_LE
     ));
+    all.push(size!(snd_ctl_ext_t));
+    all.extend(offset!(
+        snd_ctl_ext_t,
+        version,
+        card_idx,
+        id,
+        driver,
+        name,
+        longname,
+        mixername,
+        poll_fd,
+        callback,
+        private_data,
+        handle,
+        nonblock,
+        subscribed,
+        tlv
+    ));
+    all.push(size!(snd_ctl_ext_callback_t));
+    all.extend(offset!(
+        snd_ctl_ext_callback_t,
+        close,
+        elem_count,
+        elem_list,
+        find_elem,
+        free_key,
+        get_attribute,
+        get_integer_info,
+        get_integer64_info,
+        get_enumerated_info,
+        get_enumerated_name,
+        read_integer,
+        read_integer64,
+        read_enumerated,
+        read_bytes,
+        read_iec958,
+        write_integer,
+        write_integer64,
+        write_enumerated,
+        write_bytes,
+        write_iec958,
+        subscribe_events,
+        read_event,
+        poll_descriptors_count,
+        poll_descriptors,
+        poll_revents
+    ));
+    all.extend([
+        size!(snd_ctl_ext_key_t),
+        size!(snd_ctl_elem_type_t),
+        size!(snd_ctl_elem_iface_t),
+    ]);
+    all.extend(value!(
+        SND_CTL_EXT_VERSION,
+        SND_CTL_EXT_ACCESS_READ,
+        SND_CTL_EXT_ACCESS_WRITE,
+        SND_CTL_EXT_ACCESS_READWRITE,
+        SND_CTL_EXT_ACCESS_TLV_READ,
+        SND_CTL_EXT_KEY_NOT_FOUND,
+        SND_CTL_ELEM_TYPE_INTEGER,
+        SND_CTL_ELEM_IFACE_MIXER,
+        SND_CTL_EVENT_MASK_VALUE,
+        SND_CTL_TLVT_DB_MINMAX_MUTE
+    ));
     let mut map = BTreeMap::new();
     for (key, value) in all {
         assert!(map.insert(key.clone(), value).is_none(), "{key} twice");
@@ -148,7 +212,7 @@ fn header_layout() -> BTreeMap<String, i64> {
 }
 
 #[test]
-fn ioplug_layout_matches_the_header() {
+fn ffi_layout_matches_the_headers() {
     let header = header_layout();
     let rust = rust_layout();
     let mut wrong = Vec::new();

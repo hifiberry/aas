@@ -1,10 +1,11 @@
-/* Prints the layout and constants of the ALSA ioplug SDK that src/ffi.rs
- * declares by hand. tests/layout.rs compiles this against the installed
+/* Prints the layout and constants of the ALSA ioplug and ctl_ext SDKs
+ * that src/ffi.rs declares by hand. tests/layout.rs compiles this against the installed
  * headers and compares. */
 #include <stddef.h>
 #include <stdio.h>
 #include <alsa/asoundlib.h>
 #include <alsa/pcm_external.h>
+#include <alsa/control_external.h>
 
 #define SIZE(t) printf("size %s %zu\n", #t, sizeof(t))
 #define OFFSET(t, f) printf("offset %s.%s %zu\n", #t, #f, offsetof(t, f))
@@ -93,5 +94,63 @@ int main(void)
 	VALUE(SND_PCM_FORMAT_S24_3LE);
 	VALUE(SND_PCM_FORMAT_S32_LE);
 	VALUE(SND_PCM_FORMAT_FLOAT_LE);
+
+	SIZE(snd_ctl_ext_t);
+	OFFSET(snd_ctl_ext_t, version);
+	OFFSET(snd_ctl_ext_t, card_idx);
+	OFFSET(snd_ctl_ext_t, id);
+	OFFSET(snd_ctl_ext_t, driver);
+	OFFSET(snd_ctl_ext_t, name);
+	OFFSET(snd_ctl_ext_t, longname);
+	OFFSET(snd_ctl_ext_t, mixername);
+	OFFSET(snd_ctl_ext_t, poll_fd);
+	OFFSET(snd_ctl_ext_t, callback);
+	OFFSET(snd_ctl_ext_t, private_data);
+	OFFSET(snd_ctl_ext_t, handle);
+	OFFSET(snd_ctl_ext_t, nonblock);
+	OFFSET(snd_ctl_ext_t, subscribed);
+	OFFSET(snd_ctl_ext_t, tlv);
+
+	SIZE(snd_ctl_ext_callback_t);
+	OFFSET(snd_ctl_ext_callback_t, close);
+	OFFSET(snd_ctl_ext_callback_t, elem_count);
+	OFFSET(snd_ctl_ext_callback_t, elem_list);
+	OFFSET(snd_ctl_ext_callback_t, find_elem);
+	OFFSET(snd_ctl_ext_callback_t, free_key);
+	OFFSET(snd_ctl_ext_callback_t, get_attribute);
+	OFFSET(snd_ctl_ext_callback_t, get_integer_info);
+	OFFSET(snd_ctl_ext_callback_t, get_integer64_info);
+	OFFSET(snd_ctl_ext_callback_t, get_enumerated_info);
+	OFFSET(snd_ctl_ext_callback_t, get_enumerated_name);
+	OFFSET(snd_ctl_ext_callback_t, read_integer);
+	OFFSET(snd_ctl_ext_callback_t, read_integer64);
+	OFFSET(snd_ctl_ext_callback_t, read_enumerated);
+	OFFSET(snd_ctl_ext_callback_t, read_bytes);
+	OFFSET(snd_ctl_ext_callback_t, read_iec958);
+	OFFSET(snd_ctl_ext_callback_t, write_integer);
+	OFFSET(snd_ctl_ext_callback_t, write_integer64);
+	OFFSET(snd_ctl_ext_callback_t, write_enumerated);
+	OFFSET(snd_ctl_ext_callback_t, write_bytes);
+	OFFSET(snd_ctl_ext_callback_t, write_iec958);
+	OFFSET(snd_ctl_ext_callback_t, subscribe_events);
+	OFFSET(snd_ctl_ext_callback_t, read_event);
+	OFFSET(snd_ctl_ext_callback_t, poll_descriptors_count);
+	OFFSET(snd_ctl_ext_callback_t, poll_descriptors);
+	OFFSET(snd_ctl_ext_callback_t, poll_revents);
+
+	SIZE(snd_ctl_ext_key_t);
+	SIZE(snd_ctl_elem_type_t);
+	SIZE(snd_ctl_elem_iface_t);
+
+	VALUE(SND_CTL_EXT_VERSION);
+	VALUE(SND_CTL_EXT_ACCESS_READ);
+	VALUE(SND_CTL_EXT_ACCESS_WRITE);
+	VALUE(SND_CTL_EXT_ACCESS_READWRITE);
+	VALUE(SND_CTL_EXT_ACCESS_TLV_READ);
+	VALUE(SND_CTL_EXT_KEY_NOT_FOUND);
+	VALUE(SND_CTL_ELEM_TYPE_INTEGER);
+	VALUE(SND_CTL_ELEM_IFACE_MIXER);
+	VALUE(SND_CTL_EVENT_MASK_VALUE);
+	VALUE(SND_CTL_TLVT_DB_MINMAX_MUTE);
 	return 0;
 }

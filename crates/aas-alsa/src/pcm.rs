@@ -101,7 +101,7 @@ fn client_format(format: snd_pcm_format_t) -> Option<ClientFormat> {
 
 /// The positive errno for a failed call. A daemon that has gone is
 /// `ENODEV`, as for an unplugged card.
-fn errno(e: &io::Error) -> c_int {
+pub(crate) fn errno(e: &io::Error) -> c_int {
     match e.raw_os_error() {
         Some(libc::ECONNRESET | libc::EPIPE | libc::ENOTCONN) => libc::ENODEV,
         Some(n) if n > 0 => n,
@@ -110,7 +110,7 @@ fn errno(e: &io::Error) -> c_int {
 }
 
 /// Runs a callback body. A panic becomes `-EIO`, an `Err(n)` becomes `-n`.
-fn guard<T: From<c_int>>(body: impl FnOnce() -> Result<T, c_int>) -> T {
+pub(crate) fn guard<T: From<c_int>>(body: impl FnOnce() -> Result<T, c_int>) -> T {
     match catch_unwind(AssertUnwindSafe(body)) {
         Ok(Ok(value)) => value,
         Ok(Err(n)) => T::from(-n),
@@ -523,7 +523,7 @@ static CALLBACKS: snd_pcm_ioplug_callback_t = snd_pcm_ioplug_callback_t {
 ///
 /// # Safety
 /// `conf` is the PCM's configuration node.
-unsafe fn check_config(conf: *mut snd_config_t) -> Result<(), c_int> {
+pub(crate) unsafe fn check_config(conf: *mut snd_config_t) -> Result<(), c_int> {
     // SAFETY: walks the node's children as snd_config_for_each does.
     unsafe {
         let end = snd_config_iterator_end(conf);
