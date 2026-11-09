@@ -11,7 +11,9 @@ PATH=$PATH:/usr/sbin
 
 rate=48000
 work=$(mktemp -d)
-trap 'kill $(jobs -p) 2>/dev/null; rm -rf "$work"' EXIT
+# Full volume again at the end, however the run ends, for whatever plays
+# next.
+trap 'kill $(jobs -p) 2>/dev/null; amixer -q -D default sset Master 100% 2>/dev/null; rm -rf "$work"' EXIT
 failed=0
 
 pass() { echo "PASS $1${2:+: $2}"; }
@@ -770,6 +772,42 @@ case_watcher_hears_the_daemon_go() {
 	fi
 }
 
+# CPU time of process $1 so far, in clock ticks.
+cpu_ticks() { awk '{ print $14 + $15 }' "/proc/$1/stat"; }
+
+# A client that polls the control's descriptor without asking libasound
+# what it means, as alsactl monitor does, sleeps once the daemon is gone
+# instead of waking again and again.
+case_monitor_sleeps_when_the_daemon_is_gone() {
+	name=monitor_sleeps_when_the_daemon_is_gone
+	alsactl monitor default >"$work/monitor" 2>&1 &
+	monitor=$!
+	sleep 0.5
+	sudo systemctl kill -s KILL aas
+	sleep 0.5
+	if ! kill -0 $monitor 2>/dev/null; then
+		wait $monitor
+		status=$?
+		wait_daemon
+		fail $name "alsactl monitor exited $status: $(tr '\n' ' ' <"$work/monitor")"
+		return
+	fi
+	before=$(cpu_ticks $monitor)
+	sleep 5
+	after=$(cpu_ticks $monitor)
+	kill $monitor 2>/dev/null
+	wait $monitor 2>/dev/null
+	used=$((after - before))
+	hz=$(getconf CLK_TCK)
+	if ! wait_daemon; then
+		fail $name "the daemon did not come back"
+	elif [ $used -le $((hz / 20)) ]; then
+		pass $name "alsactl monitor used $used ticks of CPU (1/$hz s) in the 5 s after the daemon was killed"
+	else
+		fail $name "alsactl monitor used $used ticks of CPU (1/$hz s) in the 5 s after the daemon was killed"
+	fi
+}
+
 case_aplay_plays_each_format
 case_drain_returns
 case_pause_and_resume
@@ -787,6 +825,5 @@ case_mpd_mixer_works
 case_volume_survives_a_restart
 case_amixer_fails_without_the_daemon
 case_watcher_hears_the_daemon_go
-# Full volume again, for whatever plays next.
-amixer -q -D default sset Master 100%
+case_monitor_sleeps_when_the_daemon_is_gone
 exit $failed

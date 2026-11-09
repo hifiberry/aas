@@ -8,6 +8,23 @@
 
 use std::ffi::{c_char, c_int, c_long, c_uchar, c_uint, c_ulong, c_ushort, c_void};
 
+/// Declares a struct or union of function pointers, with `SIGNATURES`:
+/// each field's name and its type as written. `tests/layout.rs` turns the
+/// types into C and has the compiler compare them with the headers'.
+macro_rules! with_signatures {
+    (
+        $(#[$meta:meta])*
+        pub $kind:tt $name:ident { $(pub $field:ident: $type:ty,)* }
+    ) => {
+        $(#[$meta])*
+        pub $kind $name { $(pub $field: $type,)* }
+
+        impl $name {
+            pub const SIGNATURES: &[(&str, &str)] = &[$((stringify!($field), stringify!($type))),*];
+        }
+    };
+}
+
 pub type snd_pcm_uframes_t = c_ulong;
 pub type snd_pcm_sframes_t = c_long;
 pub type snd_pcm_stream_t = c_int;
@@ -120,6 +137,7 @@ pub struct snd_pcm_ioplug_t {
 
 type Io = *mut snd_pcm_ioplug_t;
 
+with_signatures! {
 #[repr(C)]
 pub struct snd_pcm_ioplug_callback_t {
     pub start: Option<unsafe extern "C" fn(Io) -> c_int>,
@@ -150,6 +168,7 @@ pub struct snd_pcm_ioplug_callback_t {
     pub query_chmaps: Option<unsafe extern "C" fn(Io) -> *mut *mut snd_pcm_chmap_query_t>,
     pub get_chmap: Option<unsafe extern "C" fn(Io) -> *mut snd_pcm_chmap_t>,
     pub set_chmap: Option<unsafe extern "C" fn(Io, *const snd_pcm_chmap_t) -> c_int>,
+}
 }
 
 pub type snd_ctl_ext_key_t = c_ulong;
@@ -187,6 +206,7 @@ pub const SND_CTL_TLVT_DB_MINMAX_MUTE: c_uint = 5;
 
 type Ext = *mut snd_ctl_ext_t;
 
+with_signatures! {
 /// The TLV data of the plugin's elements: a callback or fixed data.
 #[repr(C)]
 pub union snd_ctl_ext_tlv {
@@ -194,6 +214,7 @@ pub union snd_ctl_ext_tlv {
         unsafe extern "C" fn(Ext, snd_ctl_ext_key_t, c_int, c_uint, *mut c_uint, c_uint) -> c_int,
     >,
     pub p: *const c_uint,
+}
 }
 
 /// The control plugin's handle. The plugin fills it before
@@ -218,6 +239,7 @@ pub struct snd_ctl_ext_t {
 
 type Key = snd_ctl_ext_key_t;
 
+with_signatures! {
 #[repr(C)]
 pub struct snd_ctl_ext_callback_t {
     pub close: Option<unsafe extern "C" fn(Ext)>,
@@ -251,6 +273,7 @@ pub struct snd_ctl_ext_callback_t {
     pub poll_revents:
         Option<unsafe extern "C" fn(Ext, *mut libc::pollfd, c_uint, *mut c_ushort) -> c_int>,
 }
+}
 
 #[link(name = "asound")]
 unsafe extern "C" {
@@ -282,7 +305,6 @@ unsafe extern "C" {
     ) -> c_int;
 
     pub fn snd_ctl_ext_create(ext: Ext, name: *const c_char, mode: c_int) -> c_int;
-    pub fn snd_ctl_ext_delete(ext: Ext) -> c_int;
     pub fn snd_ctl_elem_id_get_interface(id: *const snd_ctl_elem_id_t) -> snd_ctl_elem_iface_t;
     pub fn snd_ctl_elem_id_get_name(id: *const snd_ctl_elem_id_t) -> *const c_char;
     pub fn snd_ctl_elem_id_get_index(id: *const snd_ctl_elem_id_t) -> c_uint;

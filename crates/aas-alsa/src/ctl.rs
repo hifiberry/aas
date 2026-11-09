@@ -5,18 +5,24 @@
 //!
 //! Every callback runs inside `catch_unwind`, as in `pcm`. A panic returns
 //! `-EIO`, or no element from `find_elem`, and is dropped by the callbacks
-//! that return nothing. A daemon that is gone fails each call with `-ENODEV`, and
-//! one that does not answer fails it with `-ETIMEDOUT`.
+//! that return nothing.
 //!
-//! The socket is the poll descriptor. Once a client subscribes to events,
-//! the daemon sends a notice on every volume change, and each poll that
-//! sees the socket readable reads every notice there and reports one event.
+//! Once a client subscribes to events, the daemon sends a notice on every
+//! volume change. The poll descriptor is an epoll set of the socket and an
+//! eventfd that is made readable when a request reads a notice on its way
+//! to its reply. Each event read takes every notice there and reports one
+//! change.
+//!
+//! A connection that hangs up, gives no reply in time or a reply out of
+//! step is lost: every later call fails with `-ENODEV`, as for a card that
+//! is unplugged, and the socket leaves the epoll set, so a client polling
+//! the descriptor sleeps instead of waking again and again.
 
 use crate::ffi::*;
 use crate::pcm::{check_config, errno, guard};
 use aas_client::client::socket_address;
 use aas_client::proto::{self, Reply, Request};
-use std::ffi::{CStr, c_char, c_int, c_long, c_uint, c_ushort};
+use std::ffi::{CStr, c_char, c_int, c_long, c_uint, c_ushort, c_void};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -45,10 +51,16 @@ struct Shared {
 /// The connection to the daemon.
 struct Daemon {
     socket: OwnedFd,
+    /// What clients poll: an epoll set of the socket and `wake`.
+    poll: OwnedFd,
+    /// Readable while a notice read by a request waits to be reported.
+    wake: OwnedFd,
     /// Whether the daemon sends this connection volume notices.
     subscribed: bool,
     /// A notice has come that no event has reported yet.
     changed: bool,
+    /// The connection is lost. Its socket has left the epoll set.
+    gone: bool,
 }
 
 fn check(rc: isize) -> Result<usize, c_int> {
@@ -59,19 +71,37 @@ fn check(rc: isize) -> Result<usize, c_int> {
     }
 }
 
+/// Owns a descriptor a syscall returned, or its error.
+fn owned(raw: c_int) -> Result<OwnedFd, c_int> {
+    check(raw as isize)?;
+    // SAFETY: a fresh descriptor, owned by nothing else.
+    Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+}
+
 impl Daemon {
     /// Connects and checks that the daemon speaks this protocol version.
     fn connect() -> Result<Daemon, c_int> {
         let path = proto::default_socket_path();
         let (addr, len) = socket_address(&path).map_err(|e| errno(&e))?;
-        // SAFETY: plain syscalls; the descriptor is owned at once.
-        let raw =
-            unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0) };
-        check(raw as isize)?;
-        let socket = unsafe { OwnedFd::from_raw_fd(raw) };
+        // SAFETY: a plain syscall.
+        let socket = owned(unsafe {
+            libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0)
+        })?;
+        // SAFETY: addr is a sockaddr_un of length len.
+        let rc = unsafe { libc::connect(socket.as_raw_fd(), (&raw const addr).cast(), len) };
+        check(rc as isize)?;
+        let mut daemon = Daemon::new(socket, TIMEOUT)?;
+        daemon.call(&Request::Hello {
+            version: proto::VERSION,
+        })?;
+        Ok(daemon)
+    }
+
+    /// Wraps a connected socket. Requests on it wait at most `timeout`.
+    fn new(socket: OwnedFd, timeout: Duration) -> Result<Daemon, c_int> {
         let timeout = libc::timeval {
-            tv_sec: TIMEOUT.as_secs() as libc::time_t,
-            tv_usec: 0,
+            tv_sec: timeout.as_secs() as libc::time_t,
+            tv_usec: timeout.subsec_micros() as libc::suseconds_t,
         };
         for option in [libc::SO_RCVTIMEO, libc::SO_SNDTIMEO] {
             // SAFETY: the option value is a timeval of the size given.
@@ -86,17 +116,67 @@ impl Daemon {
             };
             check(rc as isize)?;
         }
-        let rc = unsafe { libc::connect(socket.as_raw_fd(), (&raw const addr).cast(), len) };
-        check(rc as isize)?;
-        let mut daemon = Daemon {
+        // SAFETY: plain syscalls.
+        let poll = owned(unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) })?;
+        let wake = owned(unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) })?;
+        for fd in [socket.as_raw_fd(), wake.as_raw_fd()] {
+            let mut event = libc::epoll_event {
+                events: libc::EPOLLIN as u32,
+                u64: fd as u64,
+            };
+            // SAFETY: both descriptors are open; event lives for the call.
+            let rc =
+                unsafe { libc::epoll_ctl(poll.as_raw_fd(), libc::EPOLL_CTL_ADD, fd, &mut event) };
+            check(rc as isize)?;
+        }
+        Ok(Daemon {
             socket,
+            poll,
+            wake,
             subscribed: false,
             changed: false,
+            gone: false,
+        })
+    }
+
+    /// Gives the connection up. Nothing it holds wakes a poll again.
+    fn lose(&mut self) {
+        if self.gone {
+            return;
+        }
+        self.gone = true;
+        for fd in [self.socket.as_raw_fd(), self.wake.as_raw_fd()] {
+            // SAFETY: both descriptors are open and in the set.
+            unsafe { libc::epoll_ctl(self.poll.as_raw_fd(), libc::EPOLL_CTL_DEL, fd, null_mut()) };
+        }
+    }
+
+    /// Loses the connection on `err`, and passes it on.
+    fn lost(&mut self, err: c_int) -> c_int {
+        self.lose();
+        err
+    }
+
+    fn alive(&self) -> Result<(), c_int> {
+        if self.gone { Err(libc::ENODEV) } else { Ok(()) }
+    }
+
+    /// Whether the daemon has hung up. Loses the connection if it has.
+    fn hung_up(&mut self) -> bool {
+        if self.gone {
+            return true;
+        }
+        let mut pfd = libc::pollfd {
+            fd: self.socket.as_raw_fd(),
+            events: 0,
+            revents: 0,
         };
-        daemon.call(&Request::Hello {
-            version: proto::VERSION,
-        })?;
-        Ok(daemon)
+        // SAFETY: one pollfd, no wait.
+        let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
+        if rc == 1 && pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+            self.lose();
+        }
+        self.gone
     }
 
     fn send(&self, request: &Request) -> Result<(), c_int> {
@@ -147,36 +227,52 @@ impl Daemon {
             .ok_or(libc::EPROTO)
     }
 
-    /// Sends a request and waits for its reply. Notices that come first
-    /// are noted. `Reply::Error` becomes the error it names.
-    fn call(&mut self, request: &Request) -> Result<Reply, c_int> {
-        self.send(request)?;
+    /// Waits for the reply to the request just sent. A notice that comes
+    /// first is kept for the next event, and wakes the poll for it.
+    fn reply(&mut self) -> Result<Reply, c_int> {
         loop {
             match self.receive(0)? {
                 None => return Err(libc::ETIMEDOUT),
-                Some(Reply::VolumeChanged { .. }) => self.changed = true,
-                Some(Reply::Error { code }) => {
-                    return Err(c_int::try_from(code)
-                        .ok()
-                        .filter(|&n| n > 0)
-                        .unwrap_or(libc::EIO));
+                Some(Reply::VolumeChanged { .. }) => {
+                    self.changed = true;
+                    let one = 1u64;
+                    // SAFETY: 8 bytes to a non-blocking eventfd.
+                    unsafe {
+                        libc::write(self.wake.as_raw_fd(), (&raw const one).cast::<c_void>(), 8)
+                    };
                 }
                 Some(reply) => return Ok(reply),
             }
         }
     }
 
+    /// Sends a request and waits for its reply. `Reply::Error` becomes the
+    /// error it names. A reply that does not come in time would answer the
+    /// next request instead, so the connection is lost then, as on any
+    /// other failure of the socket.
+    fn call(&mut self, request: &Request) -> Result<Reply, c_int> {
+        self.alive()?;
+        let reply = self.send(request).and_then(|()| self.reply());
+        match reply.map_err(|e| self.lost(e))? {
+            Reply::Error { code } => Err(c_int::try_from(code)
+                .ok()
+                .filter(|&n| n > 0)
+                .unwrap_or(libc::EIO)),
+            reply => Ok(reply),
+        }
+    }
+
     fn volume(&mut self) -> Result<u8, c_int> {
         match self.call(&Request::GetVolume)? {
             Reply::Volume { percent } => Ok(percent),
-            _ => Err(libc::EPROTO),
+            _ => Err(self.lost(libc::EPROTO)),
         }
     }
 
     fn set_volume(&mut self, percent: u8) -> Result<(), c_int> {
         match self.call(&Request::SetVolume { percent })? {
             Reply::Ok => Ok(()),
-            _ => Err(libc::EPROTO),
+            _ => Err(self.lost(libc::EPROTO)),
         }
     }
 
@@ -191,19 +287,26 @@ impl Daemon {
                 self.subscribed = true;
                 Ok(())
             }
-            _ => Err(libc::EPROTO),
+            _ => Err(self.lost(libc::EPROTO)),
         }
     }
 
-    /// Reads every notice waiting, so that the daemon sends the next.
-    fn read_notices(&mut self) -> Result<(), c_int> {
-        while let Some(reply) = self.receive(libc::MSG_DONTWAIT)? {
-            match reply {
-                Reply::VolumeChanged { .. } => self.changed = true,
-                _ => return Err(libc::EPROTO),
+    /// Whether the volume changed since the last call. Reads every notice
+    /// waiting, so that the daemon sends the next.
+    fn next_change(&mut self) -> Result<bool, c_int> {
+        self.alive()?;
+        let mut count = 0u64;
+        // SAFETY: 8 bytes from a non-blocking eventfd.
+        unsafe { libc::read(self.wake.as_raw_fd(), (&raw mut count).cast::<c_void>(), 8) };
+        loop {
+            match self.receive(libc::MSG_DONTWAIT) {
+                Ok(None) => break,
+                Ok(Some(Reply::VolumeChanged { .. })) => self.changed = true,
+                Ok(Some(_)) => return Err(self.lost(libc::EPROTO)),
+                Err(e) => return Err(self.lost(e)),
             }
         }
-        Ok(())
+        Ok(std::mem::take(&mut self.changed))
     }
 }
 
@@ -369,8 +472,7 @@ unsafe extern "C" fn read_event(ext: Ext, id: *mut snd_ctl_elem_id_t, mask: *mut
             if subscribed && !daemon.subscribed {
                 daemon.subscribe()?;
             }
-            daemon.read_notices()?;
-            Ok(std::mem::take(&mut daemon.changed))
+            daemon.next_change()
         })?;
         if !(subscribed && changed) {
             return Err(libc::EAGAIN);
@@ -381,11 +483,11 @@ unsafe extern "C" fn read_event(ext: Ext, id: *mut snd_ctl_elem_id_t, mask: *mut
     })
 }
 
-/// A socket the daemon has hung up is `POLLERR`, as a card's control is
-/// once the card is gone. Reading an event then fails with `-ENODEV`.
-/// Clients that watch the descriptor without asking here see `POLLHUP`.
+/// A daemon that has hung up is `POLLERR`, as a card's control is once
+/// the card is gone. Reading an event then fails with `-ENODEV`, and the
+/// descriptor stays quiet from then on.
 unsafe extern "C" fn poll_revents(
-    _ext: Ext,
+    ext: Ext,
     pfd: *mut libc::pollfd,
     nfds: c_uint,
     revents: *mut c_ushort,
@@ -395,8 +497,8 @@ unsafe extern "C" fn poll_revents(
             return Err(libc::EINVAL);
         }
         let seen = (*pfd).revents;
-        let hangup = libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
-        *revents = if seen & hangup != 0 {
+        let hung_up = with(ext, |daemon| Ok(daemon.hung_up()))?;
+        *revents = if hung_up || seen & (libc::POLLERR | libc::POLLNVAL) != 0 {
             libc::POLLERR
         } else {
             seen & libc::POLLIN
@@ -428,7 +530,7 @@ static CALLBACKS: snd_ctl_ext_callback_t = snd_ctl_ext_callback_t {
     write_iec958: None,
     subscribe_events: Some(subscribe_events),
     read_event: Some(read_event),
-    // libasound polls `poll_fd` for POLLIN.
+    // libasound polls `poll_fd`, the epoll set, for POLLIN.
     poll_descriptors_count: None,
     poll_descriptors: None,
     poll_revents: Some(poll_revents),
@@ -464,7 +566,7 @@ unsafe fn open(
         name: text("aas"),
         longname: text("Alternative audio server"),
         mixername: text("aas"),
-        poll_fd: daemon.socket.as_raw_fd(),
+        poll_fd: daemon.poll.as_raw_fd(),
         callback: &CALLBACKS,
         private_data: null_mut(),
         handle: null_mut(),
@@ -511,3 +613,127 @@ pub unsafe extern "C" fn _snd_ctl_aas_open(
 #[unsafe(no_mangle)]
 #[allow(non_upper_case_globals)]
 pub static __snd_ctl_aas_open_dlsym_control_001: c_char = 0;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::fd::RawFd;
+
+    /// A connection to a fake daemon: the plugin's side and the daemon's.
+    fn pair() -> (Daemon, OwnedFd) {
+        let mut fds = [0; 2];
+        // SAFETY: fds has room for two descriptors.
+        let rc = unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+                0,
+                fds.as_mut_ptr(),
+            )
+        };
+        assert_eq!(rc, 0);
+        let [ours, theirs] = fds.map(|fd| owned(fd).unwrap());
+        let daemon = Daemon::new(ours, Duration::from_millis(100)).unwrap();
+        (daemon, theirs)
+    }
+
+    fn answer(peer: &OwnedFd, reply: Reply) {
+        let message = proto::encode_reply(&reply);
+        // SAFETY: the buffer is valid for its length.
+        let rc = unsafe { libc::send(peer.as_raw_fd(), message.as_ptr().cast(), message.len(), 0) };
+        assert_eq!(rc, message.len() as isize);
+    }
+
+    fn readable(fd: RawFd) -> bool {
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one pollfd, no wait.
+        unsafe { libc::poll(&mut pfd, 1, 0) == 1 }
+    }
+
+    #[test]
+    fn a_reply_that_comes_late_does_not_answer_the_next_request() {
+        let (mut daemon, peer) = pair();
+        assert_eq!(daemon.volume(), Err(libc::ETIMEDOUT));
+        answer(&peer, Reply::Volume { percent: 50 });
+        assert_eq!(daemon.volume(), Err(libc::ENODEV));
+        assert_eq!(daemon.set_volume(20), Err(libc::ENODEV));
+    }
+
+    #[test]
+    fn a_reply_out_of_step_loses_the_connection() {
+        let (mut daemon, peer) = pair();
+        answer(&peer, Reply::Ok);
+        assert_eq!(daemon.volume(), Err(libc::EPROTO));
+        answer(&peer, Reply::Volume { percent: 50 });
+        assert_eq!(daemon.volume(), Err(libc::ENODEV));
+    }
+
+    #[test]
+    fn a_daemon_error_keeps_the_connection() {
+        let (mut daemon, peer) = pair();
+        answer(
+            &peer,
+            Reply::Error {
+                code: libc::EINVAL as u32,
+            },
+        );
+        assert_eq!(daemon.set_volume(100), Err(libc::EINVAL));
+        answer(&peer, Reply::Volume { percent: 50 });
+        assert_eq!(daemon.volume(), Ok(50));
+    }
+
+    #[test]
+    fn a_notice_read_by_a_request_wakes_the_poll() {
+        let (mut daemon, peer) = pair();
+        daemon.subscribed = true;
+        answer(&peer, Reply::VolumeChanged { percent: 30 });
+        answer(&peer, Reply::Volume { percent: 30 });
+        assert_eq!(daemon.volume(), Ok(30));
+        assert!(
+            readable(daemon.poll.as_raw_fd()),
+            "no wake-up for the change"
+        );
+        assert_eq!(daemon.next_change(), Ok(true));
+        assert!(
+            !readable(daemon.poll.as_raw_fd()),
+            "woken with nothing to report"
+        );
+        assert_eq!(daemon.next_change(), Ok(false));
+    }
+
+    #[test]
+    fn notices_on_the_socket_make_one_change() {
+        let (mut daemon, peer) = pair();
+        assert!(!readable(daemon.poll.as_raw_fd()));
+        answer(&peer, Reply::VolumeChanged { percent: 30 });
+        answer(&peer, Reply::VolumeChanged { percent: 40 });
+        assert!(readable(daemon.poll.as_raw_fd()));
+        assert_eq!(daemon.next_change(), Ok(true));
+        assert!(!readable(daemon.poll.as_raw_fd()));
+        assert_eq!(daemon.next_change(), Ok(false));
+    }
+
+    #[test]
+    fn a_daemon_that_hangs_up_leaves_the_poll_quiet() {
+        let (mut daemon, peer) = pair();
+        drop(peer);
+        assert!(readable(daemon.poll.as_raw_fd()));
+        assert_eq!(daemon.next_change(), Err(libc::ENODEV));
+        assert!(!readable(daemon.poll.as_raw_fd()), "the poll still wakes");
+        assert_eq!(daemon.volume(), Err(libc::ENODEV));
+    }
+
+    #[test]
+    fn a_hang_up_seen_by_poll_leaves_the_poll_quiet() {
+        let (mut daemon, peer) = pair();
+        assert!(!daemon.hung_up());
+        drop(peer);
+        assert!(daemon.hung_up());
+        assert!(!readable(daemon.poll.as_raw_fd()), "the poll still wakes");
+        assert_eq!(daemon.next_change(), Err(libc::ENODEV));
+    }
+}
