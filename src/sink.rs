@@ -4,6 +4,8 @@ use rtrb::{Consumer, Producer, RingBuffer};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use crate::latency::PERIODS;
+
 /// How often `FallbackSink` tries the real sink again.
 const RETRY: Duration = Duration::from_secs(1);
 
@@ -15,10 +17,16 @@ pub enum SinkError {
     Gone,
 }
 
-/// A device that takes S32 stereo frames. `write` is the audio thread's only
-/// wait, and it returns when the device can take the next period.
+/// A device that takes S32 stereo frames. `wait_room` is the audio thread's
+/// only wait. The engine calls it before it reads the clients, so that what
+/// it reads goes to the device at once and `write` finds room.
 pub trait Sink: Send {
     fn open(&mut self, rate: u32, period: u32) -> Result<(), SinkError>;
+    /// Returns once the device has room for one period. A sink that never
+    /// waits returns at once.
+    fn wait_room(&mut self) -> Result<(), SinkError> {
+        Ok(())
+    }
     fn write(&mut self, frames: &[[i32; 2]]) -> Result<(), SinkError>;
     fn close(&mut self);
     /// Frames between the sink's input and the listener.
@@ -30,6 +38,10 @@ pub trait Sink: Send {
 impl Sink for Box<dyn Sink> {
     fn open(&mut self, rate: u32, period: u32) -> Result<(), SinkError> {
         (**self).open(rate, period)
+    }
+
+    fn wait_room(&mut self) -> Result<(), SinkError> {
+        (**self).wait_room()
     }
 
     fn write(&mut self, frames: &[[i32; 2]]) -> Result<(), SinkError> {
@@ -49,30 +61,46 @@ impl Sink for Box<dyn Sink> {
     }
 }
 
-/// Makes writes take as long as the audio they carry.
+/// Keeps time like a card with two periods buffered: writes queue up, and
+/// `wait_room` returns once the queue has room for one more period.
 #[derive(Default)]
 struct Pacer {
     rate: u32,
+    period: u32,
     /// When the frames written so far have played.
     next: Option<Instant>,
 }
 
 impl Pacer {
-    fn start(&mut self, rate: u32) {
+    fn start(&mut self, rate: u32, period: u32) {
         self.rate = rate;
+        self.period = period;
         self.next = None;
     }
 
-    fn wait(&mut self, frames: usize) {
+    fn length(&self, frames: u64) -> Duration {
+        Duration::from_nanos(frames * 1_000_000_000 / u64::from(self.rate))
+    }
+
+    fn wait_room(&mut self) {
+        let Some(next) = self.next else {
+            return;
+        };
+        let queue = self.length(u64::from(self.period) * u64::from(PERIODS - 1));
+        let now = Instant::now();
+        if let Some(due) = next.checked_sub(queue).filter(|&due| due > now) {
+            std::thread::sleep(due - now);
+        }
+    }
+
+    fn write(&mut self, frames: usize) {
         if self.rate == 0 {
             return;
         }
         let now = Instant::now();
-        let length = Duration::from_nanos(frames as u64 * 1_000_000_000 / u64::from(self.rate));
-        // A caller that fell behind starts again from now.
-        let due = self.next.filter(|&t| t > now).unwrap_or(now) + length;
-        std::thread::sleep(due - now);
-        self.next = Some(due);
+        // A writer that fell behind starts again from now.
+        let from = self.next.filter(|&t| t > now).unwrap_or(now);
+        self.next = Some(from + self.length(frames as u64));
     }
 }
 
@@ -83,13 +111,18 @@ pub struct NullSink {
 }
 
 impl Sink for NullSink {
-    fn open(&mut self, rate: u32, _period: u32) -> Result<(), SinkError> {
-        self.pacer.start(rate);
+    fn open(&mut self, rate: u32, period: u32) -> Result<(), SinkError> {
+        self.pacer.start(rate, period);
+        Ok(())
+    }
+
+    fn wait_room(&mut self) -> Result<(), SinkError> {
+        self.pacer.wait_room();
         Ok(())
     }
 
     fn write(&mut self, frames: &[[i32; 2]]) -> Result<(), SinkError> {
-        self.pacer.wait(frames.len());
+        self.pacer.write(frames.len());
         Ok(())
     }
 
@@ -119,7 +152,7 @@ struct Record {
 #[derive(Default)]
 pub struct MemorySink {
     record: Arc<Mutex<Record>>,
-    /// Takes one period per write when set.
+    /// Keeps time like a card when set.
     pacer: Option<Pacer>,
 }
 
@@ -155,7 +188,14 @@ impl Sink for MemorySink {
         record.opens.push((rate, period));
         drop(record);
         if let Some(pacer) = &mut self.pacer {
-            pacer.start(rate);
+            pacer.start(rate, period);
+        }
+        Ok(())
+    }
+
+    fn wait_room(&mut self) -> Result<(), SinkError> {
+        if let Some(pacer) = &mut self.pacer {
+            pacer.wait_room();
         }
         Ok(())
     }
@@ -168,7 +208,7 @@ impl Sink for MemorySink {
         record.frames.extend_from_slice(frames);
         drop(record);
         if let Some(pacer) = &mut self.pacer {
-            pacer.wait(frames.len());
+            pacer.write(frames.len());
         }
         Ok(())
     }
@@ -317,6 +357,20 @@ impl Sink for FallbackSink {
         Ok(())
     }
 
+    fn wait_room(&mut self) -> Result<(), SinkError> {
+        if self.live {
+            match self.inner.wait_room() {
+                Err(SinkError::Gone) => {
+                    self.inner.close();
+                    self.live = false;
+                    self.retry_at = Instant::now() + self.retry;
+                }
+                result => return result,
+            }
+        }
+        self.null.wait_room()
+    }
+
     fn write(&mut self, frames: &[[i32; 2]]) -> Result<(), SinkError> {
         if !self.live && Instant::now() >= self.retry_at {
             self.try_inner();
@@ -385,32 +439,52 @@ mod tests {
         assert_eq!(log.frames(), [[5, 6]]);
     }
 
-    fn time_of_writes(sink: &mut dyn Sink, writes: usize) -> Duration {
+    /// Waits for room and writes a 10 ms period, as the engine does.
+    fn time_of_cycles(sink: &mut dyn Sink, cycles: usize) -> Duration {
         sink.open(48000, 480).unwrap();
         let frames = [[0; 2]; 480];
         let start = Instant::now();
-        for _ in 0..writes {
+        for _ in 0..cycles {
+            sink.wait_room().unwrap();
             sink.write(&frames).unwrap();
         }
         start.elapsed()
     }
 
     #[test]
-    fn a_paced_memory_sink_takes_one_period_per_write() {
-        let took = time_of_writes(&mut MemorySink::paced(), 5);
+    fn a_paced_memory_sink_takes_one_period_per_cycle_once_full() {
+        // Two periods fill the queue, five more take a period each.
+        let took = time_of_cycles(&mut MemorySink::paced(), 7);
         assert!(took >= Duration::from_millis(50), "{took:?}");
     }
 
     #[test]
     fn an_unpaced_memory_sink_does_not_wait() {
-        let took = time_of_writes(&mut MemorySink::new(), 5);
+        let took = time_of_cycles(&mut MemorySink::new(), 7);
         assert!(took < Duration::from_millis(50), "{took:?}");
     }
 
     #[test]
-    fn null_sink_takes_one_period_per_write() {
-        let took = time_of_writes(&mut NullSink::default(), 5);
+    fn null_sink_takes_one_period_per_cycle_once_full() {
+        let took = time_of_cycles(&mut NullSink::default(), 7);
         assert!(took >= Duration::from_millis(50), "{took:?}");
+    }
+
+    #[test]
+    fn null_sink_has_room_while_less_than_two_periods_are_queued() {
+        let took = time_of_cycles(&mut NullSink::default(), 2);
+        assert!(took < Duration::from_millis(10), "{took:?}");
+    }
+
+    #[test]
+    fn null_sink_writes_do_not_wait() {
+        let mut sink = NullSink::default();
+        sink.open(48000, 480).unwrap();
+        let start = Instant::now();
+        for _ in 0..5 {
+            sink.write(&[[0; 2]; 480]).unwrap();
+        }
+        assert!(start.elapsed() < Duration::from_millis(10));
     }
 
     #[test]
@@ -463,8 +537,10 @@ mod tests {
         log.fail(Some(SinkError::Gone));
         assert_eq!(sink.write(&[[0; 2]; 480]), Ok(()));
         let start = Instant::now();
-        assert_eq!(sink.write(&[[0; 2]; 480]), Ok(()));
-        assert_eq!(sink.write(&[[0; 2]; 480]), Ok(()));
+        for _ in 0..3 {
+            assert_eq!(sink.wait_room(), Ok(()));
+            assert_eq!(sink.write(&[[0; 2]; 480]), Ok(()));
+        }
         assert!(start.elapsed() >= Duration::from_millis(10));
         assert_eq!(sink.delay_frames(), 0);
     }

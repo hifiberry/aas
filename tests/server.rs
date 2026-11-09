@@ -335,6 +335,10 @@ impl Sink for GatedSink {
         Ok(())
     }
 
+    fn wait_room(&mut self) -> Result<(), SinkError> {
+        self.inner.wait_room()
+    }
+
     fn write(&mut self, frames: &[[i32; 2]]) -> Result<(), SinkError> {
         self.inner.write(frames)
     }

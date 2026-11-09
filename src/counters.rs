@@ -16,6 +16,23 @@ pub struct Counters {
     /// than a period and 16 frames in its ring can cause this with PCM whose
     /// last frame looks like a marker.
     pub held_frames: AtomicU64,
+    /// The latest wake-up gap longer than the buffer, and when it ended on
+    /// CLOCK_MONOTONIC, so that it can be matched to other events.
+    pub last_gap_ns: AtomicU64,
+    pub last_gap_at_ns: AtomicU64,
+}
+
+/// Now on CLOCK_MONOTONIC, in ns. The same clock as `/proc/uptime` without
+/// suspend, and as `CLOCK_MONOTONIC` in other programs.
+pub fn monotonic_ns() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: ts is a valid timespec for the call. clock_gettime is
+    // async-signal-safe and does not allocate.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
 }
 
 impl Counters {
@@ -26,6 +43,8 @@ impl Counters {
         self.worst_gap_ns.fetch_max(gap_ns, Relaxed);
         self.worst_cycle_ns.fetch_max(cycle_ns, Relaxed);
         if gap_ns > buffer_ns {
+            self.last_gap_ns.store(gap_ns, Relaxed);
+            self.last_gap_at_ns.store(monotonic_ns(), Relaxed);
             self.wake_gaps.fetch_add(1, Relaxed);
         }
     }
@@ -58,6 +77,17 @@ mod tests {
         assert_eq!(c.wake_gaps.load(Relaxed), 0);
         c.on_cycle(1_001, 10, 1_000);
         assert_eq!(c.wake_gaps.load(Relaxed), 1);
+    }
+
+    #[test]
+    fn a_gap_longer_than_the_buffer_is_kept_with_its_time() {
+        let c = Counters::default();
+        let before = monotonic_ns();
+        c.on_cycle(3_000, 10, 1_000);
+        c.on_cycle(500, 10, 1_000);
+        assert_eq!(c.last_gap_ns.load(Relaxed), 3_000);
+        let at = c.last_gap_at_ns.load(Relaxed);
+        assert!(at >= before && at <= monotonic_ns());
     }
 
     #[test]

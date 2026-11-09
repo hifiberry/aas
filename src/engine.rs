@@ -466,22 +466,17 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         if self.stopped {
             return Ok(());
         }
-        let start = Instant::now();
         self.flush_backlog();
         let result = if self.open && !self.faded && self.reconfigure_queued() {
             self.faded = true;
-            self.render(start, true)
+            self.render(true)
         } else {
             self.drain_commands();
-            // Opening a card takes as long as it takes. It is not cycle time.
-            let start = if self.reopen.is_some() {
+            if self.reopen.is_some() {
                 self.apply_reopen()?;
-                Instant::now()
-            } else {
-                start
-            };
+            }
             if self.open {
-                self.render(start, false)
+                self.render(false)
             } else {
                 Ok(())
             }
@@ -685,7 +680,16 @@ impl<P: Processing, S: Sink> Engine<P, S> {
     }
 
     /// Plays one period. `fade_out` takes the level down to zero over it.
-    fn render(&mut self, start: Instant, fade_out: bool) -> Result<(), SinkError> {
+    ///
+    /// It waits for room on the card first and only then reads the clients,
+    /// so what it reads is written at once and waits behind no more than
+    /// the card's buffer. The cycle is timed from the end of that wait.
+    fn render(&mut self, fade_out: bool) -> Result<(), SinkError> {
+        let waited = self.sink.wait_room();
+        if waited == Err(SinkError::Xrun) {
+            self.counters.xruns.fetch_add(1, Ordering::Relaxed);
+        }
+        let start = Instant::now();
         self.scan();
         self.order_claims();
         let rate = self.rate;
@@ -708,7 +712,7 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         }
         let work = before_write - start + after_write.elapsed();
         self.record_timing(start, work.as_nanos() as u64);
-        result
+        waited.and(result)
     }
 
     fn record_timing(&mut self, start: Instant, cycle_ns: u64) {
@@ -2308,6 +2312,76 @@ mod tests {
         rig.cycle();
         rig.cycle();
         assert_eq!(*rig.log.opens().last().unwrap(), (RATE, MAX_PERIOD));
+    }
+
+    /// Puts a period into a client's ring each time the engine waits for
+    /// room, as a client woken by the engine refills it, and keeps what it
+    /// is given to play.
+    struct RefillOnWait {
+        ring: Ring,
+        next: i32,
+        played: Arc<std::sync::Mutex<Vec<[i32; 2]>>>,
+    }
+
+    impl crate::sink::Sink for RefillOnWait {
+        fn open(&mut self, _rate: u32, _period: u32) -> Result<(), SinkError> {
+            Ok(())
+        }
+
+        fn wait_room(&mut self) -> Result<(), SinkError> {
+            self.next += 1;
+            self.ring.write(&frames(self.next, PERIOD));
+            Ok(())
+        }
+
+        fn write(&mut self, frames: &[[i32; 2]]) -> Result<(), SinkError> {
+            self.played.lock().unwrap().extend_from_slice(frames);
+            Ok(())
+        }
+
+        fn close(&mut self) {}
+
+        fn delay_frames(&self) -> u32 {
+            0
+        }
+
+        fn supported_rates(&self) -> Vec<u32> {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn audio_written_while_the_engine_waits_for_room_plays_in_that_cycle() {
+        let (mut commands, consumer) = RingBuffer::new(16);
+        let (producer, _events) = RingBuffer::new(64);
+        let counters = Arc::new(Counters::default());
+        let mut a = client(1);
+        let played = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = RefillOnWait {
+            ring: a.ring,
+            next: 0,
+            played: played.clone(),
+        };
+        let mode = BitPerfect::Auto;
+        let mut engine = Engine::<F32, _>::new(sink, consumer, producer, counters, mode);
+        let reconfigure = Command::Reconfigure {
+            rate: RATE,
+            period: PERIOD as u32,
+        };
+        for command in [
+            reconfigure,
+            Command::Add(a.source.take().unwrap()),
+            Command::SetRunning(a.id, true),
+        ] {
+            assert!(commands.push(command).is_ok());
+        }
+        for _ in 0..4 {
+            engine.cycle().unwrap();
+        }
+        // Each period read from the ring is the one put there while the
+        // engine waited in that same cycle, not the one before.
+        let played = played.lock().unwrap();
+        assert_eq!(played[played.len() - PERIOD..], frames(4, PERIOD)[..]);
     }
 
     struct SlowOpen;

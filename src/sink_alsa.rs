@@ -336,6 +336,23 @@ mod card {
             Ok(())
         }
 
+        /// Waits until the card has room for one engine period, or for the
+        /// whole buffer if that is smaller.
+        fn wait_room(&self) -> alsa::Result<()> {
+            let period = (self.bytes.len() / self.frame_bytes()).min(self.buffer as usize);
+            while (self.pcm.avail_update()? as usize) < period {
+                match self.pcm.wait(Some(WAIT_MS)) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return Err(alsa::Error::new("snd_pcm_wait", libc::ETIMEDOUT));
+                    }
+                    Err(e) if e.errno() == libc::EINTR => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(())
+        }
+
         /// Converts and writes the frames, a buffer's worth at a time.
         fn play(&mut self, frames: &[[i32; 2]]) -> alsa::Result<()> {
             let per_chunk = (self.bytes.len() / self.frame_bytes()).max(1);
@@ -479,6 +496,25 @@ mod card {
                     Err(SinkError::Gone)
                 }
             }
+        }
+
+        fn wait_room(&mut self) -> Result<(), SinkError> {
+            let Some(open) = &mut self.open else {
+                return Err(SinkError::Gone);
+            };
+            let result = match open.wait_room() {
+                Ok(()) => Ok(()),
+                Err(e) if e.errno() == libc::ENODEV => Err(SinkError::Gone),
+                // The restart fills the buffer, so wait for room again.
+                Err(_) => match open.recover().and_then(|()| open.wait_room()) {
+                    Ok(()) => Err(SinkError::Xrun),
+                    Err(_) => Err(SinkError::Gone),
+                },
+            };
+            if result == Err(SinkError::Gone) {
+                self.open = None;
+            }
+            result
         }
 
         fn write(&mut self, frames: &[[i32; 2]]) -> Result<(), SinkError> {

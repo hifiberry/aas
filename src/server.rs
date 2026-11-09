@@ -107,9 +107,11 @@ pub fn run(
         rates,
     };
     server.control.start(Instant::now());
+    let mut gaps_seen = 0;
     while !shutdown.load(Ordering::Relaxed) {
         let was_open = server.control.output_is_open();
         server.step();
+        gaps_seen = log_new_gaps(&counters, gaps_seen);
         if was_open && !server.control.output_is_open() {
             eprintln!("aas: output closed: {counters}");
         }
@@ -121,6 +123,22 @@ pub fn run(
     drop(server);
     let _ = fs::remove_file(socket);
     joined.map_err(|_| "the audio thread panicked".to_string())
+}
+
+/// Logs a wake-up gap longer than the buffer soon after it happens, with
+/// its time on CLOCK_MONOTONIC. Several between two looks are logged as one,
+/// with the latest gap. Returns the gaps seen so far.
+fn log_new_gaps(counters: &Counters, seen: u64) -> u64 {
+    let gaps = counters.wake_gaps.load(Ordering::Relaxed);
+    if gaps > seen {
+        let ms = counters.last_gap_ns.load(Ordering::Relaxed) as f64 / 1e6;
+        let at = counters.last_gap_at_ns.load(Ordering::Relaxed) as f64 / 1e9;
+        eprintln!(
+            "aas: wake-up gap of {ms:.3} ms at {at:.3} s monotonic, {} new, {gaps} in all",
+            gaps - seen
+        );
+    }
+    gaps
 }
 
 /// The audio thread: one cycle after another, parked while the output is
