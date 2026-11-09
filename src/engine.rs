@@ -445,6 +445,12 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         self.stopped
     }
 
+    /// True while events wait for the control thread, in the queue or held
+    /// back. Lets the caller wake the control thread only when needed.
+    pub fn has_unread_events(&self) -> bool {
+        !self.backlog.is_empty() || self.events.slots() < self.events.buffer().capacity()
+    }
+
     /// Carries out queued commands and, with an open sink, plays one period.
     ///
     /// An error from the sink comes after the rest of the cycle is done. A

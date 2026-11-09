@@ -153,6 +153,15 @@ impl Resampler {
         }
     }
 
+    /// The most input frames one call can take. A ring smaller than this
+    /// may never hold enough for a period.
+    pub fn input_frames_max(&self) -> usize {
+        match &self.precision {
+            Precision::Single(s) => s.frames.len(),
+            Precision::Double(s) => s.frames.len(),
+        }
+    }
+
     /// The delay of the filter, in output frames.
     pub fn delay_frames(&self) -> u32 {
         let delay = match &self.precision {

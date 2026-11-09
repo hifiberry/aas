@@ -5,6 +5,8 @@
 use crate::convert::ClientFormat;
 use std::path::PathBuf;
 
+/// The protocol version a client sends in `Hello`.
+pub const VERSION: u32 = 1;
 pub const REQUEST_LEN: usize = 20;
 pub const REPLY_LEN: usize = 8;
 /// Largest buffer a client may ask for. Bounds the ring memory.
