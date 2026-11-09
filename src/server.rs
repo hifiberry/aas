@@ -7,7 +7,8 @@ use crate::control::{Answer, ConnId, Control, eventfd};
 use crate::counters::Counters;
 use crate::engine::Engine;
 use crate::format::{F32, F64, I32, Processing};
-use crate::sink::{FallbackSink, Sink};
+use crate::rt;
+use crate::sink::{FallbackSink, RatesWatch, Sink};
 use aas_client::client::socket_address;
 use aas_client::proto::{self, REQUEST_LEN, Reply};
 use rtrb::RingBuffer;
@@ -55,23 +56,28 @@ pub fn run(
     let notify = eventfd().map_err(|e| format!("eventfd: {e}"))?;
     let supported = sink.supported_rates();
     let sink = FallbackSink::new(sink);
+    let rates = sink.rates_watch();
     let (commands, command_queue) = RingBuffer::new(COMMAND_SLOTS);
     let (event_queue, events) = RingBuffer::new(EVENT_SLOTS);
     let counters = Arc::new(Counters::default());
+    let engine_counters = counters.clone();
     let mode = config.bit_perfect;
     let wake = notify.as_raw_fd();
     let spawned = thread::Builder::new().name("aas-audio".into());
     let audio = match config.format {
         Format::I32 => {
-            let engine = Engine::<I32, _>::new(sink, command_queue, event_queue, counters, mode);
+            let engine =
+                Engine::<I32, _>::new(sink, command_queue, event_queue, engine_counters, mode);
             spawned.spawn(move || audio_loop(engine, wake))
         }
         Format::F32 => {
-            let engine = Engine::<F32, _>::new(sink, command_queue, event_queue, counters, mode);
+            let engine =
+                Engine::<F32, _>::new(sink, command_queue, event_queue, engine_counters, mode);
             spawned.spawn(move || audio_loop(engine, wake))
         }
         Format::F64 => {
-            let engine = Engine::<F64, _>::new(sink, command_queue, event_queue, counters, mode);
+            let engine =
+                Engine::<F64, _>::new(sink, command_queue, event_queue, engine_counters, mode);
             spawned.spawn(move || audio_loop(engine, wake))
         }
     }
@@ -90,13 +96,19 @@ pub fn run(
         control,
         conns: BTreeMap::new(),
         next_conn: 1,
+        rates,
     };
     server.control.start(Instant::now());
     while !shutdown.load(Ordering::Relaxed) {
+        let was_open = server.control.output_is_open();
         server.step();
+        if was_open && !server.control.output_is_open() {
+            eprintln!("aas: output closed: {counters}");
+        }
     }
     server.control.shutdown();
     let joined = audio.join();
+    eprintln!("aas: stopped: {counters}");
     // The fds of `notify` must outlive the audio thread.
     drop(server);
     let _ = fs::remove_file(socket);
@@ -106,6 +118,10 @@ pub fn run(
 /// The audio thread: one cycle after another, parked while the output is
 /// closed. Wakes the control thread when it has events to read.
 fn audio_loop<P: Processing, S: Sink>(mut engine: Engine<P, S>, notify: RawFd) {
+    match rt::set_fifo(rt::AUDIO_PRIORITY) {
+        Ok(()) => eprintln!("aas: audio thread at SCHED_FIFO {}", rt::AUDIO_PRIORITY),
+        Err(e) => eprintln!("aas: warning: audio thread not real time: {e}"),
+    }
     while !engine.is_stopped() {
         // An error from a FallbackSink is an xrun, already counted.
         let _ = engine.cycle();
@@ -126,6 +142,8 @@ struct Server {
     control: Control,
     conns: BTreeMap<ConnId, OwnedFd>,
     next_conn: ConnId,
+    /// The card's rates, when they change.
+    rates: RatesWatch,
 }
 
 impl Server {
@@ -149,6 +167,9 @@ impl Server {
             return;
         }
         let now = Instant::now();
+        if let Some(rates) = self.rates.take() {
+            self.control.set_supported(rates, now);
+        }
         if fds[1].revents != 0 {
             let mut count = 0u64;
             // SAFETY: reads 8 bytes into a u64; non-blocking.

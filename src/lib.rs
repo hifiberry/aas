@@ -11,8 +11,10 @@ pub mod format;
 pub mod latency;
 pub mod rate;
 pub mod resample;
+pub mod rt;
 pub mod server;
 pub mod sink;
+pub mod sink_alsa;
 
 // Makes `assert_no_alloc` see every allocation in the unit tests.
 #[cfg(test)]

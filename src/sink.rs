@@ -227,11 +227,33 @@ impl SinkLog {
     }
 }
 
+/// Rates a sink has newly reported, for the control thread to pick up.
+#[derive(Clone, Default)]
+pub struct RatesWatch(Arc<Mutex<Option<Vec<u32>>>>);
+
+impl RatesWatch {
+    /// The rates reported since the last call, if they changed.
+    pub fn take(&self) -> Option<Vec<u32>> {
+        self.0.lock().unwrap().take()
+    }
+
+    fn publish(&self, rates: Vec<u32>) {
+        *self.0.lock().unwrap() = Some(rates);
+    }
+}
+
 /// Keeps the engine running while the real sink is gone. It writes to a
 /// `NullSink` meanwhile and retries the real one every second. Only an xrun
 /// gets through to the engine.
+///
+/// A card can report other rates once it is found, so after each try the
+/// rates are compared with the last known ones, and a change is published
+/// to the `RatesWatch`.
 pub struct FallbackSink {
     inner: Box<dyn Sink>,
+    /// The rates last published, or found at the start.
+    rates: Vec<u32>,
+    watch: RatesWatch,
     null: NullSink,
     /// The format to reopen with.
     format: (u32, u32),
@@ -244,6 +266,8 @@ pub struct FallbackSink {
 impl FallbackSink {
     pub fn new(inner: Box<dyn Sink>) -> FallbackSink {
         FallbackSink {
+            rates: inner.supported_rates(),
+            watch: RatesWatch::default(),
             inner,
             null: NullSink::default(),
             format: (0, 0),
@@ -253,10 +277,22 @@ impl FallbackSink {
         }
     }
 
+    /// Where changes to the inner sink's rates are published.
+    pub fn rates_watch(&self) -> RatesWatch {
+        self.watch.clone()
+    }
+
+    /// Opens the inner sink. This only happens on a reopen or a retry, so
+    /// it may allocate.
     fn try_inner(&mut self) {
         let (rate, period) = self.format;
         self.live = self.inner.open(rate, period).is_ok();
         self.retry_at = Instant::now() + self.retry;
+        let rates = self.inner.supported_rates();
+        if rates != self.rates {
+            self.rates = rates.clone();
+            self.watch.publish(rates);
+        }
     }
 }
 
@@ -442,6 +478,23 @@ mod tests {
         sink.write(&[[3; 2]; 48]).unwrap();
         assert_eq!(log.frames(), [[3; 2]; 48]);
         assert_eq!(log.opens(), [(48000, 48), (48000, 48)]);
+    }
+
+    #[test]
+    fn fallback_publishes_the_rates_of_a_sink_that_appears() {
+        let (mut sink, log) = fallback(Duration::ZERO);
+        let watch = sink.rates_watch();
+        log.fail(Some(SinkError::Gone));
+        sink.open(96000, 48).unwrap();
+        assert_eq!(watch.take(), None);
+        log.set_rates(vec![44100, 48000]);
+        log.fail(None);
+        sink.write(&[[0; 2]; 48]).unwrap();
+        assert_eq!(watch.take(), Some(vec![44100, 48000]));
+        // Unchanged rates are not published again.
+        sink.close();
+        sink.open(48000, 48).unwrap();
+        assert_eq!(watch.take(), None);
     }
 
     #[test]

@@ -556,6 +556,23 @@ impl Control {
         }
     }
 
+    /// The card's rates have changed, such as when a card that was missing
+    /// is found. The output moves at once to a rate the card takes.
+    pub fn set_supported(&mut self, rates: Vec<u32>, now: Instant) {
+        eprintln!("aas: the card takes the rates {rates:?}");
+        self.supported = rates.clone();
+        self.policy.set_supported(rates);
+        let mut batch = Vec::new();
+        self.update_dop(now, &mut batch);
+        self.decide(now, true, &mut batch);
+        self.send(batch);
+    }
+
+    /// Whether the output has been told to stay open.
+    pub fn output_is_open(&self) -> bool {
+        self.output.is_some()
+    }
+
     /// Takes what the audio thread has sent and acts on it.
     pub fn handle_events(&mut self, now: Instant) {
         let mut batch = Vec::new();

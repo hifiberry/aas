@@ -1,0 +1,19 @@
+[Unit]
+Description=Alternative audio server
+After=sound.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/aas
+DynamicUser=yes
+Group=audio
+RuntimeDirectory=aas
+RuntimeDirectoryMode=0755
+StateDirectory=aas
+Restart=always
+RestartSec=1
+LimitRTPRIO=70
+LimitMEMLOCK=infinity
+
+[Install]
+WantedBy=multi-user.target

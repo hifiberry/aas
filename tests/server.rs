@@ -522,6 +522,28 @@ fn a_gone_sink_falls_back_to_null_and_retries() {
 }
 
 #[test]
+fn a_card_that_appears_later_brings_its_rates() {
+    let (sink, log) = memory_sink();
+    log.fail(Some(SinkError::Gone));
+    let daemon = Daemon::start(default_config(), sink);
+    let mut client = daemon.client_at(96000, 131072);
+    write_all(&mut client, &vec![[0x100, 0x100]; 96000]);
+    client.start().unwrap();
+    // With no card, any rate goes, so the output follows the client.
+    wait_played(&client, 9600);
+    log.set_rates(vec![44100, 48000]);
+    log.fail(None);
+    assert!(wait_for(|| last_open(&log) == Some((48000, PERIOD))));
+    // A client starting again at 96 kHz no longer takes the card there.
+    client.stop().unwrap();
+    client.start().unwrap();
+    let opens = log.opens().len();
+    thread::sleep(SETTLE * 2);
+    assert!(log.opens()[opens..].iter().all(|&(rate, _)| rate != 96000));
+    assert_eq!(last_open(&log), Some((48000, PERIOD)));
+}
+
+#[test]
 fn a_dop_stream_restarting_does_not_change_the_rate() {
     let (sink, log) = memory_sink();
     let daemon = Daemon::start(default_config(), sink);

@@ -31,6 +31,21 @@ impl Counters {
     }
 }
 
+impl std::fmt::Display for Counters {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let ms = |ns: &AtomicU64| ns.load(Relaxed) as f64 / 1e6;
+        write!(
+            f,
+            "{} xruns, {} wake gaps, worst gap {:.3} ms, worst cycle {:.3} ms, {} cycles",
+            self.xruns.load(Relaxed),
+            self.wake_gaps.load(Relaxed),
+            ms(&self.worst_gap_ns),
+            ms(&self.worst_cycle_ns),
+            self.cycles.load(Relaxed),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -43,6 +58,17 @@ mod tests {
         assert_eq!(c.wake_gaps.load(Relaxed), 0);
         c.on_cycle(1_001, 10, 1_000);
         assert_eq!(c.wake_gaps.load(Relaxed), 1);
+    }
+
+    #[test]
+    fn the_summary_names_xruns_and_gaps() {
+        let c = Counters::default();
+        c.on_cycle(2_000_000, 500_000, 1_000_000);
+        c.xruns.fetch_add(3, Relaxed);
+        assert_eq!(
+            c.to_string(),
+            "3 xruns, 1 wake gaps, worst gap 2.000 ms, worst cycle 0.500 ms, 1 cycles"
+        );
     }
 
     #[test]

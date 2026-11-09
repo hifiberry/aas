@@ -19,8 +19,13 @@ path = "src/lib.rs"
 name = "aas"
 path = "src/main.rs"
 
+[features]
+# Drive a sound card through ALSA. Needs libasound2-dev to build.
+alsa-output = ["dep:alsa"]
+
 [dependencies]
 aas-client = { version = "0.1.0", path = "crates/aas-client" }
+alsa = { version = "0.12.1", optional = true }
 audioadapter-buffers = "4"
 libc = "0.2"
 rtrb = "0.4"
