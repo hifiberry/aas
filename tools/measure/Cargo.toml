@@ -31,3 +31,7 @@ required-features = ["alsa-probes"]
 [[bin]]
 name = "loopback-latency"
 required-features = ["alsa-probes"]
+
+[[bin]]
+name = "bit-check"
+required-features = ["alsa-probes"]
