@@ -135,13 +135,28 @@ impl Ring {
                 std::ptr::null_mut(),
                 len,
                 libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED | libc::MAP_POPULATE,
+                libc::MAP_SHARED,
                 fd,
                 0,
             )
         };
         if p == libc::MAP_FAILED {
             return Err(io::Error::last_os_error());
+        }
+        // Map every page now, for writing, so the audio path never faults.
+        // MAP_POPULATE would map a shared mapping's pages clean. A CPU that
+        // cannot set the dirty bit in hardware, such as the Pi 3's
+        // Cortex-A53, then faults on the first write to each page, and a
+        // later MADV_POPULATE_WRITE does not help: the pages count as
+        // writable already. Populating for writing an empty mapping marks
+        // them dirty, and writes nothing.
+        // SAFETY: the range is the mapping just made.
+        if unsafe { libc::madvise(p, len, libc::MADV_POPULATE_WRITE) } < 0 {
+            // Before Linux 5.14: map them for reading, as MAP_POPULATE does.
+            for offset in (0..len).step_by(4096) {
+                // SAFETY: inside the mapping.
+                unsafe { std::ptr::read_volatile((p as *const u8).add(offset)) };
+            }
         }
         // Keep the pages resident. A refused mlock only costs latency.
         unsafe { libc::mlock(p, len) };

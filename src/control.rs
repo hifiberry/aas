@@ -21,6 +21,7 @@ use std::collections::BTreeMap;
 use std::io;
 use std::os::fd::{AsFd, FromRawFd, OwnedFd};
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::thread::Thread;
 use std::time::{Duration, Instant};
 
@@ -94,8 +95,13 @@ struct Stream {
     running: bool,
     /// The output rate and period of the resampler the source has.
     resampler: Option<(u32, u32)>,
-    /// A drain waits for its reply, at the latest until then.
+    /// The control thread's own view of the ring, to see a drain progress.
+    view: Ring,
+    /// A drain waits for its reply. If the audio thread has taken nothing
+    /// from the ring by then, it is answered anyway.
     drain: Option<Instant>,
+    /// The ring's read position when the drain deadline was last set.
+    drain_seen: u64,
     /// The audio thread reported the stream drained since it last started,
     /// which can come before the request: the client sets the flag first.
     drained: bool,
@@ -359,12 +365,13 @@ impl Control {
         }
         let capacity = buffer_frames.max(min_ring_frames(rate, self.latency_ms));
         let made = Ring::create(capacity).and_then(|(ring, memfd)| {
+            let view = Ring::map(memfd.as_fd())?;
             let wake = eventfd()?;
             let theirs = wake.try_clone()?;
             let memfd_theirs = memfd.try_clone()?;
-            Ok((ring, memfd, memfd_theirs, wake, theirs))
+            Ok((ring, view, memfd, memfd_theirs, wake, theirs))
         });
-        let (ring, memfd, memfd_theirs, wake, theirs) = match made {
+        let (ring, view, memfd, memfd_theirs, wake, theirs) = match made {
             Ok(made) => made,
             Err(e) => {
                 eprintln!("aas: no ring for a client: {e}");
@@ -388,7 +395,9 @@ impl Control {
             memfd: Some(memfd),
             running: false,
             resampler: None,
+            view,
             drain: None,
+            drain_seen: 0,
             drained: false,
         };
         if let Some(state) = self.conns.get_mut(&conn) {
@@ -483,6 +492,7 @@ impl Control {
         }
         let held = Duration::from_secs_f64(stream.capacity as f64 / f64::from(stream.rate));
         stream.drain = Some(now + held + DRAIN_SPARE);
+        stream.drain_seen = stream.view.header().read_pos.load(Ordering::Acquire);
         Answer {
             reply: None,
             fds: Vec::new(),
@@ -532,6 +542,10 @@ impl Control {
 
     fn streams(&self) -> impl Iterator<Item = &Stream> {
         self.conns.values().filter_map(|c| c.stream.as_ref())
+    }
+
+    fn streams_mut(&mut self) -> impl Iterator<Item = &mut Stream> {
+        self.conns.values_mut().filter_map(|c| c.stream.as_mut())
     }
 
     fn running_count(&self) -> usize {
@@ -697,11 +711,22 @@ impl Control {
         let before = self.policy.current();
         self.policy.tick(now - self.epoch);
         let settled = self.policy.current() != before;
-        let overdue: Vec<ClientId> = self
-            .streams()
-            .filter(|s| s.drain.is_some_and(|at| now >= at))
-            .map(|s| s.id)
-            .collect();
+        let mut overdue = Vec::new();
+        for stream in self.streams_mut() {
+            if !stream.drain.is_some_and(|at| now >= at) {
+                continue;
+            }
+            // A drain that still makes progress is slow, not stuck: the
+            // audio thread can fall behind real time when its cycles run
+            // long. It gets more time for as long as it takes frames.
+            let read = stream.view.header().read_pos.load(Ordering::Acquire);
+            if read != stream.drain_seen {
+                stream.drain_seen = read;
+                stream.drain = Some(now + DRAIN_SPARE);
+            } else {
+                overdue.push(stream.id);
+            }
+        }
         for id in overdue {
             // A last resort: the audio thread should always report it.
             eprintln!("aas: a drain was never reported, answering it now");
@@ -805,6 +830,74 @@ mod tests {
                 .reply
                 .is_none()
         );
+    }
+
+    /// A control thread with one connection that has said hello, and the
+    /// audio thread's end of the command queue.
+    fn hello() -> (Control, rtrb::Consumer<Command>, Instant) {
+        let (commands, engine_commands) = rtrb::RingBuffer::new(64);
+        let (_engine_events, events) = rtrb::RingBuffer::new(64);
+        let config = Config::default();
+        let audio = std::thread::current();
+        let mut control = Control::new(&config, 12.0, Vec::new(), commands, events, audio);
+        let now = Instant::now();
+        control.connected(1, "test".into());
+        let hello = Request::Hello {
+            version: proto::VERSION,
+        };
+        assert_eq!(control.request(1, Some(hello), now).reply, Some(Reply::Ok));
+        (control, engine_commands, now)
+    }
+
+    fn configure(rate: u32, buffer_frames: u32) -> Request {
+        Request::Configure {
+            rate,
+            format: ClientFormat::S16,
+            channels: 2,
+            buffer_frames,
+        }
+    }
+
+    /// The source the audio thread was given.
+    fn added(commands: &mut rtrb::Consumer<Command>) -> Box<Source> {
+        while let Ok(command) = commands.pop() {
+            if let Command::Add(source) = command {
+                return source;
+            }
+        }
+        panic!("no source added");
+    }
+
+    #[test]
+    fn a_drain_that_makes_progress_is_not_cut_short() {
+        let (mut control, mut commands, now) = hello();
+        let answer = control.request(1, Some(configure(48000, 4096)), now);
+        assert_eq!(answer.reply, Some(Reply::Configured));
+        let source = added(&mut commands);
+        source.ring.write(&[[1, 1]; 4096]);
+        assert_eq!(
+            control.request(1, Some(Request::Start), now).reply,
+            Some(Reply::Ok)
+        );
+        assert!(
+            control
+                .request(1, Some(Request::Drain), now)
+                .reply
+                .is_none()
+        );
+        // The audio thread runs slower than real time but keeps taking
+        // frames, well past the deadline set for the ring.
+        let mut t = now;
+        for _ in 0..20 {
+            t += Duration::from_millis(400);
+            source.ring.consume(100);
+            control.tick(t);
+            assert!(control.take_replies().is_empty(), "answered early");
+        }
+        // Once it stops taking frames the drain is answered after all.
+        control.tick(t + Duration::from_millis(400));
+        control.tick(t + Duration::from_millis(1000));
+        assert_eq!(control.take_replies(), vec![(1, Reply::Ok)]);
     }
 
     #[test]

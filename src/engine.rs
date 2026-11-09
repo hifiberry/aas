@@ -646,16 +646,26 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         Ok(())
     }
 
+    /// A change fades only while something is audible, to avoid a click.
+    /// Otherwise it applies at once, so that a stream starting in the same
+    /// cycle as the change plays at the new level from its first frame.
     fn set_gain(&mut self, gain: f32) {
         if gain == self.target_gain {
             return;
         }
         self.target_gain = gain;
-        if self.open {
+        if self.open && self.audible().next().is_some() {
             self.fade_left = (self.rate * FADE_MS / 1000) as usize;
         } else {
             self.finish_fade();
         }
+    }
+
+    /// Running sources that are heard this cycle.
+    fn audible(&self) -> impl Iterator<Item = &Source> {
+        let rate = self.rate;
+        let sources = self.table.iter().map(|s| &**s);
+        sources.filter(move |s| s.running && !s.muted(rate) && s.plays)
     }
 
     fn finish_fade(&mut self) {
@@ -753,11 +763,7 @@ impl<P: Processing, S: Sink> Engine<P, S> {
 
     /// What the bit-perfect rules need to know about this cycle.
     fn situation(&self) -> Situation {
-        let rate = self.rate;
-        let audible = || {
-            let sources = self.table.iter();
-            sources.filter(move |s| s.running && !s.muted(rate) && s.plays)
-        };
+        let audible = || self.audible();
         Situation {
             mode: self.mode,
             active: audible().count(),
@@ -1329,8 +1335,10 @@ mod tests {
         let mut a = client(1);
         rig.add(&mut a);
         const LEVEL: f64 = (1 << 24) as f64;
-        let total = 10 * PERIOD;
+        let total = 11 * PERIOD;
         a.ring.write(&frames(1 << 24, total));
+        // The source is heard before the change, so the change fades.
+        rig.cycle();
         rig.send(Command::SetGain(0.5));
         for _ in 0..10 {
             rig.cycle();
@@ -1345,6 +1353,22 @@ mod tests {
             };
             let error = (f64::from(f[0]) - want * LEVEL).abs();
             assert!(error < 64.0, "frame {i}: {} against {want}", f[0]);
+        }
+    }
+
+    #[test]
+    fn a_gain_change_before_a_stream_is_heard_applies_at_once() {
+        let mut rig = Rig::<F64>::new(BitPerfect::Auto);
+        let mut a = client(1);
+        // The stream starts in the same cycle as the change.
+        rig.add(&mut a);
+        a.ring.write(&frames(1 << 24, PERIOD));
+        rig.send(Command::SetGain(0.5));
+        rig.cycle();
+        let got = rig.last_periods(1);
+        for (i, f) in got.iter().enumerate() {
+            let error = (f64::from(f[0]) - 0.5 * (1 << 24) as f64).abs();
+            assert!(error < 64.0, "frame {i}: {}", f[0]);
         }
     }
 
