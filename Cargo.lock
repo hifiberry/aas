@@ -19,6 +19,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "aas-alsa"
+version = "0.1.0"
+dependencies = [
+ "aas-client",
+ "libc",
+]
+
+[[package]]
 name = "aas-client"
 version = "0.1.0"
 dependencies = [

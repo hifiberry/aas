@@ -1,0 +1,18 @@
+[package]
+name = "aas-alsa"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "ALSA plugin that plays through the aas daemon"
+license = "MIT"
+publish = false
+
+# Kept out of the workspace's default members: building it links libasound,
+# so it needs libasound2-dev. The cdylib is installed as an ALSA plugin; the
+# rlib lets the tests reach the FFI declarations.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+aas-client = { version = "0.1.0", path = "../aas-client" }
+libc = "0.2"

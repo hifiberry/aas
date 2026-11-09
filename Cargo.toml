@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/aas-client", "tools/measure"]
+members = [".", "crates/aas-alsa", "crates/aas-client", "tools/measure"]
 default-members = [".", "crates/aas-client", "tools/measure"]
 
 [package]
