@@ -82,7 +82,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.toml");
         assert_eq!(State::load(&path).output_percent, 100);
-        for text in ["output_percent = \"x\"\n", "output_percent = 300\n", "\0\0"] {
+        let corrupt = [
+            "output_percent = \"x\"\n",
+            "output_percent = 300\n",
+            "output_percent = 150\n",
+            "\0\0",
+        ];
+        for text in corrupt {
             std::fs::write(&path, text).unwrap();
             assert_eq!(State::load(&path).output_percent, 100, "{text:?}");
         }

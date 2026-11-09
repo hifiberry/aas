@@ -24,7 +24,6 @@ const PATIENCE: Duration = Duration::from_secs(20);
 struct Daemon {
     _dir: tempfile::TempDir,
     path: PathBuf,
-    state: PathBuf,
     shutdown: Arc<AtomicBool>,
     thread: Option<JoinHandle<Result<(), String>>>,
 }
@@ -46,13 +45,12 @@ impl Daemon {
         let path = dir.path().join("aas.sock");
         let shutdown = Arc::new(AtomicBool::new(false));
         let thread = {
-            let (path, state, shutdown) = (path.clone(), state.clone(), shutdown.clone());
+            let (path, shutdown) = (path.clone(), shutdown.clone());
             thread::spawn(move || server::run(config, sink, &path, &state, None, shutdown))
         };
         let daemon = Daemon {
             _dir: dir,
             path,
-            state,
             shutdown,
             thread: Some(thread),
         };
@@ -784,7 +782,7 @@ fn a_volume_set_by_one_client_reaches_a_subscriber_and_survives_a_restart() {
         let set = call_raw(&setter, &Request::SetVolume { percent: 40 });
         assert_eq!(set, Some(Reply::Ok));
         let notice = receive_raw(&watcher, PATIENCE);
-        assert_eq!(notice, Some(Reply::Volume { percent: 40 }));
+        assert_eq!(notice, Some(Reply::VolumeChanged { percent: 40 }));
         // The same value again is no change, and over 100 is refused.
         let same = call_raw(&setter, &Request::SetVolume { percent: 40 });
         assert_eq!(same, Some(Reply::Ok));
@@ -797,10 +795,9 @@ fn a_volume_set_by_one_client_reaches_a_subscriber_and_survives_a_restart() {
         let set = call_raw(&watcher, &Request::SetVolume { percent: 45 });
         assert_eq!(set, Some(Reply::Ok));
         let own = receive_raw(&watcher, PATIENCE);
-        assert_eq!(own, Some(Reply::Volume { percent: 45 }));
+        assert_eq!(own, Some(Reply::VolumeChanged { percent: 45 }));
         let got = call_raw(&setter, &Request::GetVolume);
         assert_eq!(got, Some(Reply::Volume { percent: 45 }));
-        assert_eq!(daemon.state, state);
     }
     let (sink, _log) = memory_sink();
     let dir = tempfile::tempdir().unwrap();
@@ -830,4 +827,36 @@ fn software_volume_scales_the_output() {
         .any(|f| (f[0] - want).abs() < 64 && (f[1] + want).abs() < 64);
     assert!(hit, "no frame at -30 dB");
     assert!(!played.contains(&[1 << 30, -(1 << 30)]));
+}
+
+#[test]
+fn a_subscriber_that_does_not_read_keeps_its_connection_and_gets_the_last_value() {
+    let (sink, _log) = memory_sink();
+    let daemon = Daemon::start(default_config(), sink);
+    let watcher = volume_client(&daemon);
+    let subscribed = call_raw(&watcher, &Request::SubscribeVolume);
+    assert_eq!(subscribed, Some(Reply::Volume { percent: 100 }));
+    // Far more changes than the watcher's socket could hold, unread.
+    let setter = volume_client(&daemon);
+    let last = 33;
+    for i in 0..3000u32 {
+        let percent = if i == 2999 { last } else { (i % 100) as u8 };
+        let set = call_raw(&setter, &Request::SetVolume { percent });
+        assert_eq!(set, Some(Reply::Ok));
+    }
+    // The watcher gets one notification sent before it read, then the
+    // latest, and nothing more.
+    let mut notices = Vec::new();
+    while let Some(reply) = receive_raw(&watcher, Duration::from_secs(1)) {
+        notices.push(reply);
+    }
+    let (count, newest) = (notices.len(), notices.last());
+    assert!(count <= 2, "{count} notifications, the last {newest:?}");
+    assert_eq!(
+        notices.last(),
+        Some(&Reply::VolumeChanged { percent: last })
+    );
+    // Its connection still answers.
+    let got = call_raw(&watcher, &Request::GetVolume);
+    assert_eq!(got, Some(Reply::Volume { percent: last }));
 }

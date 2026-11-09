@@ -250,8 +250,8 @@ impl Control {
         std::mem::take(&mut self.outbox)
     }
 
-    /// Volume notifications for subscribers. Unlike a reply, one that
-    /// cannot be sent at once is dropped.
+    /// Volume notifications for subscribers, in order. The server sends
+    /// only the latest one each subscriber has waiting.
     pub fn take_notices(&mut self) -> Vec<(ConnId, Reply)> {
         std::mem::take(&mut self.notices)
     }
@@ -315,7 +315,7 @@ impl Control {
         self.volume.set(percent);
         self.send(vec![Command::SetGain(self.volume.gain())]);
         let subscribers = self.conns.iter().filter(|(_, c)| c.subscribed);
-        let notice = Reply::Volume { percent };
+        let notice = Reply::VolumeChanged { percent };
         self.notices
             .extend(subscribers.map(|(&conn, _)| (conn, notice)));
         if self.state.is_some() {
@@ -323,6 +323,9 @@ impl Control {
         }
     }
 
+    /// Writes the state file. Its fsync runs on the control thread and can
+    /// hold up requests on a slow SD card, never the audio thread; the
+    /// save delay keeps it rare.
     fn save(&mut self) {
         self.save_at = None;
         let Some(path) = &self.state else {

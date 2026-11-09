@@ -102,6 +102,7 @@ pub fn run(
         notify,
         control,
         conns: BTreeMap::new(),
+        notices: BTreeMap::new(),
         next_conn: 1,
         rates,
     };
@@ -148,6 +149,8 @@ struct Server {
     notify: OwnedFd,
     control: Control,
     conns: BTreeMap<ConnId, OwnedFd>,
+    /// The latest volume notification each subscriber has waiting.
+    notices: BTreeMap<ConnId, Reply>,
     next_conn: ConnId,
     /// The card's rates, when they change.
     rates: RatesWatch,
@@ -198,15 +201,25 @@ impl Server {
         self.notify();
     }
 
-    /// Sends the volume notifications. One that does not fit in the
-    /// socket's buffer is dropped, so that a slow subscriber holds nobody
-    /// up. A connection that has gone is closed by the next poll.
+    /// Sends the volume notifications. Each subscriber has at most one
+    /// waiting, the latest, and it is sent only once the subscriber has
+    /// read everything sent to it before. So notifications never fill its
+    /// socket, its replies always fit, and a subscriber that has not read
+    /// for a while still gets the current volume. What cannot be sent now
+    /// is tried again at the next step, within the tick.
     fn notify(&mut self) {
-        for (conn, notice) in self.control.take_notices() {
-            if let Some(fd) = self.conns.get(&conn) {
-                let _ = send_reply(fd, &notice, &[]);
+        self.notices.extend(self.control.take_notices());
+        self.notices.retain(|conn, notice| {
+            let Some(fd) = self.conns.get(conn) else {
+                return false;
+            };
+            if unread_bytes(fd) != Some(0) {
+                return true;
             }
-        }
+            // A connection that has gone is closed by the next poll.
+            let _ = send_reply(fd, notice, &[]);
+            false
+        });
     }
 
     fn accept_all(&mut self) {
@@ -282,6 +295,7 @@ impl Server {
     }
 
     fn close(&mut self, conn: ConnId, now: Instant) {
+        self.notices.remove(&conn);
         if self.conns.remove(&conn).is_some() {
             self.control.disconnected(conn, now);
         }
@@ -337,6 +351,14 @@ fn send_reply(fd: &OwnedFd, reply: &Reply, fds: &[OwnedFd]) -> io::Result<()> {
             other => return other.map(drop),
         }
     }
+}
+
+/// Bytes sent on a connection that the peer has not read yet.
+fn unread_bytes(fd: &OwnedFd) -> Option<usize> {
+    let mut queued: libc::c_int = 0;
+    // SAFETY: TIOCOUTQ, which is SIOCOUTQ on a socket, writes one int.
+    let rc = unsafe { libc::ioctl(fd.as_raw_fd(), libc::TIOCOUTQ, &mut queued) };
+    (rc == 0).then_some(queued as usize)
 }
 
 /// The client's process name, from its credentials, for the log.

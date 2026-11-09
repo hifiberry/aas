@@ -126,15 +126,21 @@ mod mixer {
         id: SelemId,
         range: (f32, f32),
         switch: bool,
+        /// The lowest step of the control is a mute.
+        floor_mutes: bool,
     }
 
-    /// The control's dB range, if it has a playback volume with one.
-    fn db_range(selem: &Selem) -> Option<(f32, f32)> {
+    /// What ALSA reports as the dB of a step that mutes, in millibel.
+    const MUTE_MB: i64 = -9_999_999;
+
+    /// The control's dB range in millibel, if it has a playback volume
+    /// with one.
+    fn db_range(selem: &Selem) -> Option<(i64, i64)> {
         if !selem.has_playback_volume() {
             return None;
         }
         let (min, max) = selem.get_playback_db_range();
-        (min < max).then(|| (min.0 as f32 / 100.0, max.0 as f32 / 100.0))
+        (min < max).then_some((min.0, max.0))
     }
 
     impl AlsaVolume {
@@ -175,17 +181,26 @@ mod mixer {
             };
             let id = SelemId::new(&name, 0);
             let selem = mixer.find_selem(&id)?;
-            let range = db_range(&selem)?;
+            let (min, max) = db_range(&selem)?;
             let switch = selem.has_playback_switch();
+            let floor_mutes = min <= MUTE_MB;
+            let range = (min as f32 / 100.0, max as f32 / 100.0);
+            let floor = if floor_mutes {
+                "mute".to_string()
+            } else {
+                format!("{} dB", range.0)
+            };
             eprintln!(
-                "aas: hardware volume {device} {name}, {} to {} dB",
-                range.0, range.1
+                "aas: hardware volume {device} {name}, {floor} to {} dB{}",
+                range.1,
+                if switch { ", with a switch" } else { "" }
             );
             Some(AlsaVolume {
                 mixer,
                 id,
                 range,
                 switch,
+                floor_mutes,
             })
         }
     }
@@ -213,6 +228,10 @@ mod mixer {
 
         fn range_db(&self) -> (f32, f32) {
             self.range
+        }
+
+        fn can_mute(&self) -> bool {
+            self.switch || self.floor_mutes
         }
     }
 }

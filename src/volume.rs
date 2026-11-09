@@ -30,6 +30,9 @@ pub trait HardwareVolume: Send {
     fn set_db(&mut self, db: f32);
     /// The lowest and highest dB the control takes.
     fn range_db(&self) -> (f32, f32);
+    /// Whether `set_db(f32::NEG_INFINITY)` silences the card. A control
+    /// without a switch whose lowest step is not a mute cannot.
+    fn can_mute(&self) -> bool;
 }
 
 /// The control to use: the configured one if the card has it, else the
@@ -92,12 +95,15 @@ impl OutputVolume {
     }
 
     /// The gain the engine applies to the output: 1 in hardware mode and
-    /// with forced bit-perfect.
+    /// with forced bit-perfect. At 0 percent on a control that cannot mute
+    /// it is 0, since bit-perfect does not matter when nothing is heard.
     pub fn gain(&self) -> f32 {
-        if self.hardware.is_some() || self.forced {
-            return 1.0;
+        let db = percent_to_db(self.percent);
+        match &self.hardware {
+            Some(hardware) if db.is_none() && !hardware.can_mute() => 0.0,
+            _ if self.hardware.is_some() || self.forced => 1.0,
+            _ => db.map_or(0.0, db_to_gain),
         }
-        percent_to_db(self.percent).map_or(0.0, db_to_gain)
     }
 }
 
@@ -111,6 +117,7 @@ mod tests {
     /// A card's mixer that records what it is set to.
     struct FakeHardware {
         range: (f32, f32),
+        mutes: bool,
         set: Arc<Mutex<Vec<f32>>>,
     }
 
@@ -122,12 +129,23 @@ mod tests {
         fn range_db(&self) -> (f32, f32) {
             self.range
         }
+
+        fn can_mute(&self) -> bool {
+            self.mutes
+        }
     }
 
-    fn hardware(range: (f32, f32)) -> (Box<dyn HardwareVolume>, Arc<Mutex<Vec<f32>>>) {
+    type Recorded = Arc<Mutex<Vec<f32>>>;
+
+    fn hardware(range: (f32, f32)) -> (Box<dyn HardwareVolume>, Recorded) {
+        hardware_muting(range, true)
+    }
+
+    fn hardware_muting(range: (f32, f32), mutes: bool) -> (Box<dyn HardwareVolume>, Recorded) {
         let set = Arc::new(Mutex::new(Vec::new()));
         let fake = FakeHardware {
             range,
+            mutes,
             set: set.clone(),
         };
         (Box::new(fake), set)
@@ -160,6 +178,19 @@ mod tests {
         volume.set(0);
         assert_eq!(volume.gain(), 1.0);
         assert_eq!(last(&set), Some(f32::NEG_INFINITY));
+    }
+
+    #[test]
+    fn zero_on_a_control_that_cannot_mute_mutes_in_software() {
+        let (hw, set) = hardware_muting((-51.5, 0.0), false);
+        let mut volume = OutputVolume::new(Some(hw), BitPerfect::Auto);
+        volume.set(0);
+        assert_eq!(volume.gain(), 0.0);
+        assert_eq!(last(&set), Some(f32::NEG_INFINITY));
+        // Above 0 the hardware carries it alone again.
+        volume.set(1);
+        assert_eq!(volume.gain(), 1.0);
+        assert_eq!(last(&set), Some(-51.5));
     }
 
     #[test]

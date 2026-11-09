@@ -2,15 +2,17 @@
 //! `REQUEST_LEN` bytes and every reply `REPLY_LEN` bytes, little endian.
 //! A message is a u32 tag followed by u32 arguments, unused ones zero.
 //!
-//! Each request gets one reply, in order. The one exception is a
-//! connection that has sent `SubscribeVolume`: it is also sent
-//! `Reply::Volume` whenever the output volume changes, from any
-//! connection, including its own. Such a notification looks the same as
-//! the reply to `GetVolume`. Both carry the volume at the time they were
-//! sent, so a subscriber keeps the last `Volume` it read, whatever it
-//! answers. Its other requests get replies other than `Volume`, which it
-//! matches to them in order. A notification that does not fit in the
-//! socket buffer is dropped.
+//! Each request gets one reply, in order. A connection that has sent
+//! `SubscribeVolume` is also sent `Reply::VolumeChanged` when the output
+//! volume changes, from any connection, including its own.
+//! `VolumeChanged` is never a reply, so a client waiting for a reply
+//! takes it aside and reads on.
+//!
+//! Notifications are coalesced: a subscriber that does not read gets no
+//! more than one waiting notification, carrying the latest volume, once
+//! it has read what was sent before. So the last notification a
+//! subscriber reads after a change always holds the current volume, and
+//! notifications never fill its socket.
 
 use crate::convert::ClientFormat;
 use std::path::PathBuf;
@@ -50,8 +52,17 @@ pub enum Request {
 pub enum Reply {
     Ok,
     Configured,
-    Volume { percent: u8 },
-    Error { code: u32 },
+    /// The reply to `GetVolume` and `SubscribeVolume`.
+    Volume {
+        percent: u8,
+    },
+    Error {
+        code: u32,
+    },
+    /// Not a reply: the output volume changed. Sent only to subscribers.
+    VolumeChanged {
+        percent: u8,
+    },
 }
 
 fn format_code(f: ClientFormat) -> u32 {
@@ -143,6 +154,7 @@ pub fn encode_reply(r: &Reply) -> [u8; REPLY_LEN] {
         Reply::Configured => (2, 0),
         Reply::Volume { percent } => (3, percent as u32),
         Reply::Error { code } => (4, code),
+        Reply::VolumeChanged { percent } => (5, percent as u32),
     };
     let mut out = [0u8; REPLY_LEN];
     out[..4].copy_from_slice(&tag.to_le_bytes());
@@ -163,6 +175,9 @@ pub fn decode_reply(b: &[u8]) -> Option<Reply> {
             percent: u8::try_from(word(b, 1)).ok()?,
         },
         4 => Reply::Error { code: word(b, 1) },
+        5 => Reply::VolumeChanged {
+            percent: u8::try_from(word(b, 1)).ok()?,
+        },
         _ => return None,
     })
 }
@@ -204,6 +219,7 @@ mod tests {
             Reply::Configured,
             Reply::Volume { percent: 100 },
             Reply::Error { code: 22 },
+            Reply::VolumeChanged { percent: 40 },
         ];
         for r in replies {
             assert_eq!(decode_reply(&encode_reply(&r)), Some(r));
@@ -245,6 +261,12 @@ mod tests {
         let reply = encode_reply(&Reply::Ok);
         assert_eq!(decode_reply(&reply[..REPLY_LEN - 1]), None);
         assert_eq!(decode_reply(&[9, 0, 0, 0, 0, 0, 0, 0]), None);
+        // A notification is told apart from a reply by its tag.
+        assert_ne!(
+            encode_reply(&Reply::VolumeChanged { percent: 40 }),
+            encode_reply(&Reply::Volume { percent: 40 })
+        );
+        assert_eq!(decode_reply(&[5, 0, 0, 0, 0, 1, 0, 0]), None);
     }
 
     #[test]
