@@ -1,6 +1,7 @@
 //! The daemon end to end: clients on a real socket, the output a `MemorySink`.
 
 use aas::config::{Config, Idle};
+use aas::rate::SETTLE;
 use aas::server;
 use aas::sink::{MemorySink, Sink, SinkError, SinkLog};
 use aas_client::client::Client;
@@ -243,17 +244,23 @@ fn second_client_at_another_rate_is_resampled() {
 
 #[test]
 fn rate_follows_the_remaining_client() {
-    let (sink, log) = memory_sink();
+    let (sink, log, _gate, opened) = gated_sink();
     let daemon = Daemon::start(default_config(), sink);
     let mut first = daemon.client_at(44100, 4096);
     first.start().unwrap();
     assert!(wait_for(|| last_open(&log) == Some((44100, PERIOD))));
     let mut second = daemon.client_at(48000, 4096);
     second.start().unwrap();
+    let stopping = Instant::now();
     first.stop().unwrap();
-    // The settle time has not passed yet.
-    assert_eq!(last_open(&log), Some((44100, PERIOD)));
     assert!(wait_for(|| last_open(&log) == Some((48000, PERIOD))));
+    // Not before the settle time, however fast or slow the machine is.
+    let (_, at) = *opened.lock().unwrap().last().unwrap();
+    assert!(
+        at >= stopping + SETTLE,
+        "switched {:?} after the stop",
+        at - stopping
+    );
 }
 
 /// Stops the first `open` after `arm` until `release`.
@@ -286,15 +293,35 @@ impl Gate {
     }
 }
 
+/// Each successful open's rate and when it happened.
+type Opened = Arc<Mutex<Vec<(u32, Instant)>>>;
+
+/// A paced memory sink whose opens can be held, and are timed.
 struct GatedSink {
     inner: MemorySink,
     gate: Gate,
+    opened: Opened,
+}
+
+fn gated_sink() -> (Box<dyn Sink>, SinkLog, Gate, Opened) {
+    let inner = MemorySink::paced();
+    let log = inner.log();
+    let gate = Gate::default();
+    let opened = Opened::default();
+    let sink = GatedSink {
+        inner,
+        gate: gate.clone(),
+        opened: opened.clone(),
+    };
+    (Box::new(sink), log, gate, opened)
 }
 
 impl Sink for GatedSink {
     fn open(&mut self, rate: u32, period: u32) -> Result<(), SinkError> {
         self.gate.pass();
-        self.inner.open(rate, period)
+        self.inner.open(rate, period)?;
+        self.opened.lock().unwrap().push((rate, Instant::now()));
+        Ok(())
     }
 
     fn write(&mut self, frames: &[[i32; 2]]) -> Result<(), SinkError> {
@@ -316,14 +343,8 @@ impl Sink for GatedSink {
 
 #[test]
 fn client_starting_during_reconfigure_loses_no_audio() {
-    let inner = MemorySink::paced();
-    let log = inner.log();
-    let gate = Gate::default();
-    let sink = GatedSink {
-        inner,
-        gate: gate.clone(),
-    };
-    let daemon = Daemon::start(default_config(), Box::new(sink));
+    let (sink, log, gate, _opened) = gated_sink();
+    let daemon = Daemon::start(default_config(), sink);
     assert!(wait_for(|| last_open(&log) == Some((48000, PERIOD))));
 
     let mut first = daemon.client_at(44100, 4096);
@@ -527,6 +548,92 @@ fn a_dop_stream_restarting_does_not_change_the_rate() {
         opens,
         "a stop and start changed the rate"
     );
+}
+
+#[test]
+fn a_second_short_drain_returns_promptly() {
+    let (sink, log) = memory_sink();
+    let daemon = Daemon::start(default_config(), sink);
+    // A large ring, so that the safety net would take about 6 s.
+    let mut client = daemon.client_at(48000, 262144);
+    write_all(&mut client, &left_pattern(1000));
+    client.start().unwrap();
+    client.drain().unwrap();
+    // Under one period, then nothing at all.
+    let short: Vec<[i32; 2]> = (1..=32).map(|i| [0, i << 12]).collect();
+    for audio in [short.clone(), Vec::new()] {
+        client.start().unwrap();
+        write_all(&mut client, &audio);
+        let started = Instant::now();
+        client.drain().unwrap();
+        let took = started.elapsed();
+        assert!(took < Duration::from_secs(1), "the drain took {took:?}");
+    }
+    assert_eq!(client.hw_position().unwrap(), 1032);
+    assert!(
+        find(&log.frames(), &short).is_some(),
+        "the short drain was not played"
+    );
+}
+
+/// DoP frames carrying `payload` in the bits below the marker.
+fn dop_frames(n: usize, payload: u32) -> Vec<[i32; 2]> {
+    (0..n)
+        .map(|i| {
+            let marker: u32 = if i % 2 == 0 { 0x05 } else { 0xFA };
+            let s = ((marker << 24) | payload) as i32;
+            [s, s]
+        })
+        .collect()
+}
+
+fn carries(frame: &[i32; 2], payload: u32) -> bool {
+    frame[0] as u32 & 0x00FF_FF00 == payload
+}
+
+const OLDER: u32 = 0x0012_3400;
+const NEWER: u32 = 0x0056_7800;
+
+/// The client configured first starts its DoP stream second, at `rate`. The
+/// stream that was playing keeps the output and the rate.
+fn oldest_dop_claim_keeps_the_output(rate: u32) {
+    let (sink, log) = memory_sink();
+    let daemon = Daemon::start(default_config(), sink);
+    let mut newer = daemon.client_at(rate, 262144);
+    let mut older = daemon.client_at(176400, 262144);
+    write_all(&mut older, &dop_frames(176400, OLDER));
+    older.start().unwrap();
+    assert!(wait_for(|| last_open(&log) == Some((176400, 256))));
+    assert!(wait_for(|| log.frames().iter().any(|f| carries(f, OLDER))));
+    let opens = log.opens().len();
+
+    write_all(&mut newer, &dop_frames(rate as usize, NEWER));
+    newer.start().unwrap();
+    // It is judged DoP and discarded from its first period on.
+    wait_played(&newer, 1);
+    let from = log.frames().len();
+    thread::sleep(Duration::from_millis(300));
+    let frames = log.frames();
+    let after = &frames[from..];
+    assert!(
+        after.iter().any(|f| carries(f, OLDER)),
+        "the playing stream lost the output"
+    );
+    assert!(
+        !after.iter().any(|f| carries(f, NEWER)),
+        "the newer claim was played"
+    );
+    assert_eq!(log.opens().len(), opens, "the output was reopened");
+}
+
+#[test]
+fn the_oldest_dop_claim_keeps_the_output_at_another_rate() {
+    oldest_dop_claim_keeps_the_output(88200);
+}
+
+#[test]
+fn the_oldest_dop_claim_keeps_the_output_at_the_same_rate() {
+    oldest_dop_claim_keeps_the_output(176400);
 }
 
 /// A seqpacket socket connected to `path`, with no client library.

@@ -92,6 +92,9 @@ pub struct Source {
     discard_remainder: u64,
     dop_reported: bool,
     drained_reported: bool,
+    /// When this stream was first seen as DoP, in the order of all claims.
+    /// Zero while it is not DoP. The oldest claim holds the output.
+    dop_claim: u64,
 }
 
 impl Source {
@@ -119,6 +122,7 @@ impl Source {
             discard_remainder: 0,
             dop_reported: false,
             drained_reported: false,
+            dop_claim: 0,
         }
     }
 
@@ -398,6 +402,8 @@ pub struct Engine<P: Processing, S: Sink> {
     /// Frames until `gain` reaches `target_gain`.
     fade_left: usize,
     last_start: Option<Instant>,
+    /// The last DoP claim handed out.
+    claims: u64,
 }
 
 impl<P: Processing, S: Sink> Engine<P, S> {
@@ -431,6 +437,7 @@ impl<P: Processing, S: Sink> Engine<P, S> {
             target_gain: 1.0,
             fade_left: 0,
             last_start: None,
+            claims: 0,
         }
     }
 
@@ -569,6 +576,8 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         };
         source.running = running;
         if running {
+            // A restarted stream drains afresh, and reports it again.
+            source.drained_reported = false;
             return;
         }
         if source.stream == Stream::Dop {
@@ -668,8 +677,11 @@ impl<P: Processing, S: Sink> Engine<P, S> {
     /// Plays one period. `fade_out` takes the level down to zero over it.
     fn render(&mut self, start: Instant, fade_out: bool) -> Result<(), SinkError> {
         self.scan();
+        self.order_claims();
         let rate = self.rate;
-        let owner = self.table.iter().position(|s| s.holds_output(rate));
+        let holders = self.table.iter().enumerate();
+        let holders = holders.filter(|(_, s)| s.holds_output(rate));
+        let owner = holders.min_by_key(|(_, s)| s.dop_claim).map(|(i, _)| i);
         match owner {
             Some(owner) => self.play_dop(owner),
             None => self.play_pcm(fade_out),
@@ -696,6 +708,20 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         // The first cycle after opening has nothing to measure from.
         let gap_ns = last.map_or(0, |l| (start - l).as_nanos() as u64);
         self.counters.on_cycle(gap_ns, cycle_ns, buffer_ns);
+    }
+
+    /// Gives each stream newly seen as DoP the next claim, in table order
+    /// within a cycle, as `report` sends `DopStarted`. A stream that is no
+    /// longer DoP gives its claim up.
+    fn order_claims(&mut self) {
+        for source in self.table.iter_mut() {
+            if source.stream != Stream::Dop {
+                source.dop_claim = 0;
+            } else if source.dop_claim == 0 {
+                self.claims += 1;
+                source.dop_claim = self.claims;
+            }
+        }
     }
 
     /// Looks at what each running source has, without consuming it. The look
@@ -1553,6 +1579,32 @@ mod tests {
         assert!(matches!(events[0], Event::DopStopped(2)));
     }
 
+    #[test]
+    fn the_oldest_dop_claim_holds_the_output() {
+        let mut rig = Rig::<I32>::new(BitPerfect::Auto);
+        // The later claim comes first in the table.
+        let (mut later, mut first) = (client(1), client(2));
+        rig.add(&mut later);
+        rig.add(&mut first);
+        let other: Vec<[i32; 2]> = dop_frames(PERIOD)
+            .iter()
+            .map(|f| [f[0] ^ 0x00AB_0000, f[1] ^ 0x00AB_0000])
+            .collect();
+        first.ring.write(&dop_frames(PERIOD));
+        rig.cycle();
+        assert!(matches!(rig.events()[..], [Event::DopStarted(2)]));
+        first.ring.write(&dop_frames(PERIOD));
+        later.ring.write(&other);
+        rig.cycle();
+        assert_eq!(rig.last_periods(1), dop_frames(PERIOD));
+        assert!(matches!(rig.events()[..], [Event::DopStarted(1)]));
+        // Once the first claim stops, the next one takes over.
+        rig.send(Command::SetRunning(2, false));
+        later.ring.write(&other);
+        rig.cycle();
+        assert_eq!(rig.last_periods(1), other);
+    }
+
     /// A DoP stream that has played, with a PCM client waiting behind it.
     fn dop_with_a_second_client() -> (Rig<I32>, Client, Client) {
         let mut rig = Rig::<I32>::new(BitPerfect::Auto);
@@ -1950,6 +2002,21 @@ mod tests {
         a.ring.header().draining.store(0, Release);
         rig.cycle();
         a.ring.header().draining.store(1, Release);
+        rig.cycle();
+        assert!(matches!(rig.events()[..], [Event::Drained(1)]));
+    }
+
+    #[test]
+    fn a_restarted_source_reports_a_new_drain() {
+        let mut rig = Rig::<F32>::new(BitPerfect::Auto);
+        let mut a = client(1);
+        rig.add(&mut a);
+        a.ring.header().draining.store(1, Release);
+        rig.cycle();
+        assert!(matches!(rig.events()[..], [Event::Drained(1)]));
+        // No cycle sees the flag clear before the next drain, of nothing.
+        rig.send(Command::SetRunning(1, false));
+        rig.send(Command::SetRunning(1, true));
         rig.cycle();
         assert!(matches!(rig.events()[..], [Event::Drained(1)]));
     }

@@ -228,7 +228,11 @@ impl Client {
         let stream = self.stream()?;
         // After the last frames, which the daemon relies on.
         stream.ring.header().draining.store(1, Ordering::Release);
-        self.call(&Request::Drain).map(drop)
+        let result = self.call(&Request::Drain).map(drop);
+        if let Some(stream) = &self.stream {
+            stream.ring.header().draining.store(0, Ordering::Release);
+        }
+        result
     }
 
     /// Converts and writes as many whole frames as the ring has room for.

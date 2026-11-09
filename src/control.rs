@@ -90,6 +90,9 @@ struct Stream {
     resampler: Option<(u32, u32)>,
     /// A drain waits for its reply, at the latest until then.
     drain: Option<Instant>,
+    /// The audio thread reported the stream drained since it last started,
+    /// which can come before the request: the client sets the flag first.
+    drained: bool,
 }
 
 struct Conn {
@@ -298,6 +301,7 @@ impl Control {
             running: false,
             resampler: None,
             drain: None,
+            drained: false,
         };
         if let Some(state) = self.conns.get_mut(&conn) {
             state.stream = Some(stream);
@@ -329,6 +333,7 @@ impl Control {
             return Answer::reply(Reply::Ok);
         }
         stream.running = true;
+        stream.drained = false;
         let (id, rate) = (stream.id, stream.rate);
         let t = now - self.epoch;
         self.policy.client_started(id, rate, t);
@@ -381,6 +386,13 @@ impl Control {
         let Some(stream) = self.stream_mut(conn) else {
             return Answer::error(libc::EBADFD);
         };
+        if std::mem::take(&mut stream.drained) {
+            let id = stream.id;
+            let mut batch = Vec::new();
+            self.stop(id, now, &mut batch);
+            self.send(batch);
+            return Answer::reply(Reply::Ok);
+        }
         let held = Duration::from_secs_f64(stream.capacity as f64 / f64::from(stream.rate));
         stream.drain = Some(now + held + DRAIN_SPARE);
         Answer {
@@ -403,8 +415,10 @@ impl Control {
             return;
         };
         if stream.drain.take().is_none() {
+            stream.drained = true;
             return;
         }
+        stream.drained = false;
         self.stop(id, now, batch);
         self.outbox.push((conn, Reply::Ok));
     }
@@ -440,19 +454,15 @@ impl Control {
         self.supported.is_empty() || self.supported.contains(&rate)
     }
 
-    /// Makes the rate rules follow the audio thread's DoP owner: the claim
-    /// added first, at a rate the card takes. A new owner needs its rate at
+    /// Makes the rate rules follow the audio thread's DoP owner: the oldest
+    /// claim of a running stream at a rate the card takes. The audio thread
+    /// ranks the streams holding the output the same way. A new owner needs its rate at
     /// once, since its audio is discarded until then.
     fn update_dop(&mut self, now: Instant, batch: &mut Vec<Command>) {
-        let owner = self
-            .dop_claims
-            .iter()
-            .copied()
-            .filter(|&id| {
-                let stream = self.streams().find(|s| s.id == id);
-                stream.is_some_and(|s| s.running && self.is_supported(s.rate))
-            })
-            .min();
+        let owner = self.dop_claims.iter().copied().find(|&id| {
+            let stream = self.streams().find(|s| s.id == id);
+            stream.is_some_and(|s| s.running && self.is_supported(s.rate))
+        });
         if owner == self.dop_owner {
             return;
         }
@@ -588,6 +598,8 @@ impl Control {
             .map(|s| s.id)
             .collect();
         for id in overdue {
+            // A last resort: the audio thread should always report it.
+            eprintln!("aas: a drain was never reported, answering it now");
             self.drained(id, now, &mut batch);
         }
         self.decide(now, settled, &mut batch);
@@ -646,6 +658,46 @@ pub(crate) fn eventfd() -> io::Result<OwnedFd> {
 mod tests {
     use super::*;
     use crate::config::{Format, Quality};
+
+    #[test]
+    fn a_drain_reported_before_its_request_is_answered_at_once() {
+        let (commands, _engine_commands) = rtrb::RingBuffer::new(64);
+        let (mut engine_events, events) = rtrb::RingBuffer::new(64);
+        let config = Config::default();
+        let audio = std::thread::current();
+        let mut control = Control::new(&config, 4.0, Vec::new(), commands, events, audio);
+        let now = Instant::now();
+        control.connected(1, "test".into());
+        let hello = Request::Hello {
+            version: proto::VERSION,
+        };
+        assert_eq!(control.request(1, Some(hello), now).reply, Some(Reply::Ok));
+        let configure = Request::Configure {
+            rate: 48000,
+            format: ClientFormat::S32,
+            channels: 2,
+            buffer_frames: 4096,
+        };
+        let answer = control.request(1, Some(configure), now);
+        assert_eq!(answer.reply, Some(Reply::Configured));
+        let start = control.request(1, Some(Request::Start), now);
+        assert_eq!(start.reply, Some(Reply::Ok));
+        // The client set the flag, and the audio thread saw the ring empty
+        // before the request arrived.
+        assert!(engine_events.push(Event::Drained(1)).is_ok());
+        control.handle_events(now);
+        let drain = control.request(1, Some(Request::Drain), now);
+        assert_eq!(drain.reply, Some(Reply::Ok));
+        // A restart forgets it.
+        let start = control.request(1, Some(Request::Start), now);
+        assert_eq!(start.reply, Some(Reply::Ok));
+        assert!(
+            control
+                .request(1, Some(Request::Drain), now)
+                .reply
+                .is_none()
+        );
+    }
 
     #[test]
     fn a_ring_holds_one_period_of_input_at_any_output_rate() {
