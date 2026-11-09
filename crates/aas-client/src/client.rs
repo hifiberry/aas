@@ -61,6 +61,8 @@ struct Stream {
 pub struct Client {
     socket: OwnedFd,
     stream: Option<Stream>,
+    /// A drain sent by `start_drain` whose reply has not been read.
+    drain_pending: bool,
 }
 
 impl Client {
@@ -74,9 +76,10 @@ impl Client {
         let socket = unsafe { OwnedFd::from_raw_fd(raw) };
         let rc = unsafe { libc::connect(socket.as_raw_fd(), (&raw const addr).cast(), len) };
         check(rc as isize)?;
-        let client = Client {
+        let mut client = Client {
             socket,
             stream: None,
+            drain_pending: false,
         };
         client.call(&Request::Hello {
             version: proto::VERSION,
@@ -107,6 +110,12 @@ impl Client {
 
     /// Waits for one reply and the descriptors that came with it.
     fn receive(&self) -> io::Result<(Reply, Vec<OwnedFd>)> {
+        self.receive_flags(0)?
+            .ok_or_else(|| io::Error::from(io::ErrorKind::WouldBlock))
+    }
+
+    /// Reads one reply. With `MSG_DONTWAIT` it is `None` if none is there.
+    fn receive_flags(&self, flags: libc::c_int) -> io::Result<Option<(Reply, Vec<OwnedFd>)>> {
         let mut data = [0u8; 64];
         let mut iov = libc::iovec {
             iov_base: data.as_mut_ptr().cast(),
@@ -122,10 +131,11 @@ impl Client {
         msg.msg_control = control.as_mut_ptr().cast();
         msg.msg_controllen = size_of_val(&control) as _;
         let n = loop {
-            let rc =
-                unsafe { libc::recvmsg(self.socket.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC) };
+            let flags = libc::MSG_CMSG_CLOEXEC | flags;
+            let rc = unsafe { libc::recvmsg(self.socket.as_raw_fd(), &mut msg, flags) };
             match check(rc) {
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(None),
                 Err(e) => return Err(e),
                 Ok(0) => return Err(daemon_gone()),
                 Ok(n) => break n,
@@ -134,7 +144,7 @@ impl Client {
         let fds = Self::descriptors(&msg);
         let reply = proto::decode_reply(&data[..n])
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad reply"))?;
-        Ok((reply, fds))
+        Ok(Some((reply, fds)))
     }
 
     fn descriptors(msg: &libc::msghdr) -> Vec<OwnedFd> {
@@ -158,9 +168,14 @@ impl Client {
     }
 
     /// Sends a request and waits for its reply. `Reply::Error` becomes the
-    /// error it names.
-    fn call(&self, request: &Request) -> io::Result<(Reply, Vec<OwnedFd>)> {
+    /// error it names. A drain still waiting is answered first, finished or
+    /// cancelled by this request, and its reply is set aside.
+    fn call(&mut self, request: &Request) -> io::Result<(Reply, Vec<OwnedFd>)> {
         self.send(request)?;
+        if self.drain_pending {
+            self.receive()?;
+            self.drain_done();
+        }
         match self.receive()? {
             (Reply::Error { code }, _) => Err(io::Error::from_raw_os_error(code as i32)),
             answer => Ok(answer),
@@ -225,14 +240,54 @@ impl Client {
     /// output. Starts the stream if it was not running. The stream is
     /// stopped afterwards.
     pub fn drain(&mut self) -> io::Result<()> {
+        self.start_drain()?;
+        let reply = self.receive();
+        self.drain_done();
+        match reply? {
+            (Reply::Error { code }, _) => Err(io::Error::from_raw_os_error(code as i32)),
+            _ => Ok(()),
+        }
+    }
+
+    /// Starts a drain without waiting for it. `poll_drain` tells when it is
+    /// done. Does nothing if one is under way already.
+    pub fn start_drain(&mut self) -> io::Result<()> {
+        if self.drain_pending {
+            return Ok(());
+        }
         let stream = self.stream()?;
         // After the last frames, which the daemon relies on.
         stream.ring.header().draining.store(1, Ordering::Release);
-        let result = self.call(&Request::Drain).map(drop);
+        if let Err(e) = self.send(&Request::Drain) {
+            self.drain_done();
+            return Err(e);
+        }
+        self.drain_pending = true;
+        Ok(())
+    }
+
+    /// Whether the drain `start_drain` began has finished. Never waits.
+    /// True also when no drain is under way.
+    pub fn poll_drain(&mut self) -> io::Result<bool> {
+        if !self.drain_pending {
+            return Ok(true);
+        }
+        let reply = match self.receive_flags(libc::MSG_DONTWAIT) {
+            Ok(None) => return Ok(false),
+            other => other,
+        };
+        self.drain_done();
+        match reply?.map(|(reply, _)| reply) {
+            Some(Reply::Error { code }) => Err(io::Error::from_raw_os_error(code as i32)),
+            _ => Ok(true),
+        }
+    }
+
+    fn drain_done(&mut self) {
+        self.drain_pending = false;
         if let Some(stream) = &self.stream {
             stream.ring.header().draining.store(0, Ordering::Release);
         }
-        result
     }
 
     /// Converts and writes as many whole frames as the ring has room for.

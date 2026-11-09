@@ -62,10 +62,14 @@ pub const SND_PCM_IOPLUG_HW_BUFFER_BYTES: c_int = 5;
 pub const SND_PCM_IOPLUG_HW_PERIODS: c_int = 6;
 
 pub const SND_PCM_STREAM_PLAYBACK: snd_pcm_stream_t = 0;
+/// The open mode bit for a non-blocking PCM.
+pub const SND_PCM_NONBLOCK: c_int = 1;
 
+pub const SND_PCM_STATE_SETUP: snd_pcm_state_t = 1;
 pub const SND_PCM_STATE_PREPARED: snd_pcm_state_t = 2;
 pub const SND_PCM_STATE_RUNNING: snd_pcm_state_t = 3;
 pub const SND_PCM_STATE_XRUN: snd_pcm_state_t = 4;
+pub const SND_PCM_STATE_DRAINING: snd_pcm_state_t = 5;
 pub const SND_PCM_STATE_PAUSED: snd_pcm_state_t = 6;
 pub const SND_PCM_STATE_DISCONNECTED: snd_pcm_state_t = 8;
 

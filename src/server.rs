@@ -276,6 +276,11 @@ impl Server {
                 .then(|| proto::decode_request(&buf[..n]))
                 .flatten();
             let answer = self.control.request(conn, request, now);
+            // Replies to earlier requests, such as a drain that finished or
+            // was cancelled by this one, go first.
+            for reply in self.control.take_replies_for(conn) {
+                self.answer(conn, Answer::from(reply), now);
+            }
             self.answer(conn, answer, now);
             self.notify();
         }

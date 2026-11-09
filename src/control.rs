@@ -54,6 +54,16 @@ pub fn min_ring_frames(rate: u32, latency_ms: f32) -> u32 {
     input.ceil() as u32 + 2 + FILTER_HALF + dop::MIN_FRAMES as u32
 }
 
+/// The smallest buffer a client may ask for: what one period of the
+/// output may take from its ring, and one period more to refill it in.
+/// Below that every cycle finds the ring short, an underrun each time.
+pub fn min_buffer_frames(rate: u32, latency_ms: f32) -> u32 {
+    let per_period = f64::from(latency_ms) / 1000.0 / f64::from(PERIODS);
+    let shortest = f64::from(MIN_PERIOD) / f64::from(MIN_RATE);
+    let refill = (f64::from(rate) * per_period.max(shortest)).ceil() as u32;
+    min_ring_frames(rate, latency_ms) + refill
+}
+
 /// What the server does with a request.
 pub struct Answer {
     /// Nothing for a drain, whose reply comes later.
@@ -256,6 +266,32 @@ impl Control {
         std::mem::take(&mut self.outbox)
     }
 
+    /// The ready replies for one connection, in order. They answer requests
+    /// it sent earlier, so they go out before the reply to a newer one.
+    pub fn take_replies_for(&mut self, conn: ConnId) -> Vec<Reply> {
+        let mut mine = Vec::new();
+        self.outbox.retain(|&(c, reply)| {
+            if c == conn {
+                mine.push(reply);
+            }
+            c != conn
+        });
+        mine
+    }
+
+    /// A request that changes the stream ends a drain still waiting. The
+    /// drain is answered with `ECANCELED`, so every request still gets one
+    /// reply, in order. A non-blocking client sends one while it drains.
+    fn cancel_drain(&mut self, conn: ConnId) {
+        let Some(stream) = self.stream_mut(conn) else {
+            return;
+        };
+        if stream.drain.take().is_some() {
+            let code = libc::ECANCELED as u32;
+            self.outbox.push((conn, Reply::Error { code }));
+        }
+    }
+
     /// Volume notifications for subscribers, in order. The server sends
     /// only the latest one each subscriber has waiting.
     pub fn take_notices(&mut self) -> Vec<(ConnId, Reply)> {
@@ -283,6 +319,12 @@ impl Control {
                 _ => Answer::fatal(libc::EPROTO),
             };
         }
+        if matches!(
+            request,
+            Request::Configure { .. } | Request::Start | Request::Stop | Request::Drain
+        ) {
+            self.cancel_drain(conn);
+        }
         match request {
             Request::Hello { .. } => Answer::reply(Reply::Ok),
             Request::Configure {
@@ -301,7 +343,9 @@ impl Control {
                 Answer::reply(Reply::Ok)
             }
             Request::SubscribeVolume => {
-                state.subscribed = true;
+                if let Some(state) = self.conns.get_mut(&conn) {
+                    state.subscribed = true;
+                }
                 self.volume_reply()
             }
         }
@@ -356,7 +400,10 @@ impl Control {
     ) -> Answer {
         // The client converts its format; the ring is always S32 stereo.
         let _ = format;
-        if !(MIN_RATE..=MAX_RATE).contains(&rate) || channels == 0 {
+        if !(MIN_RATE..=MAX_RATE).contains(&rate)
+            || channels == 0
+            || buffer_frames < min_buffer_frames(rate, self.latency_ms)
+        {
             return Answer::error(libc::EINVAL);
         }
         let mut batch = Vec::new();
@@ -866,6 +913,60 @@ mod tests {
             }
         }
         panic!("no source added");
+    }
+
+    #[test]
+    fn a_buffer_too_short_to_refill_a_period_is_refused() {
+        let (mut control, _commands, now) = hello();
+        for rate in [8000, 44100, 48000, 96000, 192000, 384000] {
+            let least = min_buffer_frames(rate, 12.0);
+            let short = control.request(1, Some(configure(rate, least - 1)), now);
+            let code = libc::EINVAL as u32;
+            assert_eq!(short.reply, Some(Reply::Error { code }), "{rate}");
+            let enough = control.request(1, Some(configure(rate, least)), now);
+            assert_eq!(enough.reply, Some(Reply::Configured), "{rate}");
+        }
+    }
+
+    #[test]
+    fn the_least_buffer_holds_two_periods_of_input_at_any_output_rate() {
+        let rates = [
+            8000, 11025, 22050, 44100, 48000, 96000, 176400, 192000, 384000,
+        ];
+        for latency_ms in [4.0, 12.0, 100.0] {
+            for from in rates {
+                let least = u64::from(min_buffer_frames(from, latency_ms));
+                for to in rates {
+                    let period = u64::from(period_frames(to, latency_ms));
+                    let input = (period * u64::from(from)).div_ceil(u64::from(to));
+                    assert!(least >= 2 * input, "{from} to {to} at {latency_ms} ms");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_request_during_a_drain_answers_the_drain_first() {
+        let (mut control, _commands, now) = hello();
+        let answer = control.request(1, Some(configure(48000, 4096)), now);
+        assert_eq!(answer.reply, Some(Reply::Configured));
+        assert_eq!(
+            control.request(1, Some(Request::Start), now).reply,
+            Some(Reply::Ok)
+        );
+        assert!(
+            control
+                .request(1, Some(Request::Drain), now)
+                .reply
+                .is_none()
+        );
+        let stop = control.request(1, Some(Request::Stop), now);
+        assert_eq!(stop.reply, Some(Reply::Ok));
+        let code = libc::ECANCELED as u32;
+        assert_eq!(control.take_replies_for(1), vec![Reply::Error { code }]);
+        // Nothing else is owed, now or later.
+        control.tick(now + Duration::from_secs(60));
+        assert!(control.take_replies().is_empty());
     }
 
     #[test]

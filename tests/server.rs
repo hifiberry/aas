@@ -860,3 +860,25 @@ fn a_subscriber_that_does_not_read_keeps_its_connection_and_gets_the_last_value(
     let got = call_raw(&watcher, &Request::GetVolume);
     assert_eq!(got, Some(Reply::Volume { percent: last }));
 }
+
+#[test]
+fn a_drain_started_without_waiting_finishes_and_a_stop_cancels_it() {
+    let (sink, _log) = memory_sink();
+    let daemon = Daemon::start(default_config(), sink);
+    let mut client = daemon.client_at(48000, 4096);
+    write_all(&mut client, &left_pattern(4096));
+    client.start_drain().unwrap();
+    // 4096 frames take 85 ms, so it cannot be done yet.
+    assert!(!client.poll_drain().unwrap());
+    assert!(wait_for(|| client.poll_drain().unwrap()));
+    assert_eq!(client.hw_position().unwrap(), 4096);
+    // A stop while a drain waits cancels it, and gets its own reply.
+    write_all(&mut client, &left_pattern(4096));
+    client.start_drain().unwrap();
+    client.stop().unwrap();
+    assert!(client.poll_drain().unwrap());
+    // The replies that follow still belong to their requests.
+    client.start().unwrap();
+    client.drain().unwrap();
+    assert_eq!(client.hw_position().unwrap(), 8192);
+}

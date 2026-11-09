@@ -3,9 +3,10 @@
 //! Every callback runs inside `catch_unwind` and returns `-EIO` on a panic,
 //! so a bug here fails one call instead of bringing down the player.
 //!
-//! Positions count from the last prepare, which sets up a fresh ring. So
-//! the frames the daemon has taken from the ring are ALSA's hw pointer, and
-//! the frames written to it are ALSA's application pointer.
+//! Positions count from when the stream was set up on a fresh ring, by
+//! hw_params or a later prepare. So the frames the daemon has taken from
+//! the ring are ALSA's hw pointer, and the frames written to it are ALSA's
+//! application pointer.
 
 use crate::ffi::*;
 use aas_client::client::Client;
@@ -13,6 +14,7 @@ use aas_client::convert::ClientFormat;
 use aas_client::proto;
 use std::ffi::{CStr, c_char, c_int, c_uint, c_ushort, c_void};
 use std::io;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr::{null, null_mut};
 use std::sync::Mutex;
@@ -36,6 +38,12 @@ const MAX_CHANNELS: c_uint = 2;
 /// the daemon's largest ring.
 const MAX_BUFFER_BYTES: c_uint = proto::MAX_BUFFER_FRAMES * 2;
 const MIN_PERIOD_BYTES: c_uint = 128;
+/// The smallest buffer offered. The daemon refuses a buffer it cannot keep
+/// fed, which depends on the rate and its latency target, so this floor
+/// only rounds the usual requests up to something it takes: 1024 frames of
+/// S32 stereo is two periods of input at 48 kHz on a 12 ms target, the
+/// Pi 3's. A smaller buffer at a higher rate is refused at hw_params.
+const MIN_BUFFER_BYTES: c_uint = 8192;
 const MAX_PERIODS: c_uint = 1024;
 
 type Io = *mut snd_pcm_ioplug_t;
@@ -50,10 +58,14 @@ struct Shared {
 
 struct Inner {
     client: Client,
+    /// The wake-up players poll. Each stream comes with its own eventfd,
+    /// which is put in place on this descriptor, so its number stays the
+    /// same for the life of the PCM.
+    wake: OwnedFd,
     stream: Option<Stream>,
 }
 
-/// The stream set up by the last prepare.
+/// The stream on the daemon, set up by hw_params or a later prepare.
 struct Stream {
     frame_bytes: usize,
     buffer: u64,
@@ -64,6 +76,8 @@ struct Stream {
     written: u64,
     /// The daemon's underrun count when the stream last started.
     underruns: u64,
+    /// Set up and not used yet, so a prepare can keep it.
+    fresh: bool,
 }
 
 impl Stream {
@@ -124,24 +138,78 @@ unsafe fn state(io: Io) -> snd_pcm_state_t {
     unsafe { (*io).state }
 }
 
-/// Makes the wake-up readable, so a poll returns at once. The daemon
-/// writes it only while the stream runs.
-fn arm(client: &Client) {
-    let fd = client.poll_fds()[0];
-    if fd >= 0 {
-        let one = 1u64;
-        // SAFETY: 8 bytes to a non-blocking eventfd.
-        unsafe { libc::write(fd, (&raw const one).cast::<c_void>(), 8) };
+/// A non-blocking eventfd.
+fn eventfd() -> Result<OwnedFd, c_int> {
+    // SAFETY: a plain syscall; the descriptor is owned at once.
+    let raw = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+    if raw < 0 {
+        return Err(errno(&io::Error::last_os_error()));
     }
+    Ok(unsafe { OwnedFd::from_raw_fd(raw) })
 }
 
-/// Clears the wake-up.
-fn clear(client: &Client) {
-    let fd = client.poll_fds()[0];
-    if fd >= 0 {
+impl Inner {
+    /// Makes the wake-up readable, so a poll returns at once. The daemon
+    /// writes it only while the stream runs.
+    fn arm(&self) {
+        let one = 1u64;
+        // SAFETY: 8 bytes to a non-blocking eventfd.
+        unsafe { libc::write(self.wake.as_raw_fd(), (&raw const one).cast::<c_void>(), 8) };
+    }
+
+    /// Clears the wake-up.
+    fn clear(&self) {
         let mut count = 0u64;
         // SAFETY: 8 bytes from a non-blocking eventfd.
-        unsafe { libc::read(fd, (&raw mut count).cast::<c_void>(), 8) };
+        unsafe { libc::read(self.wake.as_raw_fd(), (&raw mut count).cast::<c_void>(), 8) };
+    }
+
+    /// Sets up a stream on a fresh ring with the parameters libasound has
+    /// chosen. Its wake-up takes the place of the last one.
+    ///
+    /// # Safety
+    /// `io` is this PCM's handle, after hw_params.
+    #[allow(clippy::unnecessary_cast)] // c_ulong is 32 bits on some targets.
+    unsafe fn set_up(&mut self, io: Io) -> Result<(), c_int> {
+        let (format, channels, rate, buffer, period) = unsafe {
+            let io = &*io;
+            (
+                io.format,
+                io.channels,
+                io.rate,
+                io.buffer_size as u64,
+                io.period_size as u64,
+            )
+        };
+        let format = client_format(format).ok_or(libc::EINVAL)?;
+        if !(1..=MAX_CHANNELS).contains(&channels)
+            || buffer == 0
+            || buffer > u64::from(proto::MAX_BUFFER_FRAMES)
+        {
+            return Err(libc::EINVAL);
+        }
+        let boundary = self.stream.as_ref().map_or(u64::MAX, |s| s.boundary);
+        self.stream = None;
+        self.client
+            .configure(rate, format, channels as u8, buffer as u32)
+            .map_err(|e| errno(&e))?;
+        let wake = self.client.poll_fds()[0];
+        // SAFETY: both descriptors are open; dup3 replaces ours in one step.
+        let rc = unsafe { libc::dup3(wake, self.wake.as_raw_fd(), libc::O_CLOEXEC) };
+        if rc < 0 {
+            return Err(errno(&io::Error::last_os_error()));
+        }
+        self.stream = Some(Stream {
+            frame_bytes: format.sample_bytes() * channels as usize,
+            buffer,
+            period: period.max(1),
+            boundary,
+            written: 0,
+            underruns: self.client.underruns(),
+            fresh: true,
+        });
+        self.arm();
+        Ok(())
     }
 }
 
@@ -181,6 +249,7 @@ unsafe extern "C" fn start(io: Io) -> c_int {
             let underruns = inner.client.underruns();
             if let Some(stream) = &mut inner.stream {
                 stream.underruns = underruns;
+                stream.fresh = false;
             }
             Ok(0)
         })
@@ -191,7 +260,7 @@ unsafe extern "C" fn stop(io: Io) -> c_int {
     guard(|| unsafe {
         with(io, |inner| {
             let stopped = inner.client.stop();
-            arm(&inner.client);
+            inner.arm();
             stopped.map(|_| 0).map_err(|e| errno(&e))
         })
     })
@@ -223,7 +292,7 @@ unsafe extern "C" fn transfer(
         with(io, |inner| {
             let stream = inner.stream.as_mut().ok_or(libc::EBADFD)?;
             // Interleaved: the first area describes every frame.
-            let area = &*areas;
+            let area = areas.as_ref().ok_or(libc::EINVAL)?;
             if area.first % 8 != 0 || area.step as usize != stream.frame_bytes * 8 {
                 return Err(libc::EINVAL);
             }
@@ -232,6 +301,7 @@ unsafe extern "C" fn transfer(
             let bytes = std::slice::from_raw_parts(data, size as usize * stream.frame_bytes);
             let frames = inner.client.write(bytes).map_err(|e| errno(&e))?;
             stream.written += frames as u64;
+            stream.fresh = false;
             Ok(frames as snd_pcm_sframes_t)
         })
     })
@@ -248,64 +318,48 @@ unsafe extern "C" fn close(io: Io) -> c_int {
     })
 }
 
+/// Sets the stream up on the daemon at once, so that a rate, format or
+/// buffer it refuses fails hw_params, where a player expects it to.
 unsafe extern "C" fn hw_params(io: Io, _params: *mut snd_pcm_hw_params_t) -> c_int {
-    guard(|| unsafe {
-        let (format, channels) = ((*io).format, (*io).channels);
-        if client_format(format).is_none() || !(1..=MAX_CHANNELS).contains(&channels) {
-            return Err(libc::EINVAL);
-        }
-        // The stream is set up in prepare, which hw_params is followed by.
-        with(io, |inner| {
-            inner.stream = None;
-            Ok(0)
-        })
-    })
+    guard(|| unsafe { with(io, |inner| inner.set_up(io).map(|_| 0)) })
 }
 
-/// Sets up a fresh ring on the daemon, so the stream starts empty and its
-/// positions start at zero, as ALSA's do after prepare.
-#[allow(clippy::unnecessary_cast)] // c_ulong is 32 bits on some targets.
+/// Starts the stream empty, its positions at zero, as ALSA's are after
+/// prepare. A stream not used since it was set up is kept; any other is
+/// set up again on a fresh ring.
 unsafe extern "C" fn prepare(io: Io) -> c_int {
     guard(|| unsafe {
         let boundary = boundary((*io).pcm)?;
-        let format = client_format((*io).format).ok_or(libc::EINVAL)?;
-        let channels = (*io).channels;
-        let rate = (*io).rate;
-        let buffer = (*io).buffer_size as u64;
-        let period = (*io).period_size as u64;
-        if !(1..=MAX_CHANNELS).contains(&channels)
-            || buffer == 0
-            || buffer > u64::from(proto::MAX_BUFFER_FRAMES)
-        {
-            return Err(libc::EINVAL);
-        }
         with(io, |inner| {
-            inner.stream = None;
-            inner
-                .client
-                .configure(rate, format, channels as u8, buffer as u32)
-                .map_err(|e| errno(&e))?;
-            inner.stream = Some(Stream {
-                frame_bytes: format.sample_bytes() * channels as usize,
-                buffer,
-                period: period.max(1),
-                boundary,
-                written: 0,
-                underruns: inner.client.underruns(),
-            });
-            arm(&inner.client);
+            if !inner.stream.as_ref().is_some_and(|s| s.fresh) {
+                inner.set_up(io)?;
+            }
+            let stream = inner.stream.as_mut().ok_or(libc::EBADFD)?;
+            stream.boundary = boundary;
+            stream.fresh = false;
+            inner.arm();
             Ok(0)
         })
     })
 }
 
-/// Blocks until the daemon has played everything written. Starts the
-/// stream first if it was not running.
+/// Returns once the daemon has played everything written, starting the
+/// stream first if it was not running. A non-blocking PCM gets `-EAGAIN`
+/// until then, as alsa-lib's own ioplug drain gives it: the player polls,
+/// and the PCM leaves DRAINING when the drain is done.
 unsafe extern "C" fn drain(io: Io) -> c_int {
     guard(|| unsafe {
+        let nonblock = (*io).nonblock != 0;
         with(io, |inner| {
-            inner.client.drain().map_err(|e| errno(&e))?;
-            Ok(0)
+            if !nonblock {
+                inner.client.drain().map_err(|e| errno(&e))?;
+                return Ok(0);
+            }
+            inner.client.start_drain().map_err(|e| errno(&e))?;
+            match inner.client.poll_drain().map_err(|e| errno(&e))? {
+                true => Ok(0),
+                false => Err(libc::EAGAIN),
+            }
         })
     })
 }
@@ -317,7 +371,7 @@ unsafe extern "C" fn pause(io: Io, enable: c_int) -> c_int {
         with(io, |inner| {
             if enable != 0 {
                 let stopped = inner.client.stop();
-                arm(&inner.client);
+                inner.arm();
                 stopped.map_err(|e| errno(&e))?;
             } else {
                 inner.client.start().map_err(|e| errno(&e))?;
@@ -344,7 +398,8 @@ unsafe extern "C" fn poll_descriptors(io: Io, pfd: *mut libc::pollfd, space: c_u
         }
         with(io, |inner| {
             let pfds = std::slice::from_raw_parts_mut(pfd, 2);
-            for (p, fd) in pfds.iter_mut().zip(inner.client.poll_fds()) {
+            let fds = [inner.wake.as_raw_fd(), inner.client.poll_fds()[1]];
+            for (p, fd) in pfds.iter_mut().zip(fds) {
                 *p = libc::pollfd {
                     fd,
                     events: libc::POLLIN,
@@ -359,7 +414,9 @@ unsafe extern "C" fn poll_descriptors(io: Io, pfd: *mut libc::pollfd, space: c_u
 /// Turns what poll saw into what the player may do. A hang-up is
 /// `POLLERR` and the PCM is disconnected. A stream that is not running
 /// gets no wake-up from the daemon, so it keeps the wake-up armed itself
-/// and polls as level triggered, as a card does.
+/// and polls as level triggered, as a card does. While a non-blocking
+/// drain waits, the socket brings its reply; then the PCM is set up again,
+/// as alsa-lib's ioplug leaves it after a drain, and may be written.
 unsafe extern "C" fn poll_revents(
     io: Io,
     pfd: *mut libc::pollfd,
@@ -376,19 +433,25 @@ unsafe extern "C" fn poll_revents(
             std::slice::from_raw_parts(pfd, nfds as usize)
         };
         let state = state(io);
-        let (events, disconnected) = with(io, |inner| {
+        let (events, next) = with(io, |inner| {
             let socket = inner.client.poll_fds()[1];
             let hangup = libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
             let hung_up = pfds
                 .iter()
                 .any(|p| p.fd == socket && p.revents & hangup != 0);
             if hung_up || inner.client.check_alive().is_err() {
-                return Ok((libc::POLLERR, true));
+                return Ok((libc::POLLERR, Some(SND_PCM_STATE_DISCONNECTED)));
             }
-            clear(&inner.client);
+            inner.clear();
+            if state == SND_PCM_STATE_DRAINING {
+                return match inner.client.poll_drain().map_err(|e| errno(&e))? {
+                    true => Ok((libc::POLLOUT, Some(SND_PCM_STATE_SETUP))),
+                    false => Ok((0, None)),
+                };
+            }
             let Some(stream) = &inner.stream else {
-                arm(&inner.client);
-                return Ok((libc::POLLERR, false));
+                inner.arm();
+                return Ok((libc::POLLERR, None));
             };
             let read = inner.client.hw_position().map_err(|e| errno(&e))?;
             let avail = stream.avail(read);
@@ -399,21 +462,20 @@ unsafe extern "C" fn poll_revents(
                 SND_PCM_STATE_RUNNING if avail >= stream.period => libc::POLLOUT,
                 SND_PCM_STATE_RUNNING => 0,
                 SND_PCM_STATE_PREPARED | SND_PCM_STATE_PAUSED if avail > 0 => {
-                    arm(&inner.client);
+                    inner.arm();
                     libc::POLLOUT
                 }
                 SND_PCM_STATE_PREPARED | SND_PCM_STATE_PAUSED => 0,
                 _ => {
-                    arm(&inner.client);
+                    inner.arm();
                     libc::POLLERR
                 }
             };
-            Ok((events, false))
+            let xrun = state == SND_PCM_STATE_RUNNING && events == libc::POLLERR;
+            Ok((events, xrun.then_some(SND_PCM_STATE_XRUN)))
         })?;
-        if disconnected {
-            snd_pcm_ioplug_set_state(io, SND_PCM_STATE_DISCONNECTED);
-        } else if state == SND_PCM_STATE_RUNNING && events == libc::POLLERR {
-            snd_pcm_ioplug_set_state(io, SND_PCM_STATE_XRUN);
+        if let Some(next) = next {
+            snd_pcm_ioplug_set_state(io, next);
         }
         *revents = events as c_ushort;
         Ok(0)
@@ -506,7 +568,7 @@ unsafe fn constrain(io: Io) -> Result<(), c_int> {
         ))?;
         check(minmax(
             SND_PCM_IOPLUG_HW_BUFFER_BYTES,
-            2 * MIN_PERIOD_BYTES,
+            MIN_BUFFER_BYTES,
             MAX_BUFFER_BYTES,
         ))?;
         check(minmax(SND_PCM_IOPLUG_HW_PERIODS, 2, MAX_PERIODS))?;
@@ -529,6 +591,7 @@ unsafe fn open(
     }
     let client = Client::connect(proto::default_socket_path()).map_err(|e| errno(&e))?;
     let socket = client.poll_fds()[1];
+    let wake = eventfd()?;
     let io = Box::into_raw(Box::new(snd_pcm_ioplug_t {
         version: SND_PCM_IOPLUG_VERSION,
         name: NAME.as_ptr(),
@@ -555,6 +618,7 @@ unsafe fn open(
         io,
         inner: Mutex::new(Inner {
             client,
+            wake,
             stream: None,
         }),
     }));
@@ -572,6 +636,9 @@ unsafe fn open(
             snd_pcm_ioplug_delete(io);
             return Err(e);
         }
+        // alsa-lib tells an ioplug of snd_pcm_nonblock, but not of a PCM
+        // opened non-blocking. Its drain reads this field.
+        (*io).nonblock = c_int::from(mode & SND_PCM_NONBLOCK != 0);
         *pcmp = (*io).pcm;
     }
     Ok(0)

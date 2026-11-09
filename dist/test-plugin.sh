@@ -40,9 +40,12 @@ wait_daemon() {
 	return 1
 }
 
-# A helper for what aplay cannot show: pause, delay and underrun.
+# A helper for what aplay cannot show: pause, delay, underrun, polling
+# with descriptors fetched once, and a non-blocking drain.
 cat >"$work/pcmtest.c" <<'EOF'
 #include <alsa/asoundlib.h>
+#include <fcntl.h>
+#include <poll.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -61,13 +64,13 @@ static double now(void)
 	return t.tv_sec + t.tv_nsec / 1e9;
 }
 
-static int setup(const char *device, int *can_pause)
+static int setup(const char *device, int mode, int *can_pause)
 {
 	snd_pcm_hw_params_t *hw;
 	int err;
 
 	snd_pcm_hw_params_alloca(&hw);
-	if ((err = snd_pcm_open(&pcm, device, SND_PCM_STREAM_PLAYBACK, 0)) < 0 ||
+	if ((err = snd_pcm_open(&pcm, device, SND_PCM_STREAM_PLAYBACK, mode)) < 0 ||
 	    (err = snd_pcm_hw_params_any(pcm, hw)) < 0 ||
 	    (err = snd_pcm_hw_params_set_access(pcm, hw, SND_PCM_ACCESS_RW_INTERLEAVED)) < 0 ||
 	    (err = snd_pcm_hw_params_set_format(pcm, hw, SND_PCM_FORMAT_S16_LE)) < 0 ||
@@ -83,12 +86,17 @@ static int setup(const char *device, int *can_pause)
 	return 0;
 }
 
-/* Writes silence. Returns 0, or the error, which it prints. */
+/* Writes silence. Returns 0, or the error, which it prints. A
+ * non-blocking PCM waits in snd_pcm_wait for room. */
 static int put(long frames)
 {
 	while (frames > 0) {
 		long n = frames < (long)period ? frames : (long)period;
 		snd_pcm_sframes_t r = snd_pcm_writei(pcm, silence, n);
+		if (r == -EAGAIN) {
+			snd_pcm_wait(pcm, 1000);
+			continue;
+		}
 		if (r < 0) {
 			printf("write: %s\n", snd_strerror(r));
 			return r;
@@ -202,12 +210,170 @@ static int underrun_test(void)
 	return 0;
 }
 
+/* Plays `frames` by polling the descriptors in `pfd`, as a player with
+ * its own event loop does. Fails on a poll that times out, an error, or
+ * so many wake-ups that the descriptors must be stale. */
+static int play_polled(struct pollfd *pfd, int n, long frames, int *polls)
+{
+	long done = 0;
+
+	*polls = 0;
+	while (done < frames) {
+		unsigned short revents = 0;
+		if (++*polls > 2000) {
+			printf("over 2000 wake-ups for %ld frames\n", frames);
+			return 1;
+		}
+		if (poll(pfd, n, 1000) <= 0) {
+			printf("no wake-up within 1 s\n");
+			return 1;
+		}
+		if (snd_pcm_poll_descriptors_revents(pcm, pfd, n, &revents) < 0 ||
+		    (revents & POLLERR)) {
+			printf("poll error after %ld frames\n", done);
+			return 1;
+		}
+		if (!(revents & POLLOUT))
+			continue;
+		snd_pcm_sframes_t avail = snd_pcm_avail_update(pcm);
+		if (avail < 0) {
+			printf("avail: %s\n", snd_strerror(avail));
+			return 1;
+		}
+		long n2 = avail < frames - done ? avail : frames - done;
+		n2 = n2 > 16384 ? 16384 : n2;
+		snd_pcm_sframes_t r = snd_pcm_writei(pcm, silence, n2);
+		if (r < 0 && r != -EAGAIN) {
+			printf("write: %s\n", snd_strerror(r));
+			return 1;
+		}
+		done += r > 0 ? r : 0;
+	}
+	return 0;
+}
+
+/* A player fetches the poll descriptors once. The stream is then set up
+ * again, after an xrun and after a seek, and the player keeps polling what
+ * it fetched. A descriptor freed before the reset makes the fresh ones
+ * land on other numbers if the plugin does not keep its own. */
+static int stable_test(int spare)
+{
+	struct pollfd cached[8], fresh[8];
+	int n = snd_pcm_poll_descriptors_count(pcm), polls, i;
+
+	if (n <= 0 || n > 8 || snd_pcm_poll_descriptors(pcm, cached, n) != n) {
+		printf("no poll descriptors\n");
+		return 1;
+	}
+	close(spare);
+	if (put(rate / 4))
+		return 1;
+	usleep(300000);
+	if (snd_pcm_writei(pcm, silence, period) != -EPIPE || snd_pcm_prepare(pcm) < 0) {
+		printf("no xrun to recover from\n");
+		return 1;
+	}
+	if (put(rate / 4) || snd_pcm_drop(pcm) < 0 || snd_pcm_prepare(pcm) < 0) {
+		printf("seek failed\n");
+		return 1;
+	}
+	snd_pcm_poll_descriptors(pcm, fresh, n);
+	for (i = 0; i < n; i++) {
+		if (fresh[i].fd != cached[i].fd) {
+			printf("descriptor %d moved from %d to %d\n", i, cached[i].fd, fresh[i].fd);
+			return 1;
+		}
+	}
+	if (play_polled(cached, n, rate, &polls))
+		return 1;
+	snd_pcm_drain(pcm);
+	printf("descriptors %d and %d kept through an xrun and a seek; 1 s played "
+	       "polling them, %d wake-ups\n", cached[0].fd, cached[1].fd, polls);
+	return 0;
+}
+
+/* A non-blocking drain returns -EAGAIN at once, and the PCM leaves
+ * DRAINING when the audio has played, as alsa-lib's ioplug does. A drop
+ * during the drain cancels it, and the PCM plays on. */
+static int nonblock_drain_test(void)
+{
+	struct pollfd pfd[8];
+	int n = snd_pcm_poll_descriptors_count(pcm), err, calls = 1;
+	double t0, first, done;
+	snd_pcm_sframes_t queued;
+
+	if (put(rate))
+		return 1;
+	queued = (long)buffer - snd_pcm_avail(pcm);
+	t0 = now();
+	err = snd_pcm_drain(pcm);
+	first = now() - t0;
+	if (err != -EAGAIN) {
+		printf("non-blocking drain gave %d, not -EAGAIN\n", err);
+		return 1;
+	}
+	snd_pcm_poll_descriptors(pcm, pfd, n);
+	while (snd_pcm_state(pcm) == SND_PCM_STATE_DRAINING) {
+		unsigned short revents = 0;
+		if (now() - t0 > 3.0 || poll(pfd, n, 1000) <= 0) {
+			printf("the drain did not end\n");
+			return 1;
+		}
+		snd_pcm_poll_descriptors_revents(pcm, pfd, n, &revents);
+		if (revents & POLLERR) {
+			printf("poll error while draining\n");
+			return 1;
+		}
+		if (revents & POLLOUT) {
+			calls++;
+			err = snd_pcm_drain(pcm);
+			if (err < 0 && err != -EAGAIN) {
+				printf("drain: %s\n", snd_strerror(err));
+				return 1;
+			}
+		}
+	}
+	done = now() - t0;
+	double least = queued / (double)rate;
+	if (first > 0.05 || done < least - 0.01 || done > least + 0.3) {
+		printf("first call took %.0f ms; drained in %.0f ms with %.0f ms queued\n",
+		       first * 1000, done * 1000, least * 1000);
+		return 1;
+	}
+	/* Cancel one: drop while it drains, then play on and drain blocking. */
+	if (snd_pcm_prepare(pcm) < 0 || put(rate / 2) || snd_pcm_drain(pcm) != -EAGAIN ||
+	    snd_pcm_drop(pcm) < 0 || snd_pcm_prepare(pcm) < 0 || put(rate / 4)) {
+		printf("drop during a drain did not leave the PCM usable\n");
+		return 1;
+	}
+	snd_pcm_nonblock(pcm, 0);
+	if ((err = snd_pcm_drain(pcm)) < 0) {
+		printf("blocking drain after the cancel: %s\n", snd_strerror(err));
+		return 1;
+	}
+	printf("-EAGAIN after %.1f ms, drained in %.0f ms with %.0f ms queued, %d calls; "
+	       "a drop cancelled the next drain and the PCM played on\n",
+	       first * 1000, done * 1000, least * 1000, calls);
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
-	int can_pause = 0;
+	int can_pause = 0, mode = 0, spare = -1;
 
-	if (argc != 3 || setup(argv[2], &can_pause))
+	if (argc != 3)
 		return 2;
+	if (!strcmp(argv[1], "nonblock"))
+		mode = SND_PCM_NONBLOCK;
+	/* Held while the PCM is set up, freed before it is set up again. */
+	if (!strcmp(argv[1], "stable"))
+		spare = open("/dev/null", O_RDONLY);
+	if (setup(argv[2], mode, &can_pause))
+		return 2;
+	if (!strcmp(argv[1], "stable"))
+		return stable_test(spare);
+	if (!strcmp(argv[1], "nonblock"))
+		return nonblock_drain_test();
 	if (!strcmp(argv[1], "pause")) {
 		if (!can_pause) {
 			printf("the PCM cannot pause\n");
@@ -281,6 +447,44 @@ case_underrun_returns_epipe() {
 	if out=$("$work/pcmtest" underrun aas); then pass $name "$out"; else fail $name "$out"; fi
 }
 
+case_poll_descriptors_survive_a_reset() {
+	name=poll_descriptors_survive_a_reset
+	if out=$("$work/pcmtest" stable aas); then pass $name "$out"; else fail $name "$out"; fi
+}
+
+case_nonblocking_drain() {
+	name=nonblocking_drain
+	if out=$("$work/pcmtest" nonblock aas); then pass $name "$out"; else fail $name "$out"; fi
+}
+
+# A buffer smaller than the daemon can keep fed is rounded up, or refused
+# at hw_params. One that is taken plays without an underrun.
+case_small_buffer_rounds_up_or_is_refused() {
+	name=small_buffer_rounds_up_or_is_refused
+	bad=""
+	report=""
+	for spec in "S16_LE 48000" "S32_LE 48000" "S32_LE 192000"; do
+		set -- $spec
+		start=$(now_ms)
+		if aplay -v -D aas -t raw -f $1 -c 2 -r $2 --buffer-size=64 -d 1 /dev/zero \
+			>"$work/out" 2>&1; then
+			took=$(($(now_ms) - start))
+			size=$(sed -n 's/^ *buffer_size *: *//p' "$work/out" | head -n1)
+			if grep -qi underrun "$work/out" || [ $took -gt 1300 ]; then
+				bad="$bad $1/$2(${size} frames, $took ms, underrun or slow)"
+			else
+				report="$report $1/$2: buffer ${size} frames, played in $took ms;"
+			fi
+		elif grep -q "hw params\|hw_params" "$work/out"; then
+			report="$report $1/$2: refused at hw_params;"
+		else
+			bad="$bad $1/$2($(tr '\n' ' ' <"$work/out"))"
+		fi
+	done
+	report="${report# }"
+	if [ -z "$bad" ]; then pass $name "${report%;}"; else fail $name "$bad"; fi
+}
+
 case_daemon_killed_during_write_returns_an_error() {
 	name=daemon_killed_during_write_returns_an_error
 	aplay -q -D default -t raw -f S16_LE -c 2 -r $rate /dev/zero 2>"$work/err" &
@@ -349,6 +553,9 @@ case_drain_returns
 case_pause_and_resume
 case_delay_is_plausible
 case_underrun_returns_epipe
+case_poll_descriptors_survive_a_reset
+case_nonblocking_drain
+case_small_buffer_rounds_up_or_is_refused
 case_daemon_killed_during_write_returns_an_error
 case_client_reconnects_after_restart
 case_player_killed_keeps_daemon_up
