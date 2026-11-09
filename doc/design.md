@@ -115,6 +115,18 @@ reconnect *(call)*.
 `aas` accepts mono, stereo and float clients, and converts them to the output's
 format and channel count *(call)*.
 
+The plugin converts every client to S32 stereo *(call)*. Conversion runs in the
+client's process, in the plugin's `transfer` callback, so it costs the audio
+thread nothing and the shared ring has one format. S16 and S24 are shifted left
+exactly. Mono is copied to both channels.
+
+A client's buffer is its shared ring. The plugin offers at least 8192 bytes, so
+the usual small requests round up to something the daemon takes. The daemon
+refuses, at `hw_params`, a buffer too small to keep it fed: what one of its periods
+takes from the ring, with room for the resampler and for DoP detection, and one
+period more to refill it in. The largest ring is 2^20 frames. "No client is ever refused"
+is about the number of clients, not the size of a ring.
+
 A player that does not use ALSA `default` today is reconfigured to use it *(call)*.
 A direct `hw:` open cannot work while the daemon owns the card, and no PulseAudio
 endpoint is planned.
@@ -174,8 +186,13 @@ Further rules *(call)*:
   remaining client's rate after a short settle time, with a brief fade. So a
   handover between two players does not leave the new one resampled for the whole
   session.
+- More generally, when a client stops and no remaining client is at the output
+  rate, the output switches after the settle time to the rate of the oldest
+  remaining client. A client that has left never holds the rate. A client at the
+  output rate arriving during the settle time cancels the switch.
+- The settle time is 500 ms.
 - If the card does not support a client's rate, the output uses the nearest
-  supported rate and the client is resampled.
+  supported rate and the client is resampled. In a tie, the lower rate wins.
 - A source that reports no signal (see Analog input) does not count as active.
 - The card keeps its current rate when idle. It does not return to a default.
   The configured default rate applies only from startup until the first client
@@ -221,6 +238,10 @@ costs up to 1.85 times as much in `f64` as in `f32`.
 - The resampler only works on float, so a resampled client is resampled in `f32`
   and converted back *(call)*. That client is never bit-perfect anyway.
 
+On the Pi 3, mixing in `i32` costs about 3.5 times as much as in `f32` and 1.8 times
+as much as in `f64`. That is still about 1% of a period at 48 kHz with 8 sources,
+but `i32` saves no CPU.
+
 ### Resampling
 
 Resampling has two quality settings *(call)*. `high` is the default on every board.
@@ -238,7 +259,8 @@ Input volumes are calculated on this path. So is the output volume on cards
 without a hardware volume (see Volume).
 
 Volume changes and input detection opening or closing use short fades, so they do
-not click *(call)*.
+not click *(call)*. A fade lasts 10 ms *(call)*. A gain change applies at once
+when nothing is audible, since there is nothing to fade.
 
 Mixed clients that sum above full scale clip at the S32 limits unless a limiter
 plugin is in the chain. There is no built-in limiter.
@@ -272,6 +294,10 @@ bypassed.
 
 A resampled client is never bit-perfect.
 
+When the output is reconfigured, for example for a rate change, the stream being
+cut is faded out even in forced bit-perfect. The audio is being interrupted
+anyway, and a fade stops the click. DoP is exempt, as below.
+
 ### DoP
 
 DSD over PCM is supported. It looks like PCM, so `aas` detects its marker bytes.
@@ -283,6 +309,23 @@ turns it into loud noise. While a DoP stream plays:
 - it has exclusive use of the output. Other clients stay connected, but their
   audio is discarded until the DoP stream stops *(call)*. This is the one exception
   to mixing, because mixing would produce noise.
+
+How a DoP stream ends and what fills its gaps:
+
+- A DoP stream that underruns keeps the output for 100 ms and sends DoP silence:
+  the markers are kept and the payload is `0x69`. Then it releases the output.
+  Stopping or disconnecting releases it at once. So a stalled DoP client costs
+  other clients at most 100 ms of audio.
+- A short DoP period is padded with DoP silence, not zeros. Zeros drop the
+  markers, and the DAC would leave DoP mode with a pop.
+- At the end of a drain, a tail too short to judge that carries markers is
+  replaced by DoP silence rather than mixed.
+- A DoP stream at a rate the card does not support is discarded, not resampled.
+  Resampling would turn it into noise, so that client plays silence.
+- Detection needs a run of 16 frames. A PCM frame that looks like a marker is
+  held back until the run decides, and each hold is counted. In loud PCM from a
+  client that keeps less than a period and 16 frames buffered, this can cause a
+  one frame gap.
 
 ## Volume
 
@@ -297,15 +340,33 @@ reconfigured to use it, instead of writing to the card's mixer directly *(call)*
 The mode is detected from the card, and the config can override it and name the
 control *(call)*.
 
+The control is called `Master` *(call)*, which `mpd.conf.default` already uses
+on device `default`. Its range is 0 to 100, linear in dB from -60 dB to 0 dB,
+and 0 mutes *(call)*. A request above 100 is an error, not clamped. Every client
+holding the control is told when the volume changes, so a second mixer sees a
+change made by the first.
+
+In forced bit-perfect mode `aas` never touches the samples. On a card whose
+hardware control has neither a mute switch nor a mute step, 0 then plays at the
+control's lowest level, not silence.
+
 ## Latency
 
 The 4 ms budget covers what `aas` adds, from the plugin receiving audio to the
 audio leaving the card *(call)*. A player's own ALSA buffer is outside it. At
 48 kHz, 4 ms is 192 frames.
 
-Default periods, with 2 periods buffered:
+One rule sets the period from a latency target, in place of a table per board
+*(call)*. The period is the largest power of two where 2 periods fit in the
+target, with a minimum of 32 frames. The default target is 4 ms on Pi 5 class
+boards and 12 ms on everything else *(call)*. The Pi 4 uses 12 ms until it is
+measured *(call)*. That is safe, not final. The target is set with `latency_ms`
+in the config.
 
-| Rate | Pi 5 | Pi 3 |
+The rule gives exactly the periods the measurements chose, with 2 periods
+buffered:
+
+| Rate | 4 ms, Pi 5 | 12 ms, Pi 3 |
 |---|---|---|
 | 44.1 and 48 kHz | 64 frames | 256 frames |
 | 96 kHz | 128 frames | 512 frames |
@@ -314,6 +375,11 @@ Default periods, with 2 periods buffered:
 So the Pi 3 default is about 11 to 12 ms. It held for an hour under full load with
 the board throttled. Its 64 frame period did not hold under that load. The Pi 4
 default waits for its measurement.
+
+Measured through the cable in stage 2, `aas` adds three of its periods, not two:
+about 16 ms on the Pi 3. The engine renders a period and then waits for room on
+the card, so one period waits outside the card's buffer. Until the engine waits
+first and renders after, the target is not met. See `doc/measurements.md`.
 
 Resampling adds roughly 1 to 2 ms. A resampled client may exceed 4 ms, in
 preference to reducing resampling quality *(call)*.
@@ -457,8 +523,14 @@ All of this is *(call)*:
 - A stalled or crashed client loses only its own audio. It never blocks the audio
   thread.
 - The daemon runs under systemd and restarts if it crashes. The ALSA plugin
-  reports an error to the client, and the client reconnects.
+  reports an error to the client, and the client reconnects by reopening the
+  device, as ALSA players do after a write error. The plugin does not reconnect
+  an open handle by itself. Neither does the control, so a mixer that holds it
+  open must be restarted.
 - If the card is missing at startup, the daemon keeps running and waits for it.
+  Meanwhile audio goes to a timed null sink, so players keep running in real
+  time rather than hanging, and the daemon retries the card every second
+  *(call)*.
 - After an xrun on the card, the daemon recovers without client involvement.
 
 ## Bluetooth
@@ -476,6 +548,9 @@ confirmed.
 
 One plain TOML file *(call)* holds the output card, the latency target, the
 default rate, the processing format, the bit-perfect mode and the plugin chain.
+It is flat, and every key is optional. Idle behaviour is `idle = "zeros"` or
+`idle = "off"` with `idle_delay_s`, 60 by default. A delay with `zeros` is an
+error.
 
 Volumes and other values changed at runtime are state, not configuration. They
 are kept in a separate state file owned by the daemon and restored at startup
@@ -520,9 +595,9 @@ config *(call)*.
 
 ## Testing
 
-Development starts in a local VM with a virtual sound card. `snd-aloop` and
-`snd-dummy` are available. The VM proves logic and behaviour. Its timing is not
-real, so it cannot prove the latency target.
+Testing uses the test boards, not a VM *(call)*. Both boards can load
+`snd-aloop` and may be reinstalled, so a VM would add a step and prove nothing
+more. Logic is tested on any machine with a null sink.
 
 The main test board is a Compute Module 5 with a DAC+ ADC Pro and a heatsink, and
 it may be reinstalled freely. It needs the `hifiberry-dacplusadcpro,slave` overlay
@@ -530,7 +605,8 @@ before any sound card appears, and real-time rights for the daemon. Latency is
 proven there. A Pi 3 with a DAC+ ADC is the second test board. A Pi 4 is still
 needed, to confirm 4 ms and set its defaults.
 
-Bit-exactness is tested automatically by comparing samples through `snd-aloop`.
+Bit-exactness is tested automatically by comparing samples through `snd-aloop`,
+with `bit-check`.
 Real latency is measured on the test board with a cable from the DAC output to the
 ADC input *(call)*.
 
@@ -543,8 +619,7 @@ and a Lyrion server.
 
 ## Not yet known
 
-- What `i32` costs. It has not been measured. Since mixing already costs about 1%
-  of a period, it is not expected to save much CPU.
+- What `i32` costs on the CM5. On the Pi 3 it is measured, see Processing format.
 - How `librespot`, `shairport-sync`, `raat` and `sendspin` connect to audio
   today. Their configuration is not in the `hifiberry-os` repository. Check this
   before relying on "ALSA clients need no changes" for them.
