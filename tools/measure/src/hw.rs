@@ -51,3 +51,40 @@ pub fn open(
     }
     Ok(pcm)
 }
+
+/// Open `device` as S32 stereo at exactly `rate`, with the period and
+/// buffer nearest to those asked for. For a device that sets its own
+/// limits, such as a plugin. Returns the period and buffer in frames.
+pub fn open_near(
+    device: &str,
+    direction: Direction,
+    rate: u32,
+    period: usize,
+    periods: u32,
+) -> Result<(PCM, usize, usize), String> {
+    let e = |what: &str, err: alsa::Error| format!("{device}: {what}: {err}");
+    let pcm = PCM::new(device, direction, false).map_err(|x| e("open", x))?;
+    let (got_period, got_buffer) = {
+        let hw = HwParams::any(&pcm).map_err(|x| e("hw params", x))?;
+        hw.set_channels(CHANNELS).map_err(|x| e("channels", x))?;
+        hw.set_rate(rate, ValueOr::Nearest)
+            .map_err(|x| e("rate", x))?;
+        hw.set_format(Format::S32LE).map_err(|x| e("format", x))?;
+        hw.set_access(Access::RWInterleaved)
+            .map_err(|x| e("access", x))?;
+        hw.set_period_size_near(period as Frames, ValueOr::Nearest)
+            .map_err(|x| e("period", x))?;
+        hw.set_buffer_size_near(period as Frames * Frames::from(periods))
+            .map_err(|x| e("buffer", x))?;
+        pcm.hw_params(&hw).map_err(|x| e("apply", x))?;
+        let got_rate = hw.get_rate().map_err(|x| e("get rate", x))?;
+        if got_rate != rate {
+            return Err(format!("{device}: runs at {got_rate} Hz, not {rate}"));
+        }
+        (
+            hw.get_period_size().map_err(|x| e("get period", x))? as usize,
+            hw.get_buffer_size().map_err(|x| e("get buffer", x))? as usize,
+        )
+    };
+    Ok((pcm, got_period, got_buffer))
+}
