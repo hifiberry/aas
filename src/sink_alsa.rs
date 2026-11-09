@@ -1,7 +1,8 @@
 //! The sound card as a sink, through ALSA.
 //!
 //! Finding the card and converting samples need no ALSA, so they build and
-//! are tested everywhere. `AlsaSink` needs the `alsa-output` feature.
+//! are tested everywhere. `AlsaSink` and `AlsaVolume` need the
+//! `alsa-output` feature.
 
 use std::fs;
 
@@ -94,12 +95,131 @@ pub fn encode(format: CardFormat, frames: &[[i32; 2]], out: &mut [u8]) {
     }
 }
 
+/// The device of the card named in the config, or else the one found.
+#[cfg(feature = "alsa-output")]
+fn card_device(card: Option<&str>) -> Result<String, String> {
+    let ids = card_ids();
+    let card = match card {
+        Some(card) if is_present(card, &ids) => card.to_string(),
+        Some(card) => return Err(format!("card {card} not found")),
+        None => find_card(&ids).ok_or("no sound card found")?,
+    };
+    Ok(format!("hw:{card}"))
+}
+
 #[cfg(feature = "alsa-output")]
 pub use card::AlsaSink;
+#[cfg(feature = "alsa-output")]
+pub use mixer::AlsaVolume;
+
+#[cfg(feature = "alsa-output")]
+mod mixer {
+    use super::card_device;
+    use crate::volume::{HardwareVolume, find_control};
+    use alsa::Round;
+    use alsa::mixer::{MilliBel, Mixer, Selem, SelemId};
+
+    /// A volume control of the card, set in dB. Used from the control
+    /// thread only.
+    pub struct AlsaVolume {
+        mixer: Mixer,
+        id: SelemId,
+        range: (f32, f32),
+        switch: bool,
+    }
+
+    /// The control's dB range, if it has a playback volume with one.
+    fn db_range(selem: &Selem) -> Option<(f32, f32)> {
+        if !selem.has_playback_volume() {
+            return None;
+        }
+        let (min, max) = selem.get_playback_db_range();
+        (min < max).then(|| (min.0 as f32 / 100.0, max.0 as f32 / 100.0))
+    }
+
+    impl AlsaVolume {
+        /// The card's volume control: `configured` if the card has it, else
+        /// the first of `Digital`, `Master` and `PCM`. None if the card is
+        /// missing or has no such control with a range in dB.
+        pub fn open(card: Option<&str>, configured: Option<&str>) -> Option<AlsaVolume> {
+            let device = match card_device(card) {
+                Ok(device) => device,
+                Err(e) => {
+                    eprintln!("aas: no hardware volume: {e}");
+                    return None;
+                }
+            };
+            let mixer = match Mixer::new(&device, false) {
+                Ok(mixer) => mixer,
+                Err(e) => {
+                    eprintln!("aas: no hardware volume: {device}: {e}");
+                    return None;
+                }
+            };
+            let names: Vec<String> = mixer
+                .iter()
+                .filter_map(Selem::new)
+                .filter(|selem| db_range(selem).is_some())
+                .filter_map(|selem| {
+                    let id = selem.get_id();
+                    let name = id.get_name().ok()?;
+                    (id.get_index() == 0).then(|| name.to_string())
+                })
+                .collect();
+            let Some(name) = find_control(&names, configured) else {
+                match configured {
+                    Some(c) => eprintln!("aas: {device} has no volume control {c}"),
+                    None => eprintln!("aas: {device} has no hardware volume"),
+                }
+                return None;
+            };
+            let id = SelemId::new(&name, 0);
+            let selem = mixer.find_selem(&id)?;
+            let range = db_range(&selem)?;
+            let switch = selem.has_playback_switch();
+            eprintln!(
+                "aas: hardware volume {device} {name}, {} to {} dB",
+                range.0, range.1
+            );
+            Some(AlsaVolume {
+                mixer,
+                id,
+                range,
+                switch,
+            })
+        }
+    }
+
+    impl HardwareVolume for AlsaVolume {
+        fn set_db(&mut self, db: f32) {
+            // Takes in changes others made, so the element is current.
+            let _ = self.mixer.handle_events();
+            let Some(selem) = self.mixer.find_selem(&self.id) else {
+                eprintln!("aas: the hardware volume control has gone");
+                return;
+            };
+            let muted = db == f32::NEG_INFINITY;
+            let db = if muted { self.range.0 } else { db };
+            let value = MilliBel((db * 100.0).round() as i64);
+            if let Err(e) = selem.set_playback_db_all(value, Round::Floor) {
+                eprintln!("aas: could not set the hardware volume: {e}");
+            }
+            if self.switch {
+                if let Err(e) = selem.set_playback_switch_all(i32::from(!muted)) {
+                    eprintln!("aas: could not set the hardware mute: {e}");
+                }
+            }
+        }
+
+        fn range_db(&self) -> (f32, f32) {
+            self.range
+        }
+    }
+}
 
 #[cfg(feature = "alsa-output")]
 mod card {
-    use super::{CardFormat, card_ids, encode, find_card, is_present};
+    use super::{CardFormat, card_device, encode};
     use crate::latency::PERIODS;
     use crate::sink::{Sink, SinkError};
     use alsa::pcm::{Access, Format, Frames, HwParams, PCM};
@@ -259,13 +379,7 @@ mod card {
         /// The device to open. A named card is looked for first, so that a
         /// missing one does not make libasound log on every retry.
         fn device(&self) -> Result<String, String> {
-            let ids = card_ids();
-            let card = match &self.card {
-                Some(card) if is_present(card, &ids) => card.clone(),
-                Some(card) => return Err(format!("card {card} not found")),
-                None => find_card(&ids).ok_or("no sound card found")?,
-            };
-            Ok(format!("hw:{card}"))
+            card_device(self.card.as_deref())
         }
 
         fn failed(&mut self, failure: String) {

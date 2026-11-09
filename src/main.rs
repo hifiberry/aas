@@ -1,15 +1,17 @@
-//! The daemon: `aas [--config PATH] [--socket PATH]`.
+//! The daemon: `aas [--config PATH] [--socket PATH] [--state PATH]`.
 
 use aas::config::{self, Config};
 use aas::rt;
 use aas::server;
 use aas::sink::Sink;
+use aas::state;
+use aas::volume::HardwareVolume;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
-const USAGE: &str = "usage: aas [--config PATH] [--socket PATH]";
+const USAGE: &str = "usage: aas [--config PATH] [--socket PATH] [--state PATH]";
 
 /// Set by SIGTERM and SIGINT.
 static SHUTDOWN: OnceLock<Arc<AtomicBool>> = OnceLock::new();
@@ -23,18 +25,21 @@ extern "C" fn on_signal(_: libc::c_int) {
 struct Args {
     config: PathBuf,
     socket: PathBuf,
+    state: PathBuf,
 }
 
 fn parse_args() -> Result<Args, String> {
     let mut args = Args {
         config: PathBuf::from(config::DEFAULT_PATH),
         socket: aas_client::proto::default_socket_path(),
+        state: PathBuf::from(state::DEFAULT_PATH),
     };
     let mut given = std::env::args_os().skip(1);
     while let Some(arg) = given.next() {
         let slot = match arg.to_str() {
             Some("--config") => &mut args.config,
             Some("--socket") => &mut args.socket,
+            Some("--state") => &mut args.state,
             _ => return Err(format!("unknown argument {}", arg.to_string_lossy())),
         };
         *slot = given
@@ -73,6 +78,25 @@ fn output(_config: &Config) -> Box<dyn Sink> {
     Box::new(aas::sink::NullSink::default())
 }
 
+/// The card's volume control, unless the config asks for software volume.
+#[cfg(feature = "alsa-output")]
+fn hardware_volume(config: &Config) -> Option<Box<dyn HardwareVolume>> {
+    if config.volume_mode == Some(config::VolumeMode::Software) {
+        return None;
+    }
+    let control = config.volume_control.as_deref();
+    let found = aas::sink_alsa::AlsaVolume::open(config.card.as_deref(), control);
+    if found.is_none() && config.volume_mode == Some(config::VolumeMode::Hardware) {
+        eprintln!("aas: warning: no hardware volume found, using software volume");
+    }
+    found.map(|v| Box::new(v) as Box<dyn HardwareVolume>)
+}
+
+#[cfg(not(feature = "alsa-output"))]
+fn hardware_volume(_config: &Config) -> Option<Box<dyn HardwareVolume>> {
+    None
+}
+
 fn main() -> ExitCode {
     let args = match parse_args() {
         Ok(args) => args,
@@ -95,7 +119,8 @@ fn main() -> ExitCode {
     let shutdown = Arc::new(AtomicBool::new(false));
     handle_signals(shutdown.clone());
     let sink = output(&config);
-    match server::run(config, sink, &args.socket, shutdown) {
+    let hardware = hardware_volume(&config);
+    match server::run(config, sink, &args.socket, &args.state, hardware, shutdown) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("aas: {e}");

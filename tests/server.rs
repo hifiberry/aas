@@ -24,6 +24,7 @@ const PATIENCE: Duration = Duration::from_secs(20);
 struct Daemon {
     _dir: tempfile::TempDir,
     path: PathBuf,
+    state: PathBuf,
     shutdown: Arc<AtomicBool>,
     thread: Option<JoinHandle<Result<(), String>>>,
 }
@@ -31,15 +32,27 @@ struct Daemon {
 impl Daemon {
     fn start(config: Config, sink: Box<dyn Sink>) -> Daemon {
         let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state.toml");
+        Daemon::start_with(config, sink, dir, state)
+    }
+
+    /// A daemon that keeps its state in `state`.
+    fn start_with(
+        config: Config,
+        sink: Box<dyn Sink>,
+        dir: tempfile::TempDir,
+        state: PathBuf,
+    ) -> Daemon {
         let path = dir.path().join("aas.sock");
         let shutdown = Arc::new(AtomicBool::new(false));
         let thread = {
-            let (path, shutdown) = (path.clone(), shutdown.clone());
-            thread::spawn(move || server::run(config, sink, &path, shutdown))
+            let (path, state, shutdown) = (path.clone(), state.clone(), shutdown.clone());
+            thread::spawn(move || server::run(config, sink, &path, &state, None, shutdown))
         };
         let daemon = Daemon {
             _dir: dir,
             path,
+            state,
             shutdown,
             thread: Some(thread),
         };
@@ -704,4 +717,117 @@ fn a_client_of_another_protocol_version_gets_an_error() {
     // A client of this version is still served.
     let mut client = daemon.client_at(48000, 1024);
     client.start().unwrap();
+}
+
+/// Sends one request on a raw connection.
+fn send_raw(fd: &OwnedFd, request: &Request) {
+    let message = proto::encode_request(request);
+    let sent = unsafe {
+        libc::send(
+            fd.as_raw_fd(),
+            message.as_ptr().cast(),
+            message.len(),
+            libc::MSG_NOSIGNAL,
+        )
+    };
+    assert_eq!(sent, message.len() as isize);
+}
+
+/// The next message on a raw connection, or None if none comes in time.
+fn receive_raw(fd: &OwnedFd, timeout: Duration) -> Option<Reply> {
+    let mut pfd = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let rc = unsafe { libc::poll(&mut pfd, 1, timeout.as_millis() as i32) };
+    if rc <= 0 {
+        return None;
+    }
+    let mut reply = [0u8; 64];
+    let n = unsafe { libc::recv(fd.as_raw_fd(), reply.as_mut_ptr().cast(), reply.len(), 0) };
+    assert!(n > 0, "the daemon hung up");
+    proto::decode_reply(&reply[..n as usize])
+}
+
+/// A raw connection that has said hello.
+fn volume_client(daemon: &Daemon) -> OwnedFd {
+    let fd = raw_connect(&daemon.path);
+    send_raw(
+        &fd,
+        &Request::Hello {
+            version: proto::VERSION,
+        },
+    );
+    assert_eq!(receive_raw(&fd, PATIENCE), Some(Reply::Ok));
+    fd
+}
+
+fn call_raw(fd: &OwnedFd, request: &Request) -> Option<Reply> {
+    send_raw(fd, request);
+    receive_raw(fd, PATIENCE)
+}
+
+#[test]
+fn a_volume_set_by_one_client_reaches_a_subscriber_and_survives_a_restart() {
+    let keep = tempfile::tempdir().unwrap();
+    let state = keep.path().join("state.toml");
+    {
+        let (sink, _log) = memory_sink();
+        let dir = tempfile::tempdir().unwrap();
+        let daemon = Daemon::start_with(default_config(), sink, dir, state.clone());
+        let watcher = volume_client(&daemon);
+        // A fresh install starts at 0 dB.
+        let subscribed = call_raw(&watcher, &Request::SubscribeVolume);
+        assert_eq!(subscribed, Some(Reply::Volume { percent: 100 }));
+        let setter = volume_client(&daemon);
+        let set = call_raw(&setter, &Request::SetVolume { percent: 40 });
+        assert_eq!(set, Some(Reply::Ok));
+        let notice = receive_raw(&watcher, PATIENCE);
+        assert_eq!(notice, Some(Reply::Volume { percent: 40 }));
+        // The same value again is no change, and over 100 is refused.
+        let same = call_raw(&setter, &Request::SetVolume { percent: 40 });
+        assert_eq!(same, Some(Reply::Ok));
+        let over = call_raw(&setter, &Request::SetVolume { percent: 101 });
+        assert!(matches!(over, Some(Reply::Error { .. })));
+        assert_eq!(receive_raw(&watcher, Duration::from_millis(200)), None);
+        // A subscriber can still ask and set.
+        let got = call_raw(&watcher, &Request::GetVolume);
+        assert_eq!(got, Some(Reply::Volume { percent: 40 }));
+        let set = call_raw(&watcher, &Request::SetVolume { percent: 45 });
+        assert_eq!(set, Some(Reply::Ok));
+        let own = receive_raw(&watcher, PATIENCE);
+        assert_eq!(own, Some(Reply::Volume { percent: 45 }));
+        let got = call_raw(&setter, &Request::GetVolume);
+        assert_eq!(got, Some(Reply::Volume { percent: 45 }));
+        assert_eq!(daemon.state, state);
+    }
+    let (sink, _log) = memory_sink();
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start_with(default_config(), sink, dir, state);
+    let client = volume_client(&daemon);
+    let got = call_raw(&client, &Request::GetVolume);
+    assert_eq!(got, Some(Reply::Volume { percent: 45 }));
+}
+
+#[test]
+fn software_volume_scales_the_output() {
+    let (sink, log) = memory_sink();
+    let daemon = Daemon::start(default_config(), sink);
+    let control = volume_client(&daemon);
+    let set = call_raw(&control, &Request::SetVolume { percent: 50 });
+    assert_eq!(set, Some(Reply::Ok));
+    let mut client = daemon.client_at(48000, 4096);
+    let frames = vec![[1 << 30, -(1 << 30)]; 4096];
+    client.start().unwrap();
+    write_all(&mut client, &frames);
+    client.drain().unwrap();
+    // -30 dB of 2^30, as f32 mixing rounds it.
+    let want = (f64::from(1 << 30) * 10f64.powf(-30.0 / 20.0)) as i32;
+    let played = log.frames();
+    let hit = played
+        .iter()
+        .any(|f| (f[0] - want).abs() < 64 && (f[1] + want).abs() < 64);
+    assert!(hit, "no frame at -30 dB");
+    assert!(!played.contains(&[1 << 30, -(1 << 30)]));
 }

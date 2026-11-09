@@ -1,6 +1,16 @@
 //! Control protocol between client and daemon. Every request is
 //! `REQUEST_LEN` bytes and every reply `REPLY_LEN` bytes, little endian.
 //! A message is a u32 tag followed by u32 arguments, unused ones zero.
+//!
+//! Each request gets one reply, in order. The one exception is a
+//! connection that has sent `SubscribeVolume`: it is also sent
+//! `Reply::Volume` whenever the output volume changes, from any
+//! connection, including its own. Such a notification looks the same as
+//! the reply to `GetVolume`. Both carry the volume at the time they were
+//! sent, so a subscriber keeps the last `Volume` it read, whatever it
+//! answers. Its other requests get replies other than `Volume`, which it
+//! matches to them in order. A notification that does not fit in the
+//! socket buffer is dropped.
 
 use crate::convert::ClientFormat;
 use std::path::PathBuf;
@@ -26,10 +36,13 @@ pub enum Request {
     Start,
     Stop,
     Drain,
+    /// Answered by `Volume`.
     GetVolume,
+    /// From 0 to 100. Answered by `Ok`, or an error over 100.
     SetVolume {
         percent: u8,
     },
+    /// Answered by `Volume`, then sent `Volume` on every change.
     SubscribeVolume,
 }
 

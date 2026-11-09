@@ -11,6 +11,8 @@ use crate::engine::{Command, Event, INITIAL_SOURCES, Source};
 use crate::latency::{PERIODS, period_frames};
 use crate::rate::{ClientId, RatePolicy, SETTLE};
 use crate::resample::Resampler;
+use crate::state::State;
+use crate::volume::OutputVolume;
 use aas_client::convert::ClientFormat;
 use aas_client::proto::{self, Reply, Request};
 use aas_client::ring::{self, Ring};
@@ -18,6 +20,7 @@ use rtrb::{Consumer, Producer};
 use std::collections::BTreeMap;
 use std::io;
 use std::os::fd::{AsFd, FromRawFd, OwnedFd};
+use std::path::PathBuf;
 use std::thread::Thread;
 use std::time::{Duration, Instant};
 
@@ -36,6 +39,9 @@ const RATIO_HEADROOM: f64 = 1.1;
 /// How long a drain may wait beyond what its ring holds, should the audio
 /// thread never report it drained.
 const DRAIN_SPARE: Duration = Duration::from_millis(500);
+/// How long the volume stays unchanged before the state file is written,
+/// so that a volume slider being dragged does not write it many times.
+const SAVE_DELAY: Duration = Duration::from_secs(1);
 
 /// Frames a client's ring holds at least, so that one period's input fits
 /// whatever rate the output runs at. One period takes at most what the
@@ -99,6 +105,8 @@ struct Conn {
     name: String,
     hello: bool,
     stream: Option<Stream>,
+    /// Told of every change to the output volume.
+    subscribed: bool,
 }
 
 pub struct Control {
@@ -131,6 +139,13 @@ pub struct Control {
     dop_owner: Option<ClientId>,
     /// Replies that were not ready when their request came.
     outbox: Vec<(ConnId, Reply)>,
+    volume: OutputVolume,
+    /// Where the volume is kept across restarts. None keeps it nowhere.
+    state: Option<PathBuf>,
+    /// When the state file is due to be written.
+    save_at: Option<Instant>,
+    /// Volume notifications for subscribers, not yet sent.
+    notices: Vec<(ConnId, Reply)>,
 }
 
 impl Control {
@@ -166,21 +181,43 @@ impl Control {
             dop_claims: Vec::new(),
             dop_owner: None,
             outbox: Vec::new(),
+            volume: OutputVolume::new(None, config.bit_perfect),
+            state: None,
+            save_at: None,
+            notices: Vec::new(),
         }
+    }
+
+    /// Takes over the output volume, at the level the state file keeps.
+    /// In hardware mode this sets the card's mixer. Call before `start`.
+    pub fn restore_volume(&mut self, mut volume: OutputVolume, state: PathBuf) {
+        volume.set(State::load(&state).output_percent);
+        let mode = if volume.is_hardware() {
+            "hardware"
+        } else {
+            "software"
+        };
+        eprintln!("aas: output volume {}%, in {mode}", volume.percent());
+        self.volume = volume;
+        self.state = Some(state);
     }
 
     /// Opens the output at the default rate. Until a client plays it sends
     /// zeros, and the idle rule applies from now.
     pub fn start(&mut self, now: Instant) {
-        let mut batch = Vec::new();
+        let mut batch = vec![Command::SetGain(self.volume.gain())];
         self.open_output(&mut batch);
         self.idle_since = Some(now);
         self.send(batch);
     }
 
     /// Stops the audio thread. It returns once it has seen this.
+    /// Writes the state file if a change is still waiting for it.
     pub fn shutdown(&mut self) {
         self.send(vec![Command::Shutdown]);
+        if self.save_at.is_some() {
+            self.save();
+        }
     }
 
     pub fn connected(&mut self, conn: ConnId, name: String) {
@@ -189,6 +226,7 @@ impl Control {
             name,
             hello: false,
             stream: None,
+            subscribed: false,
         };
         self.conns.insert(conn, state);
     }
@@ -210,6 +248,12 @@ impl Control {
     /// Replies that have become ready, such as finished drains.
     pub fn take_replies(&mut self) -> Vec<(ConnId, Reply)> {
         std::mem::take(&mut self.outbox)
+    }
+
+    /// Volume notifications for subscribers. Unlike a reply, one that
+    /// cannot be sent at once is dropped.
+    pub fn take_notices(&mut self) -> Vec<(ConnId, Reply)> {
+        std::mem::take(&mut self.notices)
     }
 
     /// Handles one message. `None` is a message that does not decode.
@@ -244,10 +288,51 @@ impl Control {
             Request::Start => self.start_stream(conn, now),
             Request::Stop => self.stop_stream(conn, now),
             Request::Drain => self.drain(conn, now),
-            // Volume comes with the volume work, not here.
-            Request::GetVolume | Request::SetVolume { .. } | Request::SubscribeVolume => {
-                Answer::error(libc::EOPNOTSUPP)
+            Request::GetVolume => self.volume_reply(),
+            Request::SetVolume { percent } if percent > 100 => Answer::error(libc::EINVAL),
+            Request::SetVolume { percent } => {
+                self.set_volume(percent, now);
+                Answer::reply(Reply::Ok)
             }
+            Request::SubscribeVolume => {
+                state.subscribed = true;
+                self.volume_reply()
+            }
+        }
+    }
+
+    fn volume_reply(&self) -> Answer {
+        let percent = self.volume.percent();
+        Answer::reply(Reply::Volume { percent })
+    }
+
+    /// Sets the output volume and tells every subscriber. The state file is
+    /// written once the volume has been left alone for a while.
+    fn set_volume(&mut self, percent: u8, now: Instant) {
+        if percent == self.volume.percent() {
+            return;
+        }
+        self.volume.set(percent);
+        self.send(vec![Command::SetGain(self.volume.gain())]);
+        let subscribers = self.conns.iter().filter(|(_, c)| c.subscribed);
+        let notice = Reply::Volume { percent };
+        self.notices
+            .extend(subscribers.map(|(&conn, _)| (conn, notice)));
+        if self.state.is_some() {
+            self.save_at = Some(now + SAVE_DELAY);
+        }
+    }
+
+    fn save(&mut self) {
+        self.save_at = None;
+        let Some(path) = &self.state else {
+            return;
+        };
+        let state = State {
+            output_percent: self.volume.percent(),
+        };
+        if let Err(e) = state.save(path) {
+            eprintln!("aas: could not save {}: {e}", path.display());
         }
     }
 
@@ -630,6 +715,9 @@ impl Control {
             }
         }
         self.send(batch);
+        if self.save_at.is_some_and(|at| now >= at) {
+            self.save();
+        }
     }
 
     /// Queues the commands in one commit and wakes the audio thread. Waits

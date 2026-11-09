@@ -9,6 +9,7 @@ use crate::engine::Engine;
 use crate::format::{F32, F64, I32, Processing};
 use crate::rt;
 use crate::sink::{FallbackSink, RatesWatch, Sink};
+use crate::volume::{HardwareVolume, OutputVolume};
 use aas_client::client::socket_address;
 use aas_client::proto::{self, REQUEST_LEN, Reply};
 use rtrb::RingBuffer;
@@ -41,11 +42,15 @@ fn check(rc: isize) -> io::Result<usize> {
 }
 
 /// Runs the daemon until `shutdown` is set. The sink is wrapped in a
-/// `FallbackSink`, so a missing card does not stop playback.
+/// `FallbackSink`, so a missing card does not stop playback. The output
+/// volume is kept in the file `state`, and set on `hardware` if given, else
+/// in software.
 pub fn run(
     config: Config,
     sink: Box<dyn Sink>,
     socket: &Path,
+    state: &Path,
+    hardware: Option<Box<dyn HardwareVolume>>,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), String> {
     raise_file_limit();
@@ -82,7 +87,7 @@ pub fn run(
         }
     }
     .map_err(|e| format!("audio thread: {e}"))?;
-    let control = Control::new(
+    let mut control = Control::new(
         &config,
         latency_ms,
         supported,
@@ -90,6 +95,8 @@ pub fn run(
         events,
         audio.thread().clone(),
     );
+    let volume = OutputVolume::new(hardware, config.bit_perfect);
+    control.restore_volume(volume, state.to_path_buf());
     let mut server = Server {
         listener,
         notify,
@@ -188,6 +195,18 @@ impl Server {
         for (conn, reply) in self.control.take_replies() {
             self.answer(conn, Answer::from(reply), now);
         }
+        self.notify();
+    }
+
+    /// Sends the volume notifications. One that does not fit in the
+    /// socket's buffer is dropped, so that a slow subscriber holds nobody
+    /// up. A connection that has gone is closed by the next poll.
+    fn notify(&mut self) {
+        for (conn, notice) in self.control.take_notices() {
+            if let Some(fd) = self.conns.get(&conn) {
+                let _ = send_reply(fd, &notice, &[]);
+            }
+        }
     }
 
     fn accept_all(&mut self) {
@@ -245,6 +264,7 @@ impl Server {
                 .flatten();
             let answer = self.control.request(conn, request, now);
             self.answer(conn, answer, now);
+            self.notify();
         }
     }
 

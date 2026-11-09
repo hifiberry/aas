@@ -15,6 +15,8 @@ pub mod rt;
 pub mod server;
 pub mod sink;
 pub mod sink_alsa;
+pub mod state;
+pub mod volume;
 
 // Makes `assert_no_alloc` see every allocation in the unit tests.
 #[cfg(test)]
