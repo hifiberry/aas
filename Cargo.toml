@@ -34,5 +34,7 @@ serde = { version = "1", features = ["derive"] }
 toml = "1"
 
 [dev-dependencies]
-assert_no_alloc = "1"
+# Without its default `disable_release`, so the allocation checks also run
+# in release builds, which the audio thread is.
+assert_no_alloc = { version = "1", default-features = false }
 tempfile = "3"
