@@ -107,6 +107,9 @@ mod card {
 
     const CHANNELS: usize = 2;
 
+    /// How long a write waits for room before the card counts as stuck.
+    const WAIT_MS: u32 = 500;
+
     /// Rates offered to the rate rules, if the card takes them.
     const RATES: [u32; 14] = [
         8000, 11025, 16000, 22050, 32000, 44100, 48000, 64000, 88200, 96000, 176400, 192000,
@@ -119,6 +122,14 @@ mod card {
             CardFormat::S24 => Format::S24LE,
             CardFormat::S16 => Format::S16LE,
         }
+    }
+
+    /// Opens without waiting: a card that another program holds gives
+    /// EBUSY at once, which counts as gone, so the null sink plays on and
+    /// the open is retried. A blocking open would wait for the card to be
+    /// free, holding up the start or the audio thread.
+    fn open_pcm(device: &str) -> alsa::Result<PCM> {
+        PCM::new(device, Direction::Playback, true)
     }
 
     /// The best format the card takes, and its rates in that format.
@@ -142,6 +153,8 @@ mod card {
         format: CardFormat,
         /// Frames in the card's buffer.
         buffer: u32,
+        /// Frames in the card's period, which is also its avail_min.
+        period: usize,
         /// Room for one engine period in the card's format.
         bytes: Vec<u8>,
         /// The card's whole buffer of silence, to restart it after an xrun.
@@ -153,14 +166,31 @@ mod card {
             self.format.bytes() * CHANNELS
         }
 
-        /// Writes all of `bytes`, waiting for room.
+        /// Writes all of `bytes`. The PCM is non-blocking, so this waits in
+        /// `snd_pcm_wait` until there is room for the next period, or what
+        /// is left of it, and writes it whole, as a blocking write would.
+        /// Writing part of a period and then waiting for avail_min would
+        /// wait up to a period too long. A card that gives no room in
+        /// `WAIT_MS` fails.
         fn write_all(&self, bytes: &[u8]) -> alsa::Result<()> {
             let io = self.pcm.io_bytes();
             let mut done = 0;
             while done < bytes.len() {
-                match io.writei(&bytes[done..]) {
+                let want = ((bytes.len() - done) / self.frame_bytes()).min(self.period);
+                let room = self.pcm.avail_update()?;
+                let result = if room < want as Frames {
+                    Err(alsa::Error::new("snd_pcm_avail_update", libc::EAGAIN))
+                } else {
+                    io.writei(&bytes[done..])
+                };
+                match result {
                     Ok(frames) => done += frames * self.frame_bytes(),
-                    Err(e) if e.errno() == libc::EINTR || e.errno() == libc::EAGAIN => {}
+                    Err(e) if e.errno() == libc::EINTR => {}
+                    Err(e) if e.errno() == libc::EAGAIN => {
+                        if !self.pcm.wait(Some(WAIT_MS))? {
+                            return Err(alsa::Error::new("snd_pcm_wait", libc::ETIMEDOUT));
+                        }
+                    }
                     Err(e) => return Err(e),
                 }
             }
@@ -219,7 +249,7 @@ mod card {
         fn probe(&self) -> Result<Vec<u32>, String> {
             let device = self.device()?;
             let e = |err: alsa::Error| format!("{device}: {err}");
-            let pcm = PCM::new(&device, Direction::Playback, false).map_err(e)?;
+            let pcm = open_pcm(&device).map_err(e)?;
             let hw = HwParams::any(&pcm).map_err(e)?;
             let (format, rates) = choose(&hw).map_err(e)?;
             eprintln!("aas: card {device} takes {}, {rates:?}", format.name());
@@ -248,7 +278,7 @@ mod card {
         fn try_open(&mut self, rate: u32, period: u32) -> Result<Open, String> {
             let device = self.device()?;
             let e = |what: &str, err: alsa::Error| format!("{device}: {what}: {err}");
-            let pcm = PCM::new(&device, Direction::Playback, false).map_err(|x| e("open", x))?;
+            let pcm = open_pcm(&device).map_err(|x| e("open", x))?;
             let (format, buffer, card_period) = {
                 let hw = HwParams::any(&pcm).map_err(|x| e("hw params", x))?;
                 let (format, rates) = choose(&hw).map_err(|x| e("format", x))?;
@@ -294,6 +324,7 @@ mod card {
                 pcm,
                 format,
                 buffer: buffer as u32,
+                period: card_period as usize,
                 bytes: vec![0; period as usize * frame_bytes],
                 zeros: vec![0; buffer as usize * frame_bytes],
             })
@@ -321,7 +352,8 @@ mod card {
             let Some(open) = &mut self.open else {
                 return Err(SinkError::Gone);
             };
-            match open.play(frames) {
+            // alsa::Error holds the positive errno.
+            let result = match open.play(frames) {
                 Ok(()) => Ok(()),
                 Err(e) if e.errno() == libc::ENODEV => Err(SinkError::Gone),
                 // An underrun, a suspend, or anything else a restart may cure.
@@ -329,7 +361,12 @@ mod card {
                     Ok(()) => Err(SinkError::Xrun),
                     Err(_) => Err(SinkError::Gone),
                 },
+            };
+            if result == Err(SinkError::Gone) {
+                // Lets the driver go, so that the module can be unloaded.
+                self.open = None;
             }
+            result
         }
 
         fn close(&mut self) {

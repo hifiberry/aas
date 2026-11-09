@@ -1,5 +1,6 @@
 //! Where the engine's output goes.
 
+use rtrb::{Consumer, Producer, RingBuffer};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -227,18 +228,22 @@ impl SinkLog {
     }
 }
 
-/// Rates a sink has newly reported, for the control thread to pick up.
-#[derive(Clone, Default)]
-pub struct RatesWatch(Arc<Mutex<Option<Vec<u32>>>>);
+/// Slots for rate changes not yet picked up. A change that finds them full
+/// is offered again at the next try.
+const RATE_SLOTS: usize = 4;
+
+/// Rates a sink has newly reported, for the control thread to pick up. The
+/// audio thread hands them over through a lock-free queue.
+pub struct RatesWatch(Consumer<Vec<u32>>);
 
 impl RatesWatch {
-    /// The rates reported since the last call, if they changed.
-    pub fn take(&self) -> Option<Vec<u32>> {
-        self.0.lock().unwrap().take()
-    }
-
-    fn publish(&self, rates: Vec<u32>) {
-        *self.0.lock().unwrap() = Some(rates);
+    /// The latest rates reported since the last call, if any.
+    pub fn take(&mut self) -> Option<Vec<u32>> {
+        let mut latest = None;
+        while let Ok(rates) = self.0.pop() {
+            latest = Some(rates);
+        }
+        latest
     }
 }
 
@@ -253,7 +258,7 @@ pub struct FallbackSink {
     inner: Box<dyn Sink>,
     /// The rates last published, or found at the start.
     rates: Vec<u32>,
-    watch: RatesWatch,
+    watch: Option<Producer<Vec<u32>>>,
     null: NullSink,
     /// The format to reopen with.
     format: (u32, u32),
@@ -267,7 +272,7 @@ impl FallbackSink {
     pub fn new(inner: Box<dyn Sink>) -> FallbackSink {
         FallbackSink {
             rates: inner.supported_rates(),
-            watch: RatesWatch::default(),
+            watch: None,
             inner,
             null: NullSink::default(),
             format: (0, 0),
@@ -277,9 +282,11 @@ impl FallbackSink {
         }
     }
 
-    /// Where changes to the inner sink's rates are published.
-    pub fn rates_watch(&self) -> RatesWatch {
-        self.watch.clone()
+    /// Where changes to the inner sink's rates are published from now on.
+    pub fn rates_watch(&mut self) -> RatesWatch {
+        let (producer, consumer) = RingBuffer::new(RATE_SLOTS);
+        self.watch = Some(producer);
+        RatesWatch(consumer)
     }
 
     /// Opens the inner sink. This only happens on a reopen or a retry, so
@@ -289,9 +296,15 @@ impl FallbackSink {
         self.live = self.inner.open(rate, period).is_ok();
         self.retry_at = Instant::now() + self.retry;
         let rates = self.inner.supported_rates();
-        if rates != self.rates {
-            self.rates = rates.clone();
-            self.watch.publish(rates);
+        if rates == self.rates {
+            return;
+        }
+        let Some(watch) = &mut self.watch else {
+            self.rates = rates;
+            return;
+        };
+        if watch.push(rates.clone()).is_ok() {
+            self.rates = rates;
         }
     }
 }
@@ -483,7 +496,7 @@ mod tests {
     #[test]
     fn fallback_publishes_the_rates_of_a_sink_that_appears() {
         let (mut sink, log) = fallback(Duration::ZERO);
-        let watch = sink.rates_watch();
+        let mut watch = sink.rates_watch();
         log.fail(Some(SinkError::Gone));
         sink.open(96000, 48).unwrap();
         assert_eq!(watch.take(), None);
@@ -495,6 +508,19 @@ mod tests {
         sink.close();
         sink.open(48000, 48).unwrap();
         assert_eq!(watch.take(), None);
+    }
+
+    #[test]
+    fn a_rate_change_that_finds_the_queue_full_is_offered_again() {
+        let (mut sink, log) = fallback(Duration::ZERO);
+        let mut watch = sink.rates_watch();
+        for rate in 1..=RATE_SLOTS as u32 + 1 {
+            log.set_rates(vec![rate]);
+            sink.open(48000, 48).unwrap();
+        }
+        assert_eq!(watch.take(), Some(vec![RATE_SLOTS as u32]));
+        sink.open(48000, 48).unwrap();
+        assert_eq!(watch.take(), Some(vec![RATE_SLOTS as u32 + 1]));
     }
 
     #[test]

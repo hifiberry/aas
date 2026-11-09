@@ -5,6 +5,10 @@ After=sound.target
 [Service]
 Type=simple
 ExecStart=/usr/bin/aas
+# A user made for the service, in group audio for /dev/snd and the
+# socket. It brings ProtectSystem=strict and ProtectHome, so state goes in
+# StateDirectory. Tested on the Pi 3 test board: the card opens and a
+# member of group audio connects to /run/aas/aas.sock.
 DynamicUser=yes
 Group=audio
 RuntimeDirectory=aas

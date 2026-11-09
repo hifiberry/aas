@@ -55,7 +55,7 @@ pub fn run(
     let listener = listen(socket).map_err(|e| format!("{}: {e}", socket.display()))?;
     let notify = eventfd().map_err(|e| format!("eventfd: {e}"))?;
     let supported = sink.supported_rates();
-    let sink = FallbackSink::new(sink);
+    let mut sink = FallbackSink::new(sink);
     let rates = sink.rates_watch();
     let (commands, command_queue) = RingBuffer::new(COMMAND_SLOTS);
     let (event_queue, events) = RingBuffer::new(EVENT_SLOTS);
