@@ -12,7 +12,7 @@ use crate::latency::{PERIODS, period_frames};
 use crate::rate::{ClientId, RatePolicy, SETTLE};
 use crate::resample::Resampler;
 use crate::state::State;
-use crate::volume::OutputVolume;
+use crate::volume::{HardwareVolume, OutputVolume};
 use aas_client::convert::ClientFormat;
 use aas_client::proto::{self, Reply, Request};
 use aas_client::ring::{self, Ring};
@@ -208,14 +208,34 @@ impl Control {
     /// In hardware mode this sets the card's mixer. Call before `start`.
     pub fn restore_volume(&mut self, mut volume: OutputVolume, state: PathBuf) {
         volume.set(State::load(&state).output_percent);
-        let mode = if volume.is_hardware() {
+        self.volume = volume;
+        self.state = Some(state);
+        eprintln!(
+            "aas: output volume {}%, in {}",
+            self.volume.percent(),
+            self.volume_mode()
+        );
+    }
+
+    /// The card has come back, with this volume control or none: it may be
+    /// a new instance of the card, its mixer at its own default. The current
+    /// volume is set on the control, or carried in software without one.
+    pub fn card_found(&mut self, hardware: Option<Box<dyn HardwareVolume>>) {
+        self.volume.replace_hardware(hardware);
+        eprintln!(
+            "aas: output volume {}%, in {}",
+            self.volume.percent(),
+            self.volume_mode()
+        );
+        self.send(vec![Command::SetGain(self.volume.gain())]);
+    }
+
+    fn volume_mode(&self) -> &'static str {
+        if self.volume.is_hardware() {
             "hardware"
         } else {
             "software"
-        };
-        eprintln!("aas: output volume {}%, in {mode}", volume.percent());
-        self.volume = volume;
-        self.state = Some(state);
+        }
     }
 
     /// Opens the output at the default rate. Until a client plays it sends

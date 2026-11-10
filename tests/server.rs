@@ -4,6 +4,7 @@ use aas::config::{Config, Idle};
 use aas::rate::SETTLE;
 use aas::server;
 use aas::sink::{MemorySink, Sink, SinkError, SinkLog};
+use aas::volume::{HardwareVolume, OpenVolume};
 use aas_client::client::Client;
 use aas_client::convert::ClientFormat;
 use aas_client::proto::{self, Reply, Request};
@@ -42,11 +43,28 @@ impl Daemon {
         dir: tempfile::TempDir,
         state: PathBuf,
     ) -> Daemon {
+        Daemon::start_full(config, sink, dir, state, None)
+    }
+
+    /// A daemon with a card volume control that `hardware` opens.
+    fn start_with_volume(config: Config, sink: Box<dyn Sink>, hardware: OpenVolume) -> Daemon {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state.toml");
+        Daemon::start_full(config, sink, dir, state, Some(hardware))
+    }
+
+    fn start_full(
+        config: Config,
+        sink: Box<dyn Sink>,
+        dir: tempfile::TempDir,
+        state: PathBuf,
+        hardware: Option<OpenVolume>,
+    ) -> Daemon {
         let path = dir.path().join("aas.sock");
         let shutdown = Arc::new(AtomicBool::new(false));
         let thread = {
             let (path, shutdown) = (path.clone(), shutdown.clone());
-            thread::spawn(move || server::run(config, sink, &path, &state, None, shutdown))
+            thread::spawn(move || server::run(config, sink, &path, &state, hardware, shutdown))
         };
         let daemon = Daemon {
             _dir: dir,
@@ -934,4 +952,87 @@ fn a_panic_on_the_audio_thread_stops_the_daemon_with_an_error() {
     shutdown.store(true, Ordering::Relaxed);
     let result = result.expect("the daemon kept running without its audio thread");
     assert!(result.is_err(), "{result:?}");
+}
+
+/// The dB values one opening of a fake card's volume control was set to.
+type Mixer = Arc<Mutex<Vec<f32>>>;
+
+/// A card's volume control that records what it is set to.
+struct FakeVolume(Mixer);
+
+impl HardwareVolume for FakeVolume {
+    fn set_db(&mut self, db: f32) {
+        self.0.lock().unwrap().push(db);
+    }
+
+    fn range_db(&self) -> (f32, f32) {
+        (-103.5, 0.0)
+    }
+
+    fn can_mute(&self) -> bool {
+        true
+    }
+}
+
+/// Opens a fake control while `present` is set, and keeps every opening.
+fn fake_volume(present: Arc<AtomicBool>) -> (OpenVolume, Arc<Mutex<Vec<Mixer>>>) {
+    let mixers = Arc::new(Mutex::new(Vec::new()));
+    let opened = mixers.clone();
+    let open: OpenVolume = Box::new(move || {
+        if !present.load(Ordering::Relaxed) {
+            return None;
+        }
+        let mixer = Mixer::default();
+        opened.lock().unwrap().push(mixer.clone());
+        Some(Box::new(FakeVolume(mixer)) as Box<dyn HardwareVolume>)
+    });
+    (open, mixers)
+}
+
+fn last_set(mixers: &Arc<Mutex<Vec<Mixer>>>) -> Option<f32> {
+    let mixers = mixers.lock().unwrap();
+    mixers.last()?.lock().unwrap().last().copied()
+}
+
+#[test]
+fn a_card_missing_at_the_start_gets_the_volume_when_it_appears() {
+    let (sink, log) = memory_sink();
+    log.fail(Some(SinkError::Gone));
+    let present = Arc::new(AtomicBool::new(false));
+    let (open, mixers) = fake_volume(present.clone());
+    let daemon = Daemon::start_with_volume(default_config(), sink, open);
+    let control = volume_client(&daemon);
+    let set = call_raw(&control, &Request::SetVolume { percent: 50 });
+    assert_eq!(set, Some(Reply::Ok));
+    assert!(mixers.lock().unwrap().is_empty());
+    present.store(true, Ordering::Relaxed);
+    log.fail(None);
+    assert!(wait_for(|| last_set(&mixers) == Some(-30.0)));
+    // The card's control carries the volume now, so the samples pass as
+    // they are.
+    let mut client = daemon.client_at(48000, 4096);
+    let frames = vec![[1 << 30, -(1 << 30)]; 4096];
+    client.start().unwrap();
+    write_all(&mut client, &frames);
+    client.drain().unwrap();
+    assert!(log.frames().contains(&[1 << 30, -(1 << 30)]));
+}
+
+#[test]
+fn a_card_that_comes_back_gets_the_volume_again() {
+    let (sink, log) = memory_sink();
+    let present = Arc::new(AtomicBool::new(true));
+    let (open, mixers) = fake_volume(present);
+    let daemon = Daemon::start_with_volume(default_config(), sink, open);
+    let control = volume_client(&daemon);
+    let set = call_raw(&control, &Request::SetVolume { percent: 40 });
+    assert_eq!(set, Some(Reply::Ok));
+    assert_eq!(last_set(&mixers), Some(-36.0));
+    log.fail(Some(SinkError::Gone));
+    // Long enough for the audio thread to see it gone, shorter than a retry.
+    thread::sleep(Duration::from_millis(200));
+    let before = mixers.lock().unwrap().len();
+    log.fail(None);
+    assert!(wait_for(|| mixers.lock().unwrap().len() > before));
+    assert_eq!(last_set(&mixers), Some(-36.0));
 }

@@ -8,8 +8,8 @@ use crate::counters::Counters;
 use crate::engine::Engine;
 use crate::format::{F32, F64, I32, Processing};
 use crate::rt;
-use crate::sink::{FallbackSink, RatesWatch, Sink};
-use crate::volume::{HardwareVolume, OutputVolume};
+use crate::sink::{CardWatch, FallbackSink, RatesWatch, Sink};
+use crate::volume::{OpenVolume, OutputVolume};
 use aas_client::client::socket_address;
 use aas_client::proto::{self, REQUEST_LEN, Reply};
 use rtrb::RingBuffer;
@@ -43,14 +43,15 @@ fn check(rc: isize) -> io::Result<usize> {
 
 /// Runs the daemon until `shutdown` is set. The sink is wrapped in a
 /// `FallbackSink`, so a missing card does not stop playback. The output
-/// volume is kept in the file `state`, and set on `hardware` if given, else
-/// in software.
+/// volume is kept in the file `state`. It is set on the control that
+/// `hardware` opens, if given and found, else in software. `hardware` is
+/// called again each time the card comes back.
 pub fn run(
     config: Config,
     sink: Box<dyn Sink>,
     socket: &Path,
     state: &Path,
-    hardware: Option<Box<dyn HardwareVolume>>,
+    mut hardware: Option<OpenVolume>,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), String> {
     raise_file_limit();
@@ -62,6 +63,7 @@ pub fn run(
     let supported = sink.supported_rates();
     let mut sink = FallbackSink::new(sink);
     let rates = sink.rates_watch();
+    let card = sink.card_watch();
     let (commands, command_queue) = RingBuffer::new(COMMAND_SLOTS);
     let (event_queue, events) = RingBuffer::new(EVENT_SLOTS);
     let counters = Arc::new(Counters::default());
@@ -95,7 +97,8 @@ pub fn run(
         events,
         audio.thread().clone(),
     );
-    let volume = OutputVolume::new(hardware, config.bit_perfect);
+    let found = hardware.as_mut().and_then(|open| open());
+    let volume = OutputVolume::new(found, config.bit_perfect);
     control.restore_volume(volume, state.to_path_buf());
     let mut server = Server {
         listener,
@@ -105,6 +108,8 @@ pub fn run(
         notices: BTreeMap::new(),
         next_conn: 1,
         rates,
+        card,
+        hardware,
     };
     server.control.start(Instant::now());
     let mut gaps_seen = 0;
@@ -180,6 +185,11 @@ struct Server {
     next_conn: ConnId,
     /// The card's rates, when they change.
     rates: RatesWatch,
+    /// When the card comes back.
+    card: CardWatch,
+    /// Opens the card's volume control, unless the volume is in software
+    /// by config.
+    hardware: Option<OpenVolume>,
 }
 
 impl Server {
@@ -205,6 +215,12 @@ impl Server {
         let now = Instant::now();
         if let Some(rates) = self.rates.take() {
             self.control.set_supported(rates, now);
+        }
+        // The card may be a new instance, so its control is opened again.
+        if self.card.came_back() {
+            if let Some(open) = &mut self.hardware {
+                self.control.card_found(open());
+            }
         }
         if fds[1].revents != 0 {
             let mut count = 0u64;

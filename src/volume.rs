@@ -35,6 +35,10 @@ pub trait HardwareVolume: Send {
     fn can_mute(&self) -> bool;
 }
 
+/// Opens the card's volume control: on the control thread at the start,
+/// and again each time the card comes back. None if the card has none.
+pub type OpenVolume = Box<dyn FnMut() -> Option<Box<dyn HardwareVolume>> + Send>;
+
 /// The control to use: the configured one if the card has it, else the
 /// first of `Digital`, `Master` and `PCM` the card has. `names` are the
 /// card's controls that have a playback volume in dB.
@@ -83,6 +87,13 @@ impl OutputVolume {
             };
             hardware.set_db(db);
         }
+    }
+
+    /// Takes a newly opened control, or none, and sets the current volume
+    /// on it. Without one the volume is carried in software from now on.
+    pub fn replace_hardware(&mut self, hardware: Option<Box<dyn HardwareVolume>>) {
+        self.hardware = hardware;
+        self.set(self.percent);
     }
 
     pub fn percent(&self) -> u8 {
@@ -229,6 +240,33 @@ mod tests {
         let mut volume = OutputVolume::new(Some(hw), BitPerfect::Auto);
         volume.set(100);
         assert_eq!(last(&set), Some(-6.0));
+    }
+
+    #[test]
+    fn a_new_control_gets_the_current_volume() {
+        let (old, old_set) = hardware((-103.5, 0.0));
+        let mut volume = OutputVolume::new(Some(old), BitPerfect::Auto);
+        volume.set(50);
+        let (new, new_set) = hardware((-103.5, 0.0));
+        volume.replace_hardware(Some(new));
+        assert_eq!(last(&new_set), Some(-30.0));
+        assert_eq!(old_set.lock().unwrap().len(), 1);
+        assert_eq!(volume.gain(), 1.0);
+    }
+
+    #[test]
+    fn a_card_without_a_control_moves_the_volume_to_software_and_back() {
+        let (hw, _) = hardware((-103.5, 0.0));
+        let mut volume = OutputVolume::new(Some(hw), BitPerfect::Auto);
+        volume.set(50);
+        volume.replace_hardware(None);
+        assert!(!volume.is_hardware());
+        assert_eq!(volume.gain(), db_to_gain(-30.0));
+        let (hw, set) = hardware((-103.5, 0.0));
+        volume.replace_hardware(Some(hw));
+        assert!(volume.is_hardware());
+        assert_eq!(volume.gain(), 1.0);
+        assert_eq!(last(&set), Some(-30.0));
     }
 
     #[test]

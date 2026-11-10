@@ -1,6 +1,7 @@
 //! Where the engine's output goes.
 
 use rtrb::{Consumer, Producer, RingBuffer};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -287,6 +288,24 @@ impl RatesWatch {
     }
 }
 
+/// Tells the control thread that the real sink has started to play again,
+/// so that it can find the card's volume control anew. The audio thread
+/// only adds to a shared counter, which neither locks nor allocates.
+pub struct CardWatch {
+    found: Arc<AtomicU64>,
+    seen: u64,
+}
+
+impl CardWatch {
+    /// Whether the real sink has started to play since the last call.
+    pub fn came_back(&mut self) -> bool {
+        let found = self.found.load(Ordering::Acquire);
+        let changed = found != self.seen;
+        self.seen = found;
+        changed
+    }
+}
+
 /// Keeps the engine running while the real sink is gone. It writes to a
 /// `NullSink` meanwhile and retries the real one every second. Only an xrun
 /// gets through to the engine.
@@ -304,6 +323,9 @@ pub struct FallbackSink {
     format: (u32, u32),
     /// True while `inner` is open and working.
     live: bool,
+    /// Counts the times `inner` went from closed or gone to open. The card
+    /// may be a new instance each time, with its mixer at its own default.
+    found: Arc<AtomicU64>,
     retry_at: Instant,
     retry: Duration,
 }
@@ -317,6 +339,7 @@ impl FallbackSink {
             null: NullSink::default(),
             format: (0, 0),
             live: false,
+            found: Arc::default(),
             retry_at: Instant::now(),
             retry: RETRY,
         }
@@ -329,11 +352,23 @@ impl FallbackSink {
         RatesWatch(consumer)
     }
 
+    /// Where the control thread learns that the inner sink plays again.
+    pub fn card_watch(&self) -> CardWatch {
+        CardWatch {
+            found: self.found.clone(),
+            seen: self.found.load(Ordering::Acquire),
+        }
+    }
+
     /// Opens the inner sink. This only happens on a reopen or a retry, so
     /// it may allocate.
     fn try_inner(&mut self) {
         let (rate, period) = self.format;
+        let was_live = self.live;
         self.live = self.inner.open(rate, period).is_ok();
+        if self.live && !was_live {
+            self.found.fetch_add(1, Ordering::Release);
+        }
         self.retry_at = Instant::now() + self.retry;
         let rates = self.inner.supported_rates();
         if rates == self.rates {
@@ -597,6 +632,31 @@ mod tests {
         assert_eq!(watch.take(), Some(vec![RATE_SLOTS as u32]));
         sink.open(48000, 48).unwrap();
         assert_eq!(watch.take(), Some(vec![RATE_SLOTS as u32 + 1]));
+    }
+
+    #[test]
+    fn the_card_watch_sees_each_return_of_the_inner_sink() {
+        let (mut sink, log) = fallback(Duration::ZERO);
+        let mut watch = sink.card_watch();
+        assert!(!watch.came_back());
+        sink.open(48000, 48).unwrap();
+        assert!(watch.came_back());
+        assert!(!watch.came_back());
+        // A rate change while it plays is not a return.
+        sink.open(44100, 48).unwrap();
+        assert!(!watch.came_back());
+        // Gone, a failed retry, then back.
+        log.fail(Some(SinkError::Gone));
+        sink.write(&[[0; 2]; 48]).unwrap();
+        sink.write(&[[0; 2]; 48]).unwrap();
+        assert!(!watch.came_back());
+        log.fail(None);
+        sink.write(&[[0; 2]; 48]).unwrap();
+        assert!(watch.came_back());
+        // Closed while idle, then opened: the card may have changed meanwhile.
+        sink.close();
+        sink.open(48000, 48).unwrap();
+        assert!(watch.came_back());
     }
 
     #[test]

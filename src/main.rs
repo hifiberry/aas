@@ -5,7 +5,9 @@ use aas::rt;
 use aas::server;
 use aas::sink::Sink;
 use aas::state;
+#[cfg(feature = "alsa-output")]
 use aas::volume::HardwareVolume;
+use aas::volume::OpenVolume;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -78,22 +80,28 @@ fn output(_config: &Config) -> Box<dyn Sink> {
     Box::new(aas::sink::NullSink::default())
 }
 
-/// The card's volume control, unless the config asks for software volume.
+/// Opens the card's volume control, unless the config asks for software
+/// volume. The server calls it at the start and each time the card comes
+/// back.
 #[cfg(feature = "alsa-output")]
-fn hardware_volume(config: &Config) -> Option<Box<dyn HardwareVolume>> {
+fn hardware_volume(config: &Config) -> Option<OpenVolume> {
     if config.volume_mode == Some(config::VolumeMode::Software) {
         return None;
     }
-    let control = config.volume_control.as_deref();
-    let found = aas::sink_alsa::AlsaVolume::open(config.card.as_deref(), control);
-    if found.is_none() && config.volume_mode == Some(config::VolumeMode::Hardware) {
-        eprintln!("aas: warning: no hardware volume found, using software volume");
-    }
-    found.map(|v| Box::new(v) as Box<dyn HardwareVolume>)
+    let card = config.card.clone();
+    let control = config.volume_control.clone();
+    let forced = config.volume_mode == Some(config::VolumeMode::Hardware);
+    Some(Box::new(move || {
+        let found = aas::sink_alsa::AlsaVolume::open(card.as_deref(), control.as_deref());
+        if found.is_none() && forced {
+            eprintln!("aas: warning: no hardware volume found, using software volume");
+        }
+        found.map(|v| Box::new(v) as Box<dyn HardwareVolume>)
+    }))
 }
 
 #[cfg(not(feature = "alsa-output"))]
-fn hardware_volume(_config: &Config) -> Option<Box<dyn HardwareVolume>> {
+fn hardware_volume(_config: &Config) -> Option<OpenVolume> {
     None
 }
 
