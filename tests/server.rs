@@ -886,3 +886,52 @@ fn a_drain_started_without_waiting_finishes_and_a_stop_cancels_it() {
     client.drain().unwrap();
     assert_eq!(client.hw_position().unwrap(), 8192);
 }
+
+/// A sink whose first write panics, as a bug on the audio thread would.
+struct PanickingSink;
+
+impl Sink for PanickingSink {
+    fn open(&mut self, _rate: u32, _period: u32) -> Result<(), SinkError> {
+        Ok(())
+    }
+
+    fn write(&mut self, _frames: &[[i32; 2]]) -> Result<(), SinkError> {
+        panic!("a test sink that panics on write");
+    }
+
+    fn close(&mut self) {}
+
+    fn delay_frames(&self) -> u32 {
+        0
+    }
+
+    fn supported_rates(&self) -> Vec<u32> {
+        Vec::new()
+    }
+}
+
+#[test]
+fn a_panic_on_the_audio_thread_stops_the_daemon_with_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("aas.sock");
+    let state = dir.path().join("state.toml");
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let (done, finished) = std::sync::mpsc::channel();
+    let flag = shutdown.clone();
+    thread::spawn(move || {
+        let result = server::run(
+            default_config(),
+            Box::new(PanickingSink),
+            &path,
+            &state,
+            None,
+            flag,
+        );
+        let _ = done.send(result);
+    });
+    // The output opens at the start, so the first write comes at once.
+    let result = finished.recv_timeout(PATIENCE);
+    shutdown.store(true, Ordering::Relaxed);
+    let result = result.expect("the daemon kept running without its audio thread");
+    assert!(result.is_err(), "{result:?}");
+}

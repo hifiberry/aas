@@ -108,7 +108,10 @@ pub fn run(
     };
     server.control.start(Instant::now());
     let mut gaps_seen = 0;
-    while !shutdown.load(Ordering::Relaxed) {
+    // The audio thread only ends on its own if it panicked. The daemon then
+    // stops with an error, so that systemd restarts it, rather than taking
+    // clients that nothing plays.
+    while !shutdown.load(Ordering::Relaxed) && !audio.is_finished() {
         let was_open = server.control.output_is_open();
         server.step();
         gaps_seen = log_new_gaps(&counters, gaps_seen);
@@ -116,13 +119,18 @@ pub fn run(
             eprintln!("aas: output closed: {counters}");
         }
     }
+    let died = audio.is_finished();
     server.control.shutdown();
     let joined = audio.join();
     eprintln!("aas: stopped: {counters}");
     // The fds of `notify` must outlive the audio thread.
     drop(server);
     let _ = fs::remove_file(socket);
-    joined.map_err(|_| "the audio thread panicked".to_string())
+    match joined {
+        Err(_) => Err("the audio thread panicked".to_string()),
+        Ok(()) if died => Err("the audio thread stopped".to_string()),
+        Ok(()) => Ok(()),
+    }
 }
 
 /// Logs a wake-up gap longer than the buffer soon after it happens, with
