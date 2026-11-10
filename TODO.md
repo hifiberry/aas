@@ -20,49 +20,23 @@ in the capture. Both test boards have the cable connected.
 several resampled streams. Its cost is measured, its sound is not. Measure its
 passband and stopband against `high`.
 
-## Run the stage 2 measurements on the CM5
+## Find why the CM5 test board stopped responding under load
 
-Stage 2 was measured on the Pi 3 only, see "Stage 2" in `doc/measurements.md`. The
-CM5 test board's SSH server closed every connection before the banner, so nothing
-ran there. Its 4 ms criterion is unconfirmed until this is done. First step: get a
-shell on the CM5 again (console or reinstall), then sync the tree and build on it:
+The first attempt at the stage 2 hour runs on the CM5 ended about 90 seconds into
+the 44.1 kHz run under full load: the SSH server reset every connection before the
+banner, the logs on the NVMe drive stopped, and the board stayed that way
+until it was restarted 7 hours later. It had shown the same symptom earlier in
+stage 2. 15 minutes of the load alone and 4 hours of the runs did not repeat it,
+and no log of the hung boot survived, so it is not known whether the drive, the
+load, the daemon or the board is at fault. First step: make the journal persistent
+or stream the kernel log off the board (`dmesg -w` over SSH, as the later runs
+did), keep the run's own logs in RAM, and repeat the hour runs until it happens
+again. See "Hour runs" in `doc/measurements.md`.
 
-```sh
-cargo build --release --features alsa-output
-cargo build --release -p measure --features alsa-probes --bins
-sh dist/install-plugin.sh
-```
-
-The daemon runs as root with real-time rights, from the build tree:
-`target/release/aas --config FILE`. Its socket is in `/run/aas`, which only exists
-while the unit runs, so stop the unit and make the directory first: `sudo systemctl
-stop aas; sudo mkdir -p /run/aas`. Or give the daemon `--socket` in a writable
-directory and set `AAS_SOCKET` to it for the players. Then:
-
-- Bit-exactness, 36 cases: `sudo modprobe snd-aloop`, config `card = "Loopback"`,
-  `latency_ms = 48` and `format` set to `i32`, `f32` and `f64` in turn, then
-  `bit-check --format S16|S24|S32 --rate 44100|48000|96000|192000 --seconds 10`.
-  Pass: `differing 0, breaks 0` in all 36.
-- Latency, with the default config and the cable connected: at 44.1, 48, 96 and
-  192 kHz with the daemon's periods (64, 64, 128, 256), run
-  `loopback-latency --device hw:0,0 --capture hw:CARD=<card>,DEV=0 --periods 4`
-  with the daemon stopped, then `loopback-latency --device default --capture
-  hw:0,0 --periods 4` with it running. Added latency is the second minus the
-  first. Pass: below 4 ms. On the Pi 3 `aas` added two periods, which on the CM5
-  is 2.7 to 2.9 ms.
-- Hour runs under the full load in `doc/measurements.md`, with the default config:
-  `aplay -D default` of real music at 44.1 kHz, then at 96 kHz, then at 44.1 kHz
-  with a second `aplay` at 96 kHz. Play from RAM, for example a few minutes of
-  music looped by `cat` into `aplay -t raw`: a file read from the SD card while
-  the load writes to it starves the player, with or without `aas`. Pass: the
-  daemon's closing line shows 0 xruns and 0 wake gaps, and `aplay` reports no
-  underrun.
-- `dsp-bench --mix-only`, for the `i32` mix figures.
-- `mpd` and `squeezelite`, each alone and together at 44.1 and 96 kHz. Both must
-  play. `squeezelite` needs a server: a minimal SlimProto server that sends one
-  `strm` start for a FLAC file over HTTP is enough.
-
-Add the figures to the Stage 2 section and update its summary.
+In the same runs, one wake-up gap of 4.01 ms against a 2.67 ms buffer at 96 kHz
+fell within 5 ms of the end of a 128 MB synchronous write, and the repeated run
+had none. The trace planned for the Pi 3 below would show whether the drive's
+completion work delays the audio thread on the CM5 too.
 
 ## Find where the long daemon cycles on a throttled Pi 3 come from
 

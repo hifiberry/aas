@@ -27,9 +27,10 @@ synchronous disk writes.
 ## Conclusions
 
 - **Processing format: 32-bit float as the default, 64-bit still supported.** The
-  format can be set in the config. `i32` mixing was measured in stage 2, on the Pi 3
-  only: it costs more than either float. Mixing costs little
-  on any board, about 1% of a period on the Pi 3 at 48 kHz. Resampling costs 1.4 to
+  format can be set in the config. `i32` mixing was measured in stage 2 on both
+  boards: it costs more than either float, 3.5 times `f32` on the Pi 3 and 7 times
+  on the CM5. Mixing costs little on any board, about 1% of a period on the Pi 3
+  at 48 kHz. Resampling costs 1.4 to
   1.85 times as much in 64-bit.
 - **Resampling quality:** `high` by default. On the Pi 3, `high` to 192 kHz uses
   about 44% of a period in 32-bit, 62% in the worst cycle. In 64-bit it uses about
@@ -39,10 +40,14 @@ synchronous disk writes.
 - **Default period on Pi 3:** 256 frames at 44.1 and 48 kHz, 512 at 96 kHz, 1024
   at 192 kHz, with 2 periods. That is about 11 to 12 ms.
 - **4 ms on the CM5 holds,** with the handover cost included and under full load.
-  It stands in for the Pi 5, which uses the same processor. It is not confirmed on
-  the Pi 4.
+  With the daemon in stage 2, `aas` adds two periods there, 2.6 to 3.0 ms through
+  the cable. Of four hour runs under full load, one at 96 kHz had one wake-up gap
+  longer than the buffer, and its repeat passed. It stands in for the Pi 5, which
+  uses the same processor. It is not confirmed on the Pi 4.
 - **`PREEMPT_RT` is not needed.** The standard kernel holds every default on both
-  boards, under full load.
+  boards, under full load. The one exception so far is the single wake-up gap in a
+  CM5 hour run in stage 2, which fell within 5 ms of the end of a synchronous
+  write.
 - **A heatsink is not required, but it keeps the speed.** Without one, a CM5 throttled
   and still had no xruns. See [Heat](#heat).
 
@@ -175,11 +180,11 @@ full load.
 
 ## Stage 2
 
-The daemon, the ALSA plugin and real players, measured on the Pi 3 test board. The
-CM5 test board could not be reached during stage 2: its SSH server closed every
-connection before the banner. **Every CM5 run of stage 2 is still outstanding**,
-and so is the 4 ms criterion that only the CM5 can confirm. `TODO.md` lists what is
-left.
+The daemon, the ALSA plugin and real players, measured on the Pi 3 test board and
+on the CM5 test board. The CM5 could not be reached during most of stage 2, because
+its SSH server reset every connection before the banner, so its runs were made
+afterwards, with the audio loop that waits for room. Each figure below names its
+board.
 
 The daemon was built from this repository with the `alsa-output` feature and ran
 as root with real-time rights. Players reached it through the plugin as ALSA's
@@ -187,15 +192,19 @@ as root with real-time rights. Players reached it through the plugin as ALSA's
 
 ### Summary
 
-| Criterion | Pi 3 result | Verdict |
-|---|---|---|
-| Bit-exact through `snd-aloop`, 36 cases | 36 of 36 at `latency_ms = 48`. 5 of 36 at 24, from `snd-aloop` xruns | Pass at 48 ms |
-| Added latency, against the 12 ms target | Two periods: 11.6 ms at 44.1 kHz, 10.6 ms at 48 to 192 kHz | Pass |
-| One hour at 44.1 kHz, full load | 0 xruns, 0 wake-up gaps, worst gap 7.4 ms against an 11.6 ms buffer | Pass |
-| One hour at 96 kHz, full load | 0 xruns, 0 wake-up gaps, worst gap 6.6 ms against a 10.7 ms buffer | Pass |
-| One hour at 44.1 kHz with a second client at 96 kHz, full load | 0 xruns, 0 wake-up gaps, worst gap 9.1 ms against an 11.6 ms buffer | Pass |
-| `mpd` and `squeezelite`, alone and together | Both play, mixed, 0 xruns | Pass |
-| Mixing cost in `i32` | About 1.2% of a period at 48 kHz, 8 sources | Measured |
+| Criterion | Pi 3 result | CM5 result | Verdict |
+|---|---|---|---|
+| Bit-exact through `snd-aloop`, 36 cases | 36 of 36 at `latency_ms = 48`. 5 of 36 at 24, from `snd-aloop` xruns | 36 of 36 at `latency_ms = 48` | Pass at 48 ms on both |
+| Added latency, against the 12 ms target on the Pi 3 and 4 ms on the CM5 | Two periods: 11.6 ms at 44.1 kHz, 10.6 ms at 48 to 192 kHz | Two periods: 3.0 ms at 44.1 kHz, 2.6 to 2.7 ms at 48 to 192 kHz | Pass on both |
+| One hour at 44.1 kHz, full load | 0 xruns, 0 wake-up gaps, worst gap 7.4 ms against an 11.6 ms buffer | 0 xruns, 0 wake-up gaps, worst gap 1.5 ms against a 2.9 ms buffer | Pass on both |
+| One hour at 96 kHz, full load | 0 xruns, 0 wake-up gaps, worst gap 6.6 ms against a 10.7 ms buffer | First run 0 xruns but 1 wake-up gap, 4.0 ms against a 2.7 ms buffer. Repeated: 0, 0, worst gap 1.4 ms | Pass on the Pi 3. **Fail** on the CM5 by one gap, then a pass |
+| One hour at 44.1 kHz with a second client at 96 kHz, full load | 0 xruns, 0 wake-up gaps, worst gap 9.1 ms against an 11.6 ms buffer | 0 xruns, 0 wake-up gaps, worst gap 1.5 ms against a 2.9 ms buffer | Pass on both |
+| `mpd` and `squeezelite`, alone and together | Both play, mixed, 0 xruns | Both play, mixed, 0 xruns | Pass on both |
+| Mixing cost in `i32` | About 1.2% of a period at 48 kHz, 8 sources | About 0.3% of a period at 48 kHz, 8 sources | Measured |
+
+The first attempt at the CM5 hour runs stopped when the board stopped responding,
+90 seconds in. The cause is not known, and it did not happen again. See
+[Hour runs](#hour-runs).
 
 ### Bit-exactness
 
@@ -226,10 +235,16 @@ size, so 48 ms proves the same thing. Timing is measured on the real card.
 A negative check: with the volume at 99%, a 3 second case reported every one of
 its 144000 frames as differing.
 
+On the CM5 the same 36 cases at `latency_ms = 48` all gave `differing 0, breaks 0`,
+and the daemon counted 0 xruns and 0 wake-up gaps in each format. Its kernel also
+runs at HZ = 250, so 48 ms was kept there and 24 ms was not tried. The daemon
+chose 1024 frames per period on `snd-aloop` at every rate.
+
 ### Latency through the cable
 
-The daemon ran with its defaults on the DAC+ ADC: a 12 ms target, so 256 frames
-at 44.1 and 48 kHz, 512 at 96 kHz and 1024 at 192 kHz, with 2 periods buffered.
+On the Pi 3 the daemon ran with its defaults on the DAC+ ADC: a 12 ms target, so
+256 frames at 44.1 and 48 kHz, 512 at 96 kHz and 1024 at 192 kHz, with 2 periods
+buffered.
 
 A player's stream cannot be linked to the card's capture, so `loopback-latency`
 times both ends instead. It writes the chirp into a full buffer, notes when the
@@ -254,9 +269,7 @@ match stage 1 exactly.
 
 **This meets the Pi 3's 12 ms target.** The daemon waits for room on the card,
 then reads the clients' rings and writes the period at once, so a frame waits
-behind the card's two buffered periods and nothing else. On the CM5 with its 4 ms
-target, two periods are 2.9 ms at 44.1 kHz and 2.7 ms at 48 to 192 kHz, plus the
-converters, but that is still to be measured there.
+behind the card's two buffered periods and nothing else.
 
 Before that change the engine read the rings first and then blocked in the card
 write, and the same runs measured three periods: 17.4 ms at 44.1 kHz and 15.9 ms
@@ -270,17 +283,40 @@ plain `aplay` at 192 kHz through `aas`, with buffers of 2048, 4096 and 8192
 frames, had no underrun in 5 seconds each, before the change. That a player is
 never starved at 192 kHz is not proven.
 
+On the CM5 the daemon ran with its defaults on the DAC+ ADC Pro: a 4 ms target, so
+64 frames at 44.1 and 48 kHz, 128 at 96 kHz and 256 at 192 kHz, with 2 periods
+buffered. The method is the same, 20 repeats each, and the direct and through `aas`
+figures are both medians. The player used the daemon's period with 4 periods
+buffered, except through `aas` at 192 kHz: there the daemon refuses a 1024 frame
+buffer from a client at the 4 ms target, so the player used 8 periods, 2048
+frames. 16 periods gave the same figure within 0.02 ms, and so did direct `hw:`
+with 8 periods, so the player's buffer does not change the result.
+
+| Rate / period | Converters, linked | Direct, timed | Through `aas`, timed, median | Added by `aas` | In daemon periods |
+|---|---|---|---|---|---|
+| 44.1 kHz / 64 | 50 frames, 1.134 ms | 1.48 ms | 4.52 ms | 3.04 ms | 2.09 |
+| 48 kHz / 64 | 50 frames, 1.042 ms | 1.39 ms | 4.01 ms | 2.62 ms | 1.96 |
+| 96 kHz / 128 | 52 frames, 0.542 ms | 0.68 ms | 3.37 ms | 2.69 ms | 2.02 |
+| 192 kHz / 256 | 53 frames, 0.276 ms | 0.35 ms | 3.00 ms | 2.65 ms | 1.99 |
+
+**This meets the 4 ms target on the CM5.** `aas` adds two periods there too. Every
+repeat through `aas` was within 0.17 ms of its median, and the direct repeats
+within 0.12 ms. The converter delays match stage 1 exactly. The daemon counted 0
+xruns and 0 wake-up gaps, and no player hit `-EPIPE` at any rate. Counted from the
+player's write to the ADC, with the ADC and the method's 40 frames included, the
+path through `aas` reads 4.52 ms at 44.1 kHz and 3.0 to 4.0 ms at the other rates.
+
 ### Hour runs
 
-The daemon ran with its defaults on the DAC+ ADC, 256 frames at 44.1 kHz and 512 at
-96 kHz, 2 periods buffered, with the audio loop that waits for room before it reads
-the clients. Full load is the stage 1 recipe: one `sha256sum` per core and a
-repeated 128 MB synchronous write, with 5 seconds between writes. The music was
-public domain orchestral recordings from the Musopen collection, resampled to
-44.1 kHz 16-bit and 96 kHz 24-bit, a 5 minute stretch of each kept in RAM and
-looped by `cat` into `aplay -D default -t raw` for an hour. The Pi 3 has no
-heatsink. From 5 minutes into each run it sat at 86 to 87 °C and 440 to 660 MHz,
-throttled, the same worst case as stage 1.
+On the Pi 3 the daemon ran with its defaults on the DAC+ ADC, 256 frames at
+44.1 kHz and 512 at 96 kHz, 2 periods buffered, with the audio loop that waits for
+room before it reads the clients. Full load is the stage 1 recipe: one `sha256sum` per
+core and a repeated 128 MB synchronous write, with 5 seconds between writes. The
+music was public domain orchestral recordings from the Musopen collection,
+resampled to 44.1 kHz 16-bit and 96 kHz 24-bit, a 5 minute stretch of each kept in
+RAM and looped by `cat` into `aplay -D default -t raw` for an hour. The Pi 3 has
+no heatsink. From 5 minutes into each run it sat at 86 to 87 °C and
+440 to 660 MHz, throttled, the same worst case as stage 1.
 
 A fresh daemon was started for each run and stopped when its players ended, so
 its counters cover that hour, plus a few start-up cycles at 48 kHz. For the third
@@ -306,7 +342,48 @@ interrupts counts as well.
 
 No hour run was made on an otherwise idle Pi 3. The design's criterion is an hour
 at 44.1 kHz and at 96 kHz on an idle system, so stage 2 neither meets nor fails it
-as written. The runs here are under full load, which is the harder test.
+as written. The runs here are under full load, which is the harder test. The same
+holds for the CM5.
+
+On the CM5 the runs were made the same way: the daemon's defaults on the DAC+ ADC
+Pro, 64 frames at 44.1 kHz and 128 at 96 kHz with 2 periods buffered, the same
+full load and the same music from RAM, and a fresh daemon for each run. The CM5
+writes the load's 128 MB to an NVMe drive, not an SD card. With the heatsink it sat
+at 82 to 86 °C through the runs, at its soft temperature limit, and ran between
+1.5 and 2.4 GHz, at 2.1 GHz or more in four readings of five.
+
+| Run | Daemon xruns | Wake-up gaps over the buffer | Worst gap / buffer | Worst cycle | `aplay` underruns |
+|---|---|---|---|---|---|
+| 44.1 kHz | 0 | 0 | 1.54 / 2.90 ms | 0.05 ms | 0 |
+| 96 kHz | 0 | **1** | **4.01 / 2.67 ms** | 0.06 ms | 0 |
+| 96 kHz, repeated | 0 | 0 | 1.42 / 2.67 ms | 0.06 ms | 0 |
+| 44.1 kHz, then a second client at 96 kHz | 0 | 0 | 1.53 / 2.90 ms | 0.11 ms | 0 and 0 |
+
+**The first 96 kHz run fails the criterion by one event.** It had no xrun and
+`aplay` reported no underrun, but one wake-up came 4.01 ms after the one before,
+longer than the 2.67 ms buffer, so a dropout is suspected and not proven. The
+daemon logged it at 6017.795 s on `CLOCK_MONOTONIC`. The load's write loop logged
+the end of a 128 MB synchronous write at 6017.79 s, from `/proc/uptime`, within
+5 ms of the gap. That points at the drive's completion work, not at the daemon,
+but one event does not prove it. The 96 kHz run, repeated after the other runs
+with the same load, passed with a worst gap of 1.42 ms. The other runs passed with a worst
+gap of about half the buffer, as in stage 1. The worst cycle stayed below 0.11 ms,
+under 8% of a period, so the CM5 shows nothing like the long cycles of the throttled
+Pi 3.
+
+The cycle counts cover the hours: 2482672 cycles of 64 frames at 44.1 kHz and
+2701536 of 128 frames at 96 kHz are 3603 s each. In the third run the output stayed
+at 44.1 kHz, with the 96 kHz client resampled, until the first player ended.
+
+The first attempt at these runs did not finish. About 90 seconds into the 44.1 kHz
+run, with the board at 75 °C and 2.4 GHz, the board stopped answering: its SSH
+server reset every connection before the banner, the same symptom that kept the
+CM5 out of reach earlier in stage 2, and the logs on its drive stopped. It did not
+restart by itself. It came back from a restart about 7 hours later, with its file
+system not cleanly unmounted. Nothing from that boot was kept, so the cause is not
+known. 15 minutes of the full load alone did not repeat it, and neither did the 4
+hours of runs above, made with the logs in RAM and the kernel log streamed off the
+board.
 
 #### Before the change, and the SD card
 
@@ -364,6 +441,39 @@ to 70%, -18 dB, through `mpd`'s own curve for a wide dB range.
 Without a gain command from the server, `squeezelite` plays silence. The first run
 did that, until the stand-in server sent unity gain as Lyrion does.
 
+On the CM5 the same four phases ran with the audio loop that waits for room, the
+daemon's defaults, 64 frames at 44.1 kHz and 128 at 96 kHz, and a fresh daemon for
+each phase. The setup was the same, with `mpd` 0.24.4 and `squeezelite`
+2.0.0-1517 from Debian. The level was captured at the rate the card ran at.
+
+| Phase | Output rate | Level through the cable, RMS / peak |
+|---|---|---|
+| `mpd` alone | 44.1 kHz | 0.117 / 0.89 |
+| `squeezelite` alone | 96 kHz | 0.067 / 0.53 |
+| `mpd`, then `squeezelite` joins | 44.1 kHz, `squeezelite` resampled | 0.114 / 0.89 |
+| `squeezelite`, then `mpd` joins | 96 kHz, `mpd` resampled | 0.131 / 1.00 |
+
+Both players played in every phase and the output stayed at the first one's rate.
+`mpd`'s position advanced 20 seconds in 20 seconds in each phase. The elapsed time
+`squeezelite` reported advanced 29.0 seconds in 29.1 seconds alone, and 24.0 in
+24.1 after joining `mpd`. Each daemon ended with 0 xruns and 0 wake-up gaps.
+`mpc volume 50` again set `Master` to 70%, -18 dB. In the last phase the sum of
+the two players reached full scale at the ADC.
+
+A first CM5 run went wrong in the test setup, and showed something about the card.
+The stand-in server sent a malformed start command, so `squeezelite` held the
+output at 44.1 kHz and played nothing, and the level was captured at a fixed
+96 kHz. In that run `mpd`'s position advanced 44 seconds in 20, and the daemon
+logged one wake-up gap of 502 ms. Neither came back in two runs with the same
+order of phases. The fast clock is the card's, not `aas`'s: with the `,slave`
+overlay the Pi clocks playback and capture together, and a 96 kHz capture opened
+while the card plays 44.1 kHz makes the playback run at the faster clock. Straight
+to `hw:0,0` with the daemon stopped, a 10 second 44.1 kHz file played in 5.15
+seconds when a 96 kHz capture was opened one second in. 96 / 44.1 is 2.18, which
+matches `mpd`'s 44 seconds in 20. The 502 ms gap came half a second after such a
+capture closed, which fits the same cause but is not proven. On this card, capture
+only at the rate the playback runs at.
+
 ### Processing cost of `i32`
 
 `dsp-bench --mix-only` on the Pi 3, idle, at real-time priority. `i32` mixes the
@@ -380,3 +490,15 @@ saturates. Share of a period, p99.9 and then max, 8 sources:
 On the mean, `i32` costs about 3.5 times `f32` and 1.8 times `f64`. It is still
 small, but it saves no CPU. The board had throttled earlier since boot, but ran at
 1.2 GHz and 60 to 67 °C during the run.
+
+On the CM5, idle, with the heatsink, at 2.4 GHz and 54 to 55 °C, never throttled:
+
+| Case | `i32` | `f32` | `f64` |
+|---|---|---|---|
+| 48 kHz, 64 frames | 0.2%, 0.7% | 0.0%, 0.3% | 0.1%, 0.3% |
+| 48 kHz, 256 frames | 0.3%, 0.5% | 0.0%, 0.1% | 0.1%, 0.2% |
+| 192 kHz, 256 frames | 1.0%, 1.4% | 0.1%, 0.9% | 0.3%, 1.0% |
+
+On the mean at 48 kHz and 256 frames, `i32` costs about 7.0 times `f32` and 3.3
+times `f64` on the CM5: 12.5 µs against 1.8 and 3.8 µs. That is a larger ratio than
+on the Pi 3, but the share of a period stays at about 1% or less.

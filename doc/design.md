@@ -60,9 +60,10 @@ The project has failed, even if it works, if any of these become true:
 - Written in Rust. `rust-version` is declared in `Cargo.toml`; no nightly.
 - The target is Debian trixie on a 64-bit Raspberry Pi. The first shipped version
   supports Pi 3, 4 and 5 and all HiFiBerry cards.
-- The 4 ms target holds on Pi 5, measured on a Compute Module 5, and is still to
-  be confirmed on the Pi 4. More latency is fine on a Pi 3, so the default latency
-  depends on the board. See [Latency](#latency) and `doc/measurements.md`.
+- The 4 ms target holds on Pi 5, measured on a Compute Module 5 with the daemon
+  running, and is still to be confirmed on the Pi 4. More latency is fine on a
+  Pi 3, so the default latency depends on the board. See [Latency](#latency) and
+  `doc/measurements.md`.
 - The kernel on the test boards is 6.18 with standard `PREEMPT`, not
   `PREEMPT_RT`. Measurement shows the defaults hold on that kernel under full load,
   so `PREEMPT_RT` is not needed.
@@ -239,7 +240,8 @@ costs up to 1.85 times as much in `f64` as in `f32`.
   and converted back *(call)*. That client is never bit-perfect anyway.
 
 On the Pi 3, mixing in `i32` costs about 3.5 times as much as in `f32` and 1.8 times
-as much as in `f64`. That is still about 1% of a period at 48 kHz with 8 sources,
+as much as in `f64`. On the CM5 it costs about 7 times `f32` and 3.3 times `f64`.
+That is still about 1% of a period or less at 48 kHz with 8 sources on both boards,
 but `i32` saves no CPU.
 
 ### Resampling
@@ -377,14 +379,15 @@ period for an hour under full load with the board throttled, and the 64 frame
 period did not. For the daemon itself, see stage 2 in `doc/measurements.md`. The
 Pi 4 default waits for its measurement.
 
-The audio loop waits until the card has room for a period, then reads the
-clients, mixes and writes the period at once. So a frame waits behind the card's
-two periods and nothing else, and `aas` adds two periods: measured through the
-cable on the Pi 3, 10.6 ms at 48 kHz. The cost is headroom. When the loop wakes,
-one period is still queued, so the wake-up and the cycle's work together must
-fit in one period: 5.3 ms at 48 kHz on the Pi 3, and 1.3 ms with the 4 ms target.
-A loop that read the clients first and then waited for room would hide its work
-inside the full buffer, but would add a third period of latency.
+The audio loop waits until the card has room for a period, then reads the clients,
+mixes and writes the period at once. So a frame waits behind the card's two
+periods and nothing else, and `aas` adds two periods. Measured through the cable
+at 48 kHz, that is 10.6 ms on the Pi 3 and 2.6 ms on the CM5. The cost is
+headroom. When the loop wakes, one period is still queued, so the wake-up and the
+cycle's work together must fit in one period: 5.3 ms at 48 kHz on the Pi 3, and
+1.3 ms with the 4 ms target. On the CM5 the worst cycle in an hour under full load
+was 0.11 ms. A loop that read the clients first and then waited for room would
+hide its work inside the full buffer, but would add a third period of latency.
 
 Resampling adds roughly 1 to 2 ms. A resampled client may exceed 4 ms, in
 preference to reducing resampling quality *(call)*.
@@ -395,6 +398,11 @@ The target counts as met when one hour of playback at 44.1 kHz and at 96 kHz run
 on the test board with no xruns and no wake-up gap longer than the buffer, on an
 otherwise idle system *(call)*. The xrun count alone is not enough, because ALSA can
 miss an underrun when the interrupt itself is late.
+
+Stage 2 made these runs under full load instead, which is harder, on both test
+boards. All passed on the Pi 3. On the CM5 one 96 kHz run had one wake-up gap over
+the buffer, 4.0 ms against 2.7 ms, and the same run repeated passed. No run has
+been made on an idle system yet.
 
 ## Analog input
 
@@ -624,7 +632,6 @@ and a Lyrion server.
 
 ## Not yet known
 
-- What `i32` costs on the CM5. On the Pi 3 it is measured, see Processing format.
 - How `librespot`, `shairport-sync`, `raat` and `sendspin` connect to audio
   today. Their configuration is not in the `hifiberry-os` repository. Check this
   before relying on "ALSA clients need no changes" for them.
