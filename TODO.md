@@ -116,6 +116,19 @@ are from the end of stage 2 and will drift, so search for the name given.
 - `src/control.rs`, `Stream::view`: the control thread maps and mlocks the whole
   ring to read one header field, which doubles the locked memory per client. Fix:
   map only the header page for the control thread's view.
+- `src/server.rs` and `src/sink_alsa.rs`, `AlsaVolume`: the daemon holds the
+  card's mixer open while the output is closed. A driver unbound through sysfs
+  then waits until the daemon lets go, which it only does when it sees the card
+  gone during playback, and `rmmod` reports the module in use. A USB card pulled
+  while idle is fine: its control is opened anew when the output opens. Fix:
+  close the mixer with the output and open it again with it, or watch the
+  mixer's descriptor for `POLLERR` on the control thread.
+- `src/server.rs`, card return: udev runs `alsactl restore` when a card appears.
+  On the Pi 3, after an unbind and bind, it set the card's level about 0.5 s
+  after the card was back, and the daemon set its own within the next second, so
+  the daemon won. With a faster retry the restore could land last and overwrite
+  the daemon's level. Fix: set the volume again a second or two after the card
+  returns, or keep udev from restoring a card the daemon drives.
 - `src/control.rs`, `set_volume`: the same percent again returns early, so it
   does not reassert the card's mixer after someone changed it with `alsamixer`.
   Changes made outside `aas` are never read back either. Fix: always write the
