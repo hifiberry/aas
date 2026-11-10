@@ -372,14 +372,19 @@ buffered:
 | 96 kHz | 128 frames | 512 frames |
 | 192 kHz | 256 frames | 1024 frames |
 
-So the Pi 3 default is about 11 to 12 ms. It held for an hour under full load with
-the board throttled. Its 64 frame period did not hold under that load. The Pi 4
-default waits for its measurement.
+So the Pi 3 default is about 11 to 12 ms. In stage 1 a bare ALSA probe held that
+period for an hour under full load with the board throttled, and the 64 frame
+period did not. For the daemon itself, see stage 2 in `doc/measurements.md`. The
+Pi 4 default waits for its measurement.
 
-Measured through the cable in stage 2, `aas` adds three of its periods, not two:
-about 16 ms on the Pi 3. The engine renders a period and then waits for room on
-the card, so one period waits outside the card's buffer. Until the engine waits
-first and renders after, the target is not met. See `doc/measurements.md`.
+The audio loop waits until the card has room for a period, then reads the
+clients, mixes and writes the period at once. So a frame waits behind the card's
+two periods and nothing else, and `aas` adds two periods: measured through the
+cable on the Pi 3, 10.6 ms at 48 kHz. The cost is headroom. When the loop wakes,
+one period is still queued, so the wake-up and the cycle's work together must
+fit in one period: 5.3 ms at 48 kHz on the Pi 3, and 1.3 ms with the 4 ms target.
+A loop that read the clients first and then waited for room would hide its work
+inside the full buffer, but would add a third period of latency.
 
 Resampling adds roughly 1 to 2 ms. A resampled client may exceed 4 ms, in
 preference to reducing resampling quality *(call)*.

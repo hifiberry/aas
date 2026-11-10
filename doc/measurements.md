@@ -27,7 +27,8 @@ synchronous disk writes.
 ## Conclusions
 
 - **Processing format: 32-bit float as the default, 64-bit still supported.** The
-  format can be set in the config, and `i32` is not yet measured. Mixing costs little
+  format can be set in the config. `i32` mixing was measured in stage 2, on the Pi 3
+  only: it costs more than either float. Mixing costs little
   on any board, about 1% of a period on the Pi 3 at 48 kHz. Resampling costs 1.4 to
   1.85 times as much in 64-bit.
 - **Resampling quality:** `high` by default. On the Pi 3, `high` to 192 kHz uses
@@ -189,10 +190,10 @@ as root with real-time rights. Players reached it through the plugin as ALSA's
 | Criterion | Pi 3 result | Verdict |
 |---|---|---|
 | Bit-exact through `snd-aloop`, 36 cases | 36 of 36 at `latency_ms = 48`. 5 of 36 at 24, from `snd-aloop` xruns | Pass at 48 ms |
-| Added latency, against the 12 ms target | 16 ms at 48 and 96 kHz, 17.4 ms at 44.1 kHz, 10.6 or 15.9 ms at 192 kHz | **Fail** |
-| One hour at 44.1 kHz, full load | 1 xrun, 1 wake-up gap of 13.4 ms against an 11.6 ms buffer. `aplay` also underran 696 times, starved by SD card reads | **Fail** |
-| One hour at 96 kHz, full load | 0 xruns, 1 wake-up gap of 12.1 ms against a 10.7 ms buffer. `aplay` also underran 1494 times, the same way | **Fail** |
-| One hour at 44.1 kHz with a second client at 96 kHz, full load | 0 xruns, 0 wake-up gaps, worst 6.9 ms against 11.6 ms | Pass |
+| Added latency, against the 12 ms target | Two periods: 11.6 ms at 44.1 kHz, 10.6 ms at 48 to 192 kHz | Pass |
+| One hour at 44.1 kHz, full load | 0 xruns, 0 wake-up gaps, worst gap 7.4 ms against an 11.6 ms buffer | Pass |
+| One hour at 96 kHz, full load | 0 xruns, 0 wake-up gaps, worst gap 6.6 ms against a 10.7 ms buffer | Pass |
+| One hour at 44.1 kHz with a second client at 96 kHz, full load | 0 xruns, 0 wake-up gaps, worst gap 9.1 ms against an 11.6 ms buffer | Pass |
 | `mpd` and `squeezelite`, alone and together | Both play, mixed, 0 xruns | Pass |
 | Mixing cost in `i32` | About 1.2% of a period at 48 kHz, 8 sources | Measured |
 
@@ -208,22 +209,22 @@ bit-perfect, so the processing format should make no difference, and it made non
 
 With `latency_ms = 48`, all 36 cases gave `differing 0, breaks 0`: S16, S24 and S32,
 at 44.1, 48, 96 and 192 kHz, in `i32`, `f32` and `f64`. The daemon counted 0 xruns
-and 0 wake-up gaps.
+and 0 wake-up gaps. The same 36 cases passed again with the same counts after the
+audio loop was changed to wait for room before reading the clients.
 
-With `latency_ms = 24`, the setting chosen in Task 8, only 5 of the 36 passed. The
-daemon counted 31 or 32 xruns for each processing format, about one per case,
-and each failure looks like one. At the fault the capture repeats about a buffer
+With `latency_ms = 24`, the setting first chosen for `snd-aloop`, only 5 of the 36
+passed. The daemon counted 32, 31 and 35 xruns in the `i32`, `f32` and `f64` runs,
+about one per case, and each failure looks like one. At the fault the capture repeats about a buffer
 of earlier frames, then holds a buffer of silence or of frames that fit nowhere,
 then skips ahead a few hundred frames. The faults fall at random places in the
 stream. One case run three times at each latency gave 4 xruns and one failure at
 24 ms, and 0 xruns and no failure at 48 ms. The cause is `snd-aloop`'s timer: the
 board's kernel runs at HZ = 250, so the timer ticks every 4 ms, and with a capture
-running on the other end it now and then misses a 21 ms buffer. In Task 8 the same
-buffer held with no capture running. Bit-exactness does not depend on the period
+running on the other end it now and then misses a 21 ms buffer. Earlier the same buffer held with no capture running. Bit-exactness does not depend on the period
 size, so 48 ms proves the same thing. Timing is measured on the real card.
 
-A negative check: with the volume at 99%, the same case reported every one of its
-480000 frames as differing.
+A negative check: with the volume at 99%, a 3 second case reported every one of
+its 144000 frames as differing.
 
 ### Latency through the cable
 
@@ -243,61 +244,86 @@ period buffer at 96 kHz.
 
 | Rate / period | Converters, linked | Direct, timed | Through `aas`, timed, median | Added by `aas` | In daemon periods |
 |---|---|---|---|---|---|
-| 44.1 kHz / 256 | 31 frames, 0.70 ms | 1.63 ms | 19.00 ms | 17.37 ms | 3.0 |
-| 48 kHz / 256 | 31 frames, 0.65 ms | 1.49 ms | 17.45 ms | 15.95 ms | 3.0 |
-| 96 kHz / 512 | 32 to 33 frames, 0.34 ms | 0.75 ms | 16.69 ms | 15.94 ms | 3.0 |
-| 192 kHz / 1024 | 34 frames, 0.18 ms | 0.37 ms | 10.96 or 15.9 to 16.3 ms | 10.6 or 15.5 to 15.9 ms | 2.0 or 3.0 |
+| 44.1 kHz / 256 | 31 frames, 0.70 ms | 1.63 ms | 13.18 ms | 11.55 ms | 1.99 |
+| 48 kHz / 256 | 31 frames, 0.65 ms | 1.50 ms | 12.11 ms | 10.62 ms | 1.99 |
+| 96 kHz / 512 | 32 to 33 frames, 0.34 ms | 0.75 ms | 11.34 ms | 10.59 ms | 1.99 |
+| 192 kHz / 1024 | 34 frames, 0.18 ms | 0.37 ms | 10.92 ms | 10.56 ms | 1.98 |
 
-At 192 kHz the repeats split: 10 of 20 added 2 periods and 10 added 3. At 96 kHz
-1 of 20 added 2 periods. The converter delays match stage 1 exactly.
+Every repeat added two periods, within 0.1 ms of the median. The converter delays
+match stage 1 exactly.
 
-**This misses the Pi 3's 12 ms target.** `aas` adds three of its periods, about
-16 ms, where the latency rule allows two. The engine renders a period, reading
-the clients' rings, and only then blocks in the card write until there is room
-for it. So one rendered period waits outside the card's two buffered periods. A
-frame waits two to three periods, depending on where it falls in the period, which
-is why 192 kHz splits. On the CM5 with its 4 ms target, three periods would be
-4.0 ms at 48 kHz and 4.35 ms at 44.1 kHz, so its 4 ms criterion is expected to fail
-the same way. Waiting for room before rendering would remove the extra period. That
-is a change to the daemon and is not made here.
+**This meets the Pi 3's 12 ms target.** The daemon waits for room on the card,
+then reads the clients' rings and writes the period at once, so a frame waits
+behind the card's two buffered periods and nothing else. On the CM5 with its 4 ms
+target, two periods are 2.9 ms at 44.1 kHz and 2.7 ms at 48 to 192 kHz, plus the
+converters, but that is still to be measured there.
 
-The daemon counted 0 xruns. At 192 kHz, 4 of 8 attempts before the run in the
-table stopped at the player's first `-EPIPE`: its ring ran dry. Direct `hw:` at
-192 kHz underran the same way twice, until the probe's capture buffer was cut from
-8 periods to 4, so the probe's own loop is the likely cause. A plain `aplay` at
-192 kHz through `aas`, with buffers of 2048, 4096 and 8192 frames, had no underrun
-in 5 seconds each. That a player is never starved at 192 kHz is not proven.
+Before that change the engine read the rings first and then blocked in the card
+write, and the same runs measured three periods: 17.4 ms at 44.1 kHz and 15.9 ms
+at 48 and 96 kHz.
+
+The daemon counted 0 xruns. At 192 kHz the probe stops at the player's first
+`-EPIPE`, and some attempts did, through `aas` and with direct `hw:` alike: one
+in two through `aas` in the final runs, and one in two direct. The probe reads its
+capture in the same loop as it writes, so its own loop is the likely cause. A
+plain `aplay` at 192 kHz through `aas`, with buffers of 2048, 4096 and 8192
+frames, had no underrun in 5 seconds each, before the change. That a player is
+never starved at 192 kHz is not proven.
 
 ### Hour runs
 
 The daemon ran with its defaults on the DAC+ ADC, 256 frames at 44.1 kHz and 512 at
-96 kHz, 2 periods buffered. Full load is the stage 1 recipe: one `sha256sum` per
-core and a repeated 128 MB synchronous write, with 5 seconds between writes. The
-player was a plain `aplay -D default` of an hour of orchestral music, public
-domain recordings from the Musopen collection, resampled to 44.1 kHz 16-bit and to
-96 kHz 24-bit. The Pi 3 has no heatsink. From 5 minutes in it ran at 86 to 87 °C
-and 500 to 660 MHz, throttled, the same worst case as stage 1.
+96 kHz, 2 periods buffered, with the audio loop that waits for room before it reads
+the clients. Full load is the stage 1 recipe: one `sha256sum` per core and a
+repeated 128 MB synchronous write, with 5 seconds between writes. The music was
+public domain orchestral recordings from the Musopen collection, resampled to
+44.1 kHz 16-bit and 96 kHz 24-bit, a 5 minute stretch of each kept in RAM and
+looped by `cat` into `aplay -D default -t raw` for an hour. The Pi 3 has no
+heatsink. From 5 minutes into each run it sat at 86 to 87 °C and 440 to 660 MHz,
+throttled, the same worst case as stage 1.
 
-| Run | Wall time | Daemon xruns | Wake-up gaps over the buffer | Worst gap / buffer | Worst cycle | `aplay` underruns |
-|---|---|---|---|---|---|---|
-| 44.1 kHz | 82 min | **1** | **1** | 13.41 / 11.61 ms | 3.60 ms | 696 |
-| 96 kHz | 117 min, stopped | 0 | **1** | 12.06 / 10.67 ms | 6.72 ms | 1494 |
+A fresh daemon was started for each run and stopped when its players ended, so
+its counters cover that hour, plus a few start-up cycles at 48 kHz. For the third
+run the output went idle when the players ended and closed 60 seconds later, and
+its counters were printed then.
 
-**Both runs fail the daemon's own criterion**, by one event each. In stage 1,
-`period-probe` held the same 256 frame period at 48 kHz for an hour under the same
-load with a worst gap of 6.62 ms, so the daemon does worse than a bare ALSA loop
-there. Its worst cycle of 6.72 ms at 96 kHz is more than a whole 5.33 ms period of
-work, and on a throttled board that is enough to miss the buffer once. What took
-that long is not known: the cycle time counts everything but the card write, and
-the daemon reports only the worst one. Stage 1 timed resampling and mixing at a
-few percent of a period, and no client was resampled in these runs.
+| Run | Daemon xruns | Wake-up gaps over the buffer | Worst gap / buffer | Worst cycle | `aplay` underruns |
+|---|---|---|---|---|---|
+| 44.1 kHz | 0 | 0 | 7.44 / 11.61 ms | 0.83 ms | 0 |
+| 96 kHz | 0 | 0 | 6.60 / 10.67 ms | 4.65 ms | 0 |
+| 44.1 kHz, then a second client at 96 kHz | 0 | 0 | 9.15 / 11.61 ms | 7.91 ms | 0 and 0 |
 
-The `aplay` underruns are a separate failure and are not the daemon's. `aplay`
-read its file from the SD card while the load wrote to the same card with
-`fsync`, and the reads stalled for longer than its half second buffer. Each
-underrun stalls `aplay`, so its hour of audio took 82 minutes. The 96 kHz run was
-stopped after 117 minutes with its hour not yet played. A check under the same
-load, 5 minutes each, settles the cause:
+All three pass. In the third run the output stayed at 44.1 kHz and the 96 kHz client
+was resampled at `high` quality in `f32`: 630902 cycles of 256 frames are an hour
+at 44.1 kHz and the minute of idle after it.
+
+The worst cycles of 4.65 and 7.91 ms are long next to the work in them, which
+stage 1 timed at a few percent of a period. With the loop waiting for room first,
+the work must fit in the one period still queued, 5.3 to 5.8 ms here, and the
+7.91 ms cycle did not cause an xrun. Where that time went is not known: the cycle
+time counts everything but the wait, so time taken from the audio thread by
+interrupts counts as well.
+
+No hour run was made on an otherwise idle Pi 3. The design's criterion is an hour
+at 44.1 kHz and at 96 kHz on an idle system, so stage 2 neither meets nor fails it
+as written. The runs here are under full load, which is the harder test.
+
+#### Before the change, and the SD card
+
+The first hour runs, made before the loop waited for room, read the music from the
+SD card. Two of them failed the criterion by one event each. At 44.1 kHz the
+daemon counted 1 xrun and 1 wake-up gap of 13.41 ms against an 11.61 ms buffer, at
+96 kHz 1 gap of 12.06 ms against 10.67 ms. A third run, with a second client and
+the music in RAM, passed with a worst gap of 6.92 ms, close to stage 1's 6.80 ms.
+
+A gap longer than the buffer cannot come from a long cycle in that loop. Each
+cycle started with the card full, so even 6.7 ms of work left about 4 ms queued.
+The gaps need the wake-up itself to be late by more than a period, for example
+interrupt work holding the CPU. The reading `aplay` was also the difference
+between the failing runs and the passing one. It ran into the SD card's write
+load: `aplay` underran 696 times in the 44.1 kHz run and 1494 times in the 96 kHz
+run, and a check of 5 minutes each under the same load settles where that came
+from:
 
 | Player | Underruns |
 |---|---|
@@ -306,30 +332,17 @@ load, 5 minutes each, settles the cause:
 | `aplay` straight to `hw:0,0`, daemon stopped, file on the SD card | 61 |
 
 A player that reads from the SD card while something else writes to it with
-`fsync` drops out on a Pi 3, with or without `aas`. The daemon had 0 xruns and 0
-gaps in the two runs through it.
-
-The third run was made after that check, so its music came from RAM: a 5 minute
-stretch of each file, looped by `cat` into `aplay`. One `aplay` played 44.1 kHz
-16-bit, and 5 seconds later a second one played 96 kHz 24-bit, for an hour, under
-the same full load and throttling. The output stayed at 44.1 kHz with the second
-client resampled at `high` quality in `f32`. The daemon ran 632346 cycles, and an
-hour at 44.1 kHz with 256 frames is 620000 of them. It switched to 96 kHz only at
-the end, when the first player stopped, and then went idle.
-
-| Run | Daemon xruns | Wake-up gaps over the buffer | Worst gap / buffer | Worst cycle | `aplay` underruns |
-|---|---|---|---|---|---|
-| 44.1 kHz plus 96 kHz, from RAM | 0 | 0 | 6.92 / 11.61 ms | 6.50 ms | 0 and 0 |
-
-This one passes. Its worst cycle, 6.50 ms with a resampler running, is close to
-the 6.72 ms of the 96 kHz run that had no resampler, which again points at
-something other than the audio work taking the time on a throttled board. The
-44.1 kHz and 96 kHz runs were not repeated with the music in RAM.
+`fsync` drops out on a Pi 3, with or without `aas`, so the runs above keep the
+music in RAM. That the SD card's interrupt load also delayed the daemon's wake-ups
+in those two runs fits, but is not proven: they gave one event each. The daemon
+now logs each gap over the buffer as it happens, with its time on
+`CLOCK_MONOTONIC`, so that a future gap can be matched to load events.
 
 ### Players
 
 `mpd` and `squeezelite` from Debian, each alone and then together at different
-rates, through `default` with the daemon's defaults. `mpd` played a 44.1 kHz file
+rates, through `default` with the daemon's defaults. This was run before the audio
+loop was changed to wait for room first, and was not repeated after. `mpd` played a 44.1 kHz file
 with `mixer_type "hardware"` and `mixer_control "Master"`. `squeezelite` ran with
 its default ALSA settings, which use mmap, and played a 96 kHz FLAC. A minimal
 SlimProto server stood in for Lyrion: it sends one start command, unity gain and
@@ -346,7 +359,7 @@ Both players played in every phase, and the output stayed at the first one's
 rate. `mpd`'s position and the elapsed time `squeezelite` reported both advanced
 in real time, about 30 seconds in 30 seconds. `squeezelite` reported no underrun,
 and the daemon ended with 0 xruns and 0 wake-up gaps. `mpc volume 50` set `Master`
-to 70%, -18 dB, through `mpd`'s own curve, as in Task 11.
+to 70%, -18 dB, through `mpd`'s own curve for a wide dB range.
 
 Without a gain command from the server, `squeezelite` plays silence. The first run
 did that, until the stand-in server sent unity gain as Lyrion does.
