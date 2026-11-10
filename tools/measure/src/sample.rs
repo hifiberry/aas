@@ -37,7 +37,9 @@ pub fn mix_gain<T: Float>(inputs: &[&[T]], gains: &[T], out: &mut [T]) {
 const Q32_ONE: f64 = 4_294_967_296.0;
 
 /// Sum `inputs`, each multiplied by its gain, into `out` in integer
-/// arithmetic, as the daemon's `i32` format does. Each product is rounded
+/// arithmetic, as the daemon's `i32` format does. A copy of
+/// `format::I32::accumulate` and `finish` in `src/format.rs`: change both
+/// together, or the bench times old code. Each product is rounded
 /// once, the sum is kept in a 64-bit accumulator, and only the result
 /// saturates at the S32 limits. `acc` is as long as `out`.
 pub fn mix_i32(inputs: &[&[i32]], gains: &[f32], acc: &mut [i64], out: &mut [i32]) {
