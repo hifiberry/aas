@@ -292,7 +292,7 @@ mod card {
         format: CardFormat,
         /// Frames in the card's buffer.
         buffer: u32,
-        /// Frames in the card's period, which is also its avail_min.
+        /// Frames in the card's period.
         period: usize,
         /// Room for one engine period in the card's format.
         bytes: Vec<u8>,
@@ -455,7 +455,11 @@ mod card {
                 let sw = pcm.sw_params_current().map_err(|x| e("sw params", x))?;
                 sw.set_start_threshold(buffer)
                     .map_err(|x| e("start threshold", x))?;
-                sw.set_avail_min(card_period)
+                // The engine waits for room for its own period, so ALSA
+                // wakes it then, not at each of the card's periods. A card
+                // that granted a smaller period would otherwise make
+                // `wait_room` return at once until the difference had played.
+                sw.set_avail_min(Frames::from(period).min(buffer))
                     .map_err(|x| e("avail min", x))?;
                 pcm.sw_params(&sw).map_err(|x| e("apply sw", x))?;
             }
