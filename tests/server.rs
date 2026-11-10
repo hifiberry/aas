@@ -1022,16 +1022,19 @@ fn a_card_missing_at_the_start_gets_the_volume_when_it_appears() {
 fn a_card_that_comes_back_gets_the_volume_again() {
     let (sink, log) = memory_sink();
     let present = Arc::new(AtomicBool::new(true));
-    let (open, mixers) = fake_volume(present);
+    let (open, mixers) = fake_volume(present.clone());
     let daemon = Daemon::start_with_volume(default_config(), sink, open);
     let control = volume_client(&daemon);
     let set = call_raw(&control, &Request::SetVolume { percent: 40 });
     assert_eq!(set, Some(Reply::Ok));
     assert_eq!(last_set(&mixers), Some(-36.0));
+    present.store(false, Ordering::Relaxed);
     log.fail(Some(SinkError::Gone));
-    // Long enough for the audio thread to see it gone, shorter than a retry.
-    thread::sleep(Duration::from_millis(200));
+    // The old control is let go, as a card being removed waits for that.
+    let old = mixers.lock().unwrap().last().unwrap().clone();
+    assert!(wait_for(|| Arc::strong_count(&old) == 2));
     let before = mixers.lock().unwrap().len();
+    present.store(true, Ordering::Relaxed);
     log.fail(None);
     assert!(wait_for(|| mixers.lock().unwrap().len() > before));
     assert_eq!(last_set(&mixers), Some(-36.0));

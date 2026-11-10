@@ -45,7 +45,7 @@ fn check(rc: isize) -> io::Result<usize> {
 /// `FallbackSink`, so a missing card does not stop playback. The output
 /// volume is kept in the file `state`. It is set on the control that
 /// `hardware` opens, if given and found, else in software. `hardware` is
-/// called again each time the card comes back.
+/// called again each time the card goes or comes back.
 pub fn run(
     config: Config,
     sink: Box<dyn Sink>,
@@ -216,10 +216,11 @@ impl Server {
         if let Some(rates) = self.rates.take() {
             self.control.set_supported(rates, now);
         }
-        // The card may be a new instance, so its control is opened again.
-        if self.card.came_back() {
+        // A card that is back may be a new instance, so its control is
+        // opened again. One that is gone has none, and the old one is closed.
+        if self.card.changed() {
             if let Some(open) = &mut self.hardware {
-                self.control.card_found(open());
+                self.control.card_changed(open());
             }
         }
         if fds[1].revents != 0 {

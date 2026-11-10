@@ -288,20 +288,21 @@ impl RatesWatch {
     }
 }
 
-/// Tells the control thread that the real sink has started to play again,
-/// so that it can find the card's volume control anew. The audio thread
-/// only adds to a shared counter, which neither locks nor allocates.
+/// Tells the control thread that the real sink has gone or started to play
+/// again, so that it can let go of the card's volume control or open it
+/// anew. The audio thread only adds to a shared counter, which neither locks
+/// nor allocates.
 pub struct CardWatch {
-    found: Arc<AtomicU64>,
+    changes: Arc<AtomicU64>,
     seen: u64,
 }
 
 impl CardWatch {
-    /// Whether the real sink has started to play since the last call.
-    pub fn came_back(&mut self) -> bool {
-        let found = self.found.load(Ordering::Acquire);
-        let changed = found != self.seen;
-        self.seen = found;
+    /// Whether the real sink has gone or started to play since the last call.
+    pub fn changed(&mut self) -> bool {
+        let changes = self.changes.load(Ordering::Acquire);
+        let changed = changes != self.seen;
+        self.seen = changes;
         changed
     }
 }
@@ -323,9 +324,11 @@ pub struct FallbackSink {
     format: (u32, u32),
     /// True while `inner` is open and working.
     live: bool,
-    /// Counts the times `inner` went from closed or gone to open. The card
-    /// may be a new instance each time, with its mixer at its own default.
-    found: Arc<AtomicU64>,
+    /// Counts the times `inner` went from closed or gone to open, and from
+    /// open to gone. A card that is back may be a new instance, its mixer at
+    /// its own default. A card that is gone may wait to be removed until
+    /// every handle on it is closed, the mixer's too.
+    changes: Arc<AtomicU64>,
     retry_at: Instant,
     retry: Duration,
 }
@@ -339,7 +342,7 @@ impl FallbackSink {
             null: NullSink::default(),
             format: (0, 0),
             live: false,
-            found: Arc::default(),
+            changes: Arc::default(),
             retry_at: Instant::now(),
             retry: RETRY,
         }
@@ -352,11 +355,12 @@ impl FallbackSink {
         RatesWatch(consumer)
     }
 
-    /// Where the control thread learns that the inner sink plays again.
+    /// Where the control thread learns that the inner sink has gone or plays
+    /// again.
     pub fn card_watch(&self) -> CardWatch {
         CardWatch {
-            found: self.found.clone(),
-            seen: self.found.load(Ordering::Acquire),
+            changes: self.changes.clone(),
+            seen: self.changes.load(Ordering::Acquire),
         }
     }
 
@@ -367,7 +371,7 @@ impl FallbackSink {
         let was_live = self.live;
         self.live = self.inner.open(rate, period).is_ok();
         if self.live && !was_live {
-            self.found.fetch_add(1, Ordering::Release);
+            self.changes.fetch_add(1, Ordering::Release);
         }
         self.retry_at = Instant::now() + self.retry;
         let rates = self.inner.supported_rates();
@@ -384,6 +388,17 @@ impl FallbackSink {
     }
 }
 
+impl FallbackSink {
+    /// The inner sink has gone. It is closed, and tried again at the next
+    /// retry.
+    fn lost(&mut self) {
+        self.inner.close();
+        self.live = false;
+        self.retry_at = Instant::now() + self.retry;
+        self.changes.fetch_add(1, Ordering::Release);
+    }
+}
+
 impl Sink for FallbackSink {
     fn open(&mut self, rate: u32, period: u32) -> Result<(), SinkError> {
         self.format = (rate, period);
@@ -395,11 +410,7 @@ impl Sink for FallbackSink {
     fn wait_room(&mut self) -> Result<(), SinkError> {
         if self.live {
             match self.inner.wait_room() {
-                Err(SinkError::Gone) => {
-                    self.inner.close();
-                    self.live = false;
-                    self.retry_at = Instant::now() + self.retry;
-                }
+                Err(SinkError::Gone) => self.lost(),
                 result => return result,
             }
         }
@@ -412,11 +423,7 @@ impl Sink for FallbackSink {
         }
         if self.live {
             match self.inner.write(frames) {
-                Err(SinkError::Gone) => {
-                    self.inner.close();
-                    self.live = false;
-                    self.retry_at = Instant::now() + self.retry;
-                }
+                Err(SinkError::Gone) => self.lost(),
                 result => return result,
             }
         }
@@ -635,28 +642,31 @@ mod tests {
     }
 
     #[test]
-    fn the_card_watch_sees_each_return_of_the_inner_sink() {
+    fn the_card_watch_sees_each_loss_and_return_of_the_inner_sink() {
         let (mut sink, log) = fallback(Duration::ZERO);
         let mut watch = sink.card_watch();
-        assert!(!watch.came_back());
+        assert!(!watch.changed());
         sink.open(48000, 48).unwrap();
-        assert!(watch.came_back());
-        assert!(!watch.came_back());
-        // A rate change while it plays is not a return.
+        assert!(watch.changed());
+        assert!(!watch.changed());
+        // A rate change while it plays is neither.
         sink.open(44100, 48).unwrap();
-        assert!(!watch.came_back());
-        // Gone, a failed retry, then back.
+        assert!(!watch.changed());
+        // Gone, so the control thread can let go of the old card.
         log.fail(Some(SinkError::Gone));
         sink.write(&[[0; 2]; 48]).unwrap();
+        assert!(watch.changed());
+        // A failed retry is no change.
         sink.write(&[[0; 2]; 48]).unwrap();
-        assert!(!watch.came_back());
+        assert!(!watch.changed());
         log.fail(None);
         sink.write(&[[0; 2]; 48]).unwrap();
-        assert!(watch.came_back());
+        assert!(watch.changed());
         // Closed while idle, then opened: the card may have changed meanwhile.
         sink.close();
+        assert!(!watch.changed());
         sink.open(48000, 48).unwrap();
-        assert!(watch.came_back());
+        assert!(watch.changed());
     }
 
     #[test]

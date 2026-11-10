@@ -217,10 +217,11 @@ impl Control {
         );
     }
 
-    /// The card has come back, with this volume control or none: it may be
-    /// a new instance of the card, its mixer at its own default. The current
-    /// volume is set on the control, or carried in software without one.
-    pub fn card_found(&mut self, hardware: Option<Box<dyn HardwareVolume>>) {
+    /// The card has gone or come back, and has this volume control now, or
+    /// none. A card that is back may be a new instance, its mixer at its own
+    /// default. The old control is closed, and the current volume is set on
+    /// the new one, or carried in software without one.
+    pub fn card_changed(&mut self, hardware: Option<Box<dyn HardwareVolume>>) {
         self.volume.replace_hardware(hardware);
         eprintln!(
             "aas: output volume {}%, in {}",
