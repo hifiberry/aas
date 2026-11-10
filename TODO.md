@@ -117,12 +117,14 @@ are from the end of stage 2 and will drift, so search for the name given.
   ring to read one header field, which doubles the locked memory per client. Fix:
   map only the header page for the control thread's view.
 - `src/server.rs` and `src/sink_alsa.rs`, `AlsaVolume`: the daemon holds the
-  card's mixer open while the output is closed. A driver unbound through sysfs
-  then waits until the daemon lets go, which it only does when it sees the card
-  gone during playback, and `rmmod` reports the module in use. A USB card pulled
-  while idle is fine: its control is opened anew when the output opens. Fix:
-  close the mixer with the output and open it again with it, or watch the
-  mixer's descriptor for `POLLERR` on the control thread.
+  card's mixer open while the output is closed, which is the resting state after
+  60 s idle. A card lost then is never reported: `FallbackSink::close` clears
+  `live` without counting, and `try_inner` counts only an open that succeeds. So
+  a driver unbound through sysfs, or a module reload, hangs until the daemon
+  stops, even if playback starts again, and `rmmod` reports the module in use.
+  Loss during playback is handled. Fix: close the mixer with the output and open
+  it again with it, or count a failed open when the sink was live before the
+  last close (a flag that `close` does not clear).
 - `src/server.rs`, card return: udev runs `alsactl restore` when a card appears.
   On the Pi 3, after an unbind and bind, it set the card's level about 0.5 s
   after the card was back, and the daemon set its own within the next second, so
