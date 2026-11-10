@@ -1,0 +1,11 @@
+[package]
+name = "aas-client"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Shared ring, sample conversion and protocol for aas clients"
+license = "MIT"
+publish = false
+
+[dependencies]
+libc = "0.2"

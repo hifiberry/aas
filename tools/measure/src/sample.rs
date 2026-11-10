@@ -33,9 +33,54 @@ pub fn mix_gain<T: Float>(inputs: &[&[T]], gains: &[T], out: &mut [T]) {
     }
 }
 
+/// Fixed-point gain of 1.0, Q32.
+const Q32_ONE: f64 = 4_294_967_296.0;
+
+/// Sum `inputs`, each multiplied by its gain, into `out` in integer
+/// arithmetic, as the daemon's `i32` format does. A copy of
+/// `format::I32::accumulate` and `finish` in `src/format.rs`: change both
+/// together, or the bench times old code. Each product is rounded
+/// once, the sum is kept in a 64-bit accumulator, and only the result
+/// saturates at the S32 limits. `acc` is as long as `out`.
+pub fn mix_i32(inputs: &[&[i32]], gains: &[f32], acc: &mut [i64], out: &mut [i32]) {
+    acc.fill(0);
+    for (input, gain) in inputs.iter().zip(gains) {
+        for (a, i) in acc.iter_mut().zip(input.iter()) {
+            let q = (f64::from(*gain) * Q32_ONE).round() as i64;
+            let p = i128::from(*i) * i128::from(q) + (1i128 << 31);
+            let v = (p >> 32).clamp(i128::from(i64::MIN / 2), i128::from(i64::MAX / 2));
+            *a = a.saturating_add(v as i64);
+        }
+    }
+    for (o, a) in out.iter_mut().zip(acc.iter()) {
+        *o = (*a).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unity_i32_mix_of_one_input_is_exact() {
+        let input = [i32::MIN, -1, 0, 1, i32::MAX];
+        let mut acc = [0; 5];
+        let mut out = [0; 5];
+        mix_i32(&[&input], &[1.0], &mut acc, &mut out);
+        assert_eq!(out, input);
+    }
+
+    #[test]
+    fn i32_mix_saturates_only_at_the_end() {
+        let high = [i32::MAX];
+        let low = [-i32::MAX];
+        let mut acc = [0; 1];
+        let mut out = [0; 1];
+        mix_i32(&[&high, &high, &low], &[1.0; 3], &mut acc, &mut out);
+        assert_eq!(out, high);
+        mix_i32(&[&high, &high], &[1.0; 2], &mut acc, &mut out);
+        assert_eq!(out, high);
+    }
 
     #[test]
     fn f64_round_trip_is_exact() {

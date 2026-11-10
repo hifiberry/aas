@@ -1,5 +1,6 @@
 [workspace]
-members = [".", "tools/measure"]
+members = [".", "crates/aas-alsa", "crates/aas-client", "tools/measure"]
+default-members = [".", "crates/aas-client", "tools/measure"]
 
 [package]
 name = "aas"
@@ -10,4 +11,30 @@ description = "Alternative audio server"
 license = "MIT"
 repository = "https://github.com/hifiberry/aas"
 
+[lib]
+name = "aas"
+path = "src/lib.rs"
+
+[[bin]]
+name = "aas"
+path = "src/main.rs"
+
+[features]
+# Drive a sound card through ALSA. Needs libasound2-dev to build.
+alsa-output = ["dep:alsa"]
+
 [dependencies]
+aas-client = { version = "0.1.0", path = "crates/aas-client" }
+alsa = { version = "0.12.1", optional = true }
+audioadapter-buffers = "4"
+libc = "0.2"
+rtrb = "0.4"
+rubato = "4"
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+
+[dev-dependencies]
+# Without its default `disable_release`, so the allocation checks also run
+# in release builds, which the audio thread is.
+assert_no_alloc = { version = "1", default-features = false }
+tempfile = "3"
