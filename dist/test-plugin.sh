@@ -799,12 +799,13 @@ case_nonblocking_drain() {
 
 case_drop_during_a_blocking_drain() {
 	name=drop_during_a_blocking_drain
-	if out=$("$work/pcmtest" dropdrain aas); then pass $name "$out"; else fail $name "$out"; fi
+	# A drain that does not let go would hang here, so it gets 10 s.
+	if out=$(timeout 10 "$work/pcmtest" dropdrain aas); then pass $name "$out"; else fail $name "$out"; fi
 }
 
 case_hw_free_gives_the_stream_up() {
 	name=hw_free_gives_the_stream_up
-	if out=$("$work/pcmtest" hwfree aas); then pass $name "$out"; else fail $name "$out"; fi
+	if out=$(timeout 10 "$work/pcmtest" hwfree aas); then pass $name "$out"; else fail $name "$out"; fi
 }
 
 # A buffer smaller than the daemon can keep fed is rounded up, or refused
@@ -1025,7 +1026,10 @@ case_control_reconnects_after_restart() {
 	amixer -D default -s <"$work/commands" >"$work/out" 2>&1 &
 	mixer=$!
 	exec 3>"$work/commands"
-	echo "sset Master 40%" >&3
+	# An amixer that has died must fail this case, not end the script
+	# with SIGPIPE on the next write to it.
+	trap '' PIPE
+	echo "sset Master 40%" >&3 2>/dev/null
 	sleep 0.5
 	before=$(master)
 	daemon=$(main_pid)
@@ -1035,11 +1039,13 @@ case_control_reconnects_after_restart() {
 	sudo systemctl restart aas
 	if ! wait_daemon; then
 		exec 3>&-
+		trap - PIPE
 		fail $name "the daemon did not come back"
 		return
 	fi
-	echo "sset Master 60%" >&3
+	echo "sset Master 60%" >&3 2>/dev/null
 	exec 3>&-
+	trap - PIPE
 	if ! wait_gone $mixer 5000; then
 		kill -9 $mixer
 		wait $mixer 2>/dev/null
