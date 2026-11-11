@@ -49,6 +49,9 @@ pub trait Processing {
     fn gain(gain: f32) -> Self::Gain;
     /// Add `sample * gain` to `acc`.
     fn accumulate(acc: &mut Self::Acc, sample: i32, gain: Self::Gain);
+    /// Add `value * gain` to `acc`, where `value` is a sample already in
+    /// the accumulator's form, such as the result of a plugin chain.
+    fn accumulate_acc(acc: &mut Self::Acc, value: Self::Acc, gain: Self::Gain);
     /// Convert to S32, saturating at the limits. A float that is not a
     /// number becomes 0, and an infinite one the limit of its sign.
     fn finish(acc: Self::Acc) -> i32;
@@ -115,6 +118,14 @@ impl Processing for I32 {
         *acc = acc.saturating_add(v as i64);
     }
 
+    /// As `accumulate`, on a wider value.
+    fn accumulate_acc(acc: &mut i64, value: i64, q: i64) {
+        let p = i128::from(value) * i128::from(q);
+        let p = p + (1i128 << 31) + (p >> 127);
+        let v = (p >> 32).clamp(i128::from(i64::MIN / 2), i128::from(i64::MAX / 2));
+        *acc = acc.saturating_add(v as i64);
+    }
+
     fn finish(acc: i64) -> i32 {
         acc.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
     }
@@ -153,6 +164,10 @@ impl Processing for F32 {
         *acc += sample as f32 / SCALE as f32 * gain;
     }
 
+    fn accumulate_acc(acc: &mut f32, value: f32, gain: f32) {
+        *acc += value * gain;
+    }
+
     fn finish(acc: f32) -> i32 {
         (acc * SCALE as f32).round() as i32
     }
@@ -186,6 +201,10 @@ impl Processing for F64 {
 
     fn accumulate(acc: &mut f64, sample: i32, gain: f64) {
         *acc += f64::from(sample) / SCALE * gain;
+    }
+
+    fn accumulate_acc(acc: &mut f64, value: f64, gain: f64) {
+        *acc += value * gain;
     }
 
     fn finish(acc: f64) -> i32 {
@@ -247,6 +266,18 @@ pub fn mix_add<P: Processing>(samples: &[[i32; 2]], ramp: Ramp, acc: &mut [[P::A
         let g = P::gain(ramp.at(i, n));
         P::accumulate(&mut a[0], s[0], g);
         P::accumulate(&mut a[1], s[1], g);
+    }
+}
+
+/// Adds a source that is already in the accumulator's form, such as the
+/// output of a plugin chain, without going through S32 and so without
+/// clipping it. The ramp spans all of `acc`.
+pub fn mix_add_acc<P: Processing>(values: &[[P::Acc; 2]], ramp: Ramp, acc: &mut [[P::Acc; 2]]) {
+    let n = acc.len();
+    for (i, (a, v)) in acc.iter_mut().zip(values.iter()).enumerate() {
+        let g = P::gain(ramp.at(i, n));
+        P::accumulate_acc(&mut a[0], v[0], g);
+        P::accumulate_acc(&mut a[1], v[1], g);
     }
 }
 
@@ -506,5 +537,43 @@ mod tests {
     fn db_to_gain_known_values() {
         assert_eq!(db_to_gain(0.0), 1.0);
         assert!((db_to_gain(-20.0) - 0.1).abs() < 1e-6);
+    }
+
+    /// `mix_add_acc` on what `mix_add` made of S32 frames at unity gives
+    /// what `mix_add` gives with the same ramp.
+    fn adding_an_accumulator_matches_adding_its_frames<P: Processing>() {
+        let frames: Vec<[i32; 2]> = EDGES.iter().map(|&v| [v, v ^ 0x55]).collect();
+        let mut block = vec![[P::zero(); 2]; frames.len()];
+        mix_add::<P>(&frames, Ramp::flat(1.0), &mut block);
+        for ramp in [Ramp::flat(0.5), Ramp { from: 1.0, to: 0.0 }] {
+            let mut want = vec![[P::zero(); 2]; frames.len()];
+            let mut got = vec![[P::zero(); 2]; frames.len()];
+            mix_add::<P>(&frames, ramp, &mut want);
+            mix_add_acc::<P>(&block, ramp, &mut got);
+            let (mut w, mut g) = (vec![[0; 2]; frames.len()], vec![[0; 2]; frames.len()]);
+            mix_finish::<P>(&want, &mut w);
+            mix_finish::<P>(&got, &mut g);
+            assert_eq!(g, w, "{ramp:?}");
+        }
+    }
+
+    #[test]
+    fn adding_an_accumulator_is_adding_its_frames() {
+        adding_an_accumulator_matches_adding_its_frames::<I32>();
+        adding_an_accumulator_matches_adding_its_frames::<F32>();
+        adding_an_accumulator_matches_adding_its_frames::<F64>();
+    }
+
+    #[test]
+    fn a_float_accumulator_over_full_scale_is_added_unclipped() {
+        let mut out = [[0; 2]];
+        let mut acc = [[0.0f32; 2]];
+        mix_add_acc::<F32>(&[[2.0, -3.0]], Ramp::flat(0.25), &mut acc);
+        mix_finish::<F32>(&acc, &mut out);
+        assert_eq!(out, [[1 << 30, -(3 << 29)]]);
+        let mut acc = [[0.0f64; 2]];
+        mix_add_acc::<F64>(&[[2.0, -3.0]], Ramp::flat(0.25), &mut acc);
+        mix_finish::<F64>(&acc, &mut out);
+        assert_eq!(out, [[1 << 30, -(3 << 29)]]);
     }
 }

@@ -30,7 +30,8 @@ pub struct Counters {
     pub analog_padded_frames: AtomicU64,
     /// Captured frames dropped because more than two periods were queued.
     pub analog_dropped_frames: AtomicU64,
-    /// 1 while the analog input is mixed, else 0.
+    /// 1 while the analog input has signal, else 0. During DoP it can have
+    /// signal and not be played.
     pub analog_open: AtomicU64,
 }
 
