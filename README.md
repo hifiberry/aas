@@ -127,8 +127,8 @@ enabled, and it works only on cards with an ADC that `aas` knows.
 
 Each `[[plugin]]` table adds one plugin to the chain at `place`, in the order of
 the file. `type` is a built-in (`detect`, which runs only at `analog` and may
-appear once, or `balance`) or `library` with a `path`. Every other key is a
-parameter and must be a number.
+appear once, or `balance`) or `library` with a `path`, which is absolute. Every
+other key is a parameter and must be a finite number.
 
 ### After a daemon restart
 

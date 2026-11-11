@@ -203,6 +203,9 @@ fn plugin_from_table(n: usize, mut table: toml::Table) -> Result<PluginConfig, S
             toml::Value::Integer(i) => i as f64,
             _ => return Err(format!("plugin {n}: {key} must be a number")),
         };
+        if !number.is_finite() {
+            return Err(format!("plugin {n}: {key} must be a finite number"));
+        }
         params.insert(key, number);
     }
     Ok(PluginConfig {
@@ -536,6 +539,16 @@ mod tests {
     #[test]
     fn a_parameter_that_is_not_a_number_is_an_error() {
         for v in ["\"loud\"", "true", "{ a = 1 }", "[1, 2]"] {
+            let e = err(&format!(
+                "[[plugin]]\nplace = \"mix\"\ntype = \"balance\"\ngain = {v}\n"
+            ));
+            assert!(e.contains("plugin 1") && e.contains("gain"), "{v}: {e}");
+        }
+    }
+
+    #[test]
+    fn a_parameter_that_is_not_finite_is_an_error() {
+        for v in ["nan", "inf", "-inf", "+nan"] {
             let e = err(&format!(
                 "[[plugin]]\nplace = \"mix\"\ntype = \"balance\"\ngain = {v}\n"
             ));
