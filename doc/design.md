@@ -425,8 +425,10 @@ The target counts as met when one hour of playback at 44.1 kHz and at 96 kHz run
 on the test board with no xruns and no wake-up gap longer than the buffer, on an
 otherwise idle system *(call)*. The xrun count alone is not enough, because ALSA
 misses an underrun when the interrupt itself is late. A tone played through the
-cable on the CM5 showed that every gap longer than the buffer is a break in the
-sound, and that ALSA counted only some of them.
+cable on both test boards showed that every gap longer than the buffer is a
+break in the sound, and that ALSA counted only some of them. The gap alone is
+not enough either: on the Pi 3 some underruns came with a gap just under the
+buffer, and those ALSA did count.
 
 Stage 2 made these runs under full load instead, which is harder, on both test
 boards. All passed on the Pi 3. On the CM5 one 96 kHz run had one wake-up gap over

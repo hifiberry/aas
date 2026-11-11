@@ -62,11 +62,10 @@ synchronous disk writes.
 - Full load is CPU and disk. Network and USB load are not included.
 - An xrun count alone is not enough. See the 96 kHz row under
   [Periods](#periods). ALSA can miss an underrun when the interrupt itself is late,
-  so a run only passes if no wake-up gap is longer than the buffer. On the CM5 a
-  tone played through the cable settled it: a gap longer than the buffer is a
-  break in the sound, with or without an xrun. See
-  [Late wake-ups and the tone](#late-wake-ups-and-the-tone). The Pi 3 has not
-  had that test.
+  so a run only passes if it has no xrun and no wake-up gap longer than the
+  buffer. A tone played through the cable settled it on both boards: a gap
+  longer than the buffer is a break in the sound, with or without an xrun. See
+  [Late wake-ups and the tone](#late-wake-ups-and-the-tone).
 - `medium` resampling is measured for cost only. Its audio quality has not been
   measured.
 - `dsp-bench` times one resampler at a time. Several resampled clients add up.
@@ -483,8 +482,8 @@ now logs each gap over the buffer as it happens, with its time on
 ### Late wake-ups and the tone
 
 The hour runs left one question open: when the audio loop wakes later than the
-card's buffer lasts and ALSA counts no xrun, did the sound break? On the CM5 test
-board it did, every time. The Pi 3 was not tested.
+card's buffer lasts and ALSA counts no xrun, did the sound break? It did, every
+time, on the CM5 test board and on the Pi 3 test board.
 
 `tone-probe` plays a 1100 Hz sine at -6 dBFS through `default` and captures it from
 the ADC through the cable, as S32 at 48 kHz. A sine obeys
@@ -493,9 +492,12 @@ the tone is cut, repeated or shifted. The probe calibrates on one second, marks 
 break where the residual passes 8 times the largest one of that second or the
 level falls below half, and prints each break with its time on `CLOCK_MONOTONIC`,
 its length and how far the tone is shifted after it. The capture came back at
--6.1 dBFS with a residual of -91 dBFS RMS, which put the threshold 53 to 54 dB
-under the tone. The probe's own capture never overran and its player never
+-6.1 dBFS with a residual of -91 dBFS RMS on the CM5, which put the threshold 53
+to 54 dB under the tone, and at -6.0 dBFS with -85 to -88 dBFS on the Pi 3, 48 to
+50 dB under the tone. The probe's own capture never overran and its player never
 underran in any run below.
+
+#### CM5
 
 The daemon ran from its unit with its defaults: 64 frames at 48 kHz, 2 periods,
 a 2.67 ms buffer. Straight to the card for 20 s and through the daemon for 300 s,
@@ -515,7 +517,7 @@ daemon for each batch so that its counters cover that batch. Two kinds:
   kernel's handling of it adds to the hole, so the lower figure of each range is
   the stall itself.
 
-Thread late, 30 stalls per row:
+CM5, thread late, 30 stalls per row:
 
 | Stall | Gaps logged over the buffer | Xruns counted | Breaks heard |
 |---|---|---|---|
@@ -534,8 +536,8 @@ queued does nothing: between one and two periods are queued at any time, so a
 2 ms stall broke the tone 25 times in 30. The gap includes the restart of the
 card, which is why it is longer than the stall.
 
-Interrupt late. The stalls counted are those the probe was listening to, with no
-earlier outage still running:
+CM5, interrupt late. The stalls counted are those the probe was listening to,
+with no earlier outage still running:
 
 | Stall | Stalls | No gap, no break | Short silence, xrun counted | Outage of about 1.5 s, no xrun | One buffer played again, no xrun |
 |---|---|---|---|---|---|
@@ -575,25 +577,132 @@ each. What ALSA made of them differs:
   and the driver gave the transfer up. So on a CM5, and by the same chip on a
   Pi 5, a late interrupt can stop the card for good until it is reopened.
 
-Last, 15 minutes of tone under the full load, one `sha256sum` per core and 171
-writes of 128 MB with `fsync`, at 83 to 86 °C: no break, no gap over the buffer,
+Last on the CM5, 15 minutes of tone under the full load, one `sha256sum` per core
+and 171 writes of 128 MB with `fsync`, at 83 to 86 °C: no break, no gap over the buffer,
 0 xruns, worst gap 1.44 ms, no DMA error. So the load did not make a late
 interrupt in that time, as in three of the four hour runs.
 
-What this settles:
+#### Pi 3
 
-- A wake-up gap longer than the buffer is broken audio. 395 gaps were heard and
-  395 were breaks, and no break came without a gap.
+The same on the Pi 3 test board with the DAC+ ADC, first with the daemon's
+defaults there, 256 frames at 48 kHz, 2 periods, a 10.67 ms buffer. Straight to
+the card for 20 s and through the daemon for 300 s, idle, the probe heard no
+break.
+
+The card's DMA interrupt goes to all four CPUs in turn on this board, so for the
+interrupt stalls `stall` set its timers on all four at once, about 0.69 ms per
+1000 timers on each. That holds the audio thread as well, whichever CPU it is on.
+The length is the time from the instant the timers were due until a sleep due at
+the same instant returned.
+
+Pi 3, 10.67 ms buffer, thread late, 30 stalls per row:
+
+| Stall | Gaps logged over the buffer | Xruns counted | Breaks heard |
+|---|---|---|---|
+| 2 ms | 0, worst gap 7.50 ms | 0 | 0 |
+| 4 ms | 0, worst gap 10.05 ms | 0 | 0 |
+| 6 ms | 4, 17.07 to 17.62 ms | 4 | 4, 13.3 to 14.2 ms of silence |
+| 8 ms | 18, 16.92 to 21.36 ms | 18 | 18, 12.8 to 17.5 ms |
+| 10 ms | 28, 17.12 to 21.65 ms | 28 | 28, 12.8 to 19.5 ms |
+| 12 ms | 30, 18.02 to 24.62 ms | 30 | 30, 14.2 to 21.0 ms |
+| 16 ms | 30, 22.31 to 27.75 ms | 30 | 30, 18.8 to 24.4 ms |
+| 24 ms | 30, 30.62 to 35.80 ms | 30 | 30, 27.0 to 32.3 ms |
+| 40 ms | 30, 56.94 to 62.50 ms | 30 | 30, 53.0 to 58.8 ms |
+
+200 gaps, 200 xruns, 200 breaks, one for one, as on the CM5.
+
+Pi 3, 10.67 ms buffer, interrupt late:
+
+| Stall | Stalls | No gap, no break | Silence, xrun counted | Buffer played again, no xrun |
+|---|---|---|---|---|
+| 2.0 to 3.2 ms | 30 | 30 | 0 | 0 |
+| 5.6 to 6.3 ms | 30 | 24 | 3 | 3 |
+| 6.0 to 9.4 ms | 30 | 17 | 11, 2 of them with no gap logged | 2 |
+| 8.0 to 12.5 ms | 30 | 8 | 19 | 3 |
+| 10.0 to 15.6 ms | 30 | 1 | 15 | 14 |
+| 12.0 to 18.7 ms | 30 | 0 | 12 | 18 |
+| 16.1 to 24.9 ms | 29 | 0 | 7 | 22 |
+| 23.9 to 37.2 ms | 28 | 0 | 13 | 15 |
+| 39.8 to 61.6 ms | 26 | 0 | 13 | 13 |
+
+Then with `latency_ms = 4`, which gives 64 frames and a 2.67 ms buffer, because
+the 4.05 ms gap with no xrun that started this question was seen on this board
+with that buffer. Idle for 300 s there was no break, with a worst gap of 1.88 ms.
+
+Pi 3, 2.67 ms buffer, thread late, 30 stalls per row:
+
+| Stall | Gaps logged over the buffer | Xruns counted | Breaks heard |
+|---|---|---|---|
+| 0.5 ms | 1, 5.43 ms | 1 | 1 |
+| 1 ms | 1, 5.31 ms | 1 | 1 |
+| 2 ms | 17, 3.89 to 6.63 ms | 19 | 19 |
+| 2.5 ms | 30, 4.52 to 7.14 ms | 30 | 30 |
+| 3 ms | 30, 5.56 to 7.90 ms | 30 | 30 |
+| 4 ms | 30, 6.27 to 9.48 ms | 30 | 30 |
+| 6 ms | 30, 8.06 to 11.44 ms | 30 | 30 |
+| 10 ms | 30, 12.46 to 14.77 ms | 30 | 30 |
+
+Pi 3, 2.67 ms buffer, interrupt late, 50 stalls per row:
+
+| Stall | No gap, no break | Silence, xrun counted | Buffer played again, no xrun |
+|---|---|---|---|
+| 0.5 to 0.8 ms | 50 | 0 | 0 |
+| 1.0 to 1.7 ms | 29 | 12, 8 of them with no gap logged | 9 |
+| 1.5 to 2.4 ms | 6 | 10, 5 of them with no gap logged | 34 |
+| 2.8 to 3.2 ms | 0 | 0 | 50 |
+| 3.5 to 4.0 ms | 0 | 3 | 47 |
+| 3.0 to 4.8 ms | 0 | 23 | 27 |
+| 4.1 to 6.3 ms | 0 | 14 | 36 |
+| 6.0 to 9.4 ms | 0 | 17 | 33 |
+| 10.0 to 15.6 ms | 0 | 33 | 17 |
+
+What the Pi 3 shows:
+
+- **Every logged gap was a break,** 902 of 902 over the four tables.
+- **The buffer played again is the common result of a late interrupt here,** 343
+  times, never with an xrun. The card goes round its buffer of old audio once
+  for each buffer length the interrupt is late, a break every 10.67 ms or every
+  2.67 ms, and the tone runs one buffer late for each. After a stall of 1 to
+  3.2 ms with the small buffer the gap was 4.03 to 4.10 ms in all but a few: the
+  4.05 ms gap with no xrun of the earlier run is this.
+- **Silence** is ALSA seeing the underrun and the daemon restarting the card, 13
+  to 18 ms with the default buffer. With a long stall it comes after one to five
+  rounds of old audio. The daemon's xrun count equals the silences in every
+  batch whose stalls were all heard.
+- **17 silences had no gap logged.** Each was counted as an xrun. The wake-up
+  came within the buffer time, but less than a full buffer was queued, because
+  the write follows the wake-up by the cycle's own time, and the card had run
+  dry a hair before the gap reached the buffer. 15 of them were interrupt
+  stalls and 2 thread stalls. So the gap log alone is not enough either, and a run
+  needs both: no gap over the buffer and no xrun.
+- **No outage.** The card never stopped taking audio, the daemon never ran into
+  its 500 ms limit, and the kernel logged nothing during any run. The outage of
+  the CM5 belongs to the RP1's DMA controller. The Pi 3 uses the one in the
+  BCM2837.
+- With the small buffer a thread stall of 0.5 or 1 ms broke the tone once in
+  30. The idle worst gap of 1.88 ms leaves under a millisecond to spare there.
+
+Last, 15 minutes of tone under the full load with the default buffer, 42 writes
+of 128 MB to the SD card, throttled at 86 to 87 °C and 550 to 600 MHz: no break,
+no gap over the buffer, 0 xruns, worst gap 6.37 ms.
+
+#### What this settles
+
+- A wake-up gap longer than the buffer is broken audio, on both boards. 395 gaps
+  were heard on the CM5 and 902 on the Pi 3, and every one was a break.
 - ALSA's xrun count is right when only the daemon is late, and not to be trusted
-  when the interrupt is late: it counted 109 of those 190 breaks. The breaks it
-  missed include the longest.
-- The gap log stays the criterion for a run. A gap of 500 ms is the daemon's wait
-  limit and marks an outage.
+  when the interrupt is late. It counted 109 of 190 such breaks on the CM5 and
+  205 of 548 on the Pi 3. The breaks it missed include the longest.
+- The gap log is not to be trusted alone either. On the Pi 3, 17 breaks came with
+  a gap just under the buffer, and all 17 were xruns. On the CM5 no break came
+  without a gap. A run passes with no gap over the buffer and no xrun, which is
+  the design's criterion.
+- A gap of 500 ms is the daemon's wait limit and marks an outage. That happened
+  on the CM5 only.
 
 What it leaves open: the stalls were made, not found, and all at 48 kHz. How often
 the full load makes the interrupt late is known only from the hour runs, once in
-four hours. The Pi 3 has another DMA controller and was not tested, so neither
-its gaps nor an outage like this are known there.
+four hours on the CM5 and not at all on the Pi 3 with its default buffer.
 
 ### Players
 
