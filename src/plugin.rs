@@ -77,6 +77,11 @@ pub struct Param {
 pub struct Status {
     /// The block carried no signal worth sending on.
     pub no_signal: bool,
+    /// The plugin changed the block although it is neutral. Only input
+    /// detection does, while it fades in or out or sends zeros, so the
+    /// engine then takes the chain's output rather than the captured
+    /// frames. Not part of the plugin ABI.
+    pub changed: bool,
 }
 
 /// A processing stage.

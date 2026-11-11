@@ -435,6 +435,11 @@ struct Analog<P: Processing> {
     processed: Vec<[P::Acc; 2]>,
     /// `processed` holds this cycle's period, not `buf`.
     is_processed: bool,
+    /// Where the engine's own fade of the captured frames stands, from 0
+    /// to 1. Only forced bit-perfect past a chain that alters the audio
+    /// uses it: it plays the frames as captured, which the detector's fades
+    /// are not in.
+    raw_level: f32,
     gain: f32,
     /// This cycle's period goes into the mix, unless DoP has the output.
     audible: bool,
@@ -453,6 +458,7 @@ impl<P: Processing> Analog<P> {
             buf: vec![[0; 2]; max_frames],
             processed: vec![[P::zero(); 2]; max_frames],
             is_processed: false,
+            raw_level: 0.0,
             gain: 1.0,
             audible: false,
             audible_reported: false,
@@ -464,6 +470,7 @@ impl<P: Processing> Analog<P> {
         self.closed = false;
         self.failure_unreported = false;
         self.audible = false;
+        self.raw_level = 0.0;
         std::mem::replace(&mut self.capture, capture)
     }
 
@@ -476,14 +483,23 @@ impl<P: Processing> Analog<P> {
         }
         self.closed = true;
         self.audible = false;
+        self.raw_level = 0.0;
     }
 
     /// Reads one period into `buf` and runs the chain on it, which decides
     /// whether it is audible. A capture that fails is closed and is silent.
     /// `store` is the mix's, free until the mix starts. Without `plugins`,
     /// in forced bit-perfect, the chain runs for its detector only and the
-    /// frames stay as captured.
-    fn read(&mut self, period: usize, counters: &Counters, store: &mut BlockStore, plugins: bool) {
+    /// frames stay as captured, faded in and out as the detector opens and
+    /// closes.
+    fn read(
+        &mut self,
+        period: usize,
+        rate: u32,
+        counters: &Counters,
+        store: &mut BlockStore,
+        plugins: bool,
+    ) {
         self.audible = false;
         self.is_processed = false;
         let Some(capture) = self.capture.as_mut() else {
@@ -510,13 +526,52 @@ impl<P: Processing> Analog<P> {
         mix_add::<P>(buf, Ramp::flat(1.0), processed);
         let mut block = P::to_block(processed, store);
         let status = self.chain.process(block.reborrow());
-        // A neutral chain changed nothing, so the frames stay as captured
-        // and can be copied bit-perfect.
-        if plugins && !self.chain.neutral() {
-            P::from_block(block, processed);
-            self.is_processed = true;
+        let signal = !status.no_signal;
+        let neutral = self.chain.neutral();
+        if plugins || neutral {
+            // A neutral chain changed nothing unless the detector faded or
+            // zeroed, so the frames stay as captured and can be copied
+            // bit-perfect.
+            if !neutral || status.changed {
+                P::from_block(block, processed);
+                self.is_processed = true;
+            }
+            self.raw_level = if signal { 1.0 } else { 0.0 };
+            self.audible = signal;
+        } else {
+            self.audible = self.fade_raw(signal, period, rate);
         }
-        self.audible = !status.no_signal;
+    }
+
+    /// Fades the captured frames towards full level with `signal`, else
+    /// towards silence, over 10 ms from the start of the period, into
+    /// `processed`. Returns whether anything of them is heard.
+    fn fade_raw(&mut self, signal: bool, period: usize, rate: u32) -> bool {
+        let target = if signal { 1.0 } else { 0.0 };
+        if self.raw_level == target {
+            return signal;
+        }
+        let fade = (rate * FADE_MS / 1000).max(1) as f32;
+        let left = ((target - self.raw_level).abs() * fade).round() as usize;
+        let frames = left.min(period);
+        let to = if frames == left {
+            target
+        } else {
+            self.raw_level + (target - self.raw_level) * frames as f32 / left as f32
+        };
+        let processed = &mut self.processed[..period];
+        let (fading, steady) = processed.split_at_mut(frames);
+        mix_clear::<P>(fading);
+        mix_clear::<P>(steady);
+        let ramp = Ramp {
+            from: self.raw_level,
+            to,
+        };
+        mix_add::<P>(&self.buf[..frames], ramp, fading);
+        mix_add::<P>(&self.buf[frames..period], Ramp::flat(to), steady);
+        self.raw_level = to;
+        self.is_processed = true;
+        true
     }
 
     /// Adds this cycle's period at `level` to the mix, along the fade.
@@ -1282,7 +1337,7 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         let store = &mut self.store;
         let plugins = plugins_apply(self.mode);
         self.analog
-            .read(self.period, &self.counters, store, plugins);
+            .read(self.period, self.rate, &self.counters, store, plugins);
         self.taps.deliver(&self.analog, self.period);
         self.scan();
         self.order_claims();
@@ -1403,7 +1458,9 @@ impl<P: Processing, S: Sink> Engine<P, S> {
     fn play_pcm(&mut self, fade_out: bool) -> bool {
         let (rate, period) = (self.rate, self.period);
         let volumes = volumes_apply(self.mode);
-        let copy = !fade_out && decide(&self.situation()).is_ok();
+        // A detector fading the analog input has changed its frames.
+        let fading = self.analog.audible && self.analog.is_processed;
+        let copy = !fade_out && !fading && decide(&self.situation()).is_ok();
         let (next_gain, fade_frames) = self.next_fade_step();
         let (from, to) = if volumes {
             (self.gain, next_gain)
@@ -4841,6 +4898,7 @@ mod tests {
             }
             PluginStatus {
                 no_signal: self.quiet,
+                changed: false,
             }
         }
     }
@@ -5516,8 +5574,9 @@ mod tests {
             assert_eq!(rig.last_periods(30), loud[open..], "{:?}", format_of::<P>());
             let tapped = recorder.take();
             assert_eq!(tapped[tapped.len() - 30 * PERIOD..], loud[open..]);
-            // Below the threshold nothing of it plays, even times four.
-            for _ in 0..80 {
+            // Below the threshold nothing of it plays, even times four,
+            // once it has faded out.
+            for _ in 0..100 {
                 feed.push(&frames(1000, PERIOD));
                 rig.cycle();
             }
@@ -5547,6 +5606,103 @@ mod tests {
         assert_eq!(signals(&events), [true, false]);
         // Nothing of the quiet input after the close reaches the sink.
         assert_eq!(rig.last_periods(30), frames(0, 30 * PERIOD));
+    }
+
+    /// The largest change from one frame to the next, on the left channel.
+    fn largest_step(frames: &[[i32; 2]]) -> i64 {
+        let step = |w: &[[i32; 2]]| (i64::from(w[1][0]) - i64::from(w[0][0])).abs();
+        frames.windows(2).map(step).max().unwrap_or(0)
+    }
+
+    /// Plays a loud input through `analog`, a chain with a detector at
+    /// -30 dBFS and no hold, until it opens, then an input just below the
+    /// threshold until it has closed. Each period of the input is played
+    /// in the cycle it is captured in. With `client`, a client playing
+    /// zeros is mixed in. Returns what reached the sink, and where the
+    /// input turned quiet.
+    fn open_and_close<P: Processing>(
+        mode: BitPerfect,
+        analog: Vec<Box<dyn Plugin>>,
+        client: bool,
+    ) -> (Vec<[i32; 2]>, usize) {
+        let (mut rig, feed) = with_capture::<P>(mode);
+        let chain = Chain::new(analog, format_of::<P>(), MAX_PERIOD as usize);
+        rig.send(Command::SetChain(Place::Analog, Box::new(chain)));
+        let mut a = client.then(|| client_at(1, RATE));
+        if let Some(a) = a.as_mut() {
+            rig.add(a);
+        }
+        let mut out = Vec::new();
+        for round in 0..300 {
+            let value = if round < 150 { LOUD } else { QUIET };
+            feed.push(&frames(value, PERIOD));
+            if let Some(a) = &a {
+                a.ring.write(&frames(0, PERIOD));
+            }
+            rig.cycle();
+            out.extend(rig.last_periods(1));
+        }
+        (out, 150 * PERIOD)
+    }
+
+    /// -6 dBFS, and just below -30 dBFS.
+    const LOUD: i32 = 1 << 30;
+    const QUIET: i32 = 1 << 26;
+
+    fn gate(with: Option<Probe>) -> Vec<Box<dyn Plugin>> {
+        let mut detect = Detect::new(RATE);
+        detect.set_param(0, -30.0);
+        detect.set_param(1, 0.0);
+        let mut plugins: Vec<Box<dyn Plugin>> = Vec::new();
+        if let Some(p) = with {
+            plugins.push(Box::new(p));
+        }
+        plugins.push(Box::new(detect));
+        plugins
+    }
+
+    /// No step is larger than a 10 ms ramp to the level allows, the first
+    /// frame heard is near zero, and once closed the output is exact zeros.
+    fn check_fades(out: &[[i32; 2]], quiet_at: usize, what: &str) {
+        // One step of a 10 ms ramp to `level`, give or take the rounding
+        // of a gain in `f32`.
+        let ramp = |level: i32| f64::from(level) / f64::from(RATE * FADE_MS / 1000) * 1.001 + 2.0;
+        let first = out.iter().position(|f| f[0] != 0).expect(what);
+        assert!(f64::from(out[first][0]) <= ramp(LOUD), "{what}");
+        let opening = largest_step(&out[..quiet_at]);
+        assert!(opening as f64 <= ramp(LOUD), "{what}: {opening}");
+        // The input itself steps down at `quiet_at`.
+        let closing = largest_step(&out[quiet_at..]);
+        assert!(closing as f64 <= ramp(QUIET), "{what}: {closing}");
+        assert!(out[out.len() - 10 * PERIOD..].iter().all(|f| *f == [0, 0]));
+        // It did open, to the full level.
+        assert!(out[..quiet_at].iter().any(|f| f[0] == LOUD), "{what}");
+    }
+
+    #[test]
+    fn input_detection_fades_in_and_out_on_every_path() {
+        fn check<P: Processing>() {
+            let f = format_of::<P>();
+            // Alone, so copied when nothing fades.
+            let (out, at) = open_and_close::<P>(BitPerfect::Auto, gate(None), false);
+            check_fades(&out, at, &format!("copy {f:?}"));
+            // Mixed with a client.
+            let (out, at) = open_and_close::<P>(BitPerfect::Auto, gate(None), true);
+            check_fades(&out, at, &format!("mix {f:?}"));
+            // Past a plugin that alters it.
+            let (out, at) = open_and_close::<P>(BitPerfect::Off, gate(Some(times(1.0))), false);
+            check_fades(&out, at, &format!("plugin {f:?}"));
+            // Forced bit-perfect, which plays it as captured past that
+            // plugin, and with the detector alone.
+            let forced = BitPerfect::Forced;
+            let (out, at) = open_and_close::<P>(forced, gate(Some(times(1.0))), false);
+            check_fades(&out, at, &format!("forced {f:?}"));
+            let (out, at) = open_and_close::<P>(forced, gate(None), false);
+            check_fades(&out, at, &format!("forced alone {f:?}"));
+        }
+        check::<I32>();
+        check::<F32>();
+        check::<F64>();
     }
 
     #[test]

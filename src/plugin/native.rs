@@ -312,6 +312,7 @@ impl Plugin for Native {
         };
         Status {
             no_signal: bits & STATUS_NO_SIGNAL != 0,
+            changed: false,
         }
     }
 }

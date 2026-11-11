@@ -333,15 +333,18 @@ is left.
 Forced bit-perfect does not bypass input detection, because analog input must
 never pass ungated *(call)*. This is the one exception to plugins being
 bypassed. The analog chain still runs so that the detector can measure, but its
-output is not used: the captured frames are played as they are *(call)*. Below
+output is not used: the captured frames are played as they are *(call)*. Past a
+chain that alters them, the engine fades them in and out itself, over 10 ms from
+the start of the period in which the detector opens or has closed, so a few
+frames before the detector opened are heard, rising from silence. Below
 the threshold the analog input is not a source, so it does not stop bit-perfect
 in either mode. Above it the ADC is mixed in like a second client, which follows
 the rule above.
 
 In automatic mode, when the analog input is the only source and its chain alters
 nothing, its captured frames are copied to the card as they are, so the copy
-path stays bit-exact *(call)*. In the one period in which the detector opens, a
-few frames that it would have silenced are heard.
+path stays bit-exact *(call)*. While input detection fades in or out, the
+detector's output is mixed instead, so nothing it silences is heard.
 
 A resampled client is never bit-perfect.
 
@@ -540,6 +543,10 @@ Further behaviour *(call)*:
   is -50 dBFS by default.
 - A configurable hold time, 3 s by default, stops quiet passages and fade-outs
   from cutting in and out.
+- Opening and closing fade over 10 ms (see Volume and clipping). The fade in
+  starts at the first frame after the window that opens it, the fade out at the
+  frame where it closes. A block counts as without signal only when nothing of
+  it is heard, so the fade out is played to its end.
 - If the config lists no `detect`, it goes last in the analog chain, so it sees
   the signal after every other plugin there.
 - "Has signal" is what the analog chain reports.

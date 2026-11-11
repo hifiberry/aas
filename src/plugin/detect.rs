@@ -2,8 +2,12 @@
 //!
 //! The level is the RMS of both channels together over windows of 50 ms. A
 //! window above the threshold opens the detector. It closes when no window
-//! has been above the threshold for the hold time. While closed the samples
-//! are overwritten with zeros and the block reports `no_signal`.
+//! has been above the threshold for the hold time. Opening and closing
+//! fade over 10 ms, so they do not click: the level rises from the first
+//! frame after the window that opens it, and falls from the frame at which
+//! it closes. Once closed and faded out the samples are overwritten with
+//! exact zeros. A block reports `no_signal` when nothing of it is heard. While open and faded in
+//! the samples are left exactly as they are.
 //!
 //! A hold of zero closes at the end of the first window that is not above
 //! the threshold. A NaN sample makes its own window not above the
@@ -14,6 +18,9 @@ use super::{Block, Formats, Param, Plugin, Status};
 
 /// Full scale of an `i32` sample.
 const I32_FULL: f64 = 2_147_483_648.0;
+
+/// How long opening or closing fades, as the engine's volume fades.
+const FADE_MS: u32 = 10;
 
 pub struct Detect {
     params: [Param; 2],
@@ -31,6 +38,11 @@ pub struct Detect {
     open: bool,
     /// Frames since the end of the last window above the threshold.
     quiet: u64,
+    /// Frames one fade lasts.
+    fade: u32,
+    /// Where the fade stands: 0 sends zeros, `fade` leaves the samples as
+    /// they are. It moves one step per frame towards `open`.
+    level: u32,
 }
 
 impl Detect {
@@ -61,6 +73,8 @@ impl Detect {
             sum: 0.0,
             open: false,
             quiet: 0,
+            fade: (rate * FADE_MS / 1000).max(1),
+            level: 0,
         };
         d.set_param(1, 3.0);
         d
@@ -71,14 +85,34 @@ impl Detect {
         self.open
     }
 
-    /// Runs the detector over `data`, zeroing it while closed. `level`
-    /// gives a sample at full scale 1.0.
-    fn run<T: Copy>(&mut self, data: &mut [[T; 2]], level: impl Fn(T) -> f64, zero: T) {
+    /// Runs the detector over `data`, fading it in and out and zeroing it
+    /// while closed. `level` gives a sample at full scale 1.0, and `scale`
+    /// multiplies a sample by a gain below 1. Returns the status.
+    fn run<T: Copy>(
+        &mut self,
+        data: &mut [[T; 2]],
+        level: impl Fn(T) -> f64,
+        scale: impl Fn(T, f64) -> T,
+        zero: T,
+    ) -> Status {
+        let mut changed = false;
+        let mut heard = false;
         for frame in data {
             let (l, r) = (level(frame[0]), level(frame[1]));
             self.sum += l * l + r * r;
-            if !self.open {
+            if self.open {
+                self.level = (self.level + 1).min(self.fade);
+            } else {
+                self.level = self.level.saturating_sub(1);
+            }
+            heard |= self.level > 0;
+            if self.level == 0 {
                 *frame = [zero, zero];
+                changed = true;
+            } else if self.level < self.fade {
+                let gain = f64::from(self.level) / f64::from(self.fade);
+                *frame = [scale(frame[0], gain), scale(frame[1], gain)];
+                changed = true;
             }
             self.seen += 1;
             let mut loud = false;
@@ -103,6 +137,11 @@ impl Detect {
                     }
                 }
             }
+        }
+        // Signal until the fade out is over, so that the engine plays it.
+        Status {
+            no_signal: !self.open && !heard,
+            changed,
         }
     }
 }
@@ -148,12 +187,14 @@ impl Plugin for Detect {
 
     fn process(&mut self, block: Block<'_>) -> Status {
         match block {
-            Block::I32(d) => self.run(d, |x| f64::from(x) / I32_FULL, 0),
-            Block::F32(d) => self.run(d, f64::from, 0.0),
-            Block::F64(d) => self.run(d, |x| x, 0.0),
-        }
-        Status {
-            no_signal: !self.open,
+            Block::I32(d) => self.run(
+                d,
+                |x| f64::from(x) / I32_FULL,
+                |x, g| (f64::from(x) * g).round() as i32,
+                0,
+            ),
+            Block::F32(d) => self.run(d, f64::from, |x, g| (f64::from(x) * g) as f32, 0.0),
+            Block::F64(d) => self.run(d, |x| x, |x, g| x * g, 0.0),
         }
     }
 }
@@ -238,8 +279,10 @@ mod tests {
     fn it_closes_when_the_hold_time_has_passed() {
         let mut d = Detect::new(RATE);
         feed(&mut d, tone(-30.0, 4800, RATE));
-        assert!(feed(&mut d, silence(148_800)).no_signal); // 3.1 s
+        // 3.1 s: closed and faded out, so the next block carries nothing.
+        assert!(!feed(&mut d, silence(148_799)).no_signal);
         assert!(!d.open());
+        assert!(feed(&mut d, silence(1)).no_signal);
         // Exactly at the hold time: open one frame before, closed at it.
         feed(&mut d, tone(-30.0, 2400, RATE));
         feed(&mut d, silence(143_999));
@@ -261,18 +304,20 @@ mod tests {
         let mut x = vec![[1e-4f64, -1e-4]; 4800];
         d.process(Block::F64(&mut x));
         assert!(x.iter().all(|f| *f == [0.0, 0.0]));
-        // The window that opens it is gone, the next sample passes.
+        // The window that opens it is gone, the next 10 ms fade in, and
+        // the samples pass from then on.
         let mut x = tone(-30.0, 4800, RATE);
         let loud = x.clone();
         d.process(Block::F64(&mut x));
         assert!(x[..2400].iter().all(|f| *f == [0.0, 0.0]));
-        assert_eq!(x[2400..], loud[2400..]);
+        assert_eq!(x[2400 + 479..], loud[2400 + 479..]);
     }
 
     #[test]
     fn while_open_the_samples_are_unchanged() {
         let mut d = Detect::new(RATE);
-        let mut x = tone(-20.0, 2400, RATE);
+        // Open, and faded in.
+        let mut x = tone(-20.0, 2400 + 480, RATE);
         d.process(Block::F64(&mut x));
         assert!(d.open());
         let loud = tone(-20.0, 480, RATE);
@@ -393,9 +438,16 @@ mod tests {
         // Quiet, constant and below the threshold, for more than the hold.
         x.extend(vec![[1e-4, 1e-4]; 150_000]);
         d.process(Block::F64(&mut x));
-        // The hold ends 144000 frames after the loud window.
-        assert!(x[2400..2400 + 144_000].iter().all(|f| *f == [1e-4, 1e-4]));
-        assert!(x[2400 + 144_000..].iter().all(|f| *f == [0.0, 0.0]));
+        // The hold ends 144000 frames after the loud window, and the fade
+        // out 10 ms later.
+        let closed = 2400 + 144_000;
+        assert!(x[2400 + 480..closed].iter().all(|f| *f == [1e-4, 1e-4]));
+        assert!(
+            x[closed..closed + 479]
+                .iter()
+                .all(|f| f[0] < 1e-4 && f[0] > 0.0)
+        );
+        assert!(x[closed + 479..].iter().all(|f| *f == [0.0, 0.0]));
         assert!(!d.open());
     }
 
@@ -441,6 +493,79 @@ mod tests {
         assert!(d.open());
         feed(&mut d, silence(144_000));
         assert!(!d.open());
+    }
+
+    /// The largest change from one frame to the next, on the left channel.
+    fn largest_step(data: &[[f64; 2]]) -> f64 {
+        data.windows(2)
+            .map(|w| (w[1][0] - w[0][0]).abs())
+            .fold(0.0, f64::max)
+    }
+
+    #[test]
+    fn opening_fades_in_over_10_ms_at_any_rate() {
+        for rate in [44_100u32, 48_000, 192_000] {
+            let window = (rate / 20) as usize;
+            let fade = (rate / 100) as usize;
+            let mut d = Detect::new(rate);
+            let mut x = vec![[0.1, 0.1]; window + 2 * fade];
+            let status = d.process(Block::F64(&mut x));
+            assert!(!status.no_signal && status.changed, "{rate}");
+            // The window that opens it is gone. The first frame after it
+            // starts near zero, and the level rises by equal steps.
+            assert!(x[..window].iter().all(|f| *f == [0.0, 0.0]), "{rate}");
+            let step = 0.1 / fade as f64;
+            assert!((x[window][0] - step).abs() < 1e-12, "{rate}");
+            assert!(largest_step(&x) <= step * (1.0 + 1e-9), "{rate}");
+            // From 10 ms on, the samples are as they came.
+            assert!(x[window + fade - 1..].iter().all(|f| *f == [0.1, 0.1]));
+            // A block that is open all through is left as it is.
+            let mut y = vec![[0.1, 0.1]; 100];
+            let status = d.process(Block::F64(&mut y));
+            assert!(!status.changed && !status.no_signal);
+        }
+    }
+
+    #[test]
+    fn closing_fades_out_over_10_ms_then_sends_zeros() {
+        let mut d = Detect::new(RATE);
+        d.set_param(0, -10.0);
+        d.set_param(1, 0.0);
+        // -6 dBFS opens it, -14 dBFS is below the threshold.
+        feed(&mut d, vec![[0.5, 0.5]; 4800]);
+        assert!(d.open());
+        let mut x = vec![[0.2, 0.2]; 2400 + 480 + 100];
+        let status = d.process(Block::F64(&mut x));
+        assert!(!d.open());
+        // The block still carried the fade.
+        assert!(!status.no_signal && status.changed);
+        // Open to the end of the window, then down by equal steps.
+        assert!(x[..2400].iter().all(|f| *f == [0.2, 0.2]));
+        assert!(largest_step(&x) <= 0.2 / 480.0 * (1.0 + 1e-9));
+        assert!(x[2400 + 479..].iter().all(|f| *f == [0.0, 0.0]));
+        // A block that ends while it fades still has signal.
+        let mut d = Detect::new(RATE);
+        d.set_param(0, -10.0);
+        d.set_param(1, 0.0);
+        feed(&mut d, vec![[0.5, 0.5]; 4800]);
+        let status = feed(&mut d, vec![[0.2, 0.2]; 2400 + 100]);
+        assert!(!d.open() && !status.no_signal && status.changed);
+        let status = feed(&mut d, vec![[0.2, 0.2]; 380]);
+        assert!(!status.no_signal);
+        // Nothing of the next block is heard.
+        let status = feed(&mut d, vec![[0.2, 0.2]; 1]);
+        assert!(status.no_signal && status.changed);
+    }
+
+    #[test]
+    fn a_fade_in_i32_has_no_step_larger_than_the_ramp() {
+        let mut d = Detect::new(RATE);
+        let mut x = vec![[1 << 28, -(1 << 28)]; 2400 + 960];
+        d.process(Block::I32(&mut x));
+        let step = (1 << 28) / 480 + 1;
+        let largest = x.windows(2).map(|w| (w[1][0] - w[0][0]).abs()).max();
+        assert!(largest.unwrap() <= step);
+        assert_eq!(x[2400 + 479..], vec![[1 << 28, -(1 << 28)]; 481][..]);
     }
 
     #[test]

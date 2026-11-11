@@ -61,6 +61,7 @@ impl Chain {
                 (Some(to), Block::F64(d)) => converted(plugin, d, to, &mut self.store),
             };
             status.no_signal |= s.no_signal;
+            status.changed |= s.changed;
         }
         status
     }
@@ -354,6 +355,7 @@ mod tests {
             }
             Status {
                 no_signal: self.no_signal,
+                changed: false,
             }
         }
     }
