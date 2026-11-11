@@ -549,6 +549,12 @@ mod tests {
     }
 
     /// A shared mapping of a fresh memfd, not populated and not locked.
+    /// The size of a page of memory.
+    fn page_size() -> usize {
+        // SAFETY: a plain query.
+        unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }
+    }
+
     fn bare_mapping(len: usize) -> (*mut libc::c_void, OwnedFd) {
         let fd = memfd(len);
         let prot = libc::PROT_READ | libc::PROT_WRITE;
@@ -568,33 +574,34 @@ mod tests {
 
     /// How many pages of the mapping are in memory.
     fn resident(p: *mut libc::c_void, len: usize) -> usize {
-        let mut pages = vec![0u8; len.div_ceil(4096)];
+        let mut pages = vec![0u8; len.div_ceil(page_size())];
         assert_eq!(unsafe { libc::mincore(p, len, pages.as_mut_ptr()) }, 0);
         pages.iter().filter(|&&page| page & 1 == 1).count()
     }
 
     #[test]
     fn a_kernel_without_populate_write_still_gets_every_page_mapped() {
+        // In the kernel's own pages, which are 16 KiB on some boards.
         const PAGES: usize = 64;
-        const LEN: usize = PAGES * 4096;
+        let len = PAGES * page_size();
         // An advice the kernel takes and ignores populates nothing. This
         // is what the fallback is there to prevent.
-        let (p, _fd) = bare_mapping(LEN);
-        unsafe { Ring::populate(p, LEN, libc::MADV_NORMAL) };
-        assert_eq!(resident(p, LEN), 0);
-        unsafe { libc::munmap(p, LEN) };
+        let (p, _fd) = bare_mapping(len);
+        unsafe { Ring::populate(p, len, libc::MADV_NORMAL) };
+        assert_eq!(resident(p, len), 0);
+        unsafe { libc::munmap(p, len) };
 
         // An advice no kernel knows fails as MADV_POPULATE_WRITE does
         // before Linux 5.14, and the fallback reads every page in.
-        let (p, _fd) = bare_mapping(LEN);
-        unsafe { Ring::populate(p, LEN, -1) };
-        assert_eq!(resident(p, LEN), PAGES);
-        unsafe { libc::munmap(p, LEN) };
+        let (p, _fd) = bare_mapping(len);
+        unsafe { Ring::populate(p, len, -1) };
+        assert_eq!(resident(p, len), PAGES);
+        unsafe { libc::munmap(p, len) };
 
-        let (p, _fd) = bare_mapping(LEN);
-        unsafe { Ring::populate(p, LEN, libc::MADV_POPULATE_WRITE) };
-        assert_eq!(resident(p, LEN), PAGES);
-        unsafe { libc::munmap(p, LEN) };
+        let (p, _fd) = bare_mapping(len);
+        unsafe { Ring::populate(p, len, libc::MADV_POPULATE_WRITE) };
+        assert_eq!(resident(p, len), PAGES);
+        unsafe { libc::munmap(p, len) };
     }
 
     #[test]
