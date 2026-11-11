@@ -810,11 +810,12 @@ fi
 
 # A helper for the tone the format case plays and hears. `gen` writes one
 # second of a 1 kHz sine at -20 dBFS, at 48 kHz, in the format and channel
-# count given. `hear` reads a recording, S32_LE stereo at 48 kHz, and
-# prints for each channel the tone's level in dBFS, the share of the
-# signal's power that is the tone, and for how many tenths of a second the
-# tone was there. `freq` reads the same and prints for each channel the
-# frequency of its strongest component between 500 and 2000 Hz, to 0.01 Hz.
+# count given. `hear` reads a recording, S32_LE stereo at 48 kHz or at the
+# rate given, and prints for each channel the tone's level in dBFS, the
+# share of the signal's power that is the tone, and for how many tenths of
+# a second the tone was there. `freq` reads the same and prints for each
+# channel the frequency of its strongest component between 500 and 2000 Hz,
+# to 0.01 Hz. `widen` turns S16_LE into S32_LE, exactly.
 cat >"$work/tone.c" <<'EOF'
 #include <math.h>
 #include <stdint.h>
@@ -824,8 +825,11 @@ cat >"$work/tone.c" <<'EOF'
 
 #define RATE 48000
 #define FREQ 1000.0
-#define BLOCK (RATE / 10)
+#define MAX_BLOCK (RATE / 10)
 #define MAX_BLOCKS 64
+
+/* The rate of a recording `hear` and `freq` read, at most RATE. */
+static int rate = RATE;
 
 static int by_value(const void *a, const void *b)
 {
@@ -869,16 +873,17 @@ static int gen(const char *format, int channels)
 
 static int hear(void)
 {
-	static int32_t block[BLOCK][2];
+	static int32_t block[MAX_BLOCK][2];
 	static double tone[2][MAX_BLOCKS], share[2][MAX_BLOCKS];
 	int blocks = 0;
+	const int BLOCK = rate / 10;
 
-	while (blocks < MAX_BLOCKS && fread(block, sizeof block, 1, stdin) == 1) {
+	while (blocks < MAX_BLOCKS && fread(block, sizeof block[0], BLOCK, stdin) == (size_t)BLOCK) {
 		for (int c = 0; c < 2; c++) {
 			double re = 0, im = 0, sum = 0, squares = 0;
 			for (int i = 0; i < BLOCK; i++) {
 				double x = block[i][c] / 2147483648.0;
-				double w = 2 * M_PI * FREQ * i / RATE;
+				double w = 2 * M_PI * FREQ * i / rate;
 				re += x * cos(w);
 				im += x * sin(w);
 				sum += x;
@@ -918,7 +923,7 @@ static int hear(void)
 /* The power at `f` Hz of channel `c` of `n` frames, by Goertzel. */
 static double power_at(int32_t (*x)[2], long n, int c, double f)
 {
-	double k = 2 * cos(2 * M_PI * f / RATE), s1 = 0, s2 = 0;
+	double k = 2 * cos(2 * M_PI * f / rate), s1 = 0, s2 = 0;
 
 	for (long i = 0; i < n; i++) {
 		double s = x[i][c] / 2147483648.0 + k * s1 - s2;
@@ -956,14 +961,32 @@ static int freq(void)
 	return 0;
 }
 
+static int widen(void)
+{
+	int16_t v;
+
+	while (fread(&v, 2, 1, stdin) == 1) {
+		int32_t w = (int32_t)((uint32_t)(uint16_t)v << 16);
+		fwrite(&w, 4, 1, stdout);
+	}
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
-	if (argc == 2 && !strcmp(argv[1], "freq"))
+	if (argc == 3 && (!strcmp(argv[1], "freq") || !strcmp(argv[1], "hear"))) {
+		rate = atoi(argv[2]);
+		if (rate < 1000 || rate > RATE)
+			return 2;
+	}
+	if ((argc == 2 || argc == 3) && !strcmp(argv[1], "freq"))
 		return freq();
 	if (argc == 4 && !strcmp(argv[1], "gen"))
 		return gen(argv[2], atoi(argv[3]));
-	if (argc == 2 && !strcmp(argv[1], "hear"))
+	if ((argc == 2 || argc == 3) && !strcmp(argv[1], "hear"))
 		return hear();
+	if (argc == 2 && !strcmp(argv[1], "widen"))
+		return widen();
 	return 2;
 }
 EOF
@@ -1249,6 +1272,7 @@ case_capture_is_silent_without_signal() {
 case_capture_never_hears_a_player() {
 	name=capture_never_hears_a_player
 	"$work/tone" gen S16_LE 2 >"$work/tone.raw"
+	volume=$(master)
 	amixer -q -D default sset Master 100%
 	hold_output
 	timeout 5 arecord -q -D default -t raw -f S32_LE -c 2 -r $rate -s $((rate * 16 / 10)) \
@@ -1260,6 +1284,7 @@ case_capture_never_hears_a_player() {
 	wait $recorder
 	status=$?
 	release_output
+	amixer -q -D default sset Master "$volume%"
 	if [ $played -ne 0 ]; then
 		fail $name "aplay exited $played: $(head -n1 "$work/err")"
 	elif [ $status -ne 0 ]; then
@@ -1625,9 +1650,11 @@ case_analog_input_opens_on_signal() {
 		return
 	fi
 	daemon=$(main_pid)
+	volume=$(master)
 	amixer -q -D default sset Master 100%
 	if ! capture_running; then
 		fail $name "the daemon holds no running capture: $(daemon_log $daemon | grep analog | tr '\n' ' ')"
+		amixer -q -D default sset Master "$volume%"
 		analog_off
 		return
 	fi
@@ -1639,6 +1666,7 @@ case_analog_input_opens_on_signal() {
 	end=$(now_ms)
 	opened=$(log_wait $daemon "analog input: signal" 1000)
 	closed=$(log_wait $daemon "analog input: quiet" 6000)
+	amixer -q -D default sset Master "$volume%"
 	analog_off
 	took=$((end - start))
 	end=$((start + 2000))
@@ -1719,9 +1747,10 @@ case_rate_change_with_capture_open() {
 
 # A 1 kHz tone played through the daemon reaches the analog input through
 # the cable and is in what the device records: at 1 kHz within 2 Hz on
-# both channels, nine tenths of the power in the tone. Recorded twice: from
-# the default device with read access, and from the plugin itself with
-# mmap access, the way plug reads it for any conversion.
+# both channels, nine tenths of the power in the tone. Recorded three
+# times: from the default device with read access, from the plugin itself
+# with mmap access, the way plug reads it for any conversion, and from the
+# default device as S16_LE at 44.1 kHz, which plug converts.
 case_capture_hears_the_analog_input() {
 	name=capture_hears_the_analog_input
 	if ! analog_on; then
@@ -1729,12 +1758,15 @@ case_capture_hears_the_analog_input() {
 		analog_off
 		return
 	fi
+	volume=$(master)
 	amixer -q -D default sset Master 100%
 	"$work/tone" gen S16_LE 2 >"$work/tone.raw"
 	bad=""
 	report=""
-	for how in "-D default" "-M -D aas"; do
-		timeout 5 arecord -q $how -t raw -f S32_LE -c 2 -r $rate -s $((rate * 16 / 10)) \
+	for how in "-D default -f S32_LE -r $rate" "-M -D aas -f S32_LE -r $rate" \
+		"-D default -f S16_LE -r 44100"; do
+		at=${how##* }
+		timeout 5 arecord -q $how -t raw -c 2 -s $((at * 16 / 10)) \
 			"$work/rec.raw" 2>"$work/caperr" &
 		recorder=$!
 		sleep 0.3
@@ -1750,9 +1782,15 @@ case_capture_hears_the_analog_input() {
 			bad="$bad $how(arecord exited $status: $(head -n1 "$work/caperr"))"
 			continue
 		fi
-		heard=$("$work/tone" hear <"$work/rec.raw")
+		case $how in
+		*S16_LE*)
+			"$work/tone" widen <"$work/rec.raw" >"$work/rec32.raw"
+			mv "$work/rec32.raw" "$work/rec.raw"
+			;;
+		esac
+		heard=$("$work/tone" hear $at <"$work/rec.raw")
 		heard=${heard% }
-		freqs=$("$work/tone" freq <"$work/rec.raw")
+		freqs=$("$work/tone" freq $at <"$work/rec.raw")
 		freqs=${freqs% }
 		line="$how: $freqs Hz, level, share and tenths per channel $heard"
 		if echo "$freqs $heard" | awk '{
@@ -1765,6 +1803,7 @@ case_capture_hears_the_analog_input() {
 			bad="$bad $line;"
 		fi
 	done
+	amixer -q -D default sset Master "$volume%"
 	analog_off
 	if [ -z "$bad" ]; then
 		report="${report# }"

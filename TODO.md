@@ -141,17 +141,6 @@ a card the test boards do not have. First step: on the Pi 3 test board, unbind
 the card's driver through sysfs while the analog input plays, and check the log
 and that the input comes back after the bind.
 
-## Open minor findings from stage 3a
-
-- `crates/aas-alsa/src/pcm/capture.rs`: the position arithmetic mixes an
-  unwrapped count with ALSA's wrapping application pointer. Correct on 64-bit,
-  the only target. With a 32-bit `long` it would misfire after about 6 hours at
-  48 kHz. Fix: reduce both to the boundary before comparing them.
-- `dist/test-plugin.sh`: the analog tone is not yet checked through `plug` with a
-  conversion (`arecord -D default -f S16_LE -r 44100`). Fix: add a case that
-  records that way and checks level and purity. Also two cases set `Master` to
-  100% without putting it back. Fix: restore the level the run found.
-
 ## Open minor findings from stage 2
 
 Found in the stage 2 reviews. Most are fixed.

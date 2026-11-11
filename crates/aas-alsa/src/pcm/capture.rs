@@ -12,11 +12,12 @@
 //! since prepare are ALSA's hw pointer. ALSA's application pointer, the
 //! frames the recorder has taken, is libasound's to move.
 //!
-//! `plug` converts through mmap access, and libasound copies a recorder's
-//! frames into its mmap buffer on every look at what is there, before the
-//! recorder takes any. So frames leave the ring once, in order, into the
-//! place in the buffer of their position, and a later copy over the same
-//! positions skips those already there.
+//! `plug` converts through mmap access. With it libasound calls `transfer`
+//! from `snd_pcm_mmap_begin`, each time the recorder looks at what is
+//! there, so frames are copied into its mmap buffer before the recorder
+//! takes any. They leave the ring once, in order, into the place in the
+//! buffer of their position, and a later copy over the same positions
+//! skips those already there.
 //!
 //! The daemon ends the stream when its output changes rate. The PCM is
 //! then disconnected, as for a daemon that has gone, and the recorder
@@ -36,7 +37,7 @@ const CHUNK: usize = 512;
 
 /// Frames the recorder has taken since prepare: ALSA's application
 /// pointer, which libasound keeps in the ioplug and moves under its own
-/// lock. It wraps at the boundary, which no stream reaches.
+/// lock. It wraps at the boundary; `Stream::unwrap` gives the count.
 ///
 /// # Safety
 /// As for `with`. Without libasound's lock the value may be a moment old.
@@ -62,21 +63,36 @@ pub(super) fn rate(client: &mut Client) -> Result<u32, c_int> {
 
 impl Stream {
     /// Frames the daemon has recorded since prepare, at its write
-    /// position `write`.
+    /// position `write`. It does not wrap.
     fn recorded(&self, write: u64) -> u64 {
         write.saturating_sub(self.base)
+    }
+
+    /// The application pointer `appl`, which wraps at the boundary, as a
+    /// count of frames since prepare: the one that lies at most a boundary
+    /// below `count`, a count of frames the recorder cannot have passed.
+    /// The boundary is far beyond any stream with a 64-bit `long`, but not
+    /// with a 32-bit one.
+    fn unwrap(&self, appl: u64, count: u64) -> u64 {
+        let b = self.boundary;
+        let (c, a) = (count % b, appl % b);
+        // How far the recorder is behind `count`, without overflow at a
+        // boundary near the top of the range.
+        let behind = if c >= a { c - a } else { b - (a - c) };
+        count.saturating_sub(behind)
     }
 
     /// Frames the recorder may read, with the daemon at position `write`
     /// and the recorder at `appl`.
     fn ready(&self, write: u64, appl: u64) -> u64 {
-        self.recorded(write).saturating_sub(appl)
+        let recorded = self.recorded(write);
+        recorded - self.unwrap(appl, recorded)
     }
 
     /// The daemon's write position at which the recorder, at `appl`, has
-    /// the frames it waits for.
-    fn ready_at(&self, appl: u64) -> u64 {
-        self.base + appl + self.wanted
+    /// the frames it waits for. The daemon is at `write`.
+    fn ready_at(&self, write: u64, appl: u64) -> u64 {
+        self.base + self.unwrap(appl, self.recorded(write)) + self.wanted
     }
 }
 
@@ -259,15 +275,18 @@ unsafe extern "C" fn transfer(
                 return Ok(inner.take(out, size as usize)? as snd_pcm_sframes_t);
             }
             // The position of the frame at `offset`, within a buffer from
-            // the recorder's position on.
+            // the recorder's position on. The recorder has taken no more
+            // than was copied.
             let buffer = stream.buffer;
-            let start = appl + (offset as u64 + buffer - appl % buffer) % buffer;
             let copied = stream.written;
+            let appl = stream.unwrap(appl, copied);
+            let start = appl + (offset as u64 + buffer - appl % buffer) % buffer;
             if copied >= start + size {
                 return Ok(size as snd_pcm_sframes_t);
             }
-            // Never so, as the copies follow each other: frames up to the
-            // start are not wanted any more.
+            // Each copy starts where the last one ended, so this does not
+            // happen. Should it, the frames before the start are no longer
+            // wanted: they are dropped from the ring.
             if copied < start {
                 inner.take(null_mut(), (start - copied) as usize)?;
             }
@@ -370,7 +389,7 @@ unsafe extern "C" fn poll_revents(
                     if ready >= stream.wanted
                         || inner
                             .client
-                            .wake_at(stream.ready_at(appl))
+                            .wake_at(stream.ready_at(write, appl))
                             .map_err(|e| errno(&e))? =>
                 {
                     inner.arm();
@@ -417,6 +436,7 @@ unsafe extern "C" fn delay(io: Io, delayp: *mut snd_pcm_sframes_t) -> c_int {
         if delayp.is_null() {
             return Err(libc::EINVAL);
         }
+        // libasound holds its lock for a delay, so the pointer is current.
         let appl = appl(io);
         with(io, |inner| {
             inner.client.check_alive().map_err(|e| errno(&e))?;
@@ -492,4 +512,39 @@ pub(super) unsafe fn constrain(io: Io, rate: c_uint) -> Result<(), c_int> {
         check(minmax(SND_PCM_IOPLUG_HW_PERIODS, 2, MAX_PERIODS))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stream(boundary: u64) -> Stream {
+        Stream {
+            frame_bytes: FRAME_BYTES,
+            buffer: 1024,
+            wanted: 256,
+            boundary,
+            base: 1000,
+            written: 0,
+            underruns: 0,
+            fresh: false,
+        }
+    }
+
+    #[test]
+    fn positions_hold_across_the_boundary() {
+        // A boundary of 4096 frames, as a 32-bit `long` reaches one: the
+        // recorder's pointer wraps, the daemon's count does not.
+        let s = stream(4096);
+        let write = 1000 + 3 * 4096 + 100;
+        // The recorder has taken 3 * 4096 + 40 frames; ALSA shows 40.
+        assert_eq!(s.ready(write, 40), 60);
+        assert_eq!(s.ready_at(write, 40), 1000 + 3 * 4096 + 40 + 256);
+        // Just before the wrap.
+        assert_eq!(s.ready(write, 4090), 106);
+        // With no wrap at all the same as before.
+        let s = stream(u64::MAX);
+        assert_eq!(s.ready(1000 + 500, 200), 300);
+        assert_eq!(s.ready_at(1000 + 500, 200), 1000 + 200 + 256);
+    }
 }
