@@ -32,7 +32,8 @@ const RESAMPLE_PAIRS: [(usize, usize); 4] = [
 const MIX_FORMATS: usize = 3;
 /// The resampler works on float only.
 const FORMATS: usize = 2;
-const QUALITIES: usize = 2;
+/// `high` and `medium`, each interpolating and each on exact phases.
+const QUALITIES: usize = 4;
 const MIX_CASES: usize = MIX_FRAMES.len() * MIX_RATES.len() * MIX_SOURCES.len() * MIX_FORMATS;
 const RESAMPLE_CASES: usize = RESAMPLE_FRAMES.len() * RESAMPLE_PAIRS.len() * QUALITIES * FORMATS;
 const FIFO_PRIORITY: i32 = 70;
@@ -149,6 +150,16 @@ fn resample_case<T: Sample>(
     (stats.summary(), resampler.output_delay())
 }
 
+/// The phases a fixed ratio takes: the output rate over the greatest common
+/// divisor of the two rates.
+fn exact_phases(from: usize, to: usize) -> usize {
+    let (mut a, mut b) = (from, to);
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    to / a
+}
+
 /// `rate` is the rate `frames` are at, which sets the time available.
 fn print_row(label: &str, frames: usize, rate: u32, s: &Summary, extra: &str) {
     let budget = frames as f64 / f64::from(rate) * 1e9;
@@ -192,7 +203,22 @@ fn run_cases(cycles: usize, mix_only: bool) -> usize {
         .interpolation(SincInterpolationType::Linear);
     for frames in RESAMPLE_FRAMES {
         for (from, to) in RESAMPLE_PAIRS {
-            for (quality, params) in [("high", &high), ("medium", &medium)] {
+            // A fixed ratio puts every output frame on one of `to / gcd`
+            // phases, so a table with that many needs no interpolation.
+            let phases = exact_phases(from, to);
+            let exact = |length| {
+                SincInterpolationParameters::new(length, WindowFunction::Blackman2)
+                    .oversampling_factor(phases)
+                    .interpolation(SincInterpolationType::Nearest)
+            };
+            let (high_exact, medium_exact) = (exact(128), exact(64));
+            let cases = [
+                ("high", &high),
+                ("high exact", &high_exact),
+                ("medium", &medium),
+                ("medium exact", &medium_exact),
+            ];
+            for (quality, params) in cases {
                 if stop::requested() {
                     return done;
                 }

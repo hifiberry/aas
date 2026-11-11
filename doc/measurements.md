@@ -30,11 +30,14 @@ synchronous disk writes.
   format can be set in the config. `i32` mixing was measured in stage 2 on both
   boards: it costs more than either float, 3.5 times `f32` on the Pi 3 and 7 times
   on the CM5. Mixing costs little on any board, about 1% of a period on the Pi 3
-  at 48 kHz. Resampling costs 1.4 to
-  1.85 times as much in 64-bit.
-- **Resampling quality:** `high` by default. On the Pi 3, `high` to 192 kHz uses
-  about 44% of a period in 32-bit, 62% in the worst cycle. In 64-bit it uses about
-  80% and can overrun, so a Pi 3 set to 64-bit should also use `medium`.
+  at 48 kHz. Resampling costs 1.35 to
+  1.7 times as much in 64-bit.
+- **Resampling quality:** `high` by default. With a filter table of the ratio's
+  exact phases, `high` to 192 kHz on the Pi 3 uses about 10% of a period in 32-bit
+  and 17% in 64-bit, and the worst single cycle at any period was 27% and 33%. So
+  `high` fits on the Pi 3 in both formats. With the interpolating resampler it
+  used about 44% and 80%, and could overrun in 64-bit. See
+  [Exact phases](#exact-phases).
 - **Default period on CM5:** 64 frames at 44.1 and 48 kHz, 128 at 96 kHz, 256 at
   192 kHz, with 2 periods.
 - **Default period on Pi 3:** 256 frames at 44.1 and 48 kHz, 512 at 96 kHz, 1024
@@ -136,6 +139,10 @@ share is not known, but playback alone should be below 4 ms.
 
 ## Processing cost
 
+The table below was taken in stage 1 with a resampler that interpolates between
+filter phases. The daemon no longer resamples that way. See
+[Exact phases](#exact-phases) for what it costs now.
+
 Share of one period, at 256 frames, as p99.9 and then max. CM5 figures were taken
 with the heatsink fitted and no throttling. The figures barely change with the
 period, except for the max column at small periods.
@@ -159,6 +166,58 @@ Pi 3 is about 10.6 times slower than the CM5 at resampling.
 
 Resampling delay is 69 frames with `high` and 34 with `medium` at 44.1 to 48 kHz.
 At 48 to 96 kHz it is 128 and 64.
+
+### Exact phases
+
+Between two fixed rates the sinc filter only needs a fixed set of phases, the
+output rate divided by the greatest common divisor of the two rates. The resampler
+now holds exactly those in its table and takes the nearest, which is always exact,
+instead of interpolating between phases. A unit test checks that a tone resampled
+this way is as pure as one resampled by interpolating, with the same delay.
+
+One full `dsp-bench` run on each board timed both ways in the same build, idle,
+at real-time priority: 168 of 168 cases on each. Share of one period at 256 frames,
+p99.9 and then max, on exact phases:
+
+| Case | CM5 f32 | CM5 f64 | Pi 3 f32 | Pi 3 f64 |
+|---|---|---|---|---|
+| High, 44.1 to 48 kHz | 0.4%, 0.9% | 0.6%, 1.1% | 3.4%, 5.8% | 5.6%, 8.6% |
+| Medium, 44.1 to 48 kHz | 0.2%, 0.3% | 0.3%, 0.8% | 2.1%, 4.3% | 3.3%, 5.5% |
+| High, 48 to 96 kHz | 0.6%, 0.8% | 0.9%, 1.1% | 5.2%, 7.4% | 8.7%, 11.7% |
+| Medium, 48 to 96 kHz | 0.4%, 0.6% | 0.6%, 0.7% | 3.3%, 5.4% | 5.4%, 11.0% |
+| High, 48 to 192 kHz | 1.2%, 1.4% | 1.7%, 2.3% | 10.4%, 14.4% | 17.2%, 21.0% |
+| Medium, 48 to 192 kHz | 0.8%, 0.9% | 1.1%, 1.2% | 6.8%, 9.6% | 10.8%, 13.9% |
+| High, 96 to 192 kHz | 1.2%, 1.5% | 1.7%, 2.2% | 10.6%, 15.5% | 17.0%, 22.9% |
+| Medium, 96 to 192 kHz | 0.8%, 2.0% | 1.1%, 2.1% | 6.7%, 12.0% | 10.9%, 16.0% |
+
+The interpolating figures from the same run agree with the stage 1 table above:
+on the Pi 3, `high` from 48 to 192 kHz took 42.4%, 49.3% in 32-bit and 76.8%, 85.0%
+in 64-bit.
+
+Mean time per period at 64 frames, in µs, interpolating and then exact:
+
+| Case | CM5 | Pi 3 |
+|---|---|---|
+| High f32, 44.1 to 48 kHz | 13.5, 4.8 | 152.5, 41.4 |
+| High f64, 44.1 to 48 kHz | 23.9, 7.5 | 275.9, 68.2 |
+| High f32, 48 to 192 kHz | 46.1, 14.4 | 534.8, 125.2 |
+| High f64, 48 to 192 kHz | 79.6, 21.6 | 987.1, 211.6 |
+| Medium f32, 44.1 to 48 kHz | 5.0, 3.0 | 44.9, 26.4 |
+
+Over all cases on both boards, exact phases are 1.6 to 4.8 times faster on the
+mean. `high` on exact phases costs less than `medium` did by interpolating. The
+delay is unchanged.
+
+Across all period sizes the worst single cycle on the Pi 3 is now 26.7% of a period
+in 32-bit and 33.7% in 64-bit, both 96 to 192 kHz at 64 frames. Interpolating, the
+same run reached 60.8% and 109.8%. On the CM5 the worst is 4.6%. 64-bit costs 1.35
+to 1.6 times 32-bit on the CM5 and 1.5 to 1.7 times on the Pi 3. The Pi 3 is about
+8.9 times slower than the CM5 at this.
+
+The Pi 3 ran for 68 minutes, from 55 to 68 °C. Its throttle flags show a frequency
+cap and throttling at some time since boot, and none while they were read. The CM5
+ran for 6.5 minutes with the heatsink, from 51 to 62 °C. Its flags also show only
+past events.
 
 ## Heat
 
@@ -502,3 +561,24 @@ On the CM5, idle, with the heatsink, at 2.4 GHz and 54 to 55 °C, never throttle
 On the mean at 48 kHz and 256 frames, `i32` costs about 7.0 times `f32` and 3.3
 times `f64` on the CM5: 12.5 µs against 1.8 and 3.8 µs. That is a larger ratio than
 on the Pi 3, but the share of a period stays at about 1% or less.
+
+### Player wake-ups
+
+The daemon used to wake every client after every period. It now wakes a client
+once when the read position the client waits for is reached. On the Pi 3 test
+board, 15 seconds of `aplay` through the plugin, with the daemon at 256 frames and
+48 kHz, before and after:
+
+| Case | Player wake-ups | Player CPU | Daemon CPU |
+|---|---|---|---|
+| 48 kHz, `aplay` defaults | 2817, then 120 | 0.18 s, then 0.04 s | 0.13 s, then 0.20 s |
+| 48 kHz, buffer 100 ms, period 25 ms | 2816, then 601 | 0.14 s, then 0.08 s | 0.12 s, then 0.19 s |
+| 44.1 kHz resampled beside a 48 kHz player | 2817, then 120 | 0.14 s, then 0.04 s | 2.57 s, then 0.93 s |
+
+CPU time is counted in ticks of 10 ms, so the small figures are coarse. The
+daemon's fall in the last row is the resampler on exact phases. Its rise in the
+first two rows, of 7 ticks in 15 seconds, is not explained.
+
+The plugin's `pause_and_resume` test failed 40 of 40 runs on the Pi 3, because the
+stream played one period more after a pause. With the audio loop reading its
+commands after the wait for room, it passed 40 of 40.

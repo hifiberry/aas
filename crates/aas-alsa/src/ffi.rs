@@ -303,6 +303,10 @@ unsafe extern "C" {
         params: *const snd_pcm_sw_params_t,
         val: *mut snd_pcm_uframes_t,
     ) -> c_int;
+    pub fn snd_pcm_sw_params_get_avail_min(
+        params: *const snd_pcm_sw_params_t,
+        val: *mut snd_pcm_uframes_t,
+    ) -> c_int;
 
     pub fn snd_ctl_ext_create(ext: Ext, name: *const c_char, mode: c_int) -> c_int;
     pub fn snd_ctl_elem_id_get_interface(id: *const snd_ctl_elem_id_t) -> snd_ctl_elem_iface_t;

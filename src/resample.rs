@@ -19,16 +19,32 @@ const MAX_RATIO_CHANGE: f64 = 1.1;
 /// Why the calls into rubato cannot fail.
 const SIZED: &str = "the buffers are sized in Stage::new";
 
-/// The parameters `dsp-bench` measured as `high` and `medium`.
-fn parameters(quality: Quality) -> SincInterpolationParameters {
+/// Taps of the filter for each quality, as `dsp-bench` measured them.
+fn taps(quality: Quality) -> usize {
     match quality {
-        Quality::High => SincInterpolationParameters::new(128, WindowFunction::Blackman2)
-            .oversampling_factor(256)
-            .interpolation(SincInterpolationType::Cubic),
-        Quality::Medium => SincInterpolationParameters::new(64, WindowFunction::Blackman2)
-            .oversampling_factor(128)
-            .interpolation(SincInterpolationType::Linear),
+        Quality::High => 128,
+        Quality::Medium => 64,
     }
+}
+
+/// The output rate over the greatest common divisor of the two rates.
+fn phases(from: u32, to: u32) -> usize {
+    let (mut a, mut b) = (from, to);
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    (to / a) as usize
+}
+
+/// The ratio is fixed, so every output frame falls on one of `phases`
+/// places between two input frames. A table with exactly that many needs
+/// no interpolation: each place is in it. That is exact, and costs one
+/// filter per channel where interpolating between table points costs two
+/// to three.
+fn parameters(quality: Quality, from: u32, to: u32) -> SincInterpolationParameters {
+    SincInterpolationParameters::new(taps(quality), WindowFunction::Blackman2)
+        .oversampling_factor(phases(from, to))
+        .interpolation(SincInterpolationType::Nearest)
 }
 
 /// The resampler and its buffers, in the precision of `P`.
@@ -46,11 +62,11 @@ impl<P: Processing> Stage<P>
 where
     P::Acc: Sample,
 {
-    fn new(ratio: f64, period: usize, quality: Quality) -> Self {
+    fn new(ratio: f64, period: usize, parameters: &SincInterpolationParameters) -> Self {
         let inner = Async::new_sinc(
             ratio,
             MAX_RATIO_CHANGE,
-            &parameters(quality),
+            parameters,
             period,
             CHANNELS,
             FixedAsync::Output,
@@ -125,11 +141,21 @@ pub struct Resampler {
 
 impl Resampler {
     pub fn new(from: u32, to: u32, period: u32, quality: Quality, format: Format) -> Resampler {
+        Self::with(from, to, period, &parameters(quality, from, to), format)
+    }
+
+    fn with(
+        from: u32,
+        to: u32,
+        period: u32,
+        parameters: &SincInterpolationParameters,
+        format: Format,
+    ) -> Resampler {
         let ratio = f64::from(to) / f64::from(from);
         let frames = period as usize;
         let precision = match format {
-            Format::I32 | Format::F32 => Precision::Single(Stage::new(ratio, frames, quality)),
-            Format::F64 => Precision::Double(Stage::new(ratio, frames, quality)),
+            Format::I32 | Format::F32 => Precision::Single(Stage::new(ratio, frames, parameters)),
+            Format::F64 => Precision::Double(Stage::new(ratio, frames, parameters)),
         };
         let mut resampler = Resampler {
             precision,
@@ -191,6 +217,16 @@ impl Resampler {
         self.padded >= self.tail
     }
 
+    /// Empties the filter, for a stream that starts anew. Does not allocate.
+    pub fn reset(&mut self) {
+        match &mut self.precision {
+            Precision::Single(s) => s.inner.reset(),
+            Precision::Double(s) => s.inner.reset(),
+        }
+        self.padded = self.tail;
+        self.primed = false;
+    }
+
     /// Forgets what is in the filter, as its audio is being discarded.
     pub fn skip(&mut self) {
         self.padded = self.tail;
@@ -248,6 +284,102 @@ mod tests {
                 [v, -v]
             })
             .collect()
+    }
+
+    /// The filters interpolated between the points of a fine table, which
+    /// suits any ratio. The reference for the exact ones.
+    fn interpolating(quality: Quality) -> SincInterpolationParameters {
+        let (factor, kind) = match quality {
+            Quality::High => (256, SincInterpolationType::Cubic),
+            Quality::Medium => (128, SincInterpolationType::Linear),
+        };
+        SincInterpolationParameters::new(taps(quality), WindowFunction::Blackman2)
+            .oversampling_factor(factor)
+            .interpolation(kind)
+    }
+
+    #[test]
+    fn the_phases_of_a_ratio_are_the_output_rate_in_lowest_terms() {
+        assert_eq!(phases(44100, 48000), 160);
+        assert_eq!(phases(48000, 44100), 147);
+        assert_eq!(phases(48000, 96000), 2);
+        assert_eq!(phases(96000, 48000), 1);
+        assert_eq!(phases(44100, 96000), 320);
+        assert_eq!(phases(8000, 44100), 441);
+    }
+
+    /// RMS of what is left of `out` after the best fitting 1 kHz sine is
+    /// taken away, relative to the sine.
+    fn residual(out: &[f64], rate: f64) -> f64 {
+        let w = std::f64::consts::TAU * 1000.0 / rate;
+        let (mut ss, mut cc, mut sc, mut ys, mut yc) = (0.0, 0.0, 0.0, 0.0, 0.0);
+        for (n, y) in out.iter().enumerate() {
+            let (s, c) = (w * n as f64).sin_cos();
+            ss += s * s;
+            cc += c * c;
+            sc += s * c;
+            ys += y * s;
+            yc += y * c;
+        }
+        let det = ss * cc - sc * sc;
+        let (a, b) = ((ys * cc - yc * sc) / det, (yc * ss - ys * sc) / det);
+        let mut err = 0.0;
+        for (n, y) in out.iter().enumerate() {
+            let (s, c) = (w * n as f64).sin_cos();
+            err += (y - a * s - b * c).powi(2);
+        }
+        (err / out.len() as f64).sqrt() / (a * a + b * b).sqrt() * 2f64.sqrt()
+    }
+
+    /// A 1 kHz tone resampled, as dB of what is not that tone, and the
+    /// filter's delay.
+    fn purity(from: u32, to: u32, parameters: &SincInterpolationParameters) -> (f64, u32) {
+        let ring = ring();
+        let input: Vec<[i32; 2]> = (0..60_000)
+            .map(|i| {
+                let phase = f64::from(i) * 1000.0 / f64::from(from) * std::f64::consts::TAU;
+                let v = (phase.sin() * 1e9) as i32;
+                [v, -v]
+            })
+            .collect();
+        ring.write(&input);
+        let mut r = Resampler::with(from, to, PERIOD as u32, parameters, Format::F64);
+        let mut period = [[0; 2]; PERIOD];
+        let mut out = Vec::new();
+        for cycle in 0..150 {
+            r.process(&ring, &mut period);
+            // Past the start of the tone, which is not a pure one.
+            if cycle >= 20 {
+                out.extend(period.iter().map(|f| f64::from(f[0])));
+            }
+        }
+        (
+            20.0 * residual(&out, f64::from(to)).log10(),
+            r.delay_frames(),
+        )
+    }
+
+    #[test]
+    fn exact_phases_are_as_pure_as_interpolating_with_the_same_delay() {
+        let pairs = [
+            (44100, 48000),
+            (48000, 44100),
+            (48000, 96000),
+            (96000, 44100),
+        ];
+        for (from, to) in pairs {
+            for quality in [Quality::High, Quality::Medium] {
+                let (exact, delay) = purity(from, to, &parameters(quality, from, to));
+                let (reference, reference_delay) = purity(from, to, &interpolating(quality));
+                // Both reach the floor of 32-bit samples at `high`.
+                assert!(exact < -170.0, "{from}>{to} {quality:?}: {exact} dB");
+                assert!(
+                    exact < reference + 6.0,
+                    "{from}>{to} {quality:?}: {exact} dB"
+                );
+                assert_eq!(delay, reference_delay, "{from}>{to} {quality:?}");
+            }
+        }
     }
 
     #[test]

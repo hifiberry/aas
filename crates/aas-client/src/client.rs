@@ -10,7 +10,7 @@ use std::io;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{Ordering, fence};
 
 /// Descriptors a reply may carry: the ring and the wake-up.
 const MAX_FDS: usize = 2;
@@ -312,12 +312,35 @@ impl Client {
         Ok(written)
     }
 
+    /// Stops the stream and empties its ring, keeping the ring and the
+    /// stream. Positions go on counting. Returns once the ring is empty.
+    pub fn reset(&mut self) -> io::Result<()> {
+        self.stream()?;
+        self.call(&Request::Reset)?;
+        let header = self.stream()?.ring.header();
+        header.draining.store(0, Ordering::Release);
+        Ok(())
+    }
+
     /// Frames the daemon has taken from the ring since it was configured.
-    /// Fails once the daemon has gone.
+    /// It reads shared memory only, so it does not notice a daemon that
+    /// has gone: `check_alive` and the socket in `poll_fds` do.
     pub fn hw_position(&self) -> io::Result<u64> {
-        self.check_alive()?;
         let header = self.stream()?.ring.header();
         Ok(header.read_pos.load(Ordering::Acquire))
+    }
+
+    /// Asks for one wake-up once the daemon has taken `position` frames,
+    /// in place of one after every period. Returns true if it has taken
+    /// them already, in which case no wake-up may come. A position of zero
+    /// brings back the wake-up after every period.
+    pub fn wake_at(&self, position: u64) -> io::Result<bool> {
+        let header = self.stream()?.ring.header();
+        header.wake_at.store(position, Ordering::SeqCst);
+        // The daemon stores its position and then loads this one. With a
+        // full barrier on both sides, one of the two sees the other.
+        fence(Ordering::SeqCst);
+        Ok(header.read_pos.load(Ordering::SeqCst) >= position)
     }
 
     /// Frames between what is written next and the listener: what the ring
@@ -341,7 +364,8 @@ impl Client {
             .map_or(0, |s| s.ring.header().underruns.load(Ordering::Relaxed))
     }
 
-    /// The wake-up eventfd, readable after each period played, and the
+    /// The wake-up eventfd, readable after each period played or as
+    /// `wake_at` asks, and after each underrun, and the
     /// socket, which hangs up when the daemon goes. The first is -1 until
     /// the stream is configured.
     pub fn poll_fds(&self) -> [RawFd; 2] {

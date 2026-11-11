@@ -128,6 +128,17 @@ takes from the ring, with room for the resampler and for DoP detection, and one
 period more to refill it in. The largest ring is 2^20 frames. "No client is ever refused"
 is about the number of clients, not the size of a ring.
 
+The daemon wakes a waiting client through an eventfd. The plugin stores in the
+ring's header the read position it waits for, taken from the player's `avail_min`.
+The daemon wakes it once when that position is reached, or when the stream
+underruns *(call)*. A player that waits for half a buffer of room is woken once
+per half buffer, not once per daemon period. A client that stores no position is
+woken after every period.
+
+A prepare keeps the stream. The plugin asks the daemon to reset it. The audio
+thread stops the stream, empties its ring and its resampler, and the daemon
+answers when that is done. The ring and the poll descriptors stay the same.
+
 A player that does not use ALSA `default` today is reconfigured to use it *(call)*.
 A direct `hw:` open cannot work while the daemon owns the card, and no PulseAudio
 endpoint is planned.
@@ -226,7 +237,7 @@ needs every bit, and it does not use the processing format.
 
 `f32` is the default on every board. `f64` stays fully supported. Mixing costs about
 1% of a period on a Pi 3, the slowest supported board, in either format. Resampling
-costs up to 1.85 times as much in `f64` as in `f32`.
+costs 1.35 to 1.7 times as much in `f64` as in `f32`.
 
 `i32` is 32-bit signed integer, the same format the card uses:
 
@@ -249,11 +260,18 @@ but `i32` saves no CPU.
 Resampling has two quality settings *(call)*. `high` is the default on every board.
 `medium` can be set in the config.
 
-On the Pi 3, one stream at `high` to 192 kHz uses about 44% of a period in `f32`,
-and 62% in the worst cycle. In `f64` it uses about 80% and can overrun, so a Pi 3
-set to `f64` should also use `medium`. Several resampled streams add up: two at
-`high` to 192 kHz come close to a full period on a Pi 3 even in `f32`, and `medium`
-leaves room for them. The Pi 4 is still to be measured.
+The resampler is a windowed sinc filter. Between two fixed rates it only ever
+needs a fixed set of filter phases: the output rate divided by the greatest common
+divisor of the two rates. That is 160 phases from 44.1 to 48 kHz and 4 from 48 to
+192 kHz. The filter table holds exactly those phases, so no output sample is
+interpolated between two of them *(call)*. This costs 1.6 to 4.8 times less than
+interpolating, with the same delay and the same purity.
+
+On the Pi 3, one stream at `high` to 192 kHz uses about 10% of a period in `f32`
+and 17% in `f64`. The worst single cycle at any period was 27% and 33%. So `high`
+fits on a Pi 3 in either format, and so do several resampled streams. `medium`
+costs about two thirds of `high` and is no longer needed to make a Pi 3 fit. The
+Pi 4 is still to be measured.
 
 ### Volume and clipping
 
@@ -348,7 +366,13 @@ and 0 mutes *(call)*. A request above 100 is an error, not clamped. Every client
 holding the control is told when the volume changes, so a second mixer sees a
 change made by the first.
 
-In forced bit-perfect mode `aas` never touches the samples. On a card whose
+A card's control can stop above -60 dB. Below its lowest level `aas` sets the
+control to that level and calculates the rest itself, so each step is a step on
+every card. The output is then not bit-perfect, at a level where that is not
+heard.
+
+In forced bit-perfect mode `aas` never touches the samples, so the volume stops
+at the control's lowest level. On a card whose
 hardware control has neither a mute switch nor a mute step, 0 then plays at the
 control's lowest level, not silence.
 
@@ -388,6 +412,9 @@ cycle's work together must fit in one period: 5.3 ms at 48 kHz on the Pi 3, and
 1.3 ms with the 4 ms target. On the CM5 the worst cycle in an hour under full load
 was 0.11 ms. A loop that read the clients first and then waited for room would
 hide its work inside the full buffer, but would add a third period of latency.
+
+The loop reads its commands after the wait. A stop or a pause that arrives during
+the wait takes effect in that cycle, so the stream does not play one period more.
 
 Resampling adds roughly 1 to 2 ms. A resampled client may exceed 4 ms, in
 preference to reducing resampling quality *(call)*.

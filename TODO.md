@@ -16,8 +16,8 @@ in the capture. Both test boards have the cable connected.
 
 ## Measure the sound of medium resampling
 
-`medium` is no longer a default, but it is the fallback for a Pi 3 in `f64` or with
-several resampled streams. Its cost is measured, its sound is not. Measure its
+`medium` is no longer a default, and since the resampler uses exact phases a Pi 3
+no longer needs it to fit. It stays a config option. Its cost is measured, its sound is not. Measure its
 passband and stopband against `high`.
 
 ## Find why the CM5 test board stopped responding under load

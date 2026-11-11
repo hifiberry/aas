@@ -18,7 +18,7 @@ use rtrb::{Consumer, Producer, PushError};
 use std::collections::VecDeque;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{Ordering, fence};
 use std::time::Instant;
 
 /// Sources the table of a new engine has room for. The control thread sends
@@ -95,6 +95,10 @@ pub struct Source {
     /// When this stream was first seen as DoP, in the order of all claims.
     /// Zero while it is not DoP. The oldest claim holds the output.
     dop_claim: u64,
+    /// The position in the header's `wake_at` that has had its wake-up.
+    woken_at: u64,
+    /// The underruns the client has been woken for.
+    underruns_told: u64,
 }
 
 impl Source {
@@ -123,7 +127,32 @@ impl Source {
             dop_reported: false,
             drained_reported: false,
             dop_claim: 0,
+            woken_at: 0,
+            underruns_told: 0,
         }
+    }
+
+    /// Empties the ring and forgets everything about the stream so far, so
+    /// that what the client writes next starts a new one.
+    fn flush(&mut self) {
+        self.ring.consume(usize::MAX);
+        if let Some(r) = self.resampler.as_mut() {
+            r.reset();
+        }
+        self.running = false;
+        self.stream = Stream::Unknown;
+        self.ready = 0;
+        self.seen = 0;
+        self.plays = false;
+        self.held = 0;
+        self.settled = false;
+        self.in_dop_run = false;
+        self.cut_run = false;
+        self.dropped = 0;
+        self.next_marker = 0x05;
+        self.dop_dry_frames = 0;
+        self.discard_remainder = 0;
+        self.drained_reported = false;
     }
 
     fn draining(&self) -> bool {
@@ -318,14 +347,29 @@ impl Source {
         rest
     }
 
-    /// Tells the client how much plays after its ring, and that it has moved.
-    fn notify(&self, sink_delay: u32, output_rate: u32) {
+    /// Tells the client how much plays after its ring, and wakes it if it
+    /// is due: after every period, or once the position it waits for is
+    /// reached, and after each underrun. A client that waits for a position
+    /// sleeps through the periods before it, and costs no call here.
+    fn notify(&mut self, sink_delay: u32, output_rate: u32) {
         let filter = self.resampler.as_ref().map_or(0, |r| r.delay_frames());
         let delay = u64::from(sink_delay + filter) * u64::from(self.rate) / u64::from(output_rate);
         let header = self.ring.header();
         header
             .output_delay_frames
             .store(delay as u32, Ordering::Relaxed);
+        // The client stores the position it waits for and then loads ours.
+        // With a full barrier on both sides, one of the two sees the other.
+        fence(Ordering::SeqCst);
+        let wake_at = header.wake_at.load(Ordering::SeqCst);
+        let reached = header.read_pos.load(Ordering::Relaxed) >= wake_at;
+        let underruns = header.underruns.load(Ordering::Relaxed);
+        let due = wake_at == 0 || (reached && wake_at != self.woken_at);
+        if !due && underruns == self.underruns_told {
+            return;
+        }
+        self.woken_at = wake_at;
+        self.underruns_told = underruns;
         let one = 1u64;
         // SAFETY: a plain write of 8 bytes. The fd is non-blocking, and a full
         // counter only means the client has plenty of wake-ups waiting.
@@ -345,6 +389,8 @@ pub enum Command {
     Add(Box<Source>),
     Remove(ClientId),
     SetRunning(ClientId, bool),
+    /// Stops the source and empties its ring. Answered by `Event::Flushed`.
+    Flush(ClientId),
     SetResampler(ClientId, Option<Box<Resampler>>),
     /// Opens the sink, or reopens it after a period of fading out. The fade
     /// comes first even for commands queued ahead of this one, so resamplers
@@ -370,6 +416,7 @@ pub enum Event {
     DopStarted(ClientId),
     DopStopped(ClientId),
     Drained(ClientId),
+    Flushed(ClientId),
     Reconfigured,
 }
 
@@ -467,22 +514,41 @@ impl<P: Processing, S: Sink> Engine<P, S> {
             return Ok(());
         }
         self.flush_backlog();
+        // The wait comes before the commands are read, so that one sent
+        // during it, such as a stop, takes effect in this cycle.
+        let waited = self.wait_room();
+        let mut start = Instant::now();
         let result = if self.open && !self.faded && self.reconfigure_queued() {
             self.faded = true;
-            self.render(true)
+            self.render(true, start)
         } else {
             self.drain_commands();
             if self.reopen.is_some() {
                 self.apply_reopen()?;
+                // Opening the card is not part of the cycle's work.
+                start = Instant::now();
             }
             if self.open {
-                self.render(false)
+                self.render(false, start)
             } else {
                 Ok(())
             }
         };
         self.report();
-        result
+        waited.and(result)
+    }
+
+    /// Waits until the open sink has room for a period. This is the audio
+    /// thread's only wait.
+    fn wait_room(&mut self) -> Result<(), SinkError> {
+        if !self.open {
+            return Ok(());
+        }
+        let waited = self.sink.wait_room();
+        if waited == Err(SinkError::Xrun) {
+            self.counters.xruns.fetch_add(1, Ordering::Relaxed);
+        }
+        waited
     }
 
     fn flush_backlog(&mut self) {
@@ -531,6 +597,13 @@ impl<P: Processing, S: Sink> Engine<P, S> {
             Command::Add(source) => self.add(source),
             Command::Remove(id) => self.remove(id),
             Command::SetRunning(id, running) => self.set_running(id, running),
+            Command::Flush(id) => {
+                self.set_running(id, false);
+                if let Some(source) = self.find(id) {
+                    source.flush();
+                }
+                self.emit(Event::Flushed(id));
+            }
             Command::SetResampler(id, resampler) => {
                 let replaced = match self.find(id) {
                     Some(source) => std::mem::replace(&mut source.resampler, resampler),
@@ -681,15 +754,11 @@ impl<P: Processing, S: Sink> Engine<P, S> {
 
     /// Plays one period. `fade_out` takes the level down to zero over it.
     ///
-    /// It waits for room on the card first and only then reads the clients,
-    /// so what it reads is written at once and waits behind no more than
-    /// the card's buffer. The cycle is timed from the end of that wait.
-    fn render(&mut self, fade_out: bool) -> Result<(), SinkError> {
-        let waited = self.sink.wait_room();
-        if waited == Err(SinkError::Xrun) {
-            self.counters.xruns.fetch_add(1, Ordering::Relaxed);
-        }
-        let start = Instant::now();
+    /// The cycle has waited for room on the card before this and only now
+    /// reads the clients, so what it reads is written at once and waits
+    /// behind no more than the card's buffer. The cycle is timed from
+    /// `start`, the end of that wait.
+    fn render(&mut self, fade_out: bool, start: Instant) -> Result<(), SinkError> {
         self.scan();
         self.order_claims();
         let rate = self.rate;
@@ -707,12 +776,12 @@ impl<P: Processing, S: Sink> Engine<P, S> {
             self.counters.xruns.fetch_add(1, Ordering::Relaxed);
         }
         let sink_delay = self.sink.delay_frames();
-        for source in self.table.iter().filter(|s| s.running) {
+        for source in self.table.iter_mut().filter(|s| s.running) {
             source.notify(sink_delay, rate);
         }
         let work = before_write - start + after_write.elapsed();
         self.record_timing(start, work.as_nanos() as u64);
-        waited.and(result)
+        result
     }
 
     fn record_timing(&mut self, start: Instant, cycle_ns: u64) {
@@ -2375,13 +2444,101 @@ mod tests {
         ] {
             assert!(commands.push(command).is_ok());
         }
-        for _ in 0..4 {
+        // The cycle that opens the sink does not wait; four more do.
+        for _ in 0..5 {
             engine.cycle().unwrap();
         }
         // Each period read from the ring is the one put there while the
         // engine waited in that same cycle, not the one before.
         let played = played.lock().unwrap();
         assert_eq!(played[played.len() - PERIOD..], frames(4, PERIOD)[..]);
+    }
+
+    /// A sink that sends a stop for a client while the engine waits for
+    /// room, as a player's pause arriving then does.
+    struct StopOnWait {
+        commands: Option<rtrb::Producer<Command>>,
+        id: ClientId,
+        /// The call to `wait_room` that sends the stop.
+        at: usize,
+        waits: usize,
+        played: Arc<std::sync::Mutex<Vec<[i32; 2]>>>,
+        /// Frames played when the stop was sent.
+        before: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl crate::sink::Sink for StopOnWait {
+        fn open(&mut self, _rate: u32, _period: u32) -> Result<(), SinkError> {
+            Ok(())
+        }
+
+        fn wait_room(&mut self) -> Result<(), SinkError> {
+            self.waits += 1;
+            if self.waits == self.at {
+                let commands = self.commands.as_mut().unwrap();
+                assert!(commands.push(Command::SetRunning(self.id, false)).is_ok());
+                let played = self.played.lock().unwrap().len();
+                self.before.store(played, Ordering::Relaxed);
+            }
+            Ok(())
+        }
+
+        fn write(&mut self, frames: &[[i32; 2]]) -> Result<(), SinkError> {
+            self.played.lock().unwrap().extend_from_slice(frames);
+            Ok(())
+        }
+
+        fn close(&mut self) {}
+
+        fn delay_frames(&self) -> u32 {
+            0
+        }
+
+        fn supported_rates(&self) -> Vec<u32> {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn a_stop_that_comes_while_the_engine_waits_for_room_plays_no_more() {
+        let (mut commands, consumer) = RingBuffer::new(16);
+        let (producer, _events) = RingBuffer::new(64);
+        let counters = Arc::new(Counters::default());
+        let mut a = client(1);
+        a.ring.write(&frames(1, 8 * PERIOD));
+        let played = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let before = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let reconfigure = Command::Reconfigure {
+            rate: RATE,
+            period: PERIOD as u32,
+        };
+        for command in [
+            reconfigure,
+            Command::Add(a.source.take().unwrap()),
+            Command::SetRunning(a.id, true),
+        ] {
+            assert!(commands.push(command).is_ok());
+        }
+        let sink = StopOnWait {
+            commands: Some(commands),
+            id: a.id,
+            at: 3,
+            waits: 0,
+            played: played.clone(),
+            before: before.clone(),
+        };
+        let mode = BitPerfect::Auto;
+        let mut engine = Engine::<F32, _>::new(sink, consumer, producer, counters, mode);
+        for _ in 0..5 {
+            engine.cycle().unwrap();
+        }
+        // The cycle that was waiting when the stop came takes nothing
+        // more from the ring, and neither does any after it.
+        let before = before.load(Ordering::Relaxed);
+        assert!(before >= PERIOD, "the stop came before anything played");
+        assert_eq!(a.ring.available(), 8 * PERIOD - before);
+        let played = played.lock().unwrap();
+        assert!(played[before..].iter().all(|f| *f == [0, 0]));
     }
 
     struct SlowOpen;

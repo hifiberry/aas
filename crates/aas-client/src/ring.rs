@@ -15,7 +15,7 @@ use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 pub const MAGIC: u32 = 0x4141_5352;
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
 /// Bytes before the frame data. Keeps the data 64 byte aligned.
 const DATA_OFFSET: usize = 64;
@@ -33,6 +33,10 @@ pub struct Header {
     pub underruns: AtomicU64,
     pub output_delay_frames: AtomicU32,
     pub draining: AtomicU32,
+    /// The read position the client waits for. The daemon writes the
+    /// wake-up once `read_pos` has reached it, and once more only after it
+    /// has changed. Zero asks for a wake-up after every period.
+    pub wake_at: AtomicU64,
 }
 
 const _: () = assert!(std::mem::size_of::<Header>() <= DATA_OFFSET);

@@ -18,7 +18,7 @@ use crate::convert::ClientFormat;
 use std::path::PathBuf;
 
 /// The protocol version a client sends in `Hello`.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 pub const REQUEST_LEN: usize = 20;
 pub const REPLY_LEN: usize = 8;
 /// Largest buffer a client may ask for. Bounds the ring memory.
@@ -46,6 +46,9 @@ pub enum Request {
     },
     /// Answered by `Volume`, then sent `Volume` on every change.
     SubscribeVolume,
+    /// Stops the stream and empties its ring. Answered by `Ok` once the
+    /// ring is empty, so what is written after the reply is kept.
+    Reset,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -117,6 +120,7 @@ pub fn encode_request(r: &Request) -> [u8; REQUEST_LEN] {
         Request::GetVolume => pack(6, [0; 4]),
         Request::SetVolume { percent } => pack(7, [percent as u32, 0, 0, 0]),
         Request::SubscribeVolume => pack(8, [0; 4]),
+        Request::Reset => pack(9, [0; 4]),
     }
 }
 
@@ -144,6 +148,7 @@ pub fn decode_request(b: &[u8]) -> Option<Request> {
             percent: u8::try_from(word(b, 1)).ok()?,
         },
         8 => Request::SubscribeVolume,
+        9 => Request::Reset,
         _ => return None,
     })
 }
@@ -210,6 +215,7 @@ mod tests {
             Request::GetVolume,
             Request::SetVolume { percent: 55 },
             Request::SubscribeVolume,
+            Request::Reset,
         ];
         for r in requests {
             assert_eq!(decode_request(&encode_request(&r)), Some(r));

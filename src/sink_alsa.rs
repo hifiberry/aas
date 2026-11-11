@@ -325,15 +325,22 @@ mod card {
                 match result {
                     Ok(frames) => done += frames * self.frame_bytes(),
                     Err(e) if e.errno() == libc::EINTR => {}
-                    Err(e) if e.errno() == libc::EAGAIN => {
-                        if !self.pcm.wait(Some(WAIT_MS))? {
-                            return Err(alsa::Error::new("snd_pcm_wait", libc::ETIMEDOUT));
-                        }
-                    }
+                    Err(e) if e.errno() == libc::EAGAIN => self.wait()?,
                     Err(e) => return Err(e),
                 }
             }
             Ok(())
+        }
+
+        /// Waits for the card to have room, up to `WAIT_MS`. A signal that
+        /// cuts the wait short is not a failure: the caller looks again.
+        fn wait(&self) -> alsa::Result<()> {
+            match self.pcm.wait(Some(WAIT_MS)) {
+                Ok(true) => Ok(()),
+                Ok(false) => Err(alsa::Error::new("snd_pcm_wait", libc::ETIMEDOUT)),
+                Err(e) if e.errno() == libc::EINTR => Ok(()),
+                Err(e) => Err(e),
+            }
         }
 
         /// Waits until the card has room for one engine period, or for the
@@ -341,20 +348,22 @@ mod card {
         fn wait_room(&self) -> alsa::Result<()> {
             let period = (self.bytes.len() / self.frame_bytes()).min(self.buffer as usize);
             while (self.pcm.avail_update()? as usize) < period {
-                match self.pcm.wait(Some(WAIT_MS)) {
-                    Ok(true) => {}
-                    Ok(false) => {
-                        return Err(alsa::Error::new("snd_pcm_wait", libc::ETIMEDOUT));
-                    }
-                    Err(e) if e.errno() == libc::EINTR => {}
-                    Err(e) => return Err(e),
-                }
+                self.wait()?;
             }
             Ok(())
         }
 
         /// Converts and writes the frames, a buffer's worth at a time.
         fn play(&mut self, frames: &[[i32; 2]]) -> alsa::Result<()> {
+            if self.format == CardFormat::S32 && cfg!(target_endian = "little") {
+                // The frames are the card's bytes already.
+                // SAFETY: a frame is 8 bytes with no padding, and bytes
+                // have no alignment to keep.
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(frames.as_ptr().cast::<u8>(), size_of_val(frames))
+                };
+                return self.write_all(bytes);
+            }
             let per_chunk = (self.bytes.len() / self.frame_bytes()).max(1);
             for chunk in frames.chunks(per_chunk) {
                 let len = chunk.len() * self.frame_bytes();
