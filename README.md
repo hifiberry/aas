@@ -126,7 +126,10 @@ gain = -3
 ```
 
 `[analog]` turns on the card's analog input (`enabled`, default `false`) and sets
-its level (`volume_db`, from -60 to 0, default 0). The input is off unless
+its level (`volume_db`, from -60 to 0, default 0). `volume_db` is the level the
+input starts at: once the API can change the input volume (stage 4), that
+volume is kept in the state file like the output volume, and the config gives
+only its value on a fresh install. The input is off unless
 enabled, and it works only on cards with an ADC that `aas` knows: today the
 DAC+ ADC and the DAC+ ADC Pro. On any other card it logs one line and opens
 nothing. While the input is enabled the output never closes, and `idle = "off"`

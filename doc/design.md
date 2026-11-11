@@ -183,10 +183,14 @@ When idle, an output does one of two things, chosen in the config:
   that time needs no restart of the output.
 
 "Go off" is the default, with a 60 second delay *(call)*. The output counts as
-idle when no source is active. While the analog input is enabled the output never
-goes off, and `idle = "off"` is ignored with one line in the log at startup
-*(call)*. The engine's cycle is paced by the playback card, and input detection
-has to keep measuring.
+idle when no source is active. While the analog input is enabled the output stays
+open and sends silence, and `idle = "off"` does not apply; this is logged once at
+startup. The engine's cycle is paced by the playback card, and input detection
+has to keep measuring. Closing the playback with the capture running was
+measured on both test boards: the clocks keep running, but the ADC is 2.7 dB
+noisier, and another player opening the card at 44.1 kHz silently moves the
+capture clock on the CM5 and clicks on the Pi 3 (`doc/measurements.md`, Stage
+3a, "Idle output with the analog input on").
 
 ## Sample rate rules
 
@@ -524,10 +528,13 @@ Details *(call)*:
   dropped. Both are counted. Capture overruns are not counted on their own, they
   show as padded frames.
 - A capture delivers silence for 1 s after each start. The ADC of the DAC+ ADC
-  Pro starts with a DC offset of about -28 dBFS that stays above -50 dBFS for
-  about 650 ms, and would open the input by itself. This was measured on that
-  card only. The cost is that the analog input is muted for 1 s at every start
-  and every rate change.
+  Pro starts with a DC offset that stays above -50 dBFS for up to 700 ms, and
+  would open the input by itself. The DAC+ ADC on the Pi 3 test board never
+  went above -50 dBFS at a start, its loudest 50 ms being -83.8 dBFS
+  (`doc/measurements.md`, Stage 3a). So the 1 s is needed for the Pro only, but
+  it applies to every card, so that the cards behave alike *(call: the owner
+  to confirm)*. The cost is that the analog input is muted for 1 s at every
+  start and every rate change.
 - The engine tells the control thread whether the input has signal, by sending
   the current state when its event queue has room. If the queue is full while the
   input opens and closes again, no event is sent for that pair.
@@ -634,8 +641,10 @@ Details *(call)*:
 - A plugin runs at one of three places: `analog`, on the analog input before it
   is mixed; `mix`, on the mix; or `output`, just before the output. With one
   output the mix chain runs first and the output chain after it. The output
-  volume stays in the mix, so both run after it. Chains on a single client's
-  input are not built yet.
+  volume stays in the mix, so both run after it. Until stage 4 only the analog
+  input has a chain of its own, which departs on purpose from a chain on every
+  input: a client's chain needs the per-input settings that come with the API
+  and the state file.
 - Plugins form an ordered chain at each place, defined in the config. Nothing
   rewires them on its own, and a chain never runs without one of its plugins.
 - A rate at which any chain cannot be built, such as one a library plugin
@@ -681,7 +690,9 @@ Details *(call)*:
   DoP rate afterwards, the others are built for it then, without a reopen.
 
 Built in are `detect`, the input detection plugin, and `balance`, from -1 (left)
-to 1 (right). Balance and the limiter are plugins, not engine features. Balance
+to 1 (right). That departs on purpose from plugins being libraries: the analog
+input cannot run without a detector, so it must not depend on a file being
+installed, and balance is needed on every system. Balance and the limiter are plugins, not engine features. Balance
 goes on the output. The limiter can be added to the chain where wanted once it
 exists. It is not built yet.
 
@@ -803,8 +814,13 @@ It is flat, and every key is optional. Idle behaviour is `idle = "zeros"` or
 `idle = "off"` with `idle_delay_s`, 60 by default. A delay with `zeros` is an
 error.
 
-Two tables are not flat *(call)*. `[analog]` holds `enabled`, `false` by default,
-and `volume_db`. Each `[[plugin]]` table adds one plugin to the chain at its
+Two tables are not flat *(call)*. This departs on purpose from a flat file: the
+analog input's settings belong together, and plugins form an ordered list,
+which flat keys cannot hold. `[analog]` holds `enabled`, `false` by default,
+and `volume_db`. `volume_db` is the level the input starts at. It departs on
+purpose from runtime values being state: until the API exists there is no other
+way to set it, and in stage 4 the runtime input volume becomes state, with this
+as its value on a fresh install. Each `[[plugin]]` table adds one plugin to the chain at its
 `place`, `analog`, `mix` or `output`, in the order of the file. Its `type` is
 `detect`, `balance` or `library`, and a `library` has a `path` to the shared
 library, which is absolute. `detect` runs only at `analog` and appears at most
