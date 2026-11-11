@@ -716,6 +716,14 @@ one symbol, `aas_plugin`, a function that returns a descriptor: the ABI version,
 a name, the formats it takes, its channels, its parameters and six functions. A
 library is loaded once and never unloaded.
 
+The descriptor and each parameter entry start with their size as the plugin
+was compiled. Within an ABI version fields are only ever appended: the daemon
+refuses a size smaller than version 1's and ignores bytes it does not know. A
+plugin may give a `reset` function, which clears what it keeps from earlier
+blocks. The daemon calls it when a chain runs again after periods that did not
+pass it (DoP, the bit-perfect copy path, a mute for a chain at another rate, a
+gap in the capture), so that a filter or a delay does not play an old tail.
+
 A parameter has a name, a unit, a range, a default and a type: float, integer,
 switch, or enumeration with a name for each value *(call)*. Values cross the ABI
 as `f64` whatever the type, and the names are static strings of the library, so

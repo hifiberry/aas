@@ -443,3 +443,51 @@ fn an_enumeration_with_a_null_name_is_refused() {
         |msg, _| assert!(msg.contains("value 1") && msg.contains("null"), "{msg}"),
     );
 }
+
+#[test]
+fn a_descriptor_smaller_than_version_1_is_refused() {
+    refused_fixture(
+        "a_descriptor_smaller_than_version_1_is_refused",
+        "small",
+        |msg, path| {
+            assert!(msg.contains(path), "{msg}");
+            assert!(msg.contains("bytes, fewer than"), "{msg}");
+        },
+    );
+}
+
+#[test]
+fn a_larger_descriptor_and_parameter_entries_of_version_1_are_read() {
+    with_fixture(
+        "a_larger_descriptor_and_parameter_entries_of_version_1_are_read",
+        "bigger",
+        |path| {
+            let p = Library::open(path).unwrap().create(48000, 1024).unwrap();
+            let names: Vec<&str> = p.params().iter().map(|q| q.name.as_str()).collect();
+            assert_eq!(names, ["level", "taps"]);
+            assert_eq!(p.params()[1].kind, ParamKind::Integer);
+        },
+    );
+}
+
+#[test]
+fn reset_clears_a_plugins_state_and_is_optional() {
+    with_fixture(
+        "reset_clears_a_plugins_state_and_is_optional",
+        "stateful",
+        |path| {
+            let mut p = Library::open(path).unwrap().create(48000, 64).unwrap();
+            let mut d = [[0.0f32; 2]; 4];
+            p.process(Block::F32(&mut d));
+            p.process(Block::F32(&mut d));
+            assert_eq!(d[0][0], 2.0);
+            assert_no_alloc(|| p.reset());
+            p.process(Block::F32(&mut d));
+            assert_eq!(d[0][0], 1.0);
+        },
+    );
+    // The gain plugin has none, and a reset leaves it as it is.
+    let mut g = gain();
+    g.reset();
+    assert!(g.neutral());
+}

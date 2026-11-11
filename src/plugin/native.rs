@@ -8,8 +8,8 @@
 
 use super::{Block, Formats, Param, ParamKind, Plugin, Status};
 use aas_plugin::{
-    ABI, Descriptor, FORMAT_F32, FORMAT_F64, FORMAT_I32, PARAM_ENUMERATION, PARAM_FLOAT,
-    PARAM_INTEGER, PARAM_SWITCH, ParamInfo, STATUS_NO_SIGNAL,
+    ABI, DESCRIPTOR_SIZE, Descriptor, FORMAT_F32, FORMAT_F64, FORMAT_I32, PARAM_ENUMERATION,
+    PARAM_FLOAT, PARAM_INFO_SIZE, PARAM_INTEGER, PARAM_SWITCH, ParamInfo, STATUS_NO_SIGNAL,
 };
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::os::unix::ffi::OsStrExt;
@@ -55,16 +55,25 @@ impl Library {
         if !desc.is_aligned() {
             return Err(fail("aas_plugin returned a misaligned descriptor".into()));
         }
-        // SAFETY: the pointer is not null and aligned, and the ABI promises
-        // a descriptor that lives and stays as it is as long as the
-        // library, which is never unloaded.
-        let desc: &'static Descriptor = unsafe { &*desc };
-        if desc.abi != ABI {
+        // Every version starts with the size and the ABI version, so these
+        // two are read before the rest.
+        // SAFETY: not null and aligned; the ABI promises a descriptor that
+        // lives as long as the library, which is never unloaded.
+        let (size, abi) = unsafe { (desc.cast::<u32>().read(), desc.cast::<u32>().add(1).read()) };
+        if abi != ABI {
             return Err(fail(format!(
-                "it has ABI version {}, this daemon takes {ABI}",
-                desc.abi
+                "it has ABI version {abi}, this daemon takes {ABI}"
             )));
         }
+        if size < DESCRIPTOR_SIZE {
+            return Err(fail(format!(
+                "its descriptor has {size} bytes, fewer than the {DESCRIPTOR_SIZE} of version {ABI}"
+            )));
+        }
+        // SAFETY: as above, and at least as large as this version's
+        // descriptor; bytes beyond it are fields of a later plugin that
+        // are not read.
+        let desc: &'static Descriptor = unsafe { &*desc };
         if desc.channels_in != 2 || desc.channels_out != 2 {
             return Err(fail(format!(
                 "it takes {} channels in and {} out; plugins are stereo, other \
@@ -97,15 +106,32 @@ impl Library {
                 desc.param_count
             )));
         } else {
-            // SAFETY: the pointer is not null and aligned, and the ABI
-            // promises `param_count` parameters at `params` for as long as
-            // the library is loaded.
-            let infos =
-                unsafe { std::slice::from_raw_parts(desc.params, desc.param_count as usize) };
-            infos
-                .iter()
-                .enumerate()
-                .map(|(i, info)| param(info).map_err(|e| fail(format!("parameter {i}: {e}"))))
+            // The entries are as large as the first says: a later plugin
+            // of this version may have appended fields.
+            // SAFETY: not null and aligned, and the ABI promises
+            // `param_count` entries there for as long as the library is
+            // loaded, each starting with its size.
+            let stride = unsafe { desc.params.cast::<u32>().read() };
+            let align = std::mem::align_of::<ParamInfo>() as u32;
+            if stride < PARAM_INFO_SIZE || stride % align != 0 {
+                return Err(fail(format!(
+                    "its parameters have {stride} bytes, not a size of version {ABI}'s \
+                     {PARAM_INFO_SIZE} or more, in steps of {align}"
+                )));
+            }
+            let base = desc.params.cast::<u8>();
+            (0..desc.param_count as usize)
+                .map(|i| {
+                    // SAFETY: entry `i` of the list, aligned as the stride is.
+                    let info = unsafe { &*base.add(i * stride as usize).cast::<ParamInfo>() };
+                    if info.size != stride {
+                        return Err(fail(format!(
+                            "parameter {i} has {} bytes, the first has {stride}",
+                            info.size
+                        )));
+                    }
+                    param(info).map_err(|e| fail(format!("parameter {i}: {e}")))
+                })
                 .collect::<Result<_, _>>()?
         };
         Ok(Library {
@@ -129,7 +155,10 @@ impl Library {
         };
         let instance = (self.fns.create)(rate, frames);
         if instance.is_null() {
-            return Err(fail("its create returned null"));
+            return Err(fail(&format!(
+                "it refused or failed at {rate} Hz (create returned null), so that rate is \
+                 not used while the daemon runs"
+            )));
         }
         Ok(Box::new(Native {
             fns: self.fns,
@@ -155,6 +184,8 @@ struct Fns {
     neutral: extern "C" fn(*const c_void) -> u32,
     latency: extern "C" fn(*const c_void) -> u32,
     process: extern "C" fn(*mut c_void, u32, *mut c_void, u32) -> u32,
+    /// Optional.
+    reset: Option<extern "C" fn(*mut c_void)>,
 }
 
 impl Fns {
@@ -167,6 +198,7 @@ impl Fns {
             neutral: d.neutral.ok_or("neutral")?,
             latency: d.latency.ok_or("latency")?,
             process: d.process.ok_or("process")?,
+            reset: d.reset,
         })
     }
 }
@@ -383,6 +415,12 @@ impl Plugin for Native {
 
     fn neutral(&self) -> bool {
         (self.fns.neutral)(self.instance) != 0
+    }
+
+    fn reset(&mut self) {
+        if let Some(reset) = self.fns.reset {
+            reset(self.instance);
+        }
     }
 
     fn latency_frames(&self) -> u32 {

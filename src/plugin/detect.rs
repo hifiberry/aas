@@ -187,6 +187,15 @@ impl Plugin for Detect {
         0
     }
 
+    /// Closed, faded out, and at the start of a window.
+    fn reset(&mut self) {
+        self.seen = 0;
+        self.sum = 0.0;
+        self.open = false;
+        self.quiet = 0;
+        self.level = 0;
+    }
+
     fn process(&mut self, block: Block<'_>) -> Status {
         match block {
             Block::I32(d) => self.run(

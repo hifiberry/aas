@@ -3,13 +3,17 @@
 //! It takes `f32` and `f64` blocks, has no latency and reports no status.
 //! At 0 dB it is neutral and leaves the audio alone.
 
-use aas_plugin::{ABI, Descriptor, FORMAT_F32, FORMAT_F64, PARAM_FLOAT, ParamInfo};
+use aas_plugin::{
+    ABI, DESCRIPTOR_SIZE, Descriptor, FORMAT_F32, FORMAT_F64, PARAM_FLOAT, PARAM_INFO_SIZE,
+    ParamInfo,
+};
 use std::ffi::c_void;
 
 const MIN_DB: f64 = -60.0;
 const MAX_DB: f64 = 20.0;
 
 static PARAMS: [ParamInfo; 1] = [ParamInfo {
+    size: PARAM_INFO_SIZE,
     name: c"gain".as_ptr(),
     unit: c"dB".as_ptr(),
     kind: PARAM_FLOAT,
@@ -21,6 +25,7 @@ static PARAMS: [ParamInfo; 1] = [ParamInfo {
 }];
 
 static DESCRIPTOR: Descriptor = Descriptor {
+    size: DESCRIPTOR_SIZE,
     abi: ABI,
     name: c"gain".as_ptr(),
     formats: FORMAT_F32 | FORMAT_F64,
@@ -34,6 +39,8 @@ static DESCRIPTOR: Descriptor = Descriptor {
     neutral: Some(neutral),
     latency: Some(latency),
     process: Some(process),
+    // A gain keeps nothing from one block to the next.
+    reset: None,
 };
 
 /// The plugin's entry point.

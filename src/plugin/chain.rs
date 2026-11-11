@@ -83,6 +83,14 @@ impl Chain {
         status
     }
 
+    /// Resets every plugin, so that none plays a tail of audio from before
+    /// a gap in the blocks it was given.
+    pub fn reset(&mut self) {
+        for plugin in &mut self.plugins {
+            plugin.reset();
+        }
+    }
+
     /// The names of the plugins, in the order they run.
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.plugins.iter().map(|p| p.name())

@@ -12,18 +12,23 @@
 //! 0 to 2, and `badenum` an enumeration without names. `namesonfloat` has
 //! value names on a float, `enumrange` an enumeration of three values from
 //! 0 to 3, `manyvalues` one of 5000 values, and `nullname` one with a null
-//! name in its list.
+//! name in its list. `small` states a descriptor size below version 1's;
+//! `bigger` has a descriptor and parameter entries larger than version 1's,
+//! as a later plugin of the same version would. `stateful` counts the
+//! `process` calls since it was created or reset and writes the count into
+//! the samples, and has `reset`. `slow` reports a latency of `u32::MAX`.
 //! Anything else, `nodesc` among them, returns no descriptor at all.
 
 use aas_plugin::{
-    ABI, Descriptor, FORMAT_F32, PARAM_ENUMERATION, PARAM_FLOAT, PARAM_INTEGER, PARAM_SWITCH,
-    ParamInfo, STATUS_NO_SIGNAL, ValueNames,
+    ABI, DESCRIPTOR_SIZE, Descriptor, FORMAT_F32, PARAM_ENUMERATION, PARAM_FLOAT, PARAM_INFO_SIZE,
+    PARAM_INTEGER, PARAM_SWITCH, ParamInfo, STATUS_NO_SIGNAL, ValueNames,
 };
 use std::ffi::c_void;
 
 /// A fixture descriptor: stereo, `f32`, no parameters.
 const fn fixture(abi: u32, channels_in: u32) -> Descriptor {
     Descriptor {
+        size: DESCRIPTOR_SIZE,
         abi,
         name: c"fixture".as_ptr(),
         formats: FORMAT_F32,
@@ -37,6 +42,7 @@ const fn fixture(abi: u32, channels_in: u32) -> Descriptor {
         neutral: Some(neutral),
         latency: Some(latency),
         process: Some(process),
+        reset: None,
     }
 }
 
@@ -56,6 +62,7 @@ static CHUNKS: Descriptor = fixture(ABI, 2);
 /// range and default.
 const fn param(name: &'static std::ffi::CStr, kind: u32, range: (f64, f64, f64)) -> ParamInfo {
     ParamInfo {
+        size: PARAM_INFO_SIZE,
         name: name.as_ptr(),
         unit: std::ptr::null(),
         kind,
@@ -159,6 +166,61 @@ one_param!(
     }
 );
 
+static SMALL: Descriptor = Descriptor {
+    size: DESCRIPTOR_SIZE - 8,
+    ..fixture(ABI, 2)
+};
+
+/// A descriptor and a parameter entry as a later plugin of version 1
+/// could have them, with a field the daemon does not know appended.
+#[repr(C)]
+struct Grown<T> {
+    known: T,
+    later: u64,
+}
+// SAFETY: as for the crate's own: the pointers are only read, and point to
+// constants.
+unsafe impl<T> Sync for Grown<T> {}
+const GROWN_PARAM: u32 = std::mem::size_of::<Grown<ParamInfo>>() as u32;
+static BIGGER_PARAMS: [Grown<ParamInfo>; 2] = [
+    Grown {
+        known: ParamInfo {
+            size: GROWN_PARAM,
+            ..param(c"level", PARAM_FLOAT, (0.0, 10.0, 0.5))
+        },
+        later: u64::MAX,
+    },
+    Grown {
+        known: ParamInfo {
+            size: GROWN_PARAM,
+            ..param(c"taps", PARAM_INTEGER, (1.0, 16.0, 4.0))
+        },
+        later: u64::MAX,
+    },
+];
+static BIGGER: Grown<Descriptor> = Grown {
+    known: Descriptor {
+        size: std::mem::size_of::<Grown<Descriptor>>() as u32,
+        param_count: 2,
+        params: BIGGER_PARAMS.as_ptr().cast(),
+        ..fixture(ABI, 2)
+    },
+    later: u64::MAX,
+};
+
+static STATEFUL: Descriptor = Descriptor {
+    create: Some(create_counter),
+    destroy: Some(destroy_counter),
+    process: Some(process_counter),
+    reset: Some(reset_counter),
+    ..fixture(ABI, 2)
+};
+
+static SLOW: Descriptor = Descriptor {
+    latency: Some(latency_max),
+    ..fixture(ABI, 2)
+};
+
 /// The entry point. Returns the case `AAS_FIXTURE` names.
 #[unsafe(no_mangle)]
 pub extern "C" fn aas_plugin() -> *const Descriptor {
@@ -178,6 +240,10 @@ pub extern "C" fn aas_plugin() -> *const Descriptor {
         Ok("manyvalues") => &MANY_VALUES,
         Ok("nullname") => &NULL_NAME,
         Ok("chunks") => &CHUNKS,
+        Ok("small") => &SMALL,
+        Ok("bigger") => &BIGGER.known,
+        Ok("stateful") => &STATEFUL,
+        Ok("slow") => &SLOW,
         _ => std::ptr::null(),
     }
 }
@@ -212,4 +278,42 @@ extern "C" fn process(_: *mut c_void, format: u32, samples: *mut c_void, frames:
     let s = unsafe { std::slice::from_raw_parts_mut(samples.cast::<f32>(), 2 * frames as usize) };
     s.fill(frames as f32);
     if frames % 2 == 1 { STATUS_NO_SIGNAL } else { 0 }
+}
+
+extern "C" fn latency_max(_: *const c_void) -> u32 {
+    u32::MAX
+}
+
+/// An instance of `stateful`: the `process` calls since `create` or
+/// `reset`.
+extern "C" fn create_counter(_: u32, _: u32) -> *mut c_void {
+    Box::into_raw(Box::new(0u32)).cast()
+}
+
+extern "C" fn destroy_counter(p: *mut c_void) {
+    // SAFETY: an instance from `create_counter`, once.
+    drop(unsafe { Box::from_raw(p.cast::<u32>()) });
+}
+
+extern "C" fn reset_counter(p: *mut c_void) {
+    // SAFETY: a live instance from `create_counter`, used by nothing else.
+    unsafe { *p.cast::<u32>() = 0 };
+}
+
+extern "C" fn process_counter(
+    p: *mut c_void,
+    format: u32,
+    samples: *mut c_void,
+    frames: u32,
+) -> u32 {
+    // SAFETY: a live instance from `create_counter`, used by nothing else.
+    let count = unsafe { &mut *p.cast::<u32>() };
+    *count += 1;
+    if format == FORMAT_F32 {
+        // SAFETY: `2 * frames` samples in `format`, for this call only.
+        let s =
+            unsafe { std::slice::from_raw_parts_mut(samples.cast::<f32>(), 2 * frames as usize) };
+        s.fill(*count as f32);
+    }
+    0
 }

@@ -444,6 +444,9 @@ struct Analog<P: Processing> {
     raw_level: f32,
     /// The chain reports signal this cycle: a recorder gets its output.
     signal: bool,
+    /// A period passed without the chain running, such as with no capture:
+    /// it is reset before it runs again.
+    chain_idle: bool,
     /// The chain's latency, in the cycles its output is used, else 0.
     latency: u32,
     gain: f32,
@@ -468,6 +471,7 @@ impl<P: Processing> Analog<P> {
             plays: Plays::Captured,
             raw_level: 0.0,
             signal: false,
+            chain_idle: false,
             latency: 0,
             gain: 1.0,
             audible: false,
@@ -520,6 +524,8 @@ impl<P: Processing> Analog<P> {
         store: &mut BlockStore,
         plugins: bool,
     ) {
+        // Until the chain runs below, this period passes it by.
+        let idle = std::mem::replace(&mut self.chain_idle, true);
         self.audible = false;
         self.signal = false;
         self.altered = false;
@@ -551,6 +557,10 @@ impl<P: Processing> Analog<P> {
         mix_clear::<P>(processed);
         mix_add::<P>(buf, Ramp::flat(1.0), processed);
         let mut block = P::to_block(processed, store);
+        if idle {
+            self.chain.reset();
+        }
+        self.chain_idle = false;
         let status = self.chain.process(block.reborrow());
         let signal = !status.no_signal;
         let neutral = self.chain.neutral();
@@ -1005,6 +1015,10 @@ pub struct Engine<P: Processing, S: Sink> {
     /// for another rate than the engine runs at, and the output was
     /// silent for it.
     unmute_left: usize,
+    /// A period passed without the mix and output chains running: after
+    /// DoP, the copy path, a mute or in forced bit-perfect. They are reset
+    /// before they run again.
+    chains_idle: bool,
     last_start: Option<Instant>,
     /// The last DoP claim handed out.
     claims: u64,
@@ -1046,6 +1060,7 @@ impl<P: Processing, S: Sink> Engine<P, S> {
             target_gain: 1.0,
             fade_left: 0,
             unmute_left: 0,
+            chains_idle: false,
             last_start: None,
             claims: 0,
         }
@@ -1433,6 +1448,8 @@ impl<P: Processing, S: Sink> Engine<P, S> {
             }
             None => self.play_pcm(fade_out),
         };
+        // The mix and output chains missed this period's audio.
+        self.chains_idle |= !chains_ran;
         let before_write = Instant::now();
         let result = self.sink.write(&self.out[..self.period]);
         let after_write = Instant::now();
@@ -1603,6 +1620,12 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         if !copy {
             // Without plugins the mix is not copied for them at all.
             if chains_ran {
+                // After periods that did not pass them, so that a filter or
+                // a delay does not play an old tail.
+                if std::mem::take(&mut self.chains_idle) {
+                    self.mix.reset();
+                    self.output.reset();
+                }
                 let mut block = P::to_block(acc, &mut self.store);
                 self.mix.process(block.reborrow());
                 self.output.process(block.reborrow());
@@ -5045,6 +5068,78 @@ mod tests {
 
     fn set_chain<P: Processing>(rig: &mut Rig<P>, place: Place, plugins: Vec<Probe>) {
         rig.send(Command::SetChain(place, chain_of::<P>(plugins)));
+    }
+
+    /// Delays the audio by one frame: it keeps the last frame of a block
+    /// for the next. Reset, it starts from silence.
+    struct Delay {
+        kept: [f64; 2],
+    }
+
+    impl Plugin for Delay {
+        fn name(&self) -> &str {
+            "delay"
+        }
+
+        fn formats(&self) -> Formats {
+            ALL_FORMATS
+        }
+
+        fn params(&self) -> &[Param] {
+            &[]
+        }
+
+        fn set_param(&mut self, _: usize, _: f64) {}
+
+        fn neutral(&self) -> bool {
+            false
+        }
+
+        fn latency_frames(&self) -> u32 {
+            1
+        }
+
+        fn process(&mut self, block: Block<'_>) -> PluginStatus {
+            if let Block::F64(d) = block {
+                for frame in d.iter_mut() {
+                    std::mem::swap(frame, &mut self.kept);
+                }
+            }
+            PluginStatus::default()
+        }
+
+        fn reset(&mut self) {
+            self.kept = [0.0; 2];
+        }
+    }
+
+    #[test]
+    fn a_chain_that_resumes_after_dop_does_not_play_an_old_tail() {
+        let mut rig = Rig::<F64>::new(BitPerfect::Auto);
+        let plugins: Vec<Box<dyn Plugin>> = vec![Box::new(Delay { kept: [0.0; 2] })];
+        let chain = Chain::new(plugins, Format::F64, MAX_PERIOD as usize);
+        rig.send(Command::SetChain(Place::Mix, Box::new(chain)));
+        let mut a = client(1);
+        rig.add(&mut a);
+        // The delay keeps the last frame of this period.
+        a.ring.write(&frames(1 << 20, PERIOD));
+        rig.cycle();
+        // A DoP stream has the output: the chain does not run.
+        let mut d = client(2);
+        rig.add(&mut d);
+        d.ring.write(&dop_frames(4 * PERIOD));
+        for _ in 0..4 {
+            a.ring.write(&frames(1 << 20, PERIOD));
+            rig.cycle();
+        }
+        rig.send(Command::Remove(2));
+        // PCM again: the first frame is the reset delay's silence, not the
+        // frame it kept from before DoP.
+        a.ring.write(&frames(1 << 21, PERIOD));
+        rig.cycle();
+        let out = rig.last_periods(1);
+        assert_eq!(out[0], [0, 0]);
+        assert_eq!(out[1], [1 << 21, -(1 << 21)]);
     }
 
     #[test]

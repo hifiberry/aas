@@ -114,4 +114,8 @@ pub trait Plugin: Send {
     fn latency_frames(&self) -> u32;
     /// Processes one block in place. Runs on the audio thread.
     fn process(&mut self, block: Block<'_>) -> Status;
+    /// Forgets what it kept from earlier blocks, such as a filter's state.
+    /// Called when the plugin runs again after blocks that did not pass it.
+    /// Runs on the audio thread, so it must not allocate.
+    fn reset(&mut self) {}
 }

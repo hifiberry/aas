@@ -9,12 +9,42 @@
 //! A plugin processes stereo audio in place, in one of the formats it
 //! names. Stereo in place is fixed in version 1: `channels_in` and
 //! `channels_out` must both be 2. A plugin that changes the channel count
-//! needs a separate output buffer, which is ABI version 2. Float samples are scaled so that full scale is 1.0 and are not
-//! clipped. `create` and `destroy` run on the control thread. `process`,
-//! `set_param`, `neutral` and `latency` run on the audio thread and must
-//! not allocate, lock or block. An instance can move between threads but
-//! is never used by two at once. `process` may be called with
-//! `frames == 0`.
+//! needs a separate output buffer, which is ABI version 2. Float samples
+//! are scaled so that full scale is 1.0 and are not clipped. `process`
+//! may be called with `frames == 0`.
+//!
+//! # Threads
+//!
+//! The daemon builds instances on its control thread and runs them on its
+//! audio thread:
+//!
+//! - `create`, `destroy`, and `set_param` while an instance is being set
+//!   up from the config, run on the control thread.
+//! - `process`, `reset`, `neutral` and `latency` run on the audio thread,
+//!   and so will `set_param` once parameters can be changed at run time
+//!   (the API, a later stage). These must not allocate, lock or block.
+//!
+//! An instance can move between threads but is never used by two at once.
+//! But `create` and `destroy` of one instance may run on the control
+//! thread while `process` of another instance of the same library runs on
+//! the audio thread, so any state a library keeps outside its instances
+//! must be safe for that.
+//!
+//! # Growing within a version
+//!
+//! [`Descriptor`] and [`ParamInfo`] start with their size, as the plugin
+//! was compiled. Within an ABI version fields are only ever appended. The
+//! daemon refuses a size smaller than version 1's, ignores trailing bytes
+//! it does not know, and steps through the parameter list by the size its
+//! entries state. A plugin sets them to [`DESCRIPTOR_SIZE`] and
+//! [`PARAM_INFO_SIZE`].
+//!
+//! # Rates
+//!
+//! `create` returning null means the instance cannot run at that rate,
+//! whether it refuses the rate or fails. The daemon logs it and takes the
+//! rate as not usable for as long as it runs: it moves the output to the
+//! nearest rate every chain accepts.
 //!
 //! The daemon may call `aas_plugin` more than once. It must return the
 //! same descriptor every time.
@@ -23,16 +53,17 @@
 //! plugin written in Rust must not panic in the functions it exports, or
 //! must catch the panic with `std::panic::catch_unwind` first.
 //!
-//! The six functions are `Option`s of function pointers, which have the
-//! layout of a bare C function pointer with null as `None`. A C header
-//! declares them as plain function pointers. The daemon refuses a
-//! descriptor in which any of them is null.
+//! The functions are `Option`s of function pointers, which have the layout
+//! of a bare C function pointer with null as `None`. A C header declares
+//! them as plain function pointers. The daemon refuses a descriptor in
+//! which any of them but `reset` is null.
 //!
 //! A plugin written in Rust exports its descriptor as a `static`:
 //!
 //! ```
 //! use aas_plugin::{
-//!     ABI, Descriptor, FORMAT_F32, PARAM_ENUMERATION, PARAM_FLOAT, ParamInfo, ValueNames,
+//!     ABI, DESCRIPTOR_SIZE, Descriptor, FORMAT_F32, PARAM_ENUMERATION, PARAM_FLOAT,
+//!     PARAM_INFO_SIZE, ParamInfo, ValueNames,
 //! };
 //! use std::ffi::c_void;
 //!
@@ -40,6 +71,7 @@
 //!
 //! static PARAMS: [ParamInfo; 2] = [
 //!     ParamInfo {
+//!         size: PARAM_INFO_SIZE,
 //!         name: c"level".as_ptr(),
 //!         unit: c"dB".as_ptr(),
 //!         kind: PARAM_FLOAT,
@@ -50,6 +82,7 @@
 //!         value_names: std::ptr::null(),
 //!     },
 //!     ParamInfo {
+//!         size: PARAM_INFO_SIZE,
 //!         name: c"curve".as_ptr(),
 //!         unit: std::ptr::null(),
 //!         kind: PARAM_ENUMERATION,
@@ -62,6 +95,7 @@
 //! ];
 //!
 //! static DESCRIPTOR: Descriptor = Descriptor {
+//!     size: DESCRIPTOR_SIZE,
 //!     abi: ABI,
 //!     name: c"example".as_ptr(),
 //!     formats: FORMAT_F32,
@@ -75,6 +109,7 @@
 //!     neutral: Some(neutral),
 //!     latency: Some(latency),
 //!     process: Some(process),
+//!     reset: None,
 //! };
 //!
 //! #[unsafe(no_mangle)]
@@ -124,6 +159,9 @@ pub const PARAM_ENUMERATION: u32 = 3;
 #[repr(C)]
 #[derive(Debug)]
 pub struct ParamInfo {
+    /// The size of this struct as the plugin was compiled,
+    /// [`PARAM_INFO_SIZE`]. Every entry of a list has the same.
+    pub size: u32,
     /// A NUL terminated UTF-8 name. Must not be null.
     pub name: *const c_char,
     /// A NUL terminated UTF-8 unit, such as `dB`. Null means none.
@@ -145,11 +183,15 @@ pub struct ParamInfo {
     pub value_names: *const *const c_char,
 }
 
-/// What a plugin is and the functions that run it. Every function must be
-/// given; the daemon refuses a descriptor in which one is `None`.
+/// What a plugin is and the functions that run it. Every function but
+/// `reset` must be given; the daemon refuses a descriptor in which one is
+/// `None`.
 #[repr(C)]
 #[derive(Debug)]
 pub struct Descriptor {
+    /// The size of this struct as the plugin was compiled,
+    /// [`DESCRIPTOR_SIZE`].
+    pub size: u32,
     /// Must be [`ABI`].
     pub abi: u32,
     /// A NUL terminated UTF-8 name. Must not be null.
@@ -166,7 +208,9 @@ pub struct Descriptor {
     /// takes at most 4096.
     pub params: *const ParamInfo,
     /// Builds an instance for `rate` Hz and blocks of up to `max_frames`
-    /// frames, with every parameter at its default. Null means it failed.
+    /// frames, with every parameter at its default. Null means the
+    /// instance cannot run at `rate`, refused or failed; the daemon then
+    /// does not use that rate for as long as it runs.
     pub create: Option<extern "C" fn(rate: u32, max_frames: u32) -> *mut c_void>,
     /// Frees an instance `create` returned.
     pub destroy: Option<extern "C" fn(*mut c_void)>,
@@ -185,7 +229,18 @@ pub struct Descriptor {
     /// the `STATUS_` bits.
     pub process:
         Option<extern "C" fn(*mut c_void, format: u32, samples: *mut c_void, frames: u32) -> u32>,
+    /// Clears what the instance keeps from earlier blocks, such as a
+    /// filter's state or a delay line, without allocating. The daemon calls
+    /// it when the instance runs again after blocks that did not pass it,
+    /// so that it does not play an old tail. May be `None` for an instance
+    /// that keeps nothing.
+    pub reset: Option<extern "C" fn(*mut c_void)>,
 }
+
+/// The size of a version 1 [`Descriptor`], for its `size`.
+pub const DESCRIPTOR_SIZE: u32 = std::mem::size_of::<Descriptor>() as u32;
+/// The size of a version 1 [`ParamInfo`], for its `size`.
+pub const PARAM_INFO_SIZE: u32 = std::mem::size_of::<ParamInfo>() as u32;
 
 /// The names of an enumeration's values, as a `static` can hold them: a
 /// plain array of pointers cannot be one, since pointers are not `Sync`.
