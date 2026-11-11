@@ -1279,7 +1279,15 @@ impl Control {
                 // The audio thread writes it no more, so a client that
                 // reads it empty after this has all of it. A client that
                 // gave the stream up meanwhile is told nothing it minds.
-                Event::DroppedTap(tap) => tap.ring.header().ended.store(1, Ordering::Release),
+                // The client is woken: nothing else will wake one that
+                // waits for frames.
+                Event::DroppedTap(tap) => {
+                    tap.ring.header().ended.store(1, Ordering::Release);
+                    let one = 1u64;
+                    // SAFETY: 8 bytes to a non-blocking eventfd. A full
+                    // counter only means the client is woken already.
+                    unsafe { libc::write(tap.wake.as_raw_fd(), (&raw const one).cast(), 8) };
+                }
                 Event::OldCapture(_) => {
                     if let Some(analog) = &mut self.analog {
                         analog.unanswered = analog.unanswered.saturating_sub(1);
@@ -2053,6 +2061,41 @@ mod tests {
         control.handle_events(now);
         assert_eq!(ring.header().ended.load(Ordering::Acquire), 1);
         assert_eq!(ask_start(&mut control, 2, now).reply, refused);
+    }
+
+    /// The count an eventfd holds, which a read takes. Zero if it is not
+    /// readable.
+    fn wake_count(wake: &OwnedFd) -> u64 {
+        let mut count = 0u64;
+        // SAFETY: 8 bytes from a non-blocking eventfd.
+        unsafe { libc::read(wake.as_raw_fd(), (&raw mut count).cast(), 8) };
+        count
+    }
+
+    #[test]
+    fn a_recorder_is_woken_when_its_stream_ends() {
+        let (mut control, mut engine, now) = started(&Config::default(), None);
+        engine.take(true);
+        control.handle_events(now);
+        let (_ring, _) = record(&mut control, 2, now);
+        let mut tap = None;
+        while let Ok(command) = engine.commands.pop() {
+            if let Command::AddTap(t) = command {
+                tap = Some(t);
+            }
+        }
+        let tap = tap.expect("no tap added");
+        // The recorder's copy of the wake-up.
+        let wake = tap.wake.try_clone().unwrap();
+        assert_eq!(ask_start(&mut control, 2, now).reply, Some(Reply::Ok));
+        play(&mut control, 1, 44100, now);
+        engine.take(false);
+        assert_eq!(wake_count(&wake), 0);
+        // A recorder asleep in poll, with nothing more to come, has to
+        // hear that the stream is over.
+        engine.send(Event::DroppedTap(tap));
+        control.handle_events(now);
+        assert_eq!(wake_count(&wake), 1);
     }
 
     #[test]

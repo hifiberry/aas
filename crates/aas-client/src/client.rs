@@ -297,8 +297,8 @@ impl Client {
     /// dropped.
     ///
     /// The stream ends when the daemon's rate changes: `ended` turns true
-    /// once nothing more is written, what the ring holds can still be
-    /// read, and `start` fails with `ENODEV`. A new `configure_capture`
+    /// once nothing more is written, and the wake-up is written then. What
+    /// the ring holds can still be read, and `start` fails with `ENODEV`. A new `configure_capture`
     /// gets the new rate.
     pub fn configure_capture(&mut self, buffer_frames: u32) -> io::Result<u32> {
         self.set_up(0, ClientFormat::S32, 2, buffer_frames, true)
