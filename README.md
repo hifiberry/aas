@@ -119,7 +119,8 @@ Then move `/etc/asound.conf.before-aas` back, if there is one.
 - `stall` makes a wake-up late on purpose, to see what `tone-probe` hears.
   `stall --mode thread --cpu 2 --ms 3` keeps an audio thread pinned to that CPU
   from running. `stall --mode irq --cpu 0 --timers 40000` keeps the CPU that
-  serves the card's interrupt in the kernel with interrupts off.
+  serves the card's interrupt in the kernel with interrupts off. On a Pi 3 the
+  interrupt goes to any CPU, so name them all: `--cpu 0,1,2,3`.
 
 `doc/measurements.md` has the method and the results.
 
