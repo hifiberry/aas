@@ -323,6 +323,9 @@ pub struct Control {
     /// A chain failed at this rate, DoP or not, in this rate decision. It
     /// is tried again at the next one, not before.
     failed: Option<(u32, bool)>,
+    /// No other rate built either, in this rate decision, while the output
+    /// was closed. Not tried again before the next one.
+    no_fallback: bool,
     /// The gain of the analog input, from the config.
     analog_gain: f32,
     /// None unless the config enables the input and the card has an ADC.
@@ -378,6 +381,7 @@ impl Control {
             analog_refused: Vec::new(),
             stuck: false,
             failed: None,
+            no_fallback: false,
             analog_gain: db_to_gain(config.analog.volume_db),
             analog: None,
         }
@@ -1180,10 +1184,13 @@ impl Control {
             } else {
                 &self.refused
             };
-            if known.contains(&rate) || self.failed == Some((rate, dop)) {
-                // Refused already, and nothing else works; or failed in
-                // this rate decision.
+            if known.contains(&rate) {
+                // Refused already, and nothing else works.
                 return None;
+            }
+            if self.failed == Some((rate, dop)) {
+                // Failed in this rate decision.
+                return self.fallback(rate);
             }
             let spare = self.spare.as_ref();
             if spare.is_some_and(|s| s.rate == rate && s.dop == dop) {
@@ -1201,7 +1208,7 @@ impl Control {
                         "aas: {e}; the output stays as it is until the next change of clients"
                     );
                     self.failed = Some((rate, dop));
-                    return None;
+                    return self.fallback(rate);
                 }
                 Err((place, e)) => {
                     eprintln!("aas: {e}; the output does not run at {rate} Hz");
@@ -1249,6 +1256,45 @@ impl Control {
     /// again, once, at the next rate the rules want.
     fn new_rate_decision(&mut self) {
         self.failed = None;
+        self.no_fallback = false;
+    }
+
+    /// The rate to use in this rate decision when the chains for `wanted`
+    /// failed. An open output keeps what it has: None. A closed one must
+    /// not stay closed under a client: it opens at the nearest rate whose
+    /// chains build, without refusing `wanted`, which the next decision
+    /// tries again. None if no rate builds, logged once per decision.
+    fn fallback(&mut self, wanted: u32) -> Option<u32> {
+        if self.output.is_some() || self.no_fallback {
+            return None;
+        }
+        if let Some(spare) = &self.spare
+            && !spare.dop
+            && spare.rate != wanted
+        {
+            return Some(spare.rate);
+        }
+        let mut rates = if self.supported.is_empty() {
+            STANDARD_RATES.to_vec()
+        } else {
+            self.supported.clone()
+        };
+        rates.retain(|r| *r != wanted && !self.refused.contains(r));
+        rates.sort_by_key(|&r| (r.abs_diff(wanted), r));
+        for rate in rates {
+            if let Ok(chains) = self.chains_for(rate, false) {
+                eprintln!("aas: the output opens at {rate} Hz until {wanted} Hz works");
+                self.spare = Some(Spare {
+                    rate,
+                    dop: false,
+                    chains,
+                });
+                return Some(rate);
+            }
+        }
+        eprintln!("aas: error: no rate builds every plugin chain, the output stays closed");
+        self.no_fallback = true;
+        None
     }
 
     /// Whether a mix or output chain with plugins on the audio thread is
@@ -2978,6 +3024,44 @@ mod tests {
         play(&mut control, 2, 96000, now + Duration::from_secs(3));
         assert_eq!(tried() - before, 2);
         assert!(!has(&sent(&mut engine), "Reconfigure"));
+    }
+
+    #[test]
+    fn a_failing_plugin_never_keeps_the_output_closed_under_a_player() {
+        use crate::plugin::builtin::FAILS_TRIED;
+        let tried = || FAILS_TRIED.with(|n| n.get());
+        let s = Duration::from_secs;
+        let config = Config {
+            plugins: vec![entry(config::PluginPlace::Mix, "fails-above-48k")],
+            idle: Idle::Off { delay_s: 1 },
+            ..Config::default()
+        };
+        let (mut control, mut engine, now) = started(&config, None);
+        control.set_supported(vec![48000, 96000], now);
+        engine.take(true);
+        control.handle_events(now);
+        control.tick(now + s(5));
+        assert!(has(&sent(&mut engine), "CloseOutput"));
+        // A 96 kHz player while the output is closed: the build at 96 kHz
+        // fails, and for this decision the output opens at the nearest
+        // rate that builds, the player resampled to it.
+        play(&mut control, 1, 96000, now + s(6));
+        let seen = sent(&mut engine);
+        assert!(has(&seen, "Reconfigure 48000"), "{seen:?}");
+        assert!(has(&seen, "SetResampler 1 true"), "{seen:?}");
+        // 96 kHz is not refused, and is not tried again on ticks.
+        assert!(!control.refused.contains(&96000));
+        let before = tried();
+        for k in 1..50 {
+            control.tick(now + s(6) + Duration::from_millis(100 * k));
+        }
+        assert_eq!(tried(), before);
+        assert!(!has(&sent(&mut engine), "Reconfigure"));
+        // At the next decision 96 kHz is tried again, and the output stays.
+        play(&mut control, 2, 48000, now + s(12));
+        assert!(tried() > before);
+        assert!(!has(&sent(&mut engine), "Reconfigure"));
+        assert_eq!(control.output.unwrap().0, 48000);
     }
 
     #[test]

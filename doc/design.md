@@ -668,7 +668,10 @@ Details *(call)*:
   rate. At startup the failure stops the daemon. At run time it is logged with
   the plugin's name, the output keeps what it has, and the rate is tried again
   at the next rate decision, that is the next change of clients, of the
-  analog input or of the card, never more often.
+  analog input or of the card, never more often. An output that is closed does
+  not stay closed under a client for this: it opens, for that decision only,
+  at the nearest rate whose chains build, or stays closed with an error in the
+  log if none does.
 - Plugins see stereo blocks in the processing format. Float blocks are scaled so
   full scale is 1.0 and are not clipped between plugins, and the analog chain's
   output keeps that headroom until the mix. In `i32` a block is clipped before
