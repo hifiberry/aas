@@ -324,10 +324,14 @@ pub struct FallbackSink {
     format: (u32, u32),
     /// True while `inner` is open and working.
     live: bool,
+    /// `inner` was open and working when it was last closed. If it cannot
+    /// be opened after that, the card went while the output was closed.
+    closed_live: bool,
     /// Counts the times `inner` went from closed or gone to open, and from
-    /// open to gone. A card that is back may be a new instance, its mixer at
-    /// its own default. A card that is gone may wait to be removed until
-    /// every handle on it is closed, the mixer's too.
+    /// open to gone, which includes an open that fails after it was closed
+    /// while it worked. A card that is back may be a new instance, its
+    /// mixer at its own default. A card that is gone may wait to be removed
+    /// until every handle on it is closed, the mixer's too.
     changes: Arc<AtomicU64>,
     retry_at: Instant,
     retry: Duration,
@@ -342,6 +346,7 @@ impl FallbackSink {
             null: NullSink::default(),
             format: (0, 0),
             live: false,
+            closed_live: false,
             changes: Arc::default(),
             retry_at: Instant::now(),
             retry: RETRY,
@@ -368,9 +373,17 @@ impl FallbackSink {
     /// it may allocate.
     fn try_inner(&mut self) {
         let (rate, period) = self.format;
+        // The control thread holds the card's mixer open while the output
+        // is closed, and must let go of a card that went meanwhile.
         let was_live = self.live;
+        let closed_live = std::mem::take(&mut self.closed_live);
         self.live = self.inner.open(rate, period).is_ok();
-        if self.live && !was_live {
+        let changed = if self.live {
+            !was_live
+        } else {
+            was_live || closed_live
+        };
+        if changed {
             self.changes.fetch_add(1, Ordering::Release);
         }
         self.retry_at = Instant::now() + self.retry;
@@ -434,6 +447,7 @@ impl Sink for FallbackSink {
         if self.live {
             self.inner.close();
             self.live = false;
+            self.closed_live = true;
         }
     }
 
@@ -666,6 +680,41 @@ mod tests {
         sink.close();
         assert!(!watch.changed());
         sink.open(48000, 48).unwrap();
+        assert!(watch.changed());
+    }
+
+    #[test]
+    fn the_card_watch_sees_a_card_lost_while_the_output_was_closed() {
+        let (mut sink, log) = fallback(Duration::ZERO);
+        let mut watch = sink.card_watch();
+        sink.open(48000, 48).unwrap();
+        assert!(watch.changed());
+        // Closed while idle. The card goes meanwhile, and nothing can tell.
+        sink.close();
+        log.fail(Some(SinkError::Gone));
+        assert!(!watch.changed());
+        // The next open finds it gone: the control thread must hear of it,
+        // to let go of the card's volume control.
+        sink.open(48000, 48).unwrap();
+        assert!(watch.changed());
+        // Further failed tries are no change.
+        sink.write(&[[0; 2]; 48]).unwrap();
+        sink.close();
+        sink.open(48000, 48).unwrap();
+        assert!(!watch.changed());
+        log.fail(None);
+        sink.write(&[[0; 2]; 48]).unwrap();
+        assert!(watch.changed());
+    }
+
+    #[test]
+    fn the_card_watch_sees_a_card_lost_at_a_reopen_while_it_played() {
+        let (mut sink, log) = fallback(Duration::ZERO);
+        let mut watch = sink.card_watch();
+        sink.open(48000, 48).unwrap();
+        assert!(watch.changed());
+        log.fail(Some(SinkError::Gone));
+        sink.open(44100, 48).unwrap();
         assert!(watch.changed());
     }
 
