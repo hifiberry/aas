@@ -680,6 +680,10 @@ impl<P: Processing, S: Sink> Engine<P, S> {
             source.drained_reported = false;
             return;
         }
+        // The credit for a dropped tail belongs to the stream that ends
+        // here. The memory of a cut run stays: frames left in the ring can
+        // be the rest of that run, and must not be mixed after a restart.
+        source.dropped = 0;
         if source.stream == Stream::Dop {
             if source.ring.available() > 0 {
                 source.in_dop_run = true;
@@ -3884,6 +3888,42 @@ mod tests {
             let starts = count(&rig.events(), |e| matches!(e, Event::DopStarted(2, _)));
             assert_eq!(starts, 0, "tail {tail}");
         }
+    }
+
+    #[test]
+    fn the_credit_for_a_dropped_tail_ends_with_the_stream() {
+        let mut rig = rig_at_gain::<F32>(0.1);
+        let (mut a, mut b) = (client(1), client(2));
+        rig.add(&mut a);
+        rig.add(&mut b);
+        rig.cycle();
+        // The discard cuts a run of client 2, and the owner stops.
+        a.ring.write(&dop_frames(PERIOD));
+        let run = dop_frames(32);
+        let mut block = frames(0, 40);
+        block.extend(&run[..24]);
+        b.ring.write(&block);
+        rig.cycle();
+        rig.send(Command::SetRunning(1, false));
+        // The tail of 8 is dropped, with no discard after it to credit.
+        let mut next = run[24..].to_vec();
+        next.extend(frames(0, 3 * PERIOD));
+        b.ring.write(&next);
+        rig.cycle();
+        rig.cycle();
+        // Client 2 stops and starts: a new stream, in real time from here.
+        rig.send(Command::SetRunning(2, false));
+        rig.cycle();
+        rig.send(Command::SetRunning(2, true));
+        rig.send(Command::SetRunning(1, true));
+        a.ring.write(&dop_frames(PERIOD));
+        b.ring.write(&frames(0, 2 * PERIOD));
+        let before = b.ring.header().read_pos.load(Relaxed);
+        rig.cycle();
+        assert_eq!(rig.last_periods(1), dop_frames(PERIOD));
+        // A whole period is discarded, not one short of the old tail.
+        let taken = b.ring.header().read_pos.load(Relaxed) - before;
+        assert_eq!(taken, PERIOD as u64);
     }
 
     #[test]
