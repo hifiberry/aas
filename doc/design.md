@@ -348,7 +348,13 @@ and 0 mutes *(call)*. A request above 100 is an error, not clamped. Every client
 holding the control is told when the volume changes, so a second mixer sees a
 change made by the first.
 
-In forced bit-perfect mode `aas` never touches the samples. On a card whose
+A card's control can stop above -60 dB. Below its lowest level `aas` sets the
+control to that level and calculates the rest itself, so each step is a step on
+every card. The output is then not bit-perfect, at a level where that is not
+heard.
+
+In forced bit-perfect mode `aas` never touches the samples, so the volume stops
+at the control's lowest level. On a card whose
 hardware control has neither a mute switch nor a mute step, 0 then plays at the
 control's lowest level, not silence.
 

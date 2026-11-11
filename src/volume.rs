@@ -108,12 +108,18 @@ impl OutputVolume {
     /// The gain the engine applies to the output: 1 in hardware mode and
     /// with forced bit-perfect. At 0 percent on a control that cannot mute
     /// it is 0, since bit-perfect does not matter when nothing is heard.
+    /// Below the lowest level of the card's control it is what the control
+    /// lacks, so every percent is a step down on any card.
     pub fn gain(&self) -> f32 {
         let db = percent_to_db(self.percent);
-        match &self.hardware {
-            Some(hardware) if db.is_none() && !hardware.can_mute() => 0.0,
-            _ if self.hardware.is_some() || self.forced => 1.0,
-            _ => db.map_or(0.0, db_to_gain),
+        match (&self.hardware, db) {
+            (Some(hardware), None) if !hardware.can_mute() => 0.0,
+            _ if self.forced => 1.0,
+            (Some(hardware), Some(db)) if db < hardware.range_db().0 => {
+                db_to_gain(db - hardware.range_db().0)
+            }
+            (Some(_), _) => 1.0,
+            (None, db) => db.map_or(0.0, db_to_gain),
         }
     }
 }
@@ -198,10 +204,10 @@ mod tests {
         volume.set(0);
         assert_eq!(volume.gain(), 0.0);
         assert_eq!(last(&set), Some(f32::NEG_INFINITY));
-        // Above 0 the hardware carries it alone again.
-        volume.set(1);
+        // Within its range the hardware carries it alone again.
+        volume.set(20);
         assert_eq!(volume.gain(), 1.0);
-        assert_eq!(last(&set), Some(-51.5));
+        assert_eq!(last(&set), Some(-48.0));
     }
 
     #[test]
@@ -240,6 +246,29 @@ mod tests {
         let mut volume = OutputVolume::new(Some(hw), BitPerfect::Auto);
         volume.set(100);
         assert_eq!(last(&set), Some(-6.0));
+    }
+
+    #[test]
+    fn software_carries_what_the_cards_range_lacks() {
+        let (hw, set) = hardware((-51.5, 0.0));
+        let mut volume = OutputVolume::new(Some(hw), BitPerfect::Auto);
+        // 10 percent is -54 dB: the card at its lowest, and 2.5 dB more.
+        volume.set(10);
+        assert_eq!(last(&set), Some(-51.5));
+        assert!((volume.gain() - db_to_gain(-2.5)).abs() < 1e-6);
+        // Within the card's range the samples are left alone.
+        volume.set(20);
+        assert_eq!(last(&set), Some(-48.0));
+        assert_eq!(volume.gain(), 1.0);
+    }
+
+    #[test]
+    fn forced_bit_perfect_stops_at_the_cards_lowest_level() {
+        let (hw, set) = hardware((-51.5, 0.0));
+        let mut volume = OutputVolume::new(Some(hw), BitPerfect::Forced);
+        volume.set(10);
+        assert_eq!(last(&set), Some(-51.5));
+        assert_eq!(volume.gain(), 1.0);
     }
 
     #[test]
