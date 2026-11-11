@@ -413,7 +413,10 @@ pub enum Event {
     Dropped(Box<Source>),
     Replaced(Option<Box<Resampler>>),
     OldTable(Vec<Box<Source>>),
-    DopStarted(ClientId),
+    /// The client plays DoP, with the number of its claim on the output.
+    /// The lowest number among the claims is the oldest, whatever order
+    /// the events arrive in.
+    DopStarted(ClientId, u64),
     DopStopped(ClientId),
     Drained(ClientId),
     Flushed(ClientId),
@@ -918,7 +921,7 @@ impl<P: Processing, S: Sink> Engine<P, S> {
             let dop = source.stream == Stream::Dop;
             if dop != source.dop_reported {
                 let event = if dop {
-                    Event::DopStarted(source.id)
+                    Event::DopStarted(source.id, source.dop_claim)
                 } else {
                     Event::DopStopped(source.id)
                 };
@@ -1368,7 +1371,7 @@ mod tests {
         assert!(periods().any(|p| p == silence), "the grace time");
         let released = log.last().unwrap();
         assert!(released[0].abs() >= 1000, "output after the release");
-        assert!(matches!(rig.events()[..], [Event::DopStarted(_), ..]));
+        assert!(matches!(rig.events()[..], [Event::DopStarted(_, _), ..]));
     }
 
     #[test]
@@ -1671,7 +1674,7 @@ mod tests {
         assert!(resampled.ring.available() < 1000);
         let events = rig.events();
         assert_eq!(events.len(), 1);
-        assert!(matches!(events[0], Event::DopStarted(2)));
+        assert!(matches!(events[0], Event::DopStarted(2, _)));
         // The stream turns back into PCM, and mixing resumes.
         dop.ring.write(&frames(500, PERIOD));
         rig.cycle();
@@ -1695,17 +1698,49 @@ mod tests {
             .collect();
         first.ring.write(&dop_frames(PERIOD));
         rig.cycle();
-        assert!(matches!(rig.events()[..], [Event::DopStarted(2)]));
+        assert!(matches!(rig.events()[..], [Event::DopStarted(2, _)]));
         first.ring.write(&dop_frames(PERIOD));
         later.ring.write(&other);
         rig.cycle();
         assert_eq!(rig.last_periods(1), dop_frames(PERIOD));
-        assert!(matches!(rig.events()[..], [Event::DopStarted(1)]));
+        assert!(matches!(rig.events()[..], [Event::DopStarted(1, _)]));
         // Once the first claim stops, the next one takes over.
         rig.send(Command::SetRunning(2, false));
         later.ring.write(&other);
         rig.cycle();
         assert_eq!(rig.last_periods(1), other);
+    }
+
+    #[test]
+    fn a_dop_start_sent_late_carries_the_number_of_its_claim() {
+        // One slot, so that an unread event keeps the next from being sent.
+        let mut rig = Rig::<I32>::with_event_slots(BitPerfect::Auto, 1);
+        let (mut later, mut first) = (client(1), client(2));
+        rig.add(&mut later);
+        rig.add(&mut first);
+        rig.send(Command::Flush(99));
+        rig.cycle();
+        // Both claims are made while the queue is full.
+        first.ring.write(&dop_frames(PERIOD));
+        rig.cycle();
+        first.ring.write(&dop_frames(PERIOD));
+        later.ring.write(&dop_frames(PERIOD));
+        rig.cycle();
+        assert!(matches!(rig.events()[..], [Event::Flushed(99)]));
+        // They are sent in table order, the later claim first.
+        let mut claims = Vec::new();
+        for _ in 0..2 {
+            first.ring.write(&dop_frames(PERIOD));
+            later.ring.write(&dop_frames(PERIOD));
+            rig.cycle();
+            match rig.events()[..] {
+                [Event::DopStarted(id, claim)] => claims.push((id, claim)),
+                _ => panic!("no DopStarted"),
+            }
+        }
+        assert_eq!(claims[0].0, 1);
+        assert_eq!(claims[1].0, 2);
+        assert!(claims[1].1 < claims[0].1, "{claims:?}");
     }
 
     /// A DoP stream that has played, with a PCM client waiting behind it.
@@ -1825,7 +1860,7 @@ mod tests {
         want.extend(dop_silence(0x05, PERIOD - 40));
         assert_eq!(rig.last_periods(1), want);
         assert_eq!(underruns(&a), 0);
-        assert!(matches!(rig.events()[..], [Event::DopStarted(1)]));
+        assert!(matches!(rig.events()[..], [Event::DopStarted(1, _)]));
         // What follows the markers is PCM again.
         rig.cycle();
         assert!(matches!(rig.events()[..], [Event::DopStopped(1)]));
@@ -1847,7 +1882,7 @@ mod tests {
         rig.cycle();
         rig.cycle();
         assert_eq!(rig.last_periods(2), block);
-        assert!(matches!(rig.events()[..], [Event::DopStarted(1)]));
+        assert!(matches!(rig.events()[..], [Event::DopStarted(1, _)]));
     }
 
     #[test]
@@ -1891,7 +1926,7 @@ mod tests {
             rig.cycle();
         }
         assert!(rig.log.frames().iter().all(|f| *f == [0, 0]));
-        assert!(matches!(rig.events()[..], [Event::DopStarted(1)]));
+        assert!(matches!(rig.events()[..], [Event::DopStarted(1, _)]));
     }
 
     #[test]
@@ -1906,7 +1941,7 @@ mod tests {
         let events = rig.events();
         assert!(matches!(
             events[..],
-            [Event::DopStarted(1), Event::DopStopped(1)]
+            [Event::DopStarted(1, _), Event::DopStopped(1)]
         ));
         rig.send(Command::SetRunning(1, true));
         rig.cycle();
@@ -1916,7 +1951,7 @@ mod tests {
         assert!(matches!(
             events[..],
             [
-                Event::DopStarted(1),
+                Event::DopStarted(1, _),
                 Event::DopStopped(1),
                 Event::Dropped(_)
             ]
@@ -1935,7 +1970,7 @@ mod tests {
         // Muted, but discarded in real time. Other clients keep playing.
         assert_eq!(rig.last_periods(1), frames(1000, PERIOD));
         assert_eq!(dop.ring.available(), 300 - 235);
-        assert!(matches!(rig.events()[..], [Event::DopStarted(1)]));
+        assert!(matches!(rig.events()[..], [Event::DopStarted(1, _)]));
         rig.send(Command::Reconfigure {
             rate: 176400,
             period: PERIOD as u32,
@@ -2206,7 +2241,7 @@ mod tests {
         b.ring.header().draining.store(1, Release);
         rig.cycle();
         rig.cycle();
-        assert!(matches!(rig.events.pop(), Ok(Event::DopStarted(1))));
+        assert!(matches!(rig.events.pop(), Ok(Event::DopStarted(1, _))));
         rig.cycle();
         assert!(matches!(rig.events.pop(), Ok(Event::Drained(2))));
         rig.cycle();
@@ -2936,7 +2971,7 @@ mod tests {
             }
             let events = rig.events();
             if fuzz.tone_second {
-                false_starts += count(&events, |e| matches!(e, Event::DopStarted(2)));
+                false_starts += count(&events, |e| matches!(e, Event::DopStarted(2, _)));
             }
             if fuzz.stops && random.next(4) == 0 {
                 if random.next(2) == 0 {
@@ -2980,7 +3015,7 @@ mod tests {
             rig.cycle();
         }
         if fuzz.tone_second {
-            false_starts += count(&rig.events(), |e| matches!(e, Event::DopStarted(2)));
+            false_starts += count(&rig.events(), |e| matches!(e, Event::DopStarted(2, _)));
         }
         let log = rig.log.frames();
         let output = log[start..].iter();
@@ -3273,7 +3308,7 @@ mod tests {
         }
         assert!(rig.log.frames().iter().all(|f| *f == [0, 0]));
         let events = rig.events();
-        assert_eq!(count(&events, |e| matches!(e, Event::DopStarted(1))), 1);
+        assert_eq!(count(&events, |e| matches!(e, Event::DopStarted(1, _))), 1);
         assert_eq!(count(&events, |e| matches!(e, Event::Drained(1))), 1);
     }
 
@@ -3467,7 +3502,7 @@ mod tests {
     fn pcm_after_a_cut_run_is_not_taken_for_dop() {
         let (mut rig, _a, b, _start) = a_run_cut_by_a_discard(client(2), 60, 18);
         rig.cycle();
-        assert!(matches!(rig.events()[..], [Event::DopStarted(1)]));
+        assert!(matches!(rig.events()[..], [Event::DopStarted(1, _)]));
         // Past the run, and with nothing marked left to find.
         b.ring.consume(b.ring.available());
         b.ring.write(&frames(1000, PERIOD));
@@ -3504,9 +3539,9 @@ mod tests {
         assert!(matches!(
             events[..],
             [
-                Event::DopStarted(1),
+                Event::DopStarted(1, _),
                 Event::DopStopped(1),
-                Event::DopStarted(1)
+                Event::DopStarted(1, _)
             ]
         ));
     }
@@ -3568,8 +3603,8 @@ mod tests {
         let log = rig.log.frames();
         assert_eq!(first_difference(&log[start..], &dop), None);
         let events = rig.events();
-        assert_eq!(count(&events, |e| matches!(e, Event::DopStarted(2))), 0);
-        assert_eq!(count(&events, |e| matches!(e, Event::DopStarted(1))), 1);
+        assert_eq!(count(&events, |e| matches!(e, Event::DopStarted(2, _))), 0);
+        assert_eq!(count(&events, |e| matches!(e, Event::DopStarted(1, _))), 1);
     }
 
     /// An engine at a gain of 0.1 and this format.
@@ -3625,7 +3660,7 @@ mod tests {
             b.ring.write(&block);
             written_b += want;
             rig.cycle();
-            starts += count(&rig.events(), |e| matches!(e, Event::DopStarted(2)));
+            starts += count(&rig.events(), |e| matches!(e, Event::DopStarted(2, _)));
         }
         starts
     }
@@ -3651,13 +3686,13 @@ mod tests {
         let dop = dop_frames(3 * PERIOD);
         a.ring.write(&dop);
         rig.cycle();
-        assert!(matches!(rig.events()[..], [Event::DopStarted(1)]));
+        assert!(matches!(rig.events()[..], [Event::DopStarted(1, _)]));
         rig.send(Command::SetRunning(1, false));
         rig.send(Command::SetRunning(1, true));
         rig.cycle();
         assert!(matches!(
             rig.events()[..],
-            [Event::DopStopped(1), Event::DopStarted(1)]
+            [Event::DopStopped(1), Event::DopStarted(1, _)]
         ));
         assert_eq!(rig.last_periods(1), dop[PERIOD..2 * PERIOD]);
     }
@@ -3714,7 +3749,7 @@ mod tests {
             let (mut rig, start) = a_run_split_by_a_discard(24, tail);
             assert_clean(&rig, start);
             assert_eq!(rig.last_periods(2), frames(0, 2 * PERIOD), "tail {tail}");
-            let starts = count(&rig.events(), |e| matches!(e, Event::DopStarted(2)));
+            let starts = count(&rig.events(), |e| matches!(e, Event::DopStarted(2, _)));
             assert_eq!(starts, 0, "tail {tail}");
         }
     }
@@ -3818,7 +3853,7 @@ mod tests {
         let dop = dop_frames(4 * PERIOD);
         c.ring.write(&dop);
         rig.cycle();
-        assert!(matches!(rig.events()[..], [Event::DopStarted(3)]));
+        assert!(matches!(rig.events()[..], [Event::DopStarted(3, _)]));
         let start = rig.log.frames().len();
         rig.send(Command::SetRunning(1, true));
         a.ring.write(&pcm_in_the_band());

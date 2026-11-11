@@ -204,8 +204,9 @@ pub struct Control {
     switch_at: Option<Instant>,
     /// Since when no client has been running.
     idle_since: Option<Instant>,
-    /// Clients the audio thread has seen play DoP, in the order seen.
-    dop_claims: Vec<ClientId>,
+    /// Clients the audio thread has seen play DoP, each with the number
+    /// the audio thread gave its claim, oldest claim first.
+    dop_claims: Vec<(u64, ClientId)>,
     dop_owner: Option<ClientId>,
     /// Replies that were not ready when their request came.
     outbox: Vec<(ConnId, Reply)>,
@@ -627,7 +628,7 @@ impl Control {
         }
         self.policy.client_stopped(id, now - self.epoch);
         batch.push(Command::SetRunning(id, false));
-        self.dop_claims.retain(|&c| c != id);
+        self.dop_claims.retain(|&(_, c)| c != id);
         self.update_dop(now, batch);
         self.decide(now, false, batch);
     }
@@ -691,7 +692,7 @@ impl Control {
         }
         batch.push(Command::Remove(stream.id));
         self.table_len -= 1;
-        self.dop_claims.retain(|&c| c != stream.id);
+        self.dop_claims.retain(|&(_, c)| c != stream.id);
         self.update_dop(now, batch);
     }
 
@@ -725,7 +726,8 @@ impl Control {
     /// ranks the streams holding the output the same way. A new owner needs its rate at
     /// once, since its audio is discarded until then.
     fn update_dop(&mut self, now: Instant, batch: &mut Vec<Command>) {
-        let owner = self.dop_claims.iter().copied().find(|&id| {
+        let claimed = self.dop_claims.iter().map(|&(_, id)| id);
+        let owner = claimed.into_iter().find(|&id| {
             let stream = self.streams().find(|s| s.id == id);
             stream.is_some_and(|s| s.running && self.is_supported(s.rate))
         });
@@ -852,14 +854,17 @@ impl Control {
                 // Freed here, not on the audio thread.
                 Event::Dropped(_) | Event::Replaced(_) | Event::OldTable(_) => {}
                 Event::Reconfigured => self.reopening = false,
-                Event::DopStarted(id) => {
-                    if !self.dop_claims.contains(&id) {
-                        self.dop_claims.push(id);
-                    }
+                Event::DopStarted(id, claim) => {
+                    // The events can come in another order than the claims
+                    // were made, when the queue was full meanwhile. The
+                    // number says which is older, as the audio thread has it.
+                    self.dop_claims.retain(|&(_, c)| c != id);
+                    let at = self.dop_claims.partition_point(|&(c, _)| c < claim);
+                    self.dop_claims.insert(at, (claim, id));
                     self.update_dop(now, &mut batch);
                 }
                 Event::DopStopped(id) => {
-                    self.dop_claims.retain(|&c| c != id);
+                    self.dop_claims.retain(|&(_, c)| c != id);
                     self.update_dop(now, &mut batch);
                     self.decide(now, false, &mut batch);
                 }
@@ -1305,6 +1310,46 @@ mod tests {
         control.send((0..11).map(|i| Command::SetGain(i as f32)).collect());
         let expect: Vec<f32> = (0..11).map(|i| i as f32).collect();
         assert_eq!(reader.join().unwrap(), expect);
+    }
+
+    #[test]
+    fn the_oldest_dop_claim_owns_the_rate_whatever_order_the_events_come_in() {
+        let (commands, _engine_commands) = rtrb::RingBuffer::new(64);
+        let (mut engine_events, events) = rtrb::RingBuffer::new(64);
+        let audio = std::thread::current();
+        let mut control = Control::new(
+            &Config::default(),
+            12.0,
+            Vec::new(),
+            commands,
+            events,
+            audio,
+        );
+        let now = Instant::now();
+        for (conn, rate) in [(1, 176400), (2, 352800)] {
+            control.connected(conn, "test".into());
+            let hello = Request::Hello {
+                version: proto::VERSION,
+            };
+            control.request(conn, Some(hello), now);
+            let buffer = min_buffer_frames(rate, 12.0);
+            let answer = control.request(conn, Some(configure(rate, buffer)), now);
+            assert_eq!(answer.reply, Some(Reply::Configured));
+            let start = control.request(conn, Some(Request::Start), now);
+            assert_eq!(start.reply, Some(Reply::Ok));
+        }
+        // The audio thread saw client 2 play DoP first, but its event could
+        // not be sent until after the one for client 1.
+        assert!(engine_events.push(Event::DopStarted(1, 8)).is_ok());
+        assert!(engine_events.push(Event::DopStarted(2, 7)).is_ok());
+        control.handle_events(now);
+        assert_eq!(control.dop_owner, Some(2));
+        assert_eq!(control.policy.current(), 352800);
+        // Once the older claim ends, the other one holds the output.
+        assert!(engine_events.push(Event::DopStopped(2)).is_ok());
+        control.handle_events(now);
+        assert_eq!(control.dop_owner, Some(1));
+        assert_eq!(control.policy.current(), 176400);
     }
 
     #[test]
