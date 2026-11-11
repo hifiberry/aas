@@ -41,3 +41,15 @@ pub fn acquire(priority: i32, may_fail: bool) -> Result<bool, String> {
         Err(e) => Err(e),
     }
 }
+
+/// Now on CLOCK_MONOTONIC, in seconds. The daemon logs its wake-up gaps on
+/// this clock.
+pub fn monotonic_s() -> f64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: ts is a valid timespec for the call.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    ts.tv_sec as f64 + ts.tv_nsec as f64 / 1e9
+}

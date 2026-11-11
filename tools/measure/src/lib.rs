@@ -9,4 +9,5 @@ pub mod rt;
 pub mod sample;
 pub mod stats;
 pub mod stop;
+pub mod tone;
 pub mod xrun;

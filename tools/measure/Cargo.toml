@@ -41,3 +41,10 @@ required-features = ["alsa-probes"]
 [[bin]]
 name = "bit-check"
 required-features = ["alsa-probes"]
+
+[[bin]]
+name = "tone-probe"
+required-features = ["alsa-probes"]
+
+[[bin]]
+name = "stall"

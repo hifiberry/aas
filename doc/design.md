@@ -459,13 +459,18 @@ engine keeps at most two periods of captured audio and reads one per cycle
 
 The target counts as met when one hour of playback at 44.1 kHz and at 96 kHz runs
 on the test board with no xruns and no wake-up gap longer than the buffer, on an
-otherwise idle system *(call)*. The xrun count alone is not enough, because ALSA can
-miss an underrun when the interrupt itself is late.
+otherwise idle system *(call)*. The xrun count alone is not enough, because ALSA
+misses an underrun when the interrupt itself is late. A tone played through the
+cable on both test boards showed that every gap longer than the buffer is a
+break in the sound, and that ALSA counted only some of them. The gap alone is
+not enough either: on the Pi 3 some underruns came with a gap just under the
+buffer, and those ALSA did count.
 
 Stage 2 made these runs under full load instead, which is harder, on both test
 boards. All passed on the Pi 3. On the CM5 one 96 kHz run had one wake-up gap over
-the buffer, 4.0 ms against 2.7 ms, and the same run repeated passed. No run has
-been made on an idle system yet.
+the buffer, 4.0 ms against 2.7 ms, and the same run repeated passed. A gap with
+those figures, made on purpose later, played one buffer of old audio again. No
+run has been made on an idle system yet.
 
 ## Analog input
 
@@ -689,7 +694,8 @@ Details *(call)*:
   plugin, against the time available. This shows how close the system is to a
   dropout.
 - **Dropouts:** xruns per output and underruns per client, with timestamps, and
-  wake-up gaps longer than the buffer, which ALSA may not report as xruns.
+  wake-up gaps longer than the buffer, each of which is a break in the sound
+  and which ALSA does not always report as xruns.
 - **Latency:** the real current latency per client and output.
 - **Buffers:** fill level per client and per output.
 - **Resampling:** which clients and outputs are resampled, and the current
