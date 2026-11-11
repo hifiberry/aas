@@ -216,19 +216,15 @@ Further rules *(call)*:
   not support (see Plugins). A DoP stream needs only the analog chain, so only
   that one can refuse it a rate.
 - A source that reports no signal (see Analog input) does not count as active.
-- The analog input takes part in these rules at the rate the output runs at, so
-  it never sets a rate. If it has signal first it counts as the first client,
-  and a later player at another rate is resampled. When the output rate changes,
-  for DoP included, the input follows it.
-- After a DoP stream ends with only the analog input left, the card keeps the
-  DoP rate. The reopen for DoP closes the capture, which is silent for 1 s once
-  it opens again, so the input is quiet within the settle time and DoP is left
-  as the only client. When its signal is back, the input runs at that rate.
+- The analog input with signal follows the output rate, DoP included, and never
+  sets or holds one: no settle goes to its rate or waits for it. While it has
+  signal and no player set the rate before it, a player that arrives is
+  resampled to the rate the output runs at rather than moving the card. With
+  only the analog input left, the rules act as with no client left: the card
+  keeps its rate, also after a DoP stream ends.
 - A reopen of the output closes the card's capture and opens it again, so the
-  analog input goes quiet for a moment. If its signal is not back within the
-  settle time, it counts as a client that stopped. A detector built for the new
-  rate has no hold yet, so in a quiet passage this can happen at the moment the
-  rate changes.
+  analog input goes quiet for a moment. While it is quiet it does not keep a
+  player that arrives from setting the rate.
 - The card keeps its current rate when idle, a rate a DoP stream set included.
   It does not return to a default.
   The configured default rate applies only from startup until the first client

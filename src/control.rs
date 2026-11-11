@@ -8,7 +8,7 @@
 use crate::capture::Capture;
 use crate::config::{Config, Format, Idle, PluginConfig, PluginPlace, Quality};
 use crate::dop;
-use crate::engine::{ANALOG, Command, Event, INITIAL_SOURCES, INITIAL_TAPS, Source, Tap};
+use crate::engine::{Command, Event, INITIAL_SOURCES, INITIAL_TAPS, Source, Tap};
 use crate::format::db_to_gain;
 use crate::latency::{PERIODS, period_frames};
 use crate::plugin::build::{Chains, Libraries, build_chain, engine_place};
@@ -229,10 +229,8 @@ struct Conn {
 /// The analog input as the control thread keeps it.
 struct AnalogInput {
     open: OpenCapture,
-    /// The rate the rate rules have for the input while it has signal.
-    /// Always the rate the output runs at: the input follows it and never
-    /// sets it.
-    active: Option<u32>,
+    /// The input has signal, and is the rate rules' follower.
+    active: bool,
     /// `SetCapture` commands the audio thread has not answered yet. A
     /// failure reported meanwhile belongs to a capture they replace.
     unanswered: u32,
@@ -388,7 +386,7 @@ impl Control {
         }
         self.analog = Some(AnalogInput {
             open,
-            active: None,
+            active: false,
             unanswered: 0,
             reading: false,
             retry_at: None,
@@ -1085,16 +1083,6 @@ impl Control {
     /// once; otherwise it waits for the settle time, so that a stop and a
     /// start in quick succession leave the rate alone.
     fn decide(&mut self, now: Instant, urgent: bool, batch: &mut Vec<Command>) {
-        // An active analog input follows the output rate, whatever moved
-        // it. Updating a client's rate never moves the output itself.
-        if let Some(analog) = &mut self.analog {
-            let current = self.policy.current();
-            if analog.active.is_some_and(|r| r != current) {
-                analog.active = Some(current);
-                self.policy
-                    .client_started(ANALOG, current, now - self.epoch);
-            }
-        }
         let running = self.running_count() > 0;
         if running {
             self.idle_since = None;
@@ -1294,11 +1282,11 @@ impl Control {
         analog.retry_at = Some(now + CAPTURE_RETRY);
     }
 
-    /// The analog input has signal or not. With signal it is a client of
-    /// the rate rules at the rate the output runs at, a DoP rate included,
-    /// so it never sets a rate. As a client it counts as the first one if
-    /// it came first, and the rate is decided again as for a player that
-    /// starts or stops.
+    /// The analog input has signal or not. With signal it is the rate
+    /// rules' follower: it runs at whatever rate the output does, a DoP
+    /// rate included, and never sets or holds one (see
+    /// `RatePolicy::follower_started`). The rate is decided again as for a
+    /// player that starts or stops.
     fn input_signal(&mut self, on: bool, now: Instant, batch: &mut Vec<Command>) {
         let Some(analog) = &mut self.analog else {
             return;
@@ -1306,13 +1294,12 @@ impl Control {
         let t = now - self.epoch;
         if on {
             eprintln!("aas: analog input: signal");
-            let current = self.policy.current();
-            analog.active = Some(current);
-            self.policy.client_started(ANALOG, current, t);
+            analog.active = true;
+            self.policy.follower_started();
         } else {
             eprintln!("aas: analog input: quiet");
-            analog.active = None;
-            self.policy.client_stopped(ANALOG, t);
+            analog.active = false;
+            self.policy.follower_stopped(t);
         }
         self.decide(now, false, batch);
     }
@@ -2369,7 +2356,8 @@ mod tests {
 
     /// The analog input's rate in the rules, while it has signal.
     fn analog_rate(control: &Control) -> Option<u32> {
-        control.analog.as_ref().unwrap().active
+        let active = control.analog.as_ref().unwrap().active;
+        active.then(|| control.policy.current())
     }
 
     /// The capture is silent for `SETTLE_MS` after each start and the
@@ -2426,6 +2414,57 @@ mod tests {
             assert_eq!(control.policy.current(), 176400, "{held:?}");
             assert_eq!(opener.asked().len(), 2, "{held:?}");
         }
+    }
+
+    /// A 48 kHz player and the analog input with signal; DoP at 176.4 kHz
+    /// takes the output and the input's signal is back after its mute. The
+    /// player leaves during DoP, and DoP ends `gap_ms` later. Returns the
+    /// rate the output is left at.
+    fn player_leaves_during_dop(gap_ms: u64) -> u32 {
+        let ms = Duration::from_millis;
+        let opener = Opener::default();
+        let (mut control, mut engine, now) = started(&analog_config(), Some(&opener));
+        engine.take(true);
+        control.handle_events(now);
+        engine.take(true);
+        play(&mut control, 1, 48000, now);
+        engine.send(Event::InputSignal(true));
+        control.handle_events(now + ms(10));
+        engine.take(true);
+        play(&mut control, 2, 176400, now + ms(20));
+        engine.send(Event::DopStarted(2, 1));
+        control.handle_events(now + ms(20));
+        let seen = engine.take(false);
+        assert!(has(&seen, "Reconfigure 176400"), "{seen:?}");
+        engine.send(Event::InputSignal(false));
+        engine.send(Event::Reconfigured);
+        control.handle_events(now + ms(30));
+        engine.take(true);
+        let back = now + ms(30) + SIGNAL_BACK;
+        control.tick(back);
+        engine.send(Event::InputSignal(true));
+        control.handle_events(back);
+        engine.take(true);
+        let t1 = back + ms(1000);
+        let stop = control.request(1, Some(Request::Stop), t1);
+        assert_eq!(stop.reply, Some(Reply::Ok));
+        control.tick(t1);
+        let t2 = t1 + ms(gap_ms);
+        control.tick(t2);
+        let stop = control.request(2, Some(Request::Stop), t2);
+        assert_eq!(stop.reply, Some(Reply::Ok));
+        for k in 0..40 {
+            control.tick(t2 + ms(100 * k));
+            engine.take(true);
+            control.handle_events(t2 + ms(100 * k));
+        }
+        control.output.unwrap().0
+    }
+
+    #[test]
+    fn after_dop_the_card_keeps_its_rate_for_the_input_whatever_the_timing() {
+        assert_eq!(player_leaves_during_dop(200), 176400);
+        assert_eq!(player_leaves_during_dop(800), 176400);
     }
 
     #[test]

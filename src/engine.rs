@@ -23,10 +23,6 @@ use std::sync::Arc;
 use std::sync::atomic::{Ordering, fence};
 use std::time::Instant;
 
-/// The name the control thread gives the analog input where the rate rules
-/// ask for a client. The engine keeps the input out of the source table.
-pub const ANALOG: ClientId = ClientId::MAX;
-
 /// Sources the table of a new engine has room for. The control thread sends
 /// `Grow` before it adds more.
 pub const INITIAL_SOURCES: usize = 16;
