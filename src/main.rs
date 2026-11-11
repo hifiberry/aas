@@ -111,6 +111,33 @@ fn hardware_volume(config: &Config) -> Option<OpenVolume> {
     None
 }
 
+/// The analog input, if the config enables it and the card to play to has
+/// an ADC in the table. The card is looked up once, at the start; the
+/// capture opens the same card each time the output opens.
+#[cfg(feature = "alsa-output")]
+fn analog_input(config: &Config) -> Option<aas::control::OpenCapture> {
+    if !config.analog.enabled {
+        return None;
+    }
+    let Some((card, driver)) = aas::sink_alsa::card_driver_now(config.card.as_deref()) else {
+        eprintln!("aas: no sound card found for the analog input, it stays off");
+        return None;
+    };
+    let open: aas::control::OpenCapture = Box::new(move |rate, period| {
+        aas::sink_alsa::AlsaCapture::open(&card, rate, period)
+            .map(|c| Box::new(c) as Box<dyn aas::capture::Capture>)
+    });
+    server::analog_capture(config, &driver, open)
+}
+
+#[cfg(not(feature = "alsa-output"))]
+fn analog_input(config: &Config) -> Option<aas::control::OpenCapture> {
+    if config.analog.enabled {
+        eprintln!("aas: warning: built without ALSA, the analog input stays off");
+    }
+    None
+}
+
 /// Looks for the card on the control thread while it is gone, so that the
 /// audio thread tries to open it only once it is there. A build without
 /// ALSA never asks: its output is never gone.
@@ -143,8 +170,11 @@ fn main() -> ExitCode {
     let sink = output(&config);
     let hardware = hardware_volume(&config);
     let probe = Some(card_probe(&config));
+    let capture = analog_input(&config);
     let (socket, state) = (&args.socket, &args.state);
-    match server::run_probing(config, sink, socket, state, hardware, probe, None, shutdown) {
+    match server::run_probing(
+        config, sink, socket, state, hardware, probe, capture, shutdown,
+    ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("aas: {e}");

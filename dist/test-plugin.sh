@@ -12,15 +12,27 @@
 # the capture device, for example plughw:sndrpihifiberry. The format case
 # then plays a tone and checks what the input hears. Without it, the case
 # plays silence and checks only that each format plays.
+#
+# With ANALOG=1 the cases of the analog input run too, on a board whose
+# card has one and whose output is wired to it. They restart the daemon
+# with the input enabled at -20 dB, so that the loop through the cable
+# stays quiet, and put the config back after. Without ANALOG=1 they are
+# not run and not counted.
 set -u
 # alsactl is in sbin.
 PATH=$PATH:/usr/sbin
 
 rate=48000
 work=$(mktemp -d)
+conf=/etc/aas/aas.toml
+# What analog_on did to the config, for analog_off to undo: "kept" with
+# the old file in $work, "added" where there was none.
+analog_conf=""
+analog_dir=""
 # Full volume again at the end, however the run ends, for whatever plays
-# next.
-trap 'kill $(jobs -p) 2>/dev/null; amixer -q -D default sset Master 100% 2>/dev/null; rm -rf "$work"' EXIT
+# next, and the config the daemon had.
+trap 'kill $(jobs -p) 2>/dev/null; analog_off; amixer -q -D default sset Master 100% 2>/dev/null; rm -rf "$work"' EXIT
+trap 'exit 130' INT TERM HUP
 failed=0
 
 pass() { echo "PASS $1${2:+: $2}"; }
@@ -48,6 +60,86 @@ wait_daemon() {
 		fi
 		sleep 0.1
 		i=$((i + 1))
+	done
+	return 1
+}
+
+# Restarts the daemon with the analog input enabled at -20 dB, on top of
+# the config it has. A config with an [analog] table of its own is left
+# alone and the case fails.
+analog_on() {
+	if [ -e $conf ]; then
+		grep -q '^[[:space:]]*\[analog\]' $conf && return 1
+		cp $conf "$work/aas.toml.before"
+		analog_conf=kept
+	else
+		[ -d /etc/aas ] || analog_dir=made
+		: >"$work/aas.toml.before"
+		analog_conf=added
+	fi
+	{
+		cat "$work/aas.toml.before"
+		printf '\n[analog]\nenabled = true\nvolume_db = -20\n'
+	} >"$work/analog.toml"
+	sudo install -D -m 0644 "$work/analog.toml" $conf || return 1
+	# Each case starts the daemon twice. More than five starts in ten
+	# seconds would reach systemd's limit.
+	sudo systemctl reset-failed aas
+	sudo systemctl restart aas
+	wait_daemon || return 1
+	# The capture reads zeros for its first second, while the ADC settles.
+	sleep 1.5
+}
+
+# Puts the config back as analog_on found it and restarts the daemon. Does
+# nothing if analog_on changed nothing.
+analog_off() {
+	case $analog_conf in
+	kept) sudo install -m 0644 "$work/aas.toml.before" $conf ;;
+	added)
+		sudo rm -f $conf
+		[ "$analog_dir" = made ] && sudo rmdir /etc/aas
+		;;
+	*) return 0 ;;
+	esac
+	analog_conf=""
+	analog_dir=""
+	sudo systemctl reset-failed aas
+	sudo systemctl restart aas
+	wait_daemon
+}
+
+# The daemon's log since $1, in seconds since the epoch, one line each as
+# "<seconds.micro> <message>".
+log_since() {
+	journalctl -q -u aas --since "@$1" -o short-unix --no-pager 2>/dev/null |
+		sed 's/^\([0-9.]*\) [^:]*: /\1 /'
+}
+
+# Waits up to $3 ms for a line of the daemon's log since $1 that has $2,
+# and prints its time in ms since the epoch. Returns 1 if none came.
+log_wait() {
+	waited=0
+	while :; do
+		at=$(log_since "$1" | grep -F -- "$2" | head -n1 | cut -d' ' -f1)
+		if [ -n "$at" ]; then
+			echo "$at" | awk '{ printf "%d\n", $1 * 1000 }'
+			return 0
+		fi
+		[ "$waited" -ge "$3" ] && return 1
+		sleep 0.05
+		waited=$((waited + 50))
+	done
+}
+
+# Whether the daemon holds a capture stream of a card open and running.
+capture_running() {
+	daemon=$(main_pid)
+	for status in /proc/asound/card*/pcm*c/sub*/status; do
+		[ -r "$status" ] || continue
+		if grep -q "owner_pid *: $daemon\$" "$status" && grep -q 'state: RUNNING' "$status"; then
+			return 0
+		fi
 	done
 	return 1
 }
@@ -1151,6 +1243,106 @@ case_monitor_sleeps_when_the_daemon_is_gone() {
 	fi
 }
 
+# The analog input opens when a -20 dBFS tone reaches it through the
+# cable, within 200 ms of the start, and closes when the hold of 3 s has
+# passed after the tone, within a second more. The tone lasts 2 s from
+# the start: aplay exits later than it ends, after its drain.
+case_analog_input_opens_on_signal() {
+	name=analog_input_opens_on_signal
+	if ! analog_on; then
+		fail $name "the daemon did not start with the analog input"
+		return
+	fi
+	amixer -q -D default sset Master 100%
+	if ! capture_running; then
+		fail $name "the daemon holds no running capture: $(log_since "$(date +%s -d '-10 sec')" | grep analog | tr '\n' ' ')"
+		analog_off
+		return
+	fi
+	"$work/tone" gen S16_LE 2 >"$work/tone.raw"
+	cat "$work/tone.raw" "$work/tone.raw" >"$work/tone2.raw"
+	since=$(($(date +%s) - 1))
+	start=$(now_ms)
+	aplay -q -D default -t raw -f S16_LE -c 2 -r $rate "$work/tone2.raw" 2>"$work/err"
+	status=$?
+	end=$(now_ms)
+	opened=$(log_wait $since "analog input: signal" 1000)
+	closed=$(log_wait $since "analog input: quiet" 6000)
+	analog_off
+	took=$((end - start))
+	end=$((start + 2000))
+	if [ $status -ne 0 ]; then
+		fail $name "aplay exited $status: $(head -n1 "$work/err")"
+	elif [ -z "$opened" ]; then
+		fail $name "no open in the log during 2 s of tone"
+	elif [ -z "$closed" ]; then
+		fail $name "opened after $((opened - start)) ms, not closed 6 s after the tone"
+	elif [ $((opened - start)) -le 200 ] && [ $((closed - end)) -ge 3000 ] &&
+		[ $((closed - end)) -le 4000 ]; then
+		pass $name "opened $((opened - start)) ms after the tone started, closed $((closed - end)) ms after it ended; aplay took $took ms"
+	else
+		fail $name "opened $((opened - start)) ms after the tone started, closed $((closed - end)) ms after it ended; aplay took $took ms"
+	fi
+}
+
+# With nothing playing, the input stays closed from the start of the
+# daemon and for 10 s more, with the capture running all the while. The
+# start counts: the ADC's offset settling as the capture starts must not
+# open it.
+case_analog_input_stays_closed_on_silence() {
+	name=analog_input_stays_closed_on_silence
+	since=$(date +%s)
+	if ! analog_on; then
+		fail $name "the daemon did not start with the analog input"
+		return
+	fi
+	sleep 10
+	running=no
+	capture_running && running=yes
+	opens=$(log_since $since | grep -c -F "analog input: signal")
+	log=$(log_since $since | grep analog | tr '\n' ' ')
+	analog_off
+	if [ $running = yes ] && [ "$opens" -eq 0 ]; then
+		pass $name "capture running, no open in 10 s"
+	else
+		fail $name "capture running: $running, opens: $opens: $log"
+	fi
+}
+
+# The output changes rate from 44.1 to 96 kHz while the capture is open.
+# Both players finish, the capture runs at the new rate, and the daemon
+# counts no xrun and no wake-up gap.
+case_rate_change_with_capture_open() {
+	name=rate_change_with_capture_open
+	if ! analog_on; then
+		fail $name "the daemon did not start with the analog input"
+		return
+	fi
+	since=$(($(date +%s) - 1))
+	aplay -q -D default -t raw -f S16_LE -c 2 -r 44100 -d 1 /dev/zero 2>"$work/err"
+	first=$?
+	aplay -q -D default -t raw -f S16_LE -c 2 -r 96000 -d 1 /dev/zero 2>>"$work/err"
+	second=$?
+	sleep 0.5
+	running=no
+	capture_running && running=yes
+	analog_off
+	log_wait $since "aas: stopped:" 2000 >/dev/null
+	log=$(log_since $since)
+	counters=$(echo "$log" | grep -F "aas: stopped:" | head -n1 | cut -d' ' -f2-)
+	rates=$(echo "$log" | grep -o "output at [0-9]* Hz" | tr '\n' ' ')
+	failures=$(echo "$log" | grep -F "analog input" | grep -c -e fail -e "trying again")
+	if [ $first -ne 0 ] || [ $second -ne 0 ]; then
+		fail $name "aplay exited $first and $second: $(head -n2 "$work/err" | tr '\n' ' ')"
+	elif [ $running = yes ] && [ "$failures" -eq 0 ] &&
+		echo "$rates" | grep -q "output at 96000 Hz" &&
+		echo "$counters" | grep -q ": 0 xruns, 0 wake gaps,"; then
+		pass $name "$rates; $counters"
+	else
+		fail $name "capture running: $running, capture failures: $failures; $rates; $counters"
+	fi
+}
+
 cases="aplay_plays_each_format drain_returns pause_and_resume delay_is_plausible
 underrun_returns_epipe poll_descriptors_survive_a_reset nonblocking_drain
 drop_during_a_blocking_drain hw_free_gives_the_stream_up
@@ -1160,8 +1352,15 @@ amixer_reads_and_sets_master second_client_sees_the_change mpd_mixer_works
 volume_survives_a_restart control_reconnects_after_restart
 amixer_fails_without_the_daemon watcher_hears_the_daemon_go
 monitor_sleeps_when_the_daemon_is_gone"
+analog_cases="analog_input_opens_on_signal analog_input_stays_closed_on_silence
+rate_change_with_capture_open"
+[ "${ANALOG:-}" = 1 ] && cases="$cases $analog_cases"
 [ $# -gt 0 ] && cases="$*"
 for name in $cases; do
+	if [ "${ANALOG:-}" != 1 ] && echo "$analog_cases" | grep -qw -- "$name"; then
+		echo "SKIP $name: needs ANALOG=1"
+		continue
+	fi
 	if ! command -v "case_$name" >/dev/null; then
 		fail "$name" "no such case"
 		continue

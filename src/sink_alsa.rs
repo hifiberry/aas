@@ -1,8 +1,8 @@
 //! The sound card as a sink, through ALSA.
 //!
 //! Finding the card and converting samples need no ALSA, so they build and
-//! are tested everywhere. `AlsaSink` and `AlsaVolume` need the
-//! `alsa-output` feature.
+//! are tested everywhere. `AlsaSink`, `AlsaCapture` and `AlsaVolume` need
+//! the `alsa-output` feature.
 
 use std::fs;
 
@@ -35,6 +35,33 @@ pub fn card_ids() -> Vec<String> {
     fs::read_to_string(CARDS)
         .map(|text| parse_card_ids(&text))
         .unwrap_or_default()
+}
+
+/// The id and driver name of the card to play to, in `/proc/asound/cards`
+/// text: the one the config names, by id or index, or else the one
+/// `find_card` takes. None if it is not there.
+pub fn card_driver(text: &str, card: Option<&str>) -> Option<(String, String)> {
+    let ids = parse_card_ids(text);
+    let id = match card {
+        Some(card) => match card.parse::<usize>() {
+            Ok(index) => text
+                .lines()
+                .find(|line| line.split_whitespace().next() == Some(&index.to_string()))
+                .and_then(|line| parse_card_ids(line).pop())?,
+            Err(_) => ids.into_iter().find(|id| id == card)?,
+        },
+        None => find_card(&ids)?,
+    };
+    let line = text
+        .lines()
+        .find(|line| parse_card_ids(line).first() == Some(&id))?;
+    let driver = crate::cards::driver_of(line)?;
+    Some((id, driver.to_string()))
+}
+
+/// The id and driver name of the card to play to, as present now.
+pub fn card_driver_now(card: Option<&str>) -> Option<(String, String)> {
+    card_driver(&fs::read_to_string(CARDS).ok()?, card)
 }
 
 /// Whether a card named by id is among `ids`. A card named by index is
@@ -110,6 +137,47 @@ pub fn encode(format: CardFormat, frames: &[[i32; 2]], out: &mut [u8]) {
     }
 }
 
+/// Reads frames captured as `format`, little endian, into S32 with the
+/// samples in the top bits: the reverse of `encode`. `bytes` holds exactly
+/// the frames in `out`.
+pub fn decode(format: CardFormat, bytes: &[u8], out: &mut [[i32; 2]]) {
+    let samples = out.iter_mut().flatten();
+    match format {
+        CardFormat::S32 => {
+            for (s, b) in samples.zip(bytes.chunks_exact(4)) {
+                *s = i32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+            }
+        }
+        CardFormat::S24 => {
+            // The top byte, sign or not, is shifted out.
+            for (s, b) in samples.zip(bytes.chunks_exact(4)) {
+                *s = i32::from_le_bytes([0, b[0], b[1], b[2]]);
+            }
+        }
+        CardFormat::S16 => {
+            for (s, b) in samples.zip(bytes.chunks_exact(2)) {
+                *s = i32::from_le_bytes([0, 0, b[0], b[1]]);
+            }
+        }
+    }
+}
+
+/// How long a capture delivers zeros after it starts. The ADC of the DAC+
+/// ADC Pro starts with a DC offset that its high-pass filter takes this
+/// long to bring below -60 dBFS: measured on the CM5 test board, it
+/// stays above the detector's -50 dBFS for up to 650 ms at 44.1 kHz,
+/// less at higher rates. Played through, it would open the analog input
+/// for its hold time at every start and every change of rate.
+pub const SETTLE_MS: u32 = 1000;
+
+/// Zeros the front of `out` while `left` frames are still to settle, and
+/// counts them off.
+pub fn mute_settling(out: &mut [[i32; 2]], left: &mut usize) {
+    let n = out.len().min(*left);
+    out[..n].fill([0; 2]);
+    *left -= n;
+}
+
 /// The device of the card named in the config, or else the one found.
 #[cfg(feature = "alsa-output")]
 fn card_device(card: Option<&str>) -> Result<String, String> {
@@ -122,6 +190,8 @@ fn card_device(card: Option<&str>) -> Result<String, String> {
     Ok(format!("hw:{card}"))
 }
 
+#[cfg(feature = "alsa-output")]
+pub use capture::AlsaCapture;
 #[cfg(feature = "alsa-output")]
 pub use card::AlsaSink;
 #[cfg(feature = "alsa-output")]
@@ -270,7 +340,7 @@ mod card {
         352800, 384000,
     ];
 
-    fn alsa_format(format: CardFormat) -> Format {
+    pub(super) fn alsa_format(format: CardFormat) -> Format {
         match format {
             CardFormat::S32 => Format::S32LE,
             CardFormat::S24 => Format::S24LE,
@@ -580,6 +650,196 @@ mod card {
     }
 }
 
+#[cfg(feature = "alsa-output")]
+mod capture {
+    use super::card::alsa_format;
+    use super::{CardFormat, SETTLE_MS, decode, mute_settling};
+    use crate::capture::Capture;
+    use crate::sink::SinkError;
+    use alsa::pcm::{Access, Frames, HwParams, PCM};
+    use alsa::{Direction, ValueOr};
+
+    const CHANNELS: usize = 2;
+    /// Periods in the capture buffer. The engine reads one a cycle and
+    /// keeps at most two, so four leave room for a late cycle.
+    const PERIODS: u32 = 4;
+
+    /// The card's ADC, read without waiting. Opened on the control thread
+    /// and read on the audio thread.
+    pub struct AlsaCapture {
+        /// None once closed. The device is closed then, not kept until the
+        /// capture is dropped: a capture PCM of these cards takes one
+        /// opener, and the control thread opens the next one while the
+        /// engine still holds this one.
+        pcm: Option<PCM>,
+        format: CardFormat,
+        /// Frames in `bytes`, the most one read takes.
+        chunk: usize,
+        /// Room for one period in the card's format, made at the open so
+        /// that reads do not allocate.
+        bytes: Vec<u8>,
+        /// Frames still to be muted while the ADC settles.
+        settling: usize,
+    }
+
+    impl AlsaCapture {
+        /// Opens `hw:<card>` for capture at `rate`, as S32 if the card
+        /// takes it, else S24 in 32 bits, else S16, with periods of
+        /// `period` frames and four of them buffered, and starts it. The
+        /// first `SETTLE_MS` are read as zeros. The open does not wait: a
+        /// device another program holds fails at once. A card that does
+        /// not take `rate` fails too, since the ADC is never resampled.
+        pub fn open(card: &str, rate: u32, period: u32) -> Result<AlsaCapture, String> {
+            let device = format!("hw:{card}");
+            let e = |what: &str, err: alsa::Error| format!("{device} capture: {what}: {err}");
+            let pcm = PCM::new(&device, Direction::Capture, true).map_err(|x| e("open", x))?;
+            let (format, card_period, buffer) = {
+                let hw = HwParams::any(&pcm).map_err(|x| e("hw params", x))?;
+                hw.set_channels(CHANNELS as u32)
+                    .map_err(|x| e("channels", x))?;
+                hw.set_access(Access::RWInterleaved)
+                    .map_err(|x| e("access", x))?;
+                let format = CardFormat::PREFERRED
+                    .into_iter()
+                    .find(|&f| hw.test_format(alsa_format(f)).is_ok())
+                    .ok_or_else(|| format!("{device} capture: no format aas reads"))?;
+                hw.set_format(alsa_format(format))
+                    .map_err(|x| e("format", x))?;
+                if hw.test_rate(rate).is_err() {
+                    return Err(format!("{device} capture: does not take {rate} Hz"));
+                }
+                hw.set_rate(rate, ValueOr::Nearest)
+                    .map_err(|x| e("rate", x))?;
+                hw.set_period_size_near(Frames::from(period), ValueOr::Nearest)
+                    .map_err(|x| e("period", x))?;
+                hw.set_periods(PERIODS, ValueOr::Nearest)
+                    .map_err(|x| e("periods", x))?;
+                pcm.hw_params(&hw).map_err(|x| e("apply", x))?;
+                let got_rate = hw.get_rate().map_err(|x| e("get rate", x))?;
+                if got_rate != rate {
+                    return Err(format!(
+                        "{device} capture: asked for {rate} Hz, got {got_rate}"
+                    ));
+                }
+                let got_period = hw.get_period_size().map_err(|x| e("get period", x))?;
+                let got_buffer = hw.get_buffer_size().map_err(|x| e("get buffer", x))?;
+                (format, got_period, got_buffer)
+            };
+            if card_period != Frames::from(period) {
+                eprintln!(
+                    "aas: warning: {device} capture gave a period of {card_period} frames, \
+                     not {period}"
+                );
+            }
+            pcm.start().map_err(|x| e("start", x))?;
+            eprintln!(
+                "aas: capture {device} open: {}, {rate} Hz, {card_period} frames, \
+                 {buffer} frames buffered",
+                format.name(),
+            );
+            let chunk = period.max(1) as usize;
+            Ok(AlsaCapture {
+                pcm: Some(pcm),
+                format,
+                chunk,
+                bytes: vec![0; chunk * format.bytes() * CHANNELS],
+                settling: (u64::from(rate) * u64::from(SETTLE_MS) / 1000) as usize,
+            })
+        }
+
+        fn frame_bytes(&self) -> usize {
+            self.format.bytes() * CHANNELS
+        }
+
+        /// What an error leaves. Nothing queued is not an error. An overrun
+        /// restarts the stream at once, and the frames lost are what the
+        /// engine pads. Anything else, a card gone or suspended, fails the
+        /// capture, and the control thread opens it again.
+        fn recover(pcm: &PCM, err: alsa::Error) -> Result<(), SinkError> {
+            // alsa::Error holds the positive errno.
+            match err.errno() {
+                libc::EAGAIN | libc::EINTR => Ok(()),
+                libc::EPIPE => pcm
+                    .prepare()
+                    .and_then(|()| pcm.start())
+                    .map_err(|_| SinkError::Gone),
+                _ => Err(SinkError::Gone),
+            }
+        }
+
+        /// Frames queued, 0 after an overrun it has recovered from.
+        fn queued(pcm: &PCM) -> Result<usize, SinkError> {
+            match pcm.avail_update() {
+                Ok(n) => Ok(n.max(0) as usize),
+                Err(err) => Self::recover(pcm, err).map(|()| 0),
+            }
+        }
+
+        /// Reads what is queued, up to `frames` and at most `chunk`, into
+        /// `bytes`, and returns how many frames. Asks for no more than is
+        /// queued, so the read neither waits nor fails for want of frames.
+        fn read_bytes(&mut self, frames: usize) -> Result<usize, SinkError> {
+            let frame_bytes = self.frame_bytes();
+            let pcm = self.pcm.as_ref().ok_or(SinkError::Gone)?;
+            let want = frames.min(self.chunk).min(Self::queued(pcm)?);
+            if want == 0 {
+                return Ok(0);
+            }
+            let len = want * frame_bytes;
+            match pcm.io_bytes().readi(&mut self.bytes[..len]) {
+                Ok(n) => Ok(n.min(want)),
+                Err(err) => Self::recover(pcm, err).map(|()| 0),
+            }
+        }
+    }
+
+    impl Capture for AlsaCapture {
+        fn available(&mut self) -> Result<usize, SinkError> {
+            Self::queued(self.pcm.as_ref().ok_or(SinkError::Gone)?)
+        }
+
+        fn read(&mut self, out: &mut [[i32; 2]]) -> Result<usize, SinkError> {
+            let mut done = 0;
+            while done < out.len() {
+                let n = self.read_bytes(out.len() - done)?;
+                if n == 0 {
+                    break;
+                }
+                let len = n * self.frame_bytes();
+                let read = &mut out[done..done + n];
+                decode(self.format, &self.bytes[..len], read);
+                mute_settling(read, &mut self.settling);
+                done += n;
+            }
+            Ok(done)
+        }
+
+        fn skip(&mut self, frames: usize) -> Result<(), SinkError> {
+            let mut done = 0;
+            while done < frames {
+                let n = self.read_bytes(frames - done)?;
+                if n == 0 {
+                    break;
+                }
+                self.settling = self.settling.saturating_sub(n);
+                done += n;
+            }
+            Ok(())
+        }
+
+        /// Stops the stream and closes the device, so that the next
+        /// capture can open it, at the output's new rate, before this one
+        /// comes back to the control thread. Closing frees the handle on
+        /// the audio thread, as closing the output does. It happens only
+        /// before the output reopens or once the capture has failed.
+        fn close(&mut self) {
+            if let Some(pcm) = self.pcm.take() {
+                let _ = pcm.drop();
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -663,6 +923,99 @@ mod tests {
         let mut out = [0u8; 8];
         encode(CardFormat::S24, &[[0x1234_5678, i32::MIN]], &mut out);
         assert_eq!(out, [0x56, 0x34, 0x12, 0x00, 0x00, 0x00, 0x80, 0xff]);
+    }
+
+    const CARDS_TEXT: &str = concat!(
+        " 0 [Headphones     ]: bcm2835_headpho - bcm2835 Headphones\n",
+        "                      bcm2835 Headphones\n",
+        " 1 [sndrpihifiberry]: HifiberryDacpAd - snd_rpi_hifiberry_dacplusadc\n",
+        "                      snd_rpi_hifiberry_dacplusadc\n",
+    );
+
+    #[test]
+    fn the_driver_is_that_of_the_card_played_to() {
+        let found = Some((
+            "sndrpihifiberry".to_string(),
+            "snd_rpi_hifiberry_dacplusadc".to_string(),
+        ));
+        assert_eq!(card_driver(CARDS_TEXT, None), found);
+        assert_eq!(card_driver(CARDS_TEXT, Some("sndrpihifiberry")), found);
+        // A card named by index is found by it too.
+        assert_eq!(card_driver(CARDS_TEXT, Some("1")), found);
+        assert_eq!(
+            card_driver(CARDS_TEXT, Some("Headphones")),
+            Some(("Headphones".to_string(), "bcm2835 Headphones".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_card_that_is_missing_has_no_driver() {
+        assert_eq!(card_driver(CARDS_TEXT, Some("DAC")), None);
+        assert_eq!(card_driver(CARDS_TEXT, Some("7")), None);
+        assert_eq!(
+            card_driver(" 0 [Headphones     ]: bcm2835 - x\n", None),
+            None
+        );
+        assert_eq!(card_driver("--- no soundcards ---\n", None), None);
+    }
+
+    #[test]
+    fn frames_are_muted_until_the_adc_has_settled() {
+        let mut left = 3;
+        let mut out = [[1, 1], [2, 2]];
+        mute_settling(&mut out, &mut left);
+        assert_eq!((out, left), ([[0, 0], [0, 0]], 1));
+        let mut out = [[1, 1], [2, 2]];
+        mute_settling(&mut out, &mut left);
+        assert_eq!((out, left), ([[0, 0], [2, 2]], 0));
+        let mut out = [[3, 3]];
+        mute_settling(&mut out, &mut left);
+        assert_eq!((out, left), ([[3, 3]], 0));
+    }
+
+    #[test]
+    fn captured_s32_is_read_as_it_is() {
+        let mut out = [[0; 2]; 1];
+        decode(
+            CardFormat::S32,
+            &[0x78, 0x56, 0x34, 0x12, 0xfe, 0xff, 0xff, 0xff],
+            &mut out,
+        );
+        assert_eq!(out, [[0x1234_5678, -2]]);
+    }
+
+    #[test]
+    fn captured_s24_moves_to_the_top_whatever_the_top_byte_holds() {
+        let mut out = [[0; 2]; 2];
+        let bytes = [
+            0x56, 0x34, 0x12, 0x00, 0x00, 0x00, 0x80, 0xff, // sign-extended
+            0x00, 0x00, 0x80, 0x00, 0xff, 0xff, 0x7f, 0xab, // top byte not
+        ];
+        decode(CardFormat::S24, &bytes, &mut out);
+        assert_eq!(out, [[0x1234_5600, i32::MIN], [i32::MIN, 0x7fff_ff00]]);
+    }
+
+    #[test]
+    fn captured_s16_is_left_justified() {
+        let mut out = [[0; 2]; 1];
+        decode(CardFormat::S16, &[0x34, 0x12, 0xff, 0xff], &mut out);
+        assert_eq!(out, [[0x1234_0000, -65536]]);
+    }
+
+    #[test]
+    fn decoding_reverses_encoding_in_the_top_bits() {
+        let frames = [[0x1234_5678, -0x0765_4321], [i32::MAX, i32::MIN]];
+        for format in CardFormat::PREFERRED {
+            let mut bytes = vec![0u8; frames.len() * 2 * format.bytes()];
+            encode(format, &frames, &mut bytes);
+            let mut back = [[0; 2]; 2];
+            decode(format, &bytes, &mut back);
+            let bits = 8 * format.bytes() as u32 - if format == CardFormat::S24 { 8 } else { 0 };
+            let mask = !0u32 << (32 - bits);
+            for (b, f) in back.iter().flatten().zip(frames.iter().flatten()) {
+                assert_eq!(*b as u32, *f as u32 & mask, "{}", format.name());
+            }
+        }
     }
 
     #[test]
