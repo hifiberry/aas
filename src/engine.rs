@@ -467,22 +467,41 @@ impl<P: Processing, S: Sink> Engine<P, S> {
             return Ok(());
         }
         self.flush_backlog();
+        // The wait comes before the commands are read, so that one sent
+        // during it, such as a stop, takes effect in this cycle.
+        let waited = self.wait_room();
+        let mut start = Instant::now();
         let result = if self.open && !self.faded && self.reconfigure_queued() {
             self.faded = true;
-            self.render(true)
+            self.render(true, start)
         } else {
             self.drain_commands();
             if self.reopen.is_some() {
                 self.apply_reopen()?;
+                // Opening the card is not part of the cycle's work.
+                start = Instant::now();
             }
             if self.open {
-                self.render(false)
+                self.render(false, start)
             } else {
                 Ok(())
             }
         };
         self.report();
-        result
+        waited.and(result)
+    }
+
+    /// Waits until the open sink has room for a period. This is the audio
+    /// thread's only wait.
+    fn wait_room(&mut self) -> Result<(), SinkError> {
+        if !self.open {
+            return Ok(());
+        }
+        let waited = self.sink.wait_room();
+        if waited == Err(SinkError::Xrun) {
+            self.counters.xruns.fetch_add(1, Ordering::Relaxed);
+        }
+        waited
     }
 
     fn flush_backlog(&mut self) {
@@ -681,15 +700,11 @@ impl<P: Processing, S: Sink> Engine<P, S> {
 
     /// Plays one period. `fade_out` takes the level down to zero over it.
     ///
-    /// It waits for room on the card first and only then reads the clients,
-    /// so what it reads is written at once and waits behind no more than
-    /// the card's buffer. The cycle is timed from the end of that wait.
-    fn render(&mut self, fade_out: bool) -> Result<(), SinkError> {
-        let waited = self.sink.wait_room();
-        if waited == Err(SinkError::Xrun) {
-            self.counters.xruns.fetch_add(1, Ordering::Relaxed);
-        }
-        let start = Instant::now();
+    /// The cycle has waited for room on the card before this and only now
+    /// reads the clients, so what it reads is written at once and waits
+    /// behind no more than the card's buffer. The cycle is timed from
+    /// `start`, the end of that wait.
+    fn render(&mut self, fade_out: bool, start: Instant) -> Result<(), SinkError> {
         self.scan();
         self.order_claims();
         let rate = self.rate;
@@ -712,7 +727,7 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         }
         let work = before_write - start + after_write.elapsed();
         self.record_timing(start, work.as_nanos() as u64);
-        waited.and(result)
+        result
     }
 
     fn record_timing(&mut self, start: Instant, cycle_ns: u64) {
@@ -2375,13 +2390,101 @@ mod tests {
         ] {
             assert!(commands.push(command).is_ok());
         }
-        for _ in 0..4 {
+        // The cycle that opens the sink does not wait; four more do.
+        for _ in 0..5 {
             engine.cycle().unwrap();
         }
         // Each period read from the ring is the one put there while the
         // engine waited in that same cycle, not the one before.
         let played = played.lock().unwrap();
         assert_eq!(played[played.len() - PERIOD..], frames(4, PERIOD)[..]);
+    }
+
+    /// A sink that sends a stop for a client while the engine waits for
+    /// room, as a player's pause arriving then does.
+    struct StopOnWait {
+        commands: Option<rtrb::Producer<Command>>,
+        id: ClientId,
+        /// The call to `wait_room` that sends the stop.
+        at: usize,
+        waits: usize,
+        played: Arc<std::sync::Mutex<Vec<[i32; 2]>>>,
+        /// Frames played when the stop was sent.
+        before: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl crate::sink::Sink for StopOnWait {
+        fn open(&mut self, _rate: u32, _period: u32) -> Result<(), SinkError> {
+            Ok(())
+        }
+
+        fn wait_room(&mut self) -> Result<(), SinkError> {
+            self.waits += 1;
+            if self.waits == self.at {
+                let commands = self.commands.as_mut().unwrap();
+                assert!(commands.push(Command::SetRunning(self.id, false)).is_ok());
+                let played = self.played.lock().unwrap().len();
+                self.before.store(played, Ordering::Relaxed);
+            }
+            Ok(())
+        }
+
+        fn write(&mut self, frames: &[[i32; 2]]) -> Result<(), SinkError> {
+            self.played.lock().unwrap().extend_from_slice(frames);
+            Ok(())
+        }
+
+        fn close(&mut self) {}
+
+        fn delay_frames(&self) -> u32 {
+            0
+        }
+
+        fn supported_rates(&self) -> Vec<u32> {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn a_stop_that_comes_while_the_engine_waits_for_room_plays_no_more() {
+        let (mut commands, consumer) = RingBuffer::new(16);
+        let (producer, _events) = RingBuffer::new(64);
+        let counters = Arc::new(Counters::default());
+        let mut a = client(1);
+        a.ring.write(&frames(1, 8 * PERIOD));
+        let played = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let before = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let reconfigure = Command::Reconfigure {
+            rate: RATE,
+            period: PERIOD as u32,
+        };
+        for command in [
+            reconfigure,
+            Command::Add(a.source.take().unwrap()),
+            Command::SetRunning(a.id, true),
+        ] {
+            assert!(commands.push(command).is_ok());
+        }
+        let sink = StopOnWait {
+            commands: Some(commands),
+            id: a.id,
+            at: 3,
+            waits: 0,
+            played: played.clone(),
+            before: before.clone(),
+        };
+        let mode = BitPerfect::Auto;
+        let mut engine = Engine::<F32, _>::new(sink, consumer, producer, counters, mode);
+        for _ in 0..5 {
+            engine.cycle().unwrap();
+        }
+        // The cycle that was waiting when the stop came takes nothing
+        // more from the ring, and neither does any after it.
+        let before = before.load(Ordering::Relaxed);
+        assert!(before >= PERIOD, "the stop came before anything played");
+        assert_eq!(a.ring.available(), 8 * PERIOD - before);
+        let played = played.lock().unwrap();
+        assert!(played[before..].iter().all(|f| *f == [0, 0]));
     }
 
     struct SlowOpen;
