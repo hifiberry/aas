@@ -576,6 +576,12 @@ All of this is *(call)*:
   time rather than hanging, and the daemon retries the card every second
   *(call)*.
 - After an xrun on the card, the daemon recovers without client involvement.
+- The daemon locks each client's ring in memory, so that the audio thread never
+  waits for a page. A ring is at most 8 MiB, for the largest buffer a client may
+  ask for, and the control thread adds one page for its view of the header.
+  There is no bound over all clients, and the unit sets `LimitMEMLOCK=infinity`.
+  This follows the rule that no client is refused: many clients with large
+  buffers cost memory that cannot be swapped, not a refusal.
 
 ## Bluetooth
 
