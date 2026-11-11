@@ -4,6 +4,7 @@
 //! are tested everywhere. `AlsaSink`, `AlsaCapture` and `AlsaVolume` need
 //! the `alsa-output` feature.
 
+use crate::config::Config;
 use std::fs;
 
 /// Where the kernel lists the sound cards.
@@ -59,9 +60,49 @@ pub fn card_driver(text: &str, card: Option<&str>) -> Option<(String, String)> {
     Some((id, driver.to_string()))
 }
 
-/// The id and driver name of the card to play to, as present now.
-pub fn card_driver_now(card: Option<&str>) -> Option<(String, String)> {
-    card_driver(&fs::read_to_string(CARDS).ok()?, card)
+/// The kernel's list of cards now, empty if it cannot be read.
+pub fn cards_text() -> String {
+    fs::read_to_string(CARDS).unwrap_or_default()
+}
+
+/// Where the analog input's card is decided, at the start.
+#[derive(Debug, PartialEq)]
+pub enum AnalogCard {
+    /// The config does not enable the input.
+    Off,
+    /// The card to play to is there: decided now, by its driver.
+    Present { card: String, driver: String },
+    /// The card is not there yet. It is looked for, and its driver
+    /// checked, at each open, so a card whose driver probes after the
+    /// start is picked up.
+    Absent,
+}
+
+/// The analog input's card, from the kernel's list of cards in `text`.
+pub fn analog_card(text: &str, config: &Config) -> AnalogCard {
+    if !config.analog.enabled {
+        return AnalogCard::Off;
+    }
+    match card_driver(text, config.card.as_deref()) {
+        Some((card, driver)) => AnalogCard::Present { card, driver },
+        None => AnalogCard::Absent,
+    }
+}
+
+/// The id of the card to capture from, for a card that was not there at
+/// the start: the card to play to, if it is there now and has an ADC aas
+/// knows.
+pub fn capture_card(text: &str, card: Option<&str>) -> Result<String, String> {
+    let Some((id, driver)) = card_driver(text, card) else {
+        return Err(match card {
+            Some(card) => format!("card {card} not found"),
+            None => "no sound card found".to_string(),
+        });
+    };
+    if !crate::cards::has_adc(&driver) {
+        return Err(format!("the card {driver} has no analog input aas knows"));
+    }
+    Ok(id)
 }
 
 /// Whether a card named by id is among `ids`. A card named by index is
@@ -656,13 +697,15 @@ mod capture {
     use super::{CardFormat, SETTLE_MS, decode, mute_settling};
     use crate::capture::Capture;
     use crate::sink::SinkError;
-    use alsa::pcm::{Access, Frames, HwParams, PCM};
+    use alsa::pcm::{Access, Frames, HwParams, PCM, State};
     use alsa::{Direction, ValueOr};
 
     const CHANNELS: usize = 2;
-    /// Periods in the capture buffer. The engine reads one a cycle and
-    /// keeps at most two, so four leave room for a late cycle.
+    /// Engine periods in the capture buffer. The engine reads one a cycle
+    /// and keeps at most two, so four leave room for a late cycle.
     const PERIODS: u32 = 4;
+    /// Fewer engine periods than this in the buffer are worth a warning.
+    const FEWEST_PERIODS: u32 = 3;
 
     /// The card's ADC, read without waiting. Opened on the control thread
     /// and read on the audio thread.
@@ -685,7 +728,7 @@ mod capture {
     impl AlsaCapture {
         /// Opens `hw:<card>` for capture at `rate`, as S32 if the card
         /// takes it, else S24 in 32 bits, else S16, with periods of
-        /// `period` frames and four of them buffered, and starts it. The
+        /// `period` frames and a buffer of four of them, and starts it. The
         /// first `SETTLE_MS` are read as zeros. The open does not wait: a
         /// device another program holds fails at once. A card that does
         /// not take `rate` fails too, since the ADC is never resampled.
@@ -712,8 +755,10 @@ mod capture {
                     .map_err(|x| e("rate", x))?;
                 hw.set_period_size_near(Frames::from(period), ValueOr::Nearest)
                     .map_err(|x| e("period", x))?;
-                hw.set_periods(PERIODS, ValueOr::Nearest)
-                    .map_err(|x| e("periods", x))?;
+                // In engine periods, so that a card that grants a smaller
+                // period still has room for what the engine keeps.
+                hw.set_buffer_size_near(Frames::from(period * PERIODS))
+                    .map_err(|x| e("buffer", x))?;
                 pcm.hw_params(&hw).map_err(|x| e("apply", x))?;
                 let got_rate = hw.get_rate().map_err(|x| e("get rate", x))?;
                 if got_rate != rate {
@@ -729,6 +774,12 @@ mod capture {
                 eprintln!(
                     "aas: warning: {device} capture gave a period of {card_period} frames, \
                      not {period}"
+                );
+            }
+            if buffer < Frames::from(period * FEWEST_PERIODS) {
+                eprintln!(
+                    "aas: warning: {device} capture gave a buffer of {buffer} frames, \
+                     less than {FEWEST_PERIODS} periods of {period}"
                 );
             }
             pcm.start().map_err(|x| e("start", x))?;
@@ -767,10 +818,22 @@ mod capture {
             }
         }
 
-        /// Frames queued, 0 after an overrun it has recovered from.
+        /// Frames queued, 0 after an overrun it has recovered from. With
+        /// none queued, a stream that is not running, such as one
+        /// suspended or disconnected, for which `avail_update` gives 0
+        /// rather than an error, fails here instead of being read as empty
+        /// for ever. The state comes from the status ALSA maps, without a
+        /// system call where the driver maps it.
         fn queued(pcm: &PCM) -> Result<usize, SinkError> {
             match pcm.avail_update() {
-                Ok(n) => Ok(n.max(0) as usize),
+                Ok(n) if n > 0 => Ok(n as usize),
+                Ok(_) => match pcm.state() {
+                    State::Running => Ok(0),
+                    State::XRun => {
+                        Self::recover(pcm, alsa::Error::new("state", libc::EPIPE)).map(|()| 0)
+                    }
+                    _ => Err(SinkError::Gone),
+                },
                 Err(err) => Self::recover(pcm, err).map(|()| 0),
             }
         }
@@ -971,6 +1034,63 @@ mod tests {
         let mut out = [[3, 3]];
         mute_settling(&mut out, &mut left);
         assert_eq!((out, left), ([[3, 3]], 0));
+    }
+
+    fn analog_config(enabled: bool, card: Option<&str>) -> Config {
+        let mut config = Config::default();
+        config.analog.enabled = enabled;
+        config.card = card.map(str::to_string);
+        config
+    }
+
+    #[test]
+    fn a_card_present_at_the_start_is_decided_on_once() {
+        let config = analog_config(true, None);
+        assert_eq!(
+            analog_card(CARDS_TEXT, &config),
+            AnalogCard::Present {
+                card: "sndrpihifiberry".to_string(),
+                driver: "snd_rpi_hifiberry_dacplusadc".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn a_card_missing_at_the_start_is_looked_for_at_each_open() {
+        let config = analog_config(true, Some("DAC"));
+        assert_eq!(analog_card(CARDS_TEXT, &config), AnalogCard::Absent);
+        let config = analog_config(true, None);
+        assert_eq!(
+            analog_card("--- no soundcards ---\n", &config),
+            AnalogCard::Absent
+        );
+    }
+
+    #[test]
+    fn a_disabled_input_needs_no_card() {
+        let config = analog_config(false, None);
+        assert_eq!(analog_card(CARDS_TEXT, &config), AnalogCard::Off);
+        assert_eq!(analog_card("", &config), AnalogCard::Off);
+    }
+
+    #[test]
+    fn a_late_card_opens_once_it_is_there_and_has_an_adc() {
+        assert_eq!(
+            capture_card("--- no soundcards ---\n", None),
+            Err("no sound card found".to_string())
+        );
+        assert_eq!(
+            capture_card(CARDS_TEXT, Some("DAC")),
+            Err("card DAC not found".to_string())
+        );
+        assert_eq!(
+            capture_card(CARDS_TEXT, None),
+            Ok("sndrpihifiberry".to_string())
+        );
+        assert_eq!(
+            capture_card(CARDS_TEXT, Some("Headphones")),
+            Err("the card bcm2835 Headphones has no analog input aas knows".to_string())
+        );
     }
 
     #[test]

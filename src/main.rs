@@ -111,23 +111,32 @@ fn hardware_volume(config: &Config) -> Option<OpenVolume> {
     None
 }
 
-/// The analog input, if the config enables it and the card to play to has
-/// an ADC in the table. The card is looked up once, at the start; the
-/// capture opens the same card each time the output opens.
+/// The analog input, if the config enables it. A card that is there at
+/// the start is decided on now, by its driver, in `analog_capture`. A card
+/// that is not there yet is looked for at each open, so a driver that
+/// probes after the start is picked up; until then, and for a card with no
+/// ADC aas knows, the open fails and the control thread tries again.
 #[cfg(feature = "alsa-output")]
 fn analog_input(config: &Config) -> Option<aas::control::OpenCapture> {
-    if !config.analog.enabled {
-        return None;
+    use aas::capture::Capture;
+    use aas::sink_alsa::{AlsaCapture, AnalogCard, analog_card, capture_card, cards_text};
+    match analog_card(&cards_text(), config) {
+        AnalogCard::Off => None,
+        AnalogCard::Present { card, driver } => {
+            let open: aas::control::OpenCapture = Box::new(move |rate, period| {
+                AlsaCapture::open(&card, rate, period).map(|c| Box::new(c) as Box<dyn Capture>)
+            });
+            server::analog_capture(config, &driver, open)
+        }
+        AnalogCard::Absent => {
+            eprintln!("aas: analog input on, its card is not there yet");
+            let wanted = config.card.clone();
+            Some(Box::new(move |rate, period| {
+                let card = capture_card(&cards_text(), wanted.as_deref())?;
+                AlsaCapture::open(&card, rate, period).map(|c| Box::new(c) as Box<dyn Capture>)
+            }))
+        }
     }
-    let Some((card, driver)) = aas::sink_alsa::card_driver_now(config.card.as_deref()) else {
-        eprintln!("aas: no sound card found for the analog input, it stays off");
-        return None;
-    };
-    let open: aas::control::OpenCapture = Box::new(move |rate, period| {
-        aas::sink_alsa::AlsaCapture::open(&card, rate, period)
-            .map(|c| Box::new(c) as Box<dyn aas::capture::Capture>)
-    });
-    server::analog_capture(config, &driver, open)
 }
 
 #[cfg(not(feature = "alsa-output"))]

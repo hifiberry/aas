@@ -26,7 +26,9 @@ pub struct Counters {
     /// A capture has been handed to the engine at some point. Only then
     /// does the summary name the analog input.
     pub analog_enabled: AtomicBool,
-    /// Zeros put in front of a captured period that came short.
+    /// Zeros put in front of a captured period that came short. A capture
+    /// overrun is counted nowhere else: the capture restarts in place and
+    /// the frames it lost show up here.
     pub analog_padded_frames: AtomicU64,
     /// Captured frames dropped because more than two periods were queued.
     pub analog_dropped_frames: AtomicU64,

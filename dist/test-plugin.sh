@@ -109,19 +109,22 @@ analog_off() {
 	wait_daemon
 }
 
-# The daemon's log since $1, in seconds since the epoch, one line each as
-# "<seconds.micro> <message>".
-log_since() {
-	journalctl -q -u aas --since "@$1" -o short-unix --no-pager 2>/dev/null |
+# The log of the daemon that ran as process $1, from its start to its
+# "stopped" line, one line each as "<seconds.micro> <message>". By its pid,
+# so that a restart's lines from the daemon before cannot be taken for
+# its own.
+daemon_log() {
+	journalctl -q _SYSTEMD_UNIT=aas.service _PID="$1" -o short-unix --no-pager 2>/dev/null |
 		sed 's/^\([0-9.]*\) [^:]*: /\1 /'
 }
 
-# Waits up to $3 ms for a line of the daemon's log since $1 that has $2,
-# and prints its time in ms since the epoch. Returns 1 if none came.
+# Waits up to $3 ms for the first line with $2 in the log of the daemon
+# that ran as process $1, and prints its time in ms since the epoch.
+# Returns 1 if none came.
 log_wait() {
 	waited=0
 	while :; do
-		at=$(log_since "$1" | grep -F -- "$2" | head -n1 | cut -d' ' -f1)
+		at=$(daemon_log "$1" | grep -F -- "$2" | head -n1 | cut -d' ' -f1)
 		if [ -n "$at" ]; then
 			echo "$at" | awk '{ printf "%d\n", $1 * 1000 }'
 			return 0
@@ -1246,28 +1249,30 @@ case_monitor_sleeps_when_the_daemon_is_gone() {
 # The analog input opens when a -20 dBFS tone reaches it through the
 # cable, within 200 ms of the start, and closes when the hold of 3 s has
 # passed after the tone, within a second more. The tone lasts 2 s from
-# the start: aplay exits later than it ends, after its drain.
+# the start: aplay exits later than it ends, after its drain. The first
+# open of the daemon is taken, so one before the tone fails the case.
 case_analog_input_opens_on_signal() {
 	name=analog_input_opens_on_signal
 	if ! analog_on; then
 		fail $name "the daemon did not start with the analog input"
+		analog_off
 		return
 	fi
+	daemon=$(main_pid)
 	amixer -q -D default sset Master 100%
 	if ! capture_running; then
-		fail $name "the daemon holds no running capture: $(log_since "$(date +%s -d '-10 sec')" | grep analog | tr '\n' ' ')"
+		fail $name "the daemon holds no running capture: $(daemon_log $daemon | grep analog | tr '\n' ' ')"
 		analog_off
 		return
 	fi
 	"$work/tone" gen S16_LE 2 >"$work/tone.raw"
 	cat "$work/tone.raw" "$work/tone.raw" >"$work/tone2.raw"
-	since=$(($(date +%s) - 1))
 	start=$(now_ms)
 	aplay -q -D default -t raw -f S16_LE -c 2 -r $rate "$work/tone2.raw" 2>"$work/err"
 	status=$?
 	end=$(now_ms)
-	opened=$(log_wait $since "analog input: signal" 1000)
-	closed=$(log_wait $since "analog input: quiet" 6000)
+	opened=$(log_wait $daemon "analog input: signal" 1000)
+	closed=$(log_wait $daemon "analog input: quiet" 6000)
 	analog_off
 	took=$((end - start))
 	end=$((start + 2000))
@@ -1277,7 +1282,8 @@ case_analog_input_opens_on_signal() {
 		fail $name "no open in the log during 2 s of tone"
 	elif [ -z "$closed" ]; then
 		fail $name "opened after $((opened - start)) ms, not closed 6 s after the tone"
-	elif [ $((opened - start)) -le 200 ] && [ $((closed - end)) -ge 3000 ] &&
+	elif [ $opened -ge $start ] && [ $((opened - start)) -le 200 ] &&
+		[ $((closed - end)) -ge 3000 ] &&
 		[ $((closed - end)) -le 4000 ]; then
 		pass $name "opened $((opened - start)) ms after the tone started, closed $((closed - end)) ms after it ended; aplay took $took ms"
 	else
@@ -1291,16 +1297,17 @@ case_analog_input_opens_on_signal() {
 # open it.
 case_analog_input_stays_closed_on_silence() {
 	name=analog_input_stays_closed_on_silence
-	since=$(date +%s)
 	if ! analog_on; then
 		fail $name "the daemon did not start with the analog input"
+		analog_off
 		return
 	fi
+	daemon=$(main_pid)
 	sleep 10
 	running=no
 	capture_running && running=yes
-	opens=$(log_since $since | grep -c -F "analog input: signal")
-	log=$(log_since $since | grep analog | tr '\n' ' ')
+	opens=$(daemon_log $daemon | grep -c -F "analog input: signal")
+	log=$(daemon_log $daemon | grep analog | tr '\n' ' ')
 	analog_off
 	if [ $running = yes ] && [ "$opens" -eq 0 ]; then
 		pass $name "capture running, no open in 10 s"
@@ -1316,9 +1323,10 @@ case_rate_change_with_capture_open() {
 	name=rate_change_with_capture_open
 	if ! analog_on; then
 		fail $name "the daemon did not start with the analog input"
+		analog_off
 		return
 	fi
-	since=$(($(date +%s) - 1))
+	daemon=$(main_pid)
 	aplay -q -D default -t raw -f S16_LE -c 2 -r 44100 -d 1 /dev/zero 2>"$work/err"
 	first=$?
 	aplay -q -D default -t raw -f S16_LE -c 2 -r 96000 -d 1 /dev/zero 2>>"$work/err"
@@ -1327,8 +1335,8 @@ case_rate_change_with_capture_open() {
 	running=no
 	capture_running && running=yes
 	analog_off
-	log_wait $since "aas: stopped:" 2000 >/dev/null
-	log=$(log_since $since)
+	log_wait $daemon "aas: stopped:" 2000 >/dev/null
+	log=$(daemon_log $daemon)
 	counters=$(echo "$log" | grep -F "aas: stopped:" | head -n1 | cut -d' ' -f2-)
 	rates=$(echo "$log" | grep -o "output at [0-9]* Hz" | tr '\n' ' ')
 	failures=$(echo "$log" | grep -F "analog input" | grep -c -e fail -e "trying again")
@@ -1337,9 +1345,9 @@ case_rate_change_with_capture_open() {
 	elif [ $running = yes ] && [ "$failures" -eq 0 ] &&
 		echo "$rates" | grep -q "output at 96000 Hz" &&
 		echo "$counters" | grep -q ": 0 xruns, 0 wake gaps,"; then
-		pass $name "$rates; $counters"
+		pass $name "$rates; pid $daemon $counters"
 	else
-		fail $name "capture running: $running, capture failures: $failures; $rates; $counters"
+		fail $name "capture running: $running, capture failures: $failures; $rates; pid $daemon $counters"
 	fi
 }
 
