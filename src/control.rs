@@ -15,12 +15,13 @@ use crate::state::State;
 use crate::volume::{HardwareVolume, OutputVolume};
 use aas_client::convert::ClientFormat;
 use aas_client::proto::{self, Reply, Request};
-use aas_client::ring::{self, Ring};
+use aas_client::ring::{self, Header, Ring};
 use rtrb::{Consumer, Producer};
 use std::collections::BTreeMap;
 use std::io;
-use std::os::fd::{AsFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::path::PathBuf;
+use std::ptr::NonNull;
 use std::sync::atomic::Ordering;
 use std::thread::Thread;
 use std::time::{Duration, Instant};
@@ -59,6 +60,56 @@ pub fn min_buffer_frames(rate: u32, latency_ms: f32) -> u32 {
     let shortest = f64::from(MIN_PERIOD) / f64::from(MIN_RATE);
     let refill = (f64::from(rate) * per_period.max(shortest)).ceil() as u32;
     min_ring_frames(rate, latency_ms) + refill
+}
+
+/// A read-only view of a ring's header, for the control thread. It maps
+/// the header alone, which is one page. A second mapping of the whole ring
+/// would lock the ring's memory once more for each client.
+struct HeaderView {
+    base: NonNull<Header>,
+}
+
+// SAFETY: the mapping is shared memory that is only read, through atomics.
+unsafe impl Send for HeaderView {}
+
+impl HeaderView {
+    const LEN: usize = size_of::<Header>();
+
+    /// Maps the header of a ring this process made, so its size is known
+    /// to hold one.
+    fn map(fd: BorrowedFd) -> io::Result<HeaderView> {
+        // SAFETY: a fresh shared mapping, the result is checked.
+        let p = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                Self::LEN,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                fd.as_raw_fd(),
+                0,
+            )
+        };
+        if p == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        let base = NonNull::new(p.cast()).ok_or_else(|| io::Error::other("mmap gave null"))?;
+        Ok(HeaderView { base })
+    }
+
+    fn header(&self) -> &Header {
+        // SAFETY: the mapping holds a header, page aligned, until drop.
+        unsafe { self.base.as_ref() }
+    }
+}
+
+// The view never takes more than the first page of a ring.
+const _: () = assert!(HeaderView::LEN <= 4096);
+
+impl Drop for HeaderView {
+    fn drop(&mut self) {
+        // SAFETY: unmaps exactly what `map` mapped.
+        unsafe { libc::munmap(self.base.as_ptr().cast(), Self::LEN) };
+    }
 }
 
 /// What the server does with a request.
@@ -103,7 +154,7 @@ struct Stream {
     /// The output rate and period of the resampler the source has.
     resampler: Option<(u32, u32)>,
     /// The control thread's own view of the ring, to see a drain progress.
-    view: Ring,
+    view: HeaderView,
     /// A drain waits for its reply. If the audio thread has taken nothing
     /// from the ring by then, it is answered anyway.
     drain: Option<Instant>,
@@ -440,7 +491,7 @@ impl Control {
         }
         let capacity = buffer_frames.max(min_ring_frames(rate, self.latency_ms));
         let made = Ring::create(capacity).and_then(|(ring, memfd)| {
-            let view = Ring::map(memfd.as_fd())?;
+            let view = HeaderView::map(memfd.as_fd())?;
             let wake = eventfd()?;
             let theirs = wake.try_clone()?;
             let memfd_theirs = memfd.try_clone()?;
@@ -1016,6 +1067,17 @@ mod tests {
         assert!(control.take_notices().is_empty());
         assert!(commands.pop().is_err());
         assert!(control.save_at.is_none());
+    }
+
+    #[test]
+    fn the_header_view_follows_the_ring() {
+        let (ring, memfd) = Ring::create(1 << 20).unwrap();
+        let view = HeaderView::map(memfd.as_fd()).unwrap();
+        assert_eq!(view.header().capacity_frames, 1 << 20);
+        ring.write(&[[1, 1]; 300]);
+        ring.consume(200);
+        assert_eq!(view.header().read_pos.load(Ordering::Acquire), 200);
+        assert_eq!(view.header().write_pos.load(Ordering::Acquire), 300);
     }
 
     #[test]
