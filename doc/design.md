@@ -243,8 +243,10 @@ costs 1.35 to 1.7 times as much in `f64` as in `f32`.
 
 - Mixing sums in a 64-bit accumulator and saturates once at the end, so a sum that
   briefly goes over full scale in the middle of the mix does not clip *(call)*.
-- Volume multiplies in 64 bits and rounds once per stage *(call)*. The rounding
-  error is near -194 dBFS, far below the noise of any DAC.
+- Volume multiplies in 64 bits and rounds once per stage *(call)*. An exact half
+  rounds away from zero, as in the float formats, so the negative of a signal
+  gives the negative of the result. The rounding error is near -194 dBFS, far
+  below the noise of any DAC.
 - It has no headroom between stages, unlike float. A stage that goes over full
   scale clips there.
 - The resampler only works on float, so a resampled client is resampled in `f32`

@@ -40,14 +40,15 @@ const Q32_ONE: f64 = 4_294_967_296.0;
 /// arithmetic, as the daemon's `i32` format does. A copy of
 /// `format::I32::accumulate` and `finish` in `src/format.rs`: change both
 /// together, or the bench times old code. Each product is rounded
-/// once, the sum is kept in a 64-bit accumulator, and only the result
+/// once, an exact half away from zero, the sum is kept in a 64-bit accumulator, and only the result
 /// saturates at the S32 limits. `acc` is as long as `out`.
 pub fn mix_i32(inputs: &[&[i32]], gains: &[f32], acc: &mut [i64], out: &mut [i32]) {
     acc.fill(0);
     for (input, gain) in inputs.iter().zip(gains) {
         for (a, i) in acc.iter_mut().zip(input.iter()) {
             let q = (f64::from(*gain) * Q32_ONE).round() as i64;
-            let p = i128::from(*i) * i128::from(q) + (1i128 << 31);
+            let p = i128::from(*i) * i128::from(q);
+            let p = p + (1i128 << 31) + (p >> 127);
             let v = (p >> 32).clamp(i128::from(i64::MIN / 2), i128::from(i64::MAX / 2));
             *a = a.saturating_add(v as i64);
         }

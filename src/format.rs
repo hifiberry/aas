@@ -69,8 +69,11 @@ impl Processing for I32 {
 
     fn accumulate(acc: &mut i64, sample: i32, gain: f32) {
         let q = (f64::from(gain) * Q32_ONE).round() as i64;
-        // The product can pass 64 bits at large gains. Add half for rounding.
-        let p = i128::from(sample) * i128::from(q) + (1i128 << 31);
+        // The product can pass 64 bits at large gains. Add half for rounding,
+        // and one less below zero, so that an exact half rounds away from
+        // zero as the float formats do.
+        let p = i128::from(sample) * i128::from(q);
+        let p = p + (1i128 << 31) + (p >> 127);
         let v = (p >> 32).clamp(i128::from(i64::MIN / 2), i128::from(i64::MAX / 2));
         *acc = acc.saturating_add(v as i64);
     }
@@ -225,11 +228,24 @@ mod tests {
 
     #[test]
     fn i32_volume_rounds_rather_than_truncates() {
-        // 3 * 0.5 = 1.5 rounds to 2; -3 * 0.5 = -1.5 rounds to -1 (half up).
+        // 3 * 0.5 = 1.5 rounds to 2.
         assert_eq!(mix_one::<I32>(&[3, 1, 5], 0.5), [2, 1, 3]);
         // 7 * 0.25 = 1.75 truncates to 1, rounds to 2.
         assert_eq!(mix_one::<I32>(&[7], 0.25), [2]);
         assert_eq!(mix_one::<I32>(&[-7], 0.25), [-2]);
+    }
+
+    #[test]
+    fn every_format_rounds_an_exact_half_away_from_zero() {
+        // 3 * 0.5 = 1.5 and -3 * 0.5 = -1.5: the negative of a signal mixes
+        // to the negative of the result.
+        let input = [3, -3, 1, -1, 5, -5, 2, -2];
+        let expect = [2, -2, 1, -1, 3, -3, 1, -1];
+        assert_eq!(mix_one::<I32>(&input, 0.5), expect);
+        assert_eq!(mix_one::<F32>(&input, 0.5), expect);
+        assert_eq!(mix_one::<F64>(&input, 0.5), expect);
+        // Just under a half still rounds towards zero.
+        assert_eq!(mix_one::<I32>(&[-5, 5, -7, 7], 0.25), [-1, 1, -2, 2]);
     }
 
     #[test]
