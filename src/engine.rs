@@ -523,15 +523,21 @@ impl<P: Processing, S: Sink> Engine<P, S> {
             self.render(true, start)
         } else {
             self.drain_commands();
-            if self.reopen.is_some() {
-                self.apply_reopen()?;
-                // Opening the card is not part of the cycle's work.
-                start = Instant::now();
-            }
-            if self.open {
-                self.render(false, start)
-            } else {
-                Ok(())
+            let reopening = self.reopen.is_some();
+            match self.apply_reopen() {
+                // The sources are still reported below.
+                Err(e) => Err(e),
+                Ok(()) => {
+                    if reopening {
+                        // Opening the card is not part of the cycle's work.
+                        start = Instant::now();
+                    }
+                    if self.open {
+                        self.render(false, start)
+                    } else {
+                        Ok(())
+                    }
+                }
             }
         };
         self.report();
@@ -2275,6 +2281,24 @@ mod tests {
         rig.cycle();
         assert!(!rig.engine.is_closed());
         assert!(matches!(rig.events()[..], [Event::Reconfigured]));
+    }
+
+    #[test]
+    fn a_failed_reopen_still_reports_what_the_sources_did() {
+        let mut rig = Rig::<F32>::new(BitPerfect::Auto);
+        let mut a = client(1);
+        rig.add(&mut a);
+        rig.send(Command::Reconfigure {
+            rate: 96000,
+            period: 128,
+        });
+        rig.cycle();
+        rig.events();
+        // The stream ends while the card cannot be opened.
+        rig.log.fail(Some(SinkError::Gone));
+        a.ring.header().draining.store(1, Release);
+        assert_eq!(rig.engine.cycle(), Err(SinkError::Gone));
+        assert!(matches!(rig.events()[..], [Event::Drained(1)]));
     }
 
     #[test]
