@@ -41,6 +41,9 @@ pub type ConnId = u64;
 /// the device is free. A failed open is tried again a second later.
 pub type OpenCapture = Box<dyn FnMut(u32, u32) -> Result<Box<dyn Capture>, String>>;
 
+/// The name the analog input has in the rate rules while it is a client.
+pub const ANALOG: ClientId = ClientId::MAX;
+
 /// Smallest period the latency rule gives.
 const MIN_PERIOD: u32 = 32;
 /// Half the longest resampling filter, which rubato adds to its input.
@@ -229,8 +232,11 @@ struct Conn {
 /// The analog input as the control thread keeps it.
 struct AnalogInput {
     open: OpenCapture,
-    /// The input has signal, and is the rate rules' follower.
+    /// The input has signal.
     active: bool,
+    /// The input is a client of the rate rules: it has signal and no DoP
+    /// stream owns the output.
+    registered: bool,
     /// `SetCapture` commands the audio thread has not answered yet. A
     /// failure reported meanwhile belongs to a capture they replace.
     unanswered: u32,
@@ -387,6 +393,7 @@ impl Control {
         self.analog = Some(AnalogInput {
             open,
             active: false,
+            registered: false,
             unanswered: 0,
             reading: false,
             retry_at: None,
@@ -1073,9 +1080,34 @@ impl Control {
             }
         }
         self.dop_owner = owner;
+        self.sync_analog_client(now);
         if owner.is_some() {
             self.decide(now, true, batch);
         }
+    }
+
+    /// Makes the analog input a client of the rate rules while it has
+    /// signal and no DoP stream owns the output, and not otherwise. It
+    /// joins at the rate the rules run at, by the rules for any client:
+    /// it never asks for a rate of its own, it holds the running rate as a
+    /// client at it does, and its joining cancels a pending switch away
+    /// from that rate. While DoP owns the output the input is not played,
+    /// so it is not a client; it joins when DoP ends, at the rate the
+    /// rules then run at.
+    fn sync_analog_client(&mut self, now: Instant) {
+        let t = now - self.epoch;
+        let dop = self.dop_owner.is_some();
+        let Some(analog) = &mut self.analog else {
+            return;
+        };
+        let want = analog.active && !dop;
+        if want && !analog.registered {
+            let rate = self.policy.current();
+            self.policy.client_started(ANALOG, rate, t);
+        } else if !want && analog.registered {
+            self.policy.client_stopped(ANALOG, t);
+        }
+        analog.registered = want;
     }
 
     /// Takes the output to the rate the rules want, and keeps every running
@@ -1294,25 +1326,16 @@ impl Control {
         analog.retry_at = Some(now + CAPTURE_RETRY);
     }
 
-    /// The analog input has signal or not. With signal it is the rate
-    /// rules' follower: it runs at whatever rate the output does, a DoP
-    /// rate included, and never sets or holds one (see
-    /// `RatePolicy::follower_started`). The rate is decided again as for a
-    /// player that starts or stops.
+    /// The analog input has signal or not. With signal it is a client of
+    /// the rate rules, see `sync_analog_client`, and the rate is decided
+    /// again as for a player that starts or stops.
     fn input_signal(&mut self, on: bool, now: Instant, batch: &mut Vec<Command>) {
         let Some(analog) = &mut self.analog else {
             return;
         };
-        let t = now - self.epoch;
-        if on {
-            eprintln!("aas: analog input: signal");
-            analog.active = true;
-            self.policy.follower_started();
-        } else {
-            eprintln!("aas: analog input: quiet");
-            analog.active = false;
-            self.policy.follower_stopped(t);
-        }
+        eprintln!("aas: analog input: {}", if on { "signal" } else { "quiet" });
+        analog.active = on;
+        self.sync_analog_client(now);
         self.decide(now, false, batch);
     }
 
@@ -2375,9 +2398,9 @@ mod tests {
     }
 
     /// The analog input's rate in the rules, while it has signal.
+    /// The analog input's rate in the rules, while it is a client.
     fn analog_rate(control: &Control) -> Option<u32> {
-        let active = control.analog.as_ref().unwrap().active;
-        active.then(|| control.policy.current())
+        control.policy.client_rate(ANALOG)
     }
 
     /// The capture is silent for `SETTLE_MS` after each start and the
@@ -2406,8 +2429,8 @@ mod tests {
             control.handle_events(now);
             let seen = engine.take(false);
             assert!(has(&seen, "Reconfigure 176400 1024"), "{seen:?}");
-            // The input follows the output rate in the rules.
-            assert_eq!(analog_rate(&control), Some(176400));
+            // While DoP owns the output the input is not a client.
+            assert_eq!(analog_rate(&control), None);
             // The reopen closes the capture and the new detector has no
             // hold, so the input goes quiet. The capture opens again at the
             // rate the output runs at.
@@ -2441,6 +2464,11 @@ mod tests {
     /// player leaves during DoP, and DoP ends `gap_ms` later. Returns the
     /// rate the output is left at.
     fn player_leaves_during_dop(gap_ms: u64) -> u32 {
+        let (control, _) = player_leaves_during_dop_with(gap_ms);
+        control.output.unwrap().0
+    }
+
+    fn player_leaves_during_dop_with(gap_ms: u64) -> (Control, FakeEngine) {
         let ms = Duration::from_millis;
         let opener = Opener::default();
         let (mut control, mut engine, now) = started(&analog_config(), Some(&opener));
@@ -2478,13 +2506,140 @@ mod tests {
             engine.take(true);
             control.handle_events(t2 + ms(100 * k));
         }
-        control.output.unwrap().0
+        (control, engine)
     }
 
     #[test]
     fn after_dop_the_card_keeps_its_rate_for_the_input_whatever_the_timing() {
         assert_eq!(player_leaves_during_dop(200), 176400);
         assert_eq!(player_leaves_during_dop(800), 176400);
+    }
+
+    /// A control thread whose analog input has signal before any player.
+    fn input_first() -> (Control, FakeEngine, Instant) {
+        let opener = Opener::default();
+        let (mut control, mut engine, now) = started(&analog_config(), Some(&opener));
+        engine.take(true);
+        control.handle_events(now);
+        engine.take(true);
+        engine.send(Event::InputSignal(true));
+        control.handle_events(now + Duration::from_millis(10));
+        engine.take(true);
+        (control, engine, now)
+    }
+
+    /// Ticks for `secs` seconds from `from`, and returns what was sent.
+    fn run_for(
+        control: &mut Control,
+        engine: &mut FakeEngine,
+        from: Instant,
+        secs: u64,
+    ) -> Vec<String> {
+        let mut seen = engine.take(true);
+        for k in 0..=10 * secs {
+            let at = from + Duration::from_millis(100 * k);
+            control.tick(at);
+            control.handle_events(at);
+            seen.extend(engine.take(true));
+        }
+        seen
+    }
+
+    #[test]
+    fn s2_two_players_after_the_input_never_reopen_the_output_under_it() {
+        let ms = Duration::from_millis;
+        let (mut control, mut engine, now) = input_first();
+        play(&mut control, 1, 44100, now + ms(20));
+        play(&mut control, 2, 44100, now + ms(30));
+        let stop = control.request(1, Some(Request::Stop), now + ms(2000));
+        assert_eq!(stop.reply, Some(Reply::Ok));
+        let seen = run_for(&mut control, &mut engine, now + ms(2000), 3);
+        assert!(!has(&seen, "Reconfigure"), "{seen:?}");
+        assert!(control.policy.needs_resampling(2));
+    }
+
+    #[test]
+    fn s3_signal_back_within_the_settle_time_cancels_the_switch() {
+        let ms = Duration::from_millis;
+        let (mut control, mut engine, now) = input_first();
+        play(&mut control, 1, 44100, now + ms(20));
+        assert!(!has(&engine.take(true), "Reconfigure"));
+        // A quiet passage closes the detector; signal is back 300 ms later.
+        engine.send(Event::InputSignal(false));
+        control.handle_events(now + ms(5000));
+        engine.send(Event::InputSignal(true));
+        control.handle_events(now + ms(5300));
+        let seen = run_for(&mut control, &mut engine, now + ms(5300), 3);
+        assert!(!has(&seen, "Reconfigure"), "{seen:?}");
+        assert_eq!(analog_rate(&control), Some(48000));
+    }
+
+    #[test]
+    fn s4_a_quiet_input_lets_the_player_take_the_rate_after_the_settle() {
+        let ms = Duration::from_millis;
+        let (mut control, mut engine, now) = input_first();
+        play(&mut control, 1, 44100, now + ms(20));
+        engine.take(true);
+        engine.send(Event::InputSignal(false));
+        control.handle_events(now + ms(5000));
+        control.tick(now + ms(5400));
+        assert!(!has(&engine.take(true), "Reconfigure"));
+        control.tick(now + ms(5500));
+        assert!(has(&engine.take(true), "Reconfigure 44100"));
+        assert!(!control.policy.needs_resampling(1));
+    }
+
+    #[test]
+    fn s5_an_input_after_a_player_holds_the_rate_it_joined_at() {
+        let ms = Duration::from_millis;
+        let opener = Opener::default();
+        let (mut control, mut engine, now) = started(&analog_config(), Some(&opener));
+        engine.take(true);
+        control.handle_events(now);
+        engine.take(true);
+        play(&mut control, 1, 48000, now);
+        engine.send(Event::InputSignal(true));
+        control.handle_events(now + ms(10));
+        play(&mut control, 2, 44100, now + ms(20));
+        let stop = control.request(1, Some(Request::Stop), now + ms(1000));
+        assert_eq!(stop.reply, Some(Reply::Ok));
+        let seen = run_for(&mut control, &mut engine, now + ms(1000), 3);
+        assert!(!has(&seen, "Reconfigure"), "{seen:?}");
+        assert_eq!(analog_rate(&control), Some(48000));
+    }
+
+    #[test]
+    fn s1_after_dop_the_input_joins_at_the_rate_the_card_keeps() {
+        // The output part is `after_dop_the_card_keeps_its_rate_...`.
+        for gap in [200, 800] {
+            let (control, _) = player_leaves_during_dop_with(gap);
+            assert_eq!(analog_rate(&control), Some(176400), "{gap}");
+        }
+    }
+
+    #[test]
+    fn s6_after_dop_as_the_first_client_the_input_joins_at_the_rate_kept() {
+        let ms = Duration::from_millis;
+        let opener = Opener::default();
+        let (mut control, mut engine, now) = started(&analog_config(), Some(&opener));
+        engine.take(true);
+        control.handle_events(now);
+        engine.take(true);
+        play(&mut control, 1, 176400, now);
+        engine.send(Event::DopStarted(1, 1));
+        control.handle_events(now);
+        assert!(has(&engine.take(true), "Reconfigure 176400"));
+        control.handle_events(now);
+        engine.take(true);
+        // The input gets signal while DoP owns the output: not a client yet.
+        engine.send(Event::InputSignal(true));
+        control.handle_events(now + SIGNAL_BACK);
+        assert_eq!(analog_rate(&control), None);
+        let stop = control.request(1, Some(Request::Stop), now + ms(3000));
+        assert_eq!(stop.reply, Some(Reply::Ok));
+        let seen = run_for(&mut control, &mut engine, now + ms(3000), 3);
+        assert!(!has(&seen, "Reconfigure"), "{seen:?}");
+        assert_eq!(analog_rate(&control), Some(176400));
     }
 
     #[test]
@@ -2504,7 +2659,7 @@ mod tests {
         let back = now + SIGNAL_BACK;
         engine.send(Event::InputSignal(true));
         control.handle_events(back);
-        assert_eq!(analog_rate(&control), Some(176400));
+        assert_eq!(analog_rate(&control), None);
         let stop = control.request(1, Some(Request::Stop), back + ms(1000));
         assert_eq!(stop.reply, Some(Reply::Ok));
         control.tick(back + ms(10000));
@@ -2528,14 +2683,14 @@ mod tests {
         assert!(has(&engine.take(true), "Reconfigure 176400 1024"));
         control.handle_events(now);
         engine.take(true);
-        // The input gets signal while DoP holds the output, and is in the
-        // rules at the rate the output runs at.
+        // The input gets signal while DoP holds the output: it is not a
+        // client until DoP ends.
         let back = now + SIGNAL_BACK;
         engine.send(Event::InputSignal(true));
         control.handle_events(back);
-        assert_eq!(analog_rate(&control), Some(176400));
+        assert_eq!(analog_rate(&control), None);
         // DoP stops: the 48 kHz player takes the output back, and the
-        // input follows it.
+        // input joins at that rate.
         let stop = control.request(2, Some(Request::Stop), back + ms(100));
         assert_eq!(stop.reply, Some(Reply::Ok));
         control.tick(back + ms(700));

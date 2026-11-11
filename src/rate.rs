@@ -36,9 +36,6 @@ pub struct RatePolicy {
     dop: Option<ClientId>,
     /// When a switch to the remaining client's rate is due.
     switch_at: Option<Duration>,
-    /// The analog input has signal. It follows the output rate and never
-    /// sets one, see `follower_started`.
-    follower: bool,
 }
 
 impl RatePolicy {
@@ -50,7 +47,6 @@ impl RatePolicy {
             clients: Vec::new(),
             dop: None,
             switch_at: None,
-            follower: false,
         }
     }
 
@@ -94,9 +90,7 @@ impl RatePolicy {
         if let Some(c) = self.clients.iter_mut().find(|c| c.id == id) {
             c.rate = rate;
         } else {
-            // While the follower plays and no client set the rate before
-            // it, the first client is resampled to the rate it runs at.
-            if self.clients.is_empty() && !self.follower {
+            if self.clients.is_empty() {
                 self.base = self.nearest(rate);
             }
             self.clients.push(Active { id, rate });
@@ -128,23 +122,9 @@ impl RatePolicy {
         }
     }
 
-    /// The analog input has signal. It is a follower, not a client: it runs
-    /// at whatever rate the output does and has no rate of its own, so no
-    /// settle ever goes to it or is held off by it. With no client left it
-    /// counts as none, and the card keeps its rate. It does one thing: a
-    /// client that arrives while it plays and no other client does is
-    /// resampled to the running rate rather than moving the card.
-    pub fn follower_started(&mut self) {
-        self.follower = true;
-    }
-
-    /// The analog input has no signal any more. As when a client stops, the
-    /// output goes after the settle time to the oldest client's rate if no
-    /// client is at the output rate.
-    pub fn follower_stopped(&mut self, now: Duration) {
-        if std::mem::take(&mut self.follower) && self.settle_target().is_some() {
-            self.switch_at.get_or_insert(now + SETTLE);
-        }
+    /// The rate a client is active at, if it is.
+    pub fn client_rate(&self, id: ClientId) -> Option<u32> {
+        self.rate_of(id)
     }
 
     /// The client's stream is DoP. The output runs at its rate until it stops.
@@ -492,50 +472,6 @@ mod tests {
         p.client_started(2, 176400, T0);
         p.dop_started(2);
         assert_eq!(p.current(), 48000);
-    }
-
-    #[test]
-    fn a_follower_never_sets_a_rate_and_a_player_arriving_is_resampled() {
-        let mut p = policy();
-        p.follower_started();
-        p.client_started(1, 44100, T0);
-        p.tick(T0 + ms(5000));
-        assert_eq!(p.current(), 48000);
-        assert!(p.needs_resampling(1));
-        // Once it goes quiet, the player takes the rate after the settle.
-        p.follower_stopped(T0 + ms(6000));
-        p.tick(T0 + ms(6499));
-        assert_eq!(p.current(), 48000);
-        p.tick(T0 + ms(6500));
-        assert_eq!(p.current(), 44100);
-    }
-
-    #[test]
-    fn a_follower_holds_no_rate_against_a_remaining_player() {
-        let mut p = policy();
-        p.client_started(1, 48000, T0);
-        p.follower_started();
-        p.client_started(2, 96000, T0);
-        p.client_stopped(1, T0);
-        p.tick(T0 + ms(500));
-        assert_eq!(p.current(), 96000);
-    }
-
-    #[test]
-    fn with_only_the_follower_left_the_card_keeps_a_dop_rate_whatever_the_timing() {
-        for gap in [200, 800] {
-            let mut p = policy();
-            p.client_started(1, 48000, T0);
-            p.follower_started();
-            p.client_started(2, 192000, T0);
-            p.dop_started(2);
-            // The 48 kHz player leaves during DoP, then DoP ends.
-            p.client_stopped(1, T0 + ms(1000));
-            p.tick(T0 + ms(1000 + gap));
-            p.client_stopped(2, T0 + ms(1000 + gap));
-            p.tick(T0 + ms(10_000));
-            assert_eq!(p.current(), 192000, "{gap}");
-        }
     }
 
     #[test]
