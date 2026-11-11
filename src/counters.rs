@@ -11,10 +11,13 @@ pub struct Counters {
     pub worst_gap_ns: AtomicU64,
     pub worst_cycle_ns: AtomicU64,
     pub cycles: AtomicU64,
-    /// Frames held back a cycle because they might be DoP, each time it left
-    /// a gap in a running stream. They play later. A client that keeps less
-    /// than a period and 16 frames in its ring can cause this with PCM whose
-    /// last frame looks like a marker.
+    /// Frames held back a cycle because they might be DoP, counted in every
+    /// cycle that holds them in a stream under way. They play later. A
+    /// client that keeps less than a period and 16 frames in its ring can
+    /// cause this with PCM whose last frame looks like a marker. Usually
+    /// the hold leaves a gap in the stream. A resampled source that holds
+    /// such frames while it waits for the rest of a block is counted too,
+    /// though its gap comes from the wait.
     pub held_frames: AtomicU64,
     /// The latest wake-up gap longer than the buffer, and when it ended on
     /// CLOCK_MONOTONIC, so that it can be matched to other events.

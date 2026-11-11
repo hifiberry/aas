@@ -72,8 +72,21 @@ not this one is kept as `/etc/asound.conf.before-aas`. After that:
 
 The daemon reads `/etc/aas/aas.toml` if it exists. Every key is optional.
 Without the file the daemon finds the card itself and picks the latency for the
-board. The keys are in `src/config.rs`. The volume is kept in
-`/var/lib/aas/state.toml`.
+board. An unknown key or a bad value stops the daemon with an error. The volume
+is kept in `/var/lib/aas/state.toml`.
+
+| Key | Values | Default | Meaning |
+|---|---|---|---|
+| `latency_ms` | a number above 0 | 4 on a Pi 5 or CM5, 12 elsewhere | Target for the latency of the card's buffer. The period is the largest power of two that keeps two periods within it. |
+| `card` | an ALSA card id or index | the first card that is not `Loopback`, `Headphones` or HDMI | The card to play to. |
+| `format` | `"f32"`, `"f64"`, `"i32"` | `"f32"` | The arithmetic used to mix and to apply volume. |
+| `resampling` | `"high"`, `"medium"` | `"high"` | Quality of the resampler for a client at another rate than the output. |
+| `bit_perfect` | `"auto"`, `"forced"`, `"off"` | `"auto"` | `auto` copies the samples untouched while one client plays at the output rate with no software volume. `forced` also ignores the software volume. `off` always mixes. |
+| `idle` | `"off"`, `"zeros"` | `"off"` | What the output does when nothing plays: close the card after a delay, or keep it open and send zeros. |
+| `idle_delay_s` | whole seconds | 60 | The delay before `idle = "off"` closes the card. An error with `idle = "zeros"`. |
+| `volume_mode` | `"hardware"`, `"software"` | the card's control if it has one | Who applies the volume: the card's mixer, or the daemon. `hardware` on a card without a control warns and uses software. |
+| `volume_control` | a mixer control name | the first of `Digital`, `Master`, `PCM` | The card's control that carries the volume. |
+| `default_rate` | 8000 to 384000 | 48000 | The rate the output opens at before the first client plays. |
 
 ### After a daemon restart
 

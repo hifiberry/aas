@@ -243,8 +243,10 @@ costs 1.35 to 1.7 times as much in `f64` as in `f32`.
 
 - Mixing sums in a 64-bit accumulator and saturates once at the end, so a sum that
   briefly goes over full scale in the middle of the mix does not clip *(call)*.
-- Volume multiplies in 64 bits and rounds once per stage *(call)*. The rounding
-  error is near -194 dBFS, far below the noise of any DAC.
+- Volume multiplies in 64 bits and rounds once per stage *(call)*. An exact half
+  rounds away from zero, as in the float formats, so the negative of a signal
+  gives the negative of the result. The rounding error is near -194 dBFS, far
+  below the noise of any DAC.
 - It has no headroom between stages, unlike float. A stage that goes over full
   scale clips there.
 - The resampler only works on float, so a resampled client is resampled in `f32`
@@ -333,7 +335,9 @@ turns it into loud noise. While a DoP stream plays:
 How a DoP stream ends and what fills its gaps:
 
 - A DoP stream that underruns keeps the output for 100 ms and sends DoP silence:
-  the markers are kept and the payload is `0x69`. Then it releases the output.
+  the markers are kept and the payload is `0x69`. Then it releases the output
+  and counts as stopped, so the rate rules apply again as if it had. Its next
+  frames start it anew, behind any DoP stream that started meanwhile.
   Stopping or disconnecting releases it at once. So a stalled DoP client costs
   other clients at most 100 ms of audio.
 - A short DoP period is padded with DoP silence, not zeros. Zeros drop the
@@ -569,9 +573,16 @@ All of this is *(call)*:
   open must be restarted.
 - If the card is missing at startup, the daemon keeps running and waits for it.
   Meanwhile audio goes to a timed null sink, so players keep running in real
-  time rather than hanging, and the daemon retries the card every second
-  *(call)*.
+  time rather than hanging, and the daemon looks for the card every second
+  *(call)*. The control thread does the looking. The audio thread opens the
+  card once it is there, and does nothing for it before.
 - After an xrun on the card, the daemon recovers without client involvement.
+- The daemon locks each client's ring in memory, so that the audio thread never
+  waits for a page. A ring is at most 8 MiB, for the largest buffer a client may
+  ask for, and the control thread adds one page for its view of the header.
+  There is no bound over all clients, and the unit sets `LimitMEMLOCK=infinity`.
+  This follows the rule that no client is refused: many clients with large
+  buffers cost memory that cannot be swapped, not a refusal.
 
 ## Bluetooth
 

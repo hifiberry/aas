@@ -8,7 +8,7 @@ use crate::counters::Counters;
 use crate::engine::Engine;
 use crate::format::{F32, F64, I32, Processing};
 use crate::rt;
-use crate::sink::{CardWatch, FallbackSink, RatesWatch, Sink};
+use crate::sink::{CardSearch, CardWatch, FallbackSink, RETRY, RatesWatch, Sink};
 use crate::volume::{OpenVolume, OutputVolume};
 use aas_client::client::socket_address;
 use aas_client::proto::{self, REQUEST_LEN, Reply};
@@ -30,6 +30,9 @@ use std::time::{Duration, Instant};
 const TICK_MS: i32 = 50;
 /// How long the audio thread waits for a command while the output is closed.
 const PARK: Duration = Duration::from_millis(100);
+/// How long the listener is left alone after an accept that failed for
+/// want of a descriptor or memory.
+const ACCEPT_PAUSE: Duration = Duration::from_millis(250);
 const COMMAND_SLOTS: usize = 4096;
 const EVENT_SLOTS: usize = 1024;
 
@@ -41,29 +44,54 @@ fn check(rc: isize) -> io::Result<usize> {
     }
 }
 
-/// Runs the daemon until `shutdown` is set. The sink is wrapped in a
-/// `FallbackSink`, so a missing card does not stop playback. The output
-/// volume is kept in the file `state`. It is set on the control that
-/// `hardware` opens, if given and found, else in software. `hardware` is
-/// called again each time the card goes or comes back.
+/// Says whether the card the sink plays to is present. Called on the
+/// control thread, once a second while the sink is gone.
+pub type CardProbe = Box<dyn FnMut() -> bool + Send>;
+
+/// Runs the daemon as `run_probing` does, with no probe for the card: the
+/// audio thread then tries a sink that is gone every second by itself.
 pub fn run(
     config: Config,
     sink: Box<dyn Sink>,
     socket: &Path,
     state: &Path,
+    hardware: Option<OpenVolume>,
+    shutdown: Arc<AtomicBool>,
+) -> Result<(), String> {
+    run_probing(config, sink, socket, state, hardware, None, shutdown)
+}
+
+/// Runs the daemon until `shutdown` is set. The sink is wrapped in a
+/// `FallbackSink`, so a missing card does not stop playback. The output
+/// volume is kept in the file `state`. It is set on the control that
+/// `hardware` opens, if given and found, else in software. `hardware` is
+/// called again each time the card goes or comes back.
+///
+/// With a `probe`, the control thread looks for a card that is gone and
+/// has the audio thread try the sink only once the card is there. So the
+/// audio thread neither reads the list of cards nor allocates while it
+/// waits for one.
+pub fn run_probing(
+    config: Config,
+    sink: Box<dyn Sink>,
+    socket: &Path,
+    state: &Path,
     mut hardware: Option<OpenVolume>,
+    probe: Option<CardProbe>,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), String> {
     raise_file_limit();
     let latency_ms = config
         .latency_ms
         .unwrap_or_else(|| board::detect().default_latency_ms());
-    let listener = listen(socket).map_err(|e| format!("{}: {e}", socket.display()))?;
+    // Before the socket, so that a failure here leaves no socket file.
     let notify = eventfd().map_err(|e| format!("eventfd: {e}"))?;
+    let listener = listen(socket).map_err(|e| format!("{}: {e}", socket.display()))?;
     let supported = sink.supported_rates();
     let mut sink = FallbackSink::new(sink);
     let rates = sink.rates_watch();
     let card = sink.card_watch();
+    let search = probe.map(|probe| (sink.card_search(), probe));
     let (commands, command_queue) = RingBuffer::new(COMMAND_SLOTS);
     let (event_queue, events) = RingBuffer::new(EVENT_SLOTS);
     let counters = Arc::new(Counters::default());
@@ -88,7 +116,11 @@ pub fn run(
             spawned.spawn(move || audio_loop(engine, wake))
         }
     }
-    .map_err(|e| format!("audio thread: {e}"))?;
+    .map_err(|e| {
+        // Nobody will listen on the socket, so it must not stay behind.
+        let _ = fs::remove_file(socket);
+        format!("audio thread: {e}")
+    })?;
     let mut control = Control::new(
         &config,
         latency_ms,
@@ -107,8 +139,12 @@ pub fn run(
         conns: BTreeMap::new(),
         notices: BTreeMap::new(),
         next_conn: 1,
+        accept_after: None,
+        accept_short: false,
         rates,
         card,
+        search,
+        probe_wait: ProbeWait::default(),
         hardware,
     };
     server.control.start(Instant::now());
@@ -183,10 +219,20 @@ struct Server {
     /// The latest volume notification each subscriber has waiting.
     notices: BTreeMap<ConnId, Reply>,
     next_conn: ConnId,
+    /// Set while the listener is not polled, after an accept that could not
+    /// get a descriptor. The connection stays queued, so the listener would
+    /// stay readable and the poll would return at once, over and over.
+    accept_after: Option<Instant>,
+    /// Accepting is failing for want of a descriptor, and that is logged.
+    accept_short: bool,
     /// The card's rates, when they change.
     rates: RatesWatch,
     /// When the card comes back.
     card: CardWatch,
+    /// Looks for a card that is gone, and has the audio thread try it.
+    search: Option<(CardSearch, CardProbe)>,
+    /// When to look for the card next.
+    probe_wait: ProbeWait,
     /// Opens the card's volume control, unless the volume is in software
     /// by config.
     hardware: Option<OpenVolume>,
@@ -200,10 +246,15 @@ impl Server {
             events: libc::POLLIN,
             revents: 0,
         };
-        let mut fds = vec![
-            poll_in(self.listener.as_raw_fd()),
-            poll_in(self.notify.as_raw_fd()),
-        ];
+        if self.accept_after.is_some_and(|at| Instant::now() >= at) {
+            self.accept_after = None;
+        }
+        // poll skips a negative descriptor.
+        let listener = match self.accept_after {
+            Some(_) => -1,
+            None => self.listener.as_raw_fd(),
+        };
+        let mut fds = vec![poll_in(listener), poll_in(self.notify.as_raw_fd())];
         let ids: Vec<ConnId> = self.conns.keys().copied().collect();
         fds.extend(self.conns.values().map(|fd| poll_in(fd.as_raw_fd())));
         // SAFETY: fds is a valid array of its length.
@@ -221,6 +272,13 @@ impl Server {
         if self.card.changed() {
             if let Some(open) = &mut self.hardware {
                 self.control.card_changed(open());
+            }
+        }
+        // After the card change above: the mixer of a card that has just
+        // gone is closed by now, so the card is no longer listed for that.
+        if let Some((search, probe)) = &mut self.search {
+            if self.probe_wait.due(search.is_gone(), now) && probe() {
+                search.retry();
             }
         }
         if fds[1].revents != 0 {
@@ -249,14 +307,16 @@ impl Server {
     /// read everything sent to it before. So notifications never fill its
     /// socket, its replies always fit, and a subscriber that has not read
     /// for a while still gets the current volume. What cannot be sent now
-    /// is tried again at the next step, within the tick.
+    /// is tried again at the next step, within the tick. If the socket
+    /// cannot tell what is unread, the notice is sent rather than kept for
+    /// good.
     fn notify(&mut self) {
         self.notices.extend(self.control.take_notices());
         self.notices.retain(|conn, notice| {
             let Some(fd) = self.conns.get(conn) else {
                 return false;
             };
-            if unread_bytes(fd) != Some(0) {
+            if !notice_is_due(fd) {
                 return true;
             }
             // A connection that has gone is closed by the next poll.
@@ -278,12 +338,22 @@ impl Server {
             };
             if raw < 0 {
                 let e = io::Error::last_os_error();
-                if e.kind() != io::ErrorKind::WouldBlock {
+                if accept_must_pause(&e) {
+                    // Logged once, not at every pause until it passes.
+                    if !std::mem::replace(&mut self.accept_short, true) {
+                        let ms = ACCEPT_PAUSE.as_millis();
+                        eprintln!("aas: accept: {e}, trying every {ms} ms until it works");
+                    }
+                    self.accept_after = Some(Instant::now() + ACCEPT_PAUSE);
+                } else if e.kind() != io::ErrorKind::WouldBlock {
                     eprintln!("aas: accept: {e}");
                 }
                 return;
             }
             let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+            if std::mem::take(&mut self.accept_short) {
+                eprintln!("aas: accepting clients again");
+            }
             let conn = self.next_conn;
             self.next_conn += 1;
             let name = peer_name(&fd);
@@ -409,6 +479,52 @@ fn unread_bytes(fd: &OwnedFd) -> Option<usize> {
     (rc == 0).then_some(queued as usize)
 }
 
+/// When to look for a card that is gone: a second after it went, and
+/// every second from then. Never at once, since a card that has just gone
+/// can still be listed, and a try that is bound to fail costs the audio
+/// thread an open.
+#[derive(Default)]
+struct ProbeWait {
+    /// When to look next. None while the card is not gone.
+    at: Option<Instant>,
+}
+
+impl ProbeWait {
+    /// Whether to look now. `gone` is what the sink says in this step.
+    fn due(&mut self, gone: bool, now: Instant) -> bool {
+        if !gone {
+            self.at = None;
+            return false;
+        }
+        match self.at {
+            Some(at) if now >= at => {
+                self.at = Some(now + RETRY);
+                true
+            }
+            Some(_) => false,
+            None => {
+                self.at = Some(now + RETRY);
+                false
+            }
+        }
+    }
+}
+
+/// Whether an accept failed for want of a descriptor or memory. The
+/// connection is still queued then, and trying again at once cannot help.
+fn accept_must_pause(e: &io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM)
+    )
+}
+
+/// Whether a subscriber's notice can go out now: it has read everything
+/// sent before, or the socket cannot tell.
+fn notice_is_due(fd: &OwnedFd) -> bool {
+    !matches!(unread_bytes(fd), Some(unread) if unread > 0)
+}
+
 /// The client's process name, from its credentials, for the log.
 fn peer_name(fd: &OwnedFd) -> String {
     // SAFETY: an all-zero ucred is valid, and getsockopt fills at most len.
@@ -505,5 +621,69 @@ fn raise_file_limit() {
     {
         limit.rlim_cur = limit.rlim_max;
         unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn socket_pair() -> (OwnedFd, OwnedFd) {
+        let mut fds = [0; 2];
+        let kind = libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC;
+        // SAFETY: fds has room for the two descriptors.
+        let rc = unsafe { libc::socketpair(libc::AF_UNIX, kind, 0, fds.as_mut_ptr()) };
+        assert_eq!(rc, 0);
+        unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) }
+    }
+
+    #[test]
+    fn a_notice_waits_until_the_subscriber_has_read_what_was_sent() {
+        let (ours, theirs) = socket_pair();
+        assert!(notice_is_due(&ours));
+        send_reply(&ours, &Reply::Ok, &[]).unwrap();
+        assert!(!notice_is_due(&ours));
+        let mut buf = [0u8; 64];
+        // SAFETY: the buffer is valid for its length.
+        let n = unsafe { libc::recv(theirs.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0) };
+        assert!(n > 0);
+        assert!(notice_is_due(&ours));
+    }
+
+    #[test]
+    fn a_notice_is_sent_when_the_unread_bytes_cannot_be_told() {
+        // The ioctl fails on a descriptor that is no socket.
+        let file = OwnedFd::from(fs::File::open("/dev/null").unwrap());
+        assert_eq!(unread_bytes(&file), None);
+        assert!(notice_is_due(&file));
+    }
+
+    #[test]
+    fn a_gone_card_is_looked_for_a_second_after_it_went_and_each_second_after() {
+        let mut wait = ProbeWait::default();
+        let t = Instant::now();
+        let ms = Duration::from_millis;
+        assert!(!wait.due(false, t));
+        // Just gone: not yet.
+        assert!(!wait.due(true, t + ms(50)));
+        assert!(!wait.due(true, t + ms(1000)));
+        assert!(wait.due(true, t + ms(1050)));
+        assert!(!wait.due(true, t + ms(1100)));
+        assert!(wait.due(true, t + ms(2050)));
+        // Back and gone again: the second starts anew.
+        assert!(!wait.due(false, t + ms(2100)));
+        assert!(!wait.due(true, t + ms(4000)));
+        assert!(!wait.due(true, t + ms(4900)));
+        assert!(wait.due(true, t + ms(5000)));
+    }
+
+    #[test]
+    fn only_running_out_of_descriptors_or_memory_pauses_accepting() {
+        for errno in [libc::EMFILE, libc::ENFILE, libc::ENOBUFS, libc::ENOMEM] {
+            assert!(accept_must_pause(&io::Error::from_raw_os_error(errno)));
+        }
+        for errno in [libc::EAGAIN, libc::ECONNABORTED, libc::EINTR] {
+            assert!(!accept_must_pause(&io::Error::from_raw_os_error(errno)));
+        }
     }
 }

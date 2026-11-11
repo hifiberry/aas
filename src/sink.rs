@@ -1,14 +1,14 @@
 //! Where the engine's output goes.
 
 use rtrb::{Consumer, Producer, RingBuffer};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use crate::latency::PERIODS;
 
-/// How often `FallbackSink` tries the real sink again.
-const RETRY: Duration = Duration::from_secs(1);
+/// How often the real sink is tried again, or looked for, while it is gone.
+pub const RETRY: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SinkError {
@@ -34,6 +34,14 @@ pub trait Sink: Send {
     fn delay_frames(&self) -> u32;
     /// Rates the device takes. Empty means any.
     fn supported_rates(&self) -> Vec<u32>;
+    /// True once after a `write` that moved to another device, such as
+    /// from no card to a card that is back. Opening it took that write
+    /// far longer than the buffer lasts, with nothing audible at stake, so
+    /// the engine does not count the time to the next cycle as a late
+    /// wake-up.
+    fn switched(&mut self) -> bool {
+        false
+    }
 }
 
 impl Sink for Box<dyn Sink> {
@@ -59,6 +67,10 @@ impl Sink for Box<dyn Sink> {
 
     fn supported_rates(&self) -> Vec<u32> {
         (**self).supported_rates()
+    }
+
+    fn switched(&mut self) -> bool {
+        (**self).switched()
     }
 }
 
@@ -307,9 +319,36 @@ impl CardWatch {
     }
 }
 
+/// The control thread's side of the search for a card that is gone. The
+/// control thread looks for the card, which reads a file and allocates,
+/// and tells the audio thread to try the sink once it is there. The audio
+/// thread only reads a flag meanwhile.
+pub struct CardSearch {
+    gone: Arc<AtomicBool>,
+    retry: Arc<AtomicBool>,
+}
+
+impl CardSearch {
+    /// Whether the output is meant to play and the real sink is gone.
+    pub fn is_gone(&self) -> bool {
+        self.gone.load(Ordering::Acquire)
+    }
+
+    /// Has the audio thread try the real sink at its next write.
+    pub fn retry(&self) {
+        self.retry.store(true, Ordering::Release);
+    }
+}
+
 /// Keeps the engine running while the real sink is gone. It writes to a
-/// `NullSink` meanwhile and retries the real one every second. Only an xrun
-/// gets through to the engine.
+/// `NullSink` meanwhile and tries the real one again: when the control
+/// thread says so through a `CardSearch`, or every second by itself if
+/// nobody holds one. Only an xrun gets through to the engine.
+///
+/// A try opens the sink, which may allocate and read files. By itself the
+/// audio thread would do that once a second for as long as the card is
+/// gone. With a `CardSearch` it does so only once the card has been seen,
+/// as for any other open.
 ///
 /// A card can report other rates once it is found, so after each try the
 /// rates are compared with the last known ones, and a change is published
@@ -324,11 +363,23 @@ pub struct FallbackSink {
     format: (u32, u32),
     /// True while `inner` is open and working.
     live: bool,
+    /// A `write` has just gone back to `inner`, until the engine asks.
+    switched: bool,
+    /// `inner` was open and working when it was last closed. If it cannot
+    /// be opened after that, the card went while the output was closed.
+    closed_live: bool,
     /// Counts the times `inner` went from closed or gone to open, and from
-    /// open to gone. A card that is back may be a new instance, its mixer at
-    /// its own default. A card that is gone may wait to be removed until
-    /// every handle on it is closed, the mixer's too.
+    /// open to gone, which includes an open that fails after it was closed
+    /// while it worked. A card that is back may be a new instance, its
+    /// mixer at its own default. A card that is gone may wait to be removed
+    /// until every handle on it is closed, the mixer's too.
     changes: Arc<AtomicU64>,
+    /// The output is open for the engine and `inner` is not.
+    gone: Arc<AtomicBool>,
+    /// Set by the control thread to ask for a try.
+    retry_now: Arc<AtomicBool>,
+    /// A `CardSearch` was handed out, so retries come from there.
+    searched: bool,
     retry_at: Instant,
     retry: Duration,
 }
@@ -342,7 +393,12 @@ impl FallbackSink {
             null: NullSink::default(),
             format: (0, 0),
             live: false,
+            switched: false,
+            closed_live: false,
             changes: Arc::default(),
+            gone: Arc::default(),
+            retry_now: Arc::default(),
+            searched: false,
             retry_at: Instant::now(),
             retry: RETRY,
         }
@@ -364,15 +420,43 @@ impl FallbackSink {
         }
     }
 
+    /// Hands the search for a card that is gone to the control thread. From
+    /// now on the inner sink is retried only when the `CardSearch` says so.
+    pub fn card_search(&mut self) -> CardSearch {
+        self.searched = true;
+        CardSearch {
+            gone: self.gone.clone(),
+            retry: self.retry_now.clone(),
+        }
+    }
+
+    /// Whether to try the inner sink again now.
+    fn retry_due(&mut self) -> bool {
+        if self.searched {
+            self.retry_now.swap(false, Ordering::AcqRel)
+        } else {
+            Instant::now() >= self.retry_at
+        }
+    }
+
     /// Opens the inner sink. This only happens on a reopen or a retry, so
     /// it may allocate.
     fn try_inner(&mut self) {
         let (rate, period) = self.format;
+        // The control thread holds the card's mixer open while the output
+        // is closed, and must let go of a card that went meanwhile.
         let was_live = self.live;
+        let closed_live = std::mem::take(&mut self.closed_live);
         self.live = self.inner.open(rate, period).is_ok();
-        if self.live && !was_live {
+        let changed = if self.live {
+            !was_live
+        } else {
+            was_live || closed_live
+        };
+        if changed {
             self.changes.fetch_add(1, Ordering::Release);
         }
+        self.gone.store(!self.live, Ordering::Release);
         self.retry_at = Instant::now() + self.retry;
         let rates = self.inner.supported_rates();
         if rates == self.rates {
@@ -394,6 +478,10 @@ impl FallbackSink {
     fn lost(&mut self) {
         self.inner.close();
         self.live = false;
+        // A retry asked for while the sink still worked is about a loss
+        // before this one.
+        self.retry_now.store(false, Ordering::Release);
+        self.gone.store(true, Ordering::Release);
         self.retry_at = Instant::now() + self.retry;
         self.changes.fetch_add(1, Ordering::Release);
     }
@@ -403,6 +491,8 @@ impl Sink for FallbackSink {
     fn open(&mut self, rate: u32, period: u32) -> Result<(), SinkError> {
         self.format = (rate, period);
         self.null.open(rate, period)?;
+        // This open is a try of its own. One asked for before it is stale.
+        self.retry_now.store(false, Ordering::Release);
         self.try_inner();
         Ok(())
     }
@@ -418,8 +508,9 @@ impl Sink for FallbackSink {
     }
 
     fn write(&mut self, frames: &[[i32; 2]]) -> Result<(), SinkError> {
-        if !self.live && Instant::now() >= self.retry_at {
+        if !self.live && self.retry_due() {
             self.try_inner();
+            self.switched = self.live;
         }
         if self.live {
             match self.inner.write(frames) {
@@ -434,7 +525,9 @@ impl Sink for FallbackSink {
         if self.live {
             self.inner.close();
             self.live = false;
+            self.closed_live = true;
         }
+        self.gone.store(false, Ordering::Release);
     }
 
     fn delay_frames(&self) -> u32 {
@@ -447,6 +540,10 @@ impl Sink for FallbackSink {
 
     fn supported_rates(&self) -> Vec<u32> {
         self.inner.supported_rates()
+    }
+
+    fn switched(&mut self) -> bool {
+        std::mem::take(&mut self.switched)
     }
 }
 
@@ -612,6 +709,95 @@ mod tests {
     }
 
     #[test]
+    fn fallback_says_once_that_a_write_went_back_to_the_inner_sink() {
+        let (mut sink, log) = fallback(Duration::ZERO);
+        sink.open(48000, 48).unwrap();
+        // Opened by the engine, not inside a write.
+        assert!(!sink.switched());
+        log.fail(Some(SinkError::Gone));
+        sink.write(&[[1; 2]; 48]).unwrap();
+        sink.write(&[[1; 2]; 48]).unwrap();
+        assert!(!sink.switched());
+        log.fail(None);
+        sink.write(&[[2; 2]; 48]).unwrap();
+        assert!(sink.switched());
+        assert!(!sink.switched());
+        sink.write(&[[2; 2]; 48]).unwrap();
+        assert!(!sink.switched());
+    }
+
+    #[test]
+    fn a_searched_fallback_retries_only_when_told() {
+        // No wait between retries, so a retry by the clock would come at
+        // every write.
+        let (mut sink, log) = fallback(Duration::ZERO);
+        let search = sink.card_search();
+        assert!(!search.is_gone());
+        log.fail(Some(SinkError::Gone));
+        sink.open(48000, 48).unwrap();
+        assert!(search.is_gone());
+        log.fail(None);
+        for _ in 0..3 {
+            sink.write(&[[1; 2]; 48]).unwrap();
+        }
+        assert!(log.opens().is_empty());
+        search.retry();
+        sink.write(&[[2; 2]; 48]).unwrap();
+        assert_eq!(log.frames(), [[2; 2]; 48]);
+        assert!(!search.is_gone());
+        // A retry that fails is asked for again, not repeated by itself.
+        log.fail(Some(SinkError::Gone));
+        sink.write(&[[3; 2]; 48]).unwrap();
+        assert!(search.is_gone());
+        search.retry();
+        sink.write(&[[3; 2]; 48]).unwrap();
+        log.fail(None);
+        sink.write(&[[3; 2]; 48]).unwrap();
+        assert_eq!(log.opens().len(), 1);
+        assert!(search.is_gone());
+        // A closed output is not looked for.
+        sink.close();
+        assert!(!search.is_gone());
+    }
+
+    #[test]
+    fn a_retry_asked_for_while_the_sink_worked_is_not_kept_for_the_next_loss() {
+        let (mut sink, log) = fallback(Duration::ZERO);
+        let search = sink.card_search();
+        sink.open(48000, 48).unwrap();
+        // The control thread saw the sink gone a moment ago and asks late.
+        search.retry();
+        sink.write(&[[1; 2]; 48]).unwrap();
+        log.fail(Some(SinkError::Gone));
+        sink.write(&[[1; 2]; 48]).unwrap();
+        assert!(search.is_gone());
+        // Nobody has seen the card since it went, so it is not tried, even
+        // though it would open.
+        log.fail(None);
+        sink.write(&[[2; 2]; 48]).unwrap();
+        assert_eq!(log.opens().len(), 1);
+        assert!(search.is_gone());
+    }
+
+    #[test]
+    fn a_searched_fallback_does_not_allocate_while_the_card_is_gone() {
+        let (mut sink, log) = fallback(Duration::ZERO);
+        let _search = sink.card_search();
+        let _rates = sink.rates_watch();
+        // A try would copy these, which allocates.
+        log.set_rates(vec![44100, 48000]);
+        log.fail(Some(SinkError::Gone));
+        sink.open(48000, 48).unwrap();
+        let frames = [[0; 2]; 48];
+        assert_no_alloc::assert_no_alloc(|| {
+            for _ in 0..3 {
+                sink.wait_room().unwrap();
+                sink.write(&frames).unwrap();
+            }
+        });
+    }
+
+    #[test]
     fn fallback_publishes_the_rates_of_a_sink_that_appears() {
         let (mut sink, log) = fallback(Duration::ZERO);
         let mut watch = sink.rates_watch();
@@ -666,6 +852,41 @@ mod tests {
         sink.close();
         assert!(!watch.changed());
         sink.open(48000, 48).unwrap();
+        assert!(watch.changed());
+    }
+
+    #[test]
+    fn the_card_watch_sees_a_card_lost_while_the_output_was_closed() {
+        let (mut sink, log) = fallback(Duration::ZERO);
+        let mut watch = sink.card_watch();
+        sink.open(48000, 48).unwrap();
+        assert!(watch.changed());
+        // Closed while idle. The card goes meanwhile, and nothing can tell.
+        sink.close();
+        log.fail(Some(SinkError::Gone));
+        assert!(!watch.changed());
+        // The next open finds it gone: the control thread must hear of it,
+        // to let go of the card's volume control.
+        sink.open(48000, 48).unwrap();
+        assert!(watch.changed());
+        // Further failed tries are no change.
+        sink.write(&[[0; 2]; 48]).unwrap();
+        sink.close();
+        sink.open(48000, 48).unwrap();
+        assert!(!watch.changed());
+        log.fail(None);
+        sink.write(&[[0; 2]; 48]).unwrap();
+        assert!(watch.changed());
+    }
+
+    #[test]
+    fn the_card_watch_sees_a_card_lost_at_a_reopen_while_it_played() {
+        let (mut sink, log) = fallback(Duration::ZERO);
+        let mut watch = sink.card_watch();
+        sink.open(48000, 48).unwrap();
+        assert!(watch.changed());
+        log.fail(Some(SinkError::Gone));
+        sink.open(44100, 48).unwrap();
         assert!(watch.changed());
     }
 
