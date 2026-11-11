@@ -273,6 +273,15 @@ pub fn mix_add<P: Processing>(samples: &[[i32; 2]], ramp: Ramp, acc: &mut [[P::A
 /// output of a plugin chain, without going through S32 and so without
 /// clipping it. The ramp spans all of `acc`.
 pub fn mix_add_acc<P: Processing>(values: &[[P::Acc; 2]], ramp: Ramp, acc: &mut [[P::Acc; 2]]) {
+    if ramp.from == ramp.to {
+        // The usual case, as in `mix_add`: one gain for the whole call.
+        let g = P::gain(ramp.from);
+        for (a, v) in acc.iter_mut().zip(values.iter()) {
+            P::accumulate_acc(&mut a[0], v[0], g);
+            P::accumulate_acc(&mut a[1], v[1], g);
+        }
+        return;
+    }
     let n = acc.len();
     for (i, (a, v)) in acc.iter_mut().zip(values.iter()).enumerate() {
         let g = P::gain(ramp.at(i, n));
