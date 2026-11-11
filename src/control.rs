@@ -193,6 +193,9 @@ pub struct Control {
     /// The rate and period the output was last told to open at. None while
     /// it is closed.
     output: Option<(u32, u32)>,
+    /// The audio thread has been told to open the output and has not yet
+    /// said that it did. Nothing plays meanwhile.
+    reopening: bool,
     /// A rate change that waits, so that a stop and a start close together
     /// do not change the rate twice.
     switch_at: Option<Instant>,
@@ -240,6 +243,7 @@ impl Control {
             table_capacity: INITIAL_SOURCES,
             table_len: 0,
             output: None,
+            reopening: false,
             switch_at: None,
             idle_since: None,
             dop_claims: Vec::new(),
@@ -779,6 +783,7 @@ impl Control {
         let period = period_frames(rate, self.latency_ms);
         eprintln!("aas: output at {rate} Hz, {period} frames per period");
         self.output = Some((rate, period));
+        self.reopening = true;
         self.switch_at = None;
         self.sync_resamplers(batch);
         batch.push(Command::Reconfigure { rate, period });
@@ -843,7 +848,7 @@ impl Control {
             match event {
                 // Freed here, not on the audio thread.
                 Event::Dropped(_) | Event::Replaced(_) | Event::OldTable(_) => {}
-                Event::Reconfigured => {}
+                Event::Reconfigured => self.reopening = false,
                 Event::DopStarted(id) => {
                     if !self.dop_claims.contains(&id) {
                         self.dop_claims.push(id);
@@ -863,22 +868,26 @@ impl Control {
     }
 
     /// Applies what is due by the clock: a settled rate change, the end of
-    /// a drain the audio thread never reported, and the idle timer.
+    /// a drain the audio thread never reported, and the idle timer. Such a
+    /// drain is not ended while the output is being opened.
     pub fn tick(&mut self, now: Instant) {
         let mut batch = Vec::new();
         let before = self.policy.current();
         self.policy.tick(now - self.epoch);
         let settled = self.policy.current() != before;
         let mut overdue = Vec::new();
+        let reopening = self.reopening;
         for stream in self.streams_mut() {
             if !stream.drain.is_some_and(|at| now >= at) {
                 continue;
             }
             // A drain that still makes progress is slow, not stuck: the
             // audio thread can fall behind real time when its cycles run
-            // long. It gets more time for as long as it takes frames.
+            // long. It gets more time for as long as it takes frames. So
+            // does one that waits for the card to open: its audio has not
+            // been played, and the time runs from when the card is open.
             let read = stream.view.header().read_pos.load(Ordering::Acquire);
-            if read != stream.drain_seen {
+            if read != stream.drain_seen || reopening {
                 stream.drain_seen = read;
                 stream.drain = Some(now + DRAIN_SPARE);
             } else {
@@ -896,6 +905,8 @@ impl Control {
             if self.output.is_some() && now >= since + delay {
                 eprintln!("aas: output off after {delay_s} s idle");
                 self.output = None;
+                // A close takes back an open the audio thread has not done.
+                self.reopening = false;
                 self.switch_at = None;
                 batch.push(Command::CloseOutput);
             }
@@ -991,10 +1002,13 @@ mod tests {
     }
 
     /// A control thread with one connection that has said hello, and the
-    /// audio thread's end of the command queue.
+    /// audio thread's end of the command queue. One `Reconfigured` waits in
+    /// the event queue, for a test to take with `handle_events` once it has
+    /// made the output open.
     fn hello() -> (Control, rtrb::Consumer<Command>, Instant) {
         let (commands, engine_commands) = rtrb::RingBuffer::new(64);
-        let (_engine_events, events) = rtrb::RingBuffer::new(64);
+        let (mut engine_events, events) = rtrb::RingBuffer::new(64);
+        assert!(engine_events.push(Event::Reconfigured).is_ok());
         let config = Config::default();
         let audio = std::thread::current();
         let mut control = Control::new(&config, 12.0, Vec::new(), commands, events, audio);
@@ -1151,6 +1165,8 @@ mod tests {
                 .reply
                 .is_none()
         );
+        // The output has opened.
+        control.handle_events(now);
         // The audio thread runs slower than real time but keeps taking
         // frames, well past the deadline set for the ring.
         let mut t = now;
@@ -1162,6 +1178,33 @@ mod tests {
         }
         // Once it stops taking frames the drain is answered after all.
         control.tick(t + Duration::from_millis(400));
+        control.tick(t + Duration::from_millis(1000));
+        assert_eq!(control.take_replies(), vec![(1, Reply::Ok)]);
+    }
+
+    #[test]
+    fn a_drain_is_not_answered_while_the_output_is_still_opening() {
+        let (mut control, mut commands, now) = hello();
+        let answer = control.request(1, Some(configure(48000, 4096)), now);
+        assert_eq!(answer.reply, Some(Reply::Configured));
+        let source = added(&mut commands);
+        source.ring.write(&[[1, 1]; 4096]);
+        let start = control.request(1, Some(Request::Start), now);
+        assert_eq!(start.reply, Some(Reply::Ok));
+        let drain = control.request(1, Some(Request::Drain), now);
+        assert!(drain.reply.is_none());
+        // The card takes long to open, so nothing is played, far past the
+        // time the ring lasts. The audio was not played, so no reply.
+        let mut t = now;
+        for _ in 0..20 {
+            t += Duration::from_millis(400);
+            control.tick(t);
+            assert!(control.take_replies().is_empty(), "answered unplayed");
+        }
+        // Once it is open, the last resort applies again from then.
+        control.handle_events(t);
+        control.tick(t + Duration::from_millis(400));
+        assert!(control.take_replies().is_empty());
         control.tick(t + Duration::from_millis(1000));
         assert_eq!(control.take_replies(), vec![(1, Reply::Ok)]);
     }
