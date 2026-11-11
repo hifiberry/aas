@@ -5,6 +5,13 @@
 # alsactl, cc and libasound2-dev, and for the mixer case mpd, mpc and
 # python3. Each case prints PASS or FAIL and its name. The exit status is
 # the number of cases that failed.
+#
+# With arguments, only the cases named run: sh dist/test-plugin.sh drain_returns
+#
+# On a board whose output is wired to its input, set AAS_TEST_CAPTURE to
+# the capture device, for example plughw:sndrpihifiberry. The format case
+# then plays a tone and checks what the input hears. Without it, the case
+# plays silence and checks only that each format plays.
 set -u
 # alsactl is in sbin.
 PATH=$PATH:/usr/sbin
@@ -51,6 +58,7 @@ cat >"$work/pcmtest.c" <<'EOF'
 #include <alsa/asoundlib.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -69,14 +77,14 @@ static double now(void)
 	return t.tv_sec + t.tv_nsec / 1e9;
 }
 
-static int setup(const char *device, int mode, int *can_pause)
+/* Sets the hardware parameters of the open PCM. */
+static int params(int *can_pause)
 {
 	snd_pcm_hw_params_t *hw;
 	int err;
 
 	snd_pcm_hw_params_alloca(&hw);
-	if ((err = snd_pcm_open(&pcm, device, SND_PCM_STREAM_PLAYBACK, mode)) < 0 ||
-	    (err = snd_pcm_hw_params_any(pcm, hw)) < 0 ||
+	if ((err = snd_pcm_hw_params_any(pcm, hw)) < 0 ||
 	    (err = snd_pcm_hw_params_set_access(pcm, hw, SND_PCM_ACCESS_RW_INTERLEAVED)) < 0 ||
 	    (err = snd_pcm_hw_params_set_format(pcm, hw, SND_PCM_FORMAT_S16_LE)) < 0 ||
 	    (err = snd_pcm_hw_params_set_channels(pcm, hw, 2)) < 0 ||
@@ -89,6 +97,17 @@ static int setup(const char *device, int mode, int *can_pause)
 	}
 	*can_pause = snd_pcm_hw_params_can_pause(hw);
 	return 0;
+}
+
+static int setup(const char *device, int mode, int *can_pause)
+{
+	int err = snd_pcm_open(&pcm, device, SND_PCM_STREAM_PLAYBACK, mode);
+
+	if (err < 0) {
+		printf("open: %s\n", snd_strerror(err));
+		return -1;
+	}
+	return params(can_pause);
 }
 
 /* Writes silence. Returns 0, or the error, which it prints. A
@@ -362,12 +381,112 @@ static int nonblock_drain_test(void)
 	return 0;
 }
 
+static int drain_result;
+static double drain_took;
+
+static void *drain_thread(void *arg)
+{
+	double t0 = now();
+
+	(void)arg;
+	drain_result = snd_pcm_drain(pcm);
+	drain_took = now() - t0;
+	return NULL;
+}
+
+/* A blocking drain in one thread does not hold up a drop from another:
+ * the drop returns at once, the drain returns with it, and the PCM plays
+ * on. The buffer holds a second, so the drain alone would take that long. */
+static int drop_during_drain_test(void)
+{
+	pthread_t thread;
+	double t0, drop_took, after;
+	snd_pcm_state_t state;
+	int err;
+
+	if (put(rate - period))
+		return 1;
+	if (pthread_create(&thread, NULL, drain_thread, NULL)) {
+		printf("no thread\n");
+		return 1;
+	}
+	usleep(200000);
+	state = snd_pcm_state(pcm);
+	t0 = now();
+	err = snd_pcm_drop(pcm);
+	drop_took = now() - t0;
+	pthread_join(thread, NULL);
+	if (state != SND_PCM_STATE_DRAINING || err < 0 || drain_result < 0) {
+		printf("state %s before the drop, drop gave %d, drain gave %d\n",
+		       snd_pcm_state_name(state), err, drain_result);
+		return 1;
+	}
+	t0 = now();
+	if (snd_pcm_prepare(pcm) < 0 || put(rate / 4) || snd_pcm_drain(pcm) < 0) {
+		printf("the PCM did not play on after the drop\n");
+		return 1;
+	}
+	after = now() - t0;
+	printf("drop took %.1f ms during a drain of %.0f ms, which returned after %.0f ms; "
+	       "250 ms more played in %.0f ms\n", drop_took * 1000,
+	       (rate - period) * 1000.0 / rate, drain_took * 1000, after * 1000);
+	return !(drop_took < 0.1 && drain_took < 0.4 && after > 0.2 && after < 0.6);
+}
+
+/* Mappings of a ring this process holds. */
+static int rings(void)
+{
+	char line[512];
+	int n = 0;
+	FILE *maps = fopen("/proc/self/maps", "r");
+
+	if (!maps)
+		return -1;
+	while (fgets(line, sizeof line, maps))
+		n += strstr(line, "aas-ring") != NULL;
+	fclose(maps);
+	return n;
+}
+
+/* hw_free gives the stream up, and the PCM can be set up again at another
+ * rate on the same handle. */
+static int hw_free_test(void)
+{
+	int before = rings(), after, again, err, can_pause;
+	double t0, took;
+
+	if (put(rate / 4) || snd_pcm_drop(pcm) < 0)
+		return 1;
+	if ((err = snd_pcm_hw_free(pcm)) < 0) {
+		printf("hw_free: %s\n", snd_strerror(err));
+		return 1;
+	}
+	after = rings();
+	rate = 44100;
+	if (params(&can_pause))
+		return 1;
+	again = rings();
+	t0 = now();
+	if (put(rate / 2) || (err = snd_pcm_drain(pcm)) < 0) {
+		printf("no playback after the second hw_params\n");
+		return 1;
+	}
+	took = now() - t0;
+	printf("%d ring mapped before hw_free, %d after, %d after hw_params at %u Hz; "
+	       "500 ms played in %.0f ms\n", before, after, again, rate, took * 1000);
+	return !(before == 1 && after == 0 && again == 1 && took > 0.45 && took < 0.8);
+}
+
 int main(int argc, char **argv)
 {
 	int can_pause = 0, mode = 0, spare = -1;
 
 	if (argc != 3)
 		return 2;
+	if (!strcmp(argv[1], "dropdrain")) {
+		period = 4096;
+		buffer = rate;
+	}
 	if (!strcmp(argv[1], "nonblock"))
 		mode = SND_PCM_NONBLOCK;
 	/* Held while the PCM is set up, freed before it is set up again. */
@@ -379,6 +498,10 @@ int main(int argc, char **argv)
 		return stable_test(spare);
 	if (!strcmp(argv[1], "nonblock"))
 		return nonblock_drain_test();
+	if (!strcmp(argv[1], "dropdrain"))
+		return drop_during_drain_test();
+	if (!strcmp(argv[1], "hwfree"))
+		return hw_free_test();
 	if (!strcmp(argv[1], "pause")) {
 		if (!can_pause) {
 			printf("the PCM cannot pause\n");
@@ -393,7 +516,7 @@ int main(int argc, char **argv)
 	return 2;
 }
 EOF
-if ! cc -O2 -o "$work/pcmtest" "$work/pcmtest.c" -lasound; then
+if ! cc -O2 -pthread -o "$work/pcmtest" "$work/pcmtest.c" -lasound; then
 	echo "FAIL setup: cannot build the helper"
 	exit 1
 fi
@@ -444,6 +567,126 @@ if ! cc -O2 -o "$work/ctlwatch" "$work/ctlwatch.c" -lasound; then
 	echo "FAIL setup: cannot build the control helper"
 	exit 1
 fi
+
+# A helper for the tone the format case plays and hears. `gen` writes one
+# second of a 1 kHz sine at -20 dBFS, at 48 kHz, in the format and channel
+# count given. `hear` reads a recording, S32_LE stereo at 48 kHz, and
+# prints for each channel the tone's level in dBFS, the share of the
+# signal's power that is the tone, and for how many tenths of a second the
+# tone was there.
+cat >"$work/tone.c" <<'EOF'
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define RATE 48000
+#define FREQ 1000.0
+#define BLOCK (RATE / 10)
+#define MAX_BLOCKS 64
+
+static int by_value(const void *a, const void *b)
+{
+	double x = *(const double *)a, y = *(const double *)b;
+	return (x > y) - (x < y);
+}
+
+static double median(double *v, int n)
+{
+	qsort(v, n, sizeof *v, by_value);
+	return v[n / 2];
+}
+
+static int gen(const char *format, int channels)
+{
+	for (int i = 0; i < RATE; i++) {
+		double x = 0.1 * sin(2 * M_PI * FREQ * i / RATE);
+		for (int c = 0; c < channels; c++) {
+			if (!strcmp(format, "S16_LE")) {
+				int16_t v = lrint(x * 32767);
+				fwrite(&v, 2, 1, stdout);
+			} else if (!strcmp(format, "S24_LE")) {
+				int32_t v = lrint(x * 8388607) & 0xffffff;
+				fwrite(&v, 4, 1, stdout);
+			} else if (!strcmp(format, "S24_3LE")) {
+				int32_t v = lrint(x * 8388607);
+				fwrite(&v, 3, 1, stdout);
+			} else if (!strcmp(format, "S32_LE")) {
+				int32_t v = lrint(x * 2147483647);
+				fwrite(&v, 4, 1, stdout);
+			} else if (!strcmp(format, "FLOAT_LE")) {
+				float v = x;
+				fwrite(&v, 4, 1, stdout);
+			} else {
+				return 2;
+			}
+		}
+	}
+	return 0;
+}
+
+static int hear(void)
+{
+	static int32_t block[BLOCK][2];
+	static double tone[2][MAX_BLOCKS], share[2][MAX_BLOCKS];
+	int blocks = 0;
+
+	while (blocks < MAX_BLOCKS && fread(block, sizeof block, 1, stdin) == 1) {
+		for (int c = 0; c < 2; c++) {
+			double re = 0, im = 0, sum = 0, squares = 0;
+			for (int i = 0; i < BLOCK; i++) {
+				double x = block[i][c] / 2147483648.0;
+				double w = 2 * M_PI * FREQ * i / RATE;
+				re += x * cos(w);
+				im += x * sin(w);
+				sum += x;
+				squares += x * x;
+			}
+			double mean = sum / BLOCK;
+			double power = squares / BLOCK - mean * mean;
+			tone[c][blocks] = 2 * (re * re + im * im) / ((double)BLOCK * BLOCK);
+			share[c][blocks] = power > 0 ? tone[c][blocks] / power : 0;
+		}
+		blocks++;
+	}
+	for (int c = 0; c < 2; c++) {
+		double loudest = 0, levels[MAX_BLOCKS], shares[MAX_BLOCKS];
+		int on = 0;
+		for (int b = 0; b < blocks; b++)
+			loudest = tone[c][b] > loudest ? tone[c][b] : loudest;
+		/* Blocks the tone fills, or nearly: at least half its power. */
+		for (int b = 0; b < blocks; b++) {
+			if (loudest > 0 && tone[c][b] >= loudest / 2) {
+				levels[on] = tone[c][b];
+				shares[on++] = share[c][b];
+			}
+		}
+		if (!on) {
+			printf("-200.0 0.000 0 ");
+			continue;
+		}
+		/* The power of a sine is half its peak squared. */
+		printf("%.1f %.3f %d ", 10 * log10(2 * median(levels, on)),
+		       median(shares, on), on);
+	}
+	printf("\n");
+	return 0;
+}
+
+int main(int argc, char **argv)
+{
+	if (argc == 4 && !strcmp(argv[1], "gen"))
+		return gen(argv[2], atoi(argv[3]));
+	if (argc == 2 && !strcmp(argv[1], "hear"))
+		return hear();
+	return 2;
+}
+EOF
+if ! cc -O2 -o "$work/tone" "$work/tone.c" -lm; then
+	echo "FAIL setup: cannot build the tone helper"
+	exit 1
+fi
 if ! wait_daemon; then
 	echo "FAIL setup: aas.service is not running"
 	exit 1
@@ -454,19 +697,64 @@ fi
 # leaves out.
 play_second() { aplay -q -D "$1" -t raw -f S16_LE -c 2 -r $rate -d 1 /dev/zero; }
 
+# Plays one second in each format the plugin takes, mono and stereo. With
+# AAS_TEST_CAPTURE it is a tone, recorded from the board's input: each
+# format must come out as a clean 1 kHz for the whole second, on both
+# channels, at the level of the first. The analog path is not exact, so
+# it is the tone's level and purity that are compared, not the samples.
 case_aplay_plays_each_format() {
 	name=aplay_plays_each_format
+	capture=${AAS_TEST_CAPTURE:-}
 	bad=""
+	first=""
+	heard=""
+	[ -n "$capture" ] && amixer -q -D default sset Master 100%
 	for format in S16_LE S24_LE S24_3LE S32_LE FLOAT_LE; do
 		for channels in 1 2; do
-			# Straight to the plugin, so plug converts nothing.
-			if ! aplay -q -D aas -t raw -f $format -c $channels -r $rate -d 1 /dev/zero \
+			if [ -z "$capture" ]; then
+				# Straight to the plugin, so plug converts nothing.
+				if ! aplay -q -D aas -t raw -f $format -c $channels -r $rate -d 1 /dev/zero \
+					2>"$work/err"; then
+					bad="$bad $format/$channels($(head -n1 "$work/err"))"
+				fi
+				continue
+			fi
+			"$work/tone" gen $format $channels >"$work/tone.raw"
+			# 1.6 s: the tone with 0.3 s before and after.
+			arecord -q -D "$capture" -t raw -f S32_LE -c 2 -r $rate -s $((rate * 16 / 10)) \
+				"$work/heard.raw" 2>"$work/caperr" &
+			recorder=$!
+			sleep 0.3
+			if ! aplay -q -D aas -t raw -f $format -c $channels -r $rate "$work/tone.raw" \
 				2>"$work/err"; then
 				bad="$bad $format/$channels($(head -n1 "$work/err"))"
 			fi
+			if ! wait $recorder; then
+				bad="$bad $format/$channels(capture: $(head -n1 "$work/caperr"))"
+				continue
+			fi
+			heard=$("$work/tone" hear <"$work/heard.raw")
+			[ -z "$first" ] && first=${heard%% *}
+			# Level within 1 dB of the first, nine tenths of the power in
+			# the tone, and the tone there for 9 to 11 tenths of a second.
+			if ! echo "$first $heard" | awk '{
+				for (c = 0; c < 2; c++) {
+					level = $(2 + 3 * c); share = $(3 + 3 * c); on = $(4 + 3 * c)
+					if (level < $1 - 1 || level > $1 + 1 || share < 0.9 || on < 9 || on > 11)
+						exit 1
+				}
+			}'; then
+				bad="$bad $format/$channels(heard $heard, first level $first)"
+			fi
 		done
 	done
-	if [ -z "$bad" ]; then pass $name; else fail $name "failed:$bad"; fi
+	if [ -n "$bad" ]; then
+		fail $name "failed:$bad"
+	elif [ -n "$capture" ]; then
+		pass $name "each heard on $capture as 1 kHz at $first dBFS; the last, per channel as level, share of the power and tenths of a second: $heard"
+	else
+		pass $name
+	fi
 }
 
 case_drain_returns() {
@@ -507,6 +795,16 @@ case_poll_descriptors_survive_a_reset() {
 case_nonblocking_drain() {
 	name=nonblocking_drain
 	if out=$("$work/pcmtest" nonblock aas); then pass $name "$out"; else fail $name "$out"; fi
+}
+
+case_drop_during_a_blocking_drain() {
+	name=drop_during_a_blocking_drain
+	if out=$("$work/pcmtest" dropdrain aas); then pass $name "$out"; else fail $name "$out"; fi
+}
+
+case_hw_free_gives_the_stream_up() {
+	name=hw_free_gives_the_stream_up
+	if out=$("$work/pcmtest" hwfree aas); then pass $name "$out"; else fail $name "$out"; fi
 }
 
 # A buffer smaller than the daemon can keep fed is rounded up, or refused
@@ -718,6 +1016,45 @@ case_volume_survives_a_restart() {
 	fi
 }
 
+# A mixer that holds the control open across a restart of the daemon sets
+# the volume with its next call. amixer -s keeps one handle for every
+# command it reads.
+case_control_reconnects_after_restart() {
+	name=control_reconnects_after_restart
+	mkfifo "$work/commands"
+	amixer -D default -s <"$work/commands" >"$work/out" 2>&1 &
+	mixer=$!
+	exec 3>"$work/commands"
+	echo "sset Master 40%" >&3
+	sleep 0.5
+	before=$(master)
+	daemon=$(main_pid)
+	# The cases around this one start the daemon four times in a few
+	# seconds. One more would reach systemd's limit of five in ten.
+	sudo systemctl reset-failed aas
+	sudo systemctl restart aas
+	if ! wait_daemon; then
+		exec 3>&-
+		fail $name "the daemon did not come back"
+		return
+	fi
+	echo "sset Master 60%" >&3
+	exec 3>&-
+	if ! wait_gone $mixer 5000; then
+		kill -9 $mixer
+		wait $mixer 2>/dev/null
+		fail $name "amixer still runs 5 s after its last command"
+		return
+	fi
+	wait $mixer
+	after=$(master)
+	if [ "$before" = 40 ] && [ "$after" = 60 ] && [ "$(main_pid)" != "$daemon" ]; then
+		pass $name "one amixer set 40% on pid $daemon and 60% on pid $(main_pid)"
+	else
+		fail $name "$before% before the restart, $after% after: $(tr '\n' ' ' <"$work/out")"
+	fi
+}
+
 # With the daemon gone, the control fails at once instead of hanging.
 case_amixer_fails_without_the_daemon() {
 	name=amixer_fails_without_the_daemon
@@ -808,22 +1145,21 @@ case_monitor_sleeps_when_the_daemon_is_gone() {
 	fi
 }
 
-case_aplay_plays_each_format
-case_drain_returns
-case_pause_and_resume
-case_delay_is_plausible
-case_underrun_returns_epipe
-case_poll_descriptors_survive_a_reset
-case_nonblocking_drain
-case_small_buffer_rounds_up_or_is_refused
-case_daemon_killed_during_write_returns_an_error
-case_client_reconnects_after_restart
-case_player_killed_keeps_daemon_up
-case_amixer_reads_and_sets_master
-case_second_client_sees_the_change
-case_mpd_mixer_works
-case_volume_survives_a_restart
-case_amixer_fails_without_the_daemon
-case_watcher_hears_the_daemon_go
-case_monitor_sleeps_when_the_daemon_is_gone
+cases="aplay_plays_each_format drain_returns pause_and_resume delay_is_plausible
+underrun_returns_epipe poll_descriptors_survive_a_reset nonblocking_drain
+drop_during_a_blocking_drain hw_free_gives_the_stream_up
+small_buffer_rounds_up_or_is_refused daemon_killed_during_write_returns_an_error
+client_reconnects_after_restart player_killed_keeps_daemon_up
+amixer_reads_and_sets_master second_client_sees_the_change mpd_mixer_works
+volume_survives_a_restart control_reconnects_after_restart
+amixer_fails_without_the_daemon watcher_hears_the_daemon_go
+monitor_sleeps_when_the_daemon_is_gone"
+[ $# -gt 0 ] && cases="$*"
+for name in $cases; do
+	if ! command -v "case_$name" >/dev/null; then
+		fail "$name" "no such case"
+		continue
+	fi
+	"case_$name"
+done
 exit $failed

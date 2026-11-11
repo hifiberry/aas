@@ -105,7 +105,11 @@ Then move `/etc/asound.conf.before-aas` back, if there is one.
 - `sh dist/test-plugin.sh` on the board, with the unit running and the plugin
   installed. It needs `aplay`, `amixer`, `alsactl`, `cc` and `libasound2-dev`,
   and `mpd`, `mpc` and `python3` for the mixer case. It prints PASS or FAIL for
-  each case.
+  each case. Case names as arguments run only those. On a board whose output is
+  wired to its input, `AAS_TEST_CAPTURE=plughw:<card> sh dist/test-plugin.sh`
+  also records what each sample format plays and checks the tone's level and
+  purity.
+- `cargo test -p aas-alsa` on the board, for the plugin's own tests.
 - `bit-check` proves that what a player sends reaches the card unchanged. Load
   `snd-aloop`, set `card = "Loopback"` and `latency_ms = 48` in the daemon's
   config, then run for example
