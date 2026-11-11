@@ -61,8 +61,9 @@ pub fn run(
     let latency_ms = config
         .latency_ms
         .unwrap_or_else(|| board::detect().default_latency_ms());
-    let listener = listen(socket).map_err(|e| format!("{}: {e}", socket.display()))?;
+    // Before the socket, so that a failure here leaves no socket file.
     let notify = eventfd().map_err(|e| format!("eventfd: {e}"))?;
+    let listener = listen(socket).map_err(|e| format!("{}: {e}", socket.display()))?;
     let supported = sink.supported_rates();
     let mut sink = FallbackSink::new(sink);
     let rates = sink.rates_watch();
@@ -91,7 +92,11 @@ pub fn run(
             spawned.spawn(move || audio_loop(engine, wake))
         }
     }
-    .map_err(|e| format!("audio thread: {e}"))?;
+    .map_err(|e| {
+        // Nobody will listen on the socket, so it must not stay behind.
+        let _ = fs::remove_file(socket);
+        format!("audio thread: {e}")
+    })?;
     let mut control = Control::new(
         &config,
         latency_ms,
