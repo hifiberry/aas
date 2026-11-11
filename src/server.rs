@@ -2,11 +2,13 @@
 //! the listener, the clients, the audio thread's events and a 50 ms timer.
 
 use crate::board;
+use crate::cards;
 use crate::config::{Config, Format};
-use crate::control::{Answer, ConnId, Control, eventfd};
+use crate::control::{Answer, ConnId, Control, OpenCapture, eventfd};
 use crate::counters::Counters;
 use crate::engine::Engine;
 use crate::format::{F32, F64, I32, Processing};
+use crate::plugin::build::{Chains, Libraries};
 use crate::rt;
 use crate::sink::{CardSearch, CardWatch, FallbackSink, RETRY, RatesWatch, Sink};
 use crate::volume::{OpenVolume, OutputVolume};
@@ -56,9 +58,27 @@ pub fn run(
     socket: &Path,
     state: &Path,
     hardware: Option<OpenVolume>,
+    capture: Option<OpenCapture>,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), String> {
-    run_probing(config, sink, socket, state, hardware, None, shutdown)
+    run_probing(
+        config, sink, socket, state, hardware, None, capture, shutdown,
+    )
+}
+
+/// The analog input's capture, if the config enables the input and the
+/// card, by its driver name, has an ADC. Logs one line when the input is
+/// enabled, whether it runs or not.
+pub fn analog_capture(config: &Config, driver: &str, open: OpenCapture) -> Option<OpenCapture> {
+    if !config.analog.enabled {
+        return None;
+    }
+    if !cards::has_adc(driver) {
+        eprintln!("aas: the card {driver} has no analog input aas knows, it stays off");
+        return None;
+    }
+    eprintln!("aas: analog input on, from the card {driver}");
+    Some(open)
 }
 
 /// Runs the daemon until `shutdown` is set. The sink is wrapped in a
@@ -71,6 +91,11 @@ pub fn run(
 /// has the audio thread try the sink only once the card is there. So the
 /// audio thread neither reads the list of cards nor allocates while it
 /// waits for one.
+///
+/// With a `capture`, the analog input runs; `analog_capture` decides
+/// whether there is one. Every plugin library is loaded and every chain
+/// built before anything starts, so a plugin that fails stops the start.
+#[allow(clippy::too_many_arguments)]
 pub fn run_probing(
     config: Config,
     sink: Box<dyn Sink>,
@@ -78,6 +103,7 @@ pub fn run_probing(
     state: &Path,
     mut hardware: Option<OpenVolume>,
     probe: Option<CardProbe>,
+    capture: Option<OpenCapture>,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), String> {
     raise_file_limit();
@@ -85,6 +111,13 @@ pub fn run_probing(
         .latency_ms
         .unwrap_or_else(|| board::detect().default_latency_ms());
     // Before the socket, so that a failure here leaves no socket file.
+    let mut libraries = Libraries::default();
+    let chains = Chains::build(
+        &config.plugins,
+        config.default_rate,
+        config.format,
+        &mut libraries,
+    )?;
     let notify = eventfd().map_err(|e| format!("eventfd: {e}"))?;
     let listener = listen(socket).map_err(|e| format!("{}: {e}", socket.display()))?;
     let supported = sink.supported_rates();
@@ -129,6 +162,10 @@ pub fn run_probing(
         events,
         audio.thread().clone(),
     );
+    control.set_plugins(libraries, chains);
+    if let Some(open) = capture {
+        control.set_analog(open);
+    }
     let found = hardware.as_mut().and_then(|open| open());
     let volume = OutputVolume::new(found, config.bit_perfect);
     control.restore_volume(volume, state.to_path_buf());

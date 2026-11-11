@@ -1,6 +1,8 @@
 //! The daemon end to end: clients on a real socket, the output a `MemorySink`.
 
-use aas::config::{Config, Idle};
+use aas::capture::{Capture, CaptureFeed, MemoryCapture};
+use aas::config::{Analog, Config, Idle, PluginConfig, PluginPlace};
+use aas::control::OpenCapture;
 use aas::rate::SETTLE;
 use aas::server::{self, CardProbe};
 use aas::sink::{MemorySink, Sink, SinkError, SinkLog};
@@ -21,6 +23,9 @@ const LATENCY_MS: f32 = 4.0;
 const PERIOD: u32 = 64;
 /// Long enough for anything here on a loaded machine.
 const PATIENCE: Duration = Duration::from_secs(20);
+
+/// Opens a capture. `Send`, so that it can go to the daemon's thread.
+type SendCapture = Box<dyn FnMut(u32, u32) -> Result<Box<dyn Capture>, String> + Send>;
 
 struct Daemon {
     _dir: tempfile::TempDir,
@@ -57,7 +62,14 @@ impl Daemon {
     fn start_probing(config: Config, sink: Box<dyn Sink>, probe: CardProbe) -> Daemon {
         let dir = tempfile::tempdir().unwrap();
         let state = dir.path().join("state.toml");
-        Daemon::start_all(config, sink, dir, state, None, Some(probe))
+        Daemon::start_all(config, sink, dir, state, None, Some(probe), None)
+    }
+
+    /// A daemon with the analog input, which `capture` opens.
+    fn start_analog(config: Config, sink: Box<dyn Sink>, capture: SendCapture) -> Daemon {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state.toml");
+        Daemon::start_all(config, sink, dir, state, None, None, Some(capture))
     }
 
     fn start_full(
@@ -67,7 +79,7 @@ impl Daemon {
         state: PathBuf,
         hardware: Option<OpenVolume>,
     ) -> Daemon {
-        Daemon::start_all(config, sink, dir, state, hardware, None)
+        Daemon::start_all(config, sink, dir, state, hardware, None, None)
     }
 
     fn start_all(
@@ -77,13 +89,17 @@ impl Daemon {
         state: PathBuf,
         hardware: Option<OpenVolume>,
         probe: Option<CardProbe>,
+        capture: Option<SendCapture>,
     ) -> Daemon {
         let path = dir.path().join("aas.sock");
         let shutdown = Arc::new(AtomicBool::new(false));
         let thread = {
             let (path, shutdown) = (path.clone(), shutdown.clone());
             thread::spawn(move || {
-                server::run_probing(config, sink, &path, &state, hardware, probe, shutdown)
+                let capture = capture.map(|c| c as OpenCapture);
+                server::run_probing(
+                    config, sink, &path, &state, hardware, probe, capture, shutdown,
+                )
             })
         };
         let daemon = Daemon {
@@ -989,6 +1005,7 @@ fn a_panic_on_the_audio_thread_stops_the_daemon_with_an_error() {
             &path,
             &state,
             None,
+            None,
             flag,
         );
         let _ = done.send(result);
@@ -1207,4 +1224,108 @@ fn a_reset_gives_a_resampled_stream_an_empty_filter() {
         after[before..].iter().all(|f| f[0] == 0),
         "the filter's old audio played after the reset"
     );
+}
+
+fn analog_config() -> Config {
+    Config {
+        analog: Analog {
+            enabled: true,
+            volume_db: 0.0,
+        },
+        ..default_config()
+    }
+}
+
+#[test]
+fn the_analog_input_plays_through_the_daemon() {
+    let (sink, log) = memory_sink();
+    let feeds: Arc<Mutex<Vec<(u32, u32, CaptureFeed)>>> = Arc::default();
+    let opened = feeds.clone();
+    let capture: SendCapture = Box::new(move |rate, period| {
+        let (capture, feed) = MemoryCapture::new();
+        opened.lock().unwrap().push((rate, period, feed));
+        Ok(Box::new(capture) as Box<dyn Capture>)
+    });
+    let _daemon = Daemon::start_analog(analog_config(), sink, capture);
+    // The output opens without a client, and the capture after it.
+    assert!(wait_for(|| !feeds.lock().unwrap().is_empty()));
+    let (rate, period, feed) = feeds.lock().unwrap()[0].clone();
+    assert_eq!((rate, period), (48000, PERIOD));
+    assert_eq!(log.opens(), [(48000, PERIOD)]);
+    // A signal at -18 dBFS, delivered as a card would: a period or two
+    // queued at a time.
+    let v = 1 << 28;
+    let done = Arc::new(AtomicBool::new(false));
+    let feeder = {
+        let (feed, done) = (feed.clone(), done.clone());
+        thread::spawn(move || {
+            while !done.load(Ordering::Relaxed) {
+                if feed.queued() < 2 * PERIOD as usize {
+                    feed.push(&[[v, -v]; PERIOD as usize]);
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+        })
+    };
+    let played = wait_for(|| log.frames().contains(&[v, -v]));
+    done.store(true, Ordering::Relaxed);
+    feeder.join().unwrap();
+    assert!(played, "the input never reached the card");
+    // It was never closed or opened again.
+    assert!(!feed.closed());
+    assert_eq!(feeds.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn a_plugin_that_cannot_be_loaded_stops_the_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("aas.sock");
+    let state = dir.path().join("state.toml");
+    let missing = "/nonexistent/libaas_nothing.so";
+    let config = Config {
+        plugins: vec![PluginConfig {
+            place: PluginPlace::Output,
+            kind: "library".into(),
+            path: Some(missing.into()),
+            params: Default::default(),
+        }],
+        ..default_config()
+    };
+    let (sink, log) = memory_sink();
+    // Set at once, so that a daemon that starts after all stops again.
+    let shutdown = Arc::new(AtomicBool::new(true));
+    let result = server::run(config, sink, &path, &state, None, None, shutdown);
+    let e = result.expect_err("the daemon started");
+    assert!(e.contains(missing), "{e}");
+    assert!(log.opens().is_empty());
+    assert!(!path.exists());
+}
+
+#[test]
+fn an_enabled_input_on_a_card_without_an_adc_opens_nothing() {
+    let asked: Arc<Mutex<Vec<(u32, u32)>>> = Arc::default();
+    let open = || -> OpenCapture {
+        let asked = asked.clone();
+        Box::new(move |rate, period| {
+            asked.lock().unwrap().push((rate, period));
+            Err("no capture in this test".into())
+        })
+    };
+    let config = Config {
+        idle: Idle::Off { delay_s: 1 },
+        ..analog_config()
+    };
+    // The card table decides, and only an enabled input counts.
+    let adc = "snd_rpi_hifiberry_dacplusadc";
+    assert!(server::analog_capture(&config, adc, open()).is_some());
+    assert!(server::analog_capture(&default_config(), adc, open()).is_none());
+    assert!(server::analog_capture(&config, "snd_some_other_card", open()).is_none());
+    let capture = server::analog_capture(&config, "snd_rpi_hifiberry_digi", open());
+    assert!(capture.is_none());
+    // So the daemon runs as without the input: the output goes off when
+    // idle, and no capture is opened.
+    let (sink, log) = memory_sink();
+    let _daemon = Daemon::start(config, sink);
+    assert!(wait_for(|| log.closes() >= 1), "the output never went off");
+    assert!(asked.lock().unwrap().is_empty());
 }

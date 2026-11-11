@@ -65,6 +65,11 @@ impl Chain {
         status
     }
 
+    /// The names of the plugins, in the order they run.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.plugins.iter().map(|p| p.name())
+    }
+
     /// True if the chain has no plugins.
     pub fn is_empty(&self) -> bool {
         self.plugins.is_empty()

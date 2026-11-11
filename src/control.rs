@@ -5,10 +5,14 @@
 //! back is freed here. Commands that belong together go into the queue in
 //! one commit, so the audio thread never sees half a decision.
 
-use crate::config::{Config, Format, Idle, Quality};
+use crate::capture::Capture;
+use crate::config::{Config, Format, Idle, PluginConfig, PluginPlace, Quality};
 use crate::dop;
-use crate::engine::{Command, Event, INITIAL_SOURCES, Source};
+use crate::engine::{ANALOG, Command, Event, INITIAL_SOURCES, Source};
+use crate::format::db_to_gain;
 use crate::latency::{PERIODS, period_frames};
+use crate::plugin::build::{Chains, Libraries, build_chain, engine_place};
+use crate::plugin::chain::Chain;
 use crate::rate::{ClientId, MAX_RATE, MIN_RATE, RatePolicy, SETTLE};
 use crate::resample::Resampler;
 use crate::state::{Saver, State};
@@ -29,6 +33,10 @@ use std::time::{Duration, Instant};
 /// Identifies a connection to the server.
 pub type ConnId = u64;
 
+/// Opens the card's capture at a rate and period. Called on the control
+/// thread, after the output has opened at them.
+pub type OpenCapture = Box<dyn FnMut(u32, u32) -> Result<Box<dyn Capture>, String>>;
+
 /// Smallest period the latency rule gives.
 const MIN_PERIOD: u32 = 32;
 /// Half the longest resampling filter, which rubato adds to its input.
@@ -44,6 +52,8 @@ const SEND_WARN: Duration = Duration::from_secs(1);
 /// How long the volume stays unchanged before the state file is written,
 /// so that a volume slider being dragged does not write it many times.
 const SAVE_DELAY: Duration = Duration::from_secs(1);
+/// How often a capture that failed, or would not open, is tried again.
+const CAPTURE_RETRY: Duration = Duration::from_secs(1);
 
 /// Frames a client's ring holds at least, so that one period's input fits
 /// whatever rate the output runs at. One period takes at most what the
@@ -176,6 +186,24 @@ struct Conn {
     subscribed: bool,
 }
 
+/// The analog input as the control thread keeps it.
+struct AnalogInput {
+    open: OpenCapture,
+    /// The rate the rate rules have for the input while it has signal. It
+    /// is the output's rate, since the input never gets a resampler.
+    active: Option<u32>,
+    /// `SetCapture` commands the audio thread has not answered yet. A
+    /// failure reported meanwhile belongs to a capture they replace.
+    unanswered: u32,
+    /// The audio thread has a capture for the output as it is, which has
+    /// not failed.
+    reading: bool,
+    /// When to try again to open the capture.
+    retry_at: Option<Instant>,
+    /// A failure has been logged, and the recovery is not yet.
+    failing: bool,
+}
+
 pub struct Control {
     latency_ms: f32,
     quality: Quality,
@@ -220,6 +248,18 @@ pub struct Control {
     save_at: Option<Instant>,
     /// Volume notifications for subscribers, not yet sent.
     notices: Vec<(ConnId, Reply)>,
+    /// The plugins of the config, to build chains from at each rate.
+    plugins: Vec<PluginConfig>,
+    libraries: Libraries,
+    /// Chains built ahead, sent at the first open if it is at their rate.
+    ready: Option<Chains>,
+    /// The rate the chains sent to the audio thread were built for. None
+    /// before any are sent.
+    chains_rate: Option<u32>,
+    /// The gain of the analog input, from the config.
+    analog_gain: f32,
+    /// None unless the config enables the input and the card has an ADC.
+    analog: Option<AnalogInput>,
 }
 
 impl Control {
@@ -260,7 +300,39 @@ impl Control {
             saver: None,
             save_at: None,
             notices: Vec::new(),
+            plugins: config.plugins.clone(),
+            libraries: Libraries::default(),
+            ready: None,
+            chains_rate: None,
+            analog_gain: db_to_gain(config.analog.volume_db),
+            analog: None,
         }
+    }
+
+    /// Takes over the libraries loaded at startup, and the chains built
+    /// then. Call before `start`. Without this the chains are built at the
+    /// first open.
+    pub fn set_plugins(&mut self, libraries: Libraries, chains: Chains) {
+        self.libraries = libraries;
+        self.ready = Some(chains);
+    }
+
+    /// Runs the analog input, which `open` opens. Call before `start`, and
+    /// only when the config enables the input and the card has an ADC.
+    /// The output then stays open when idle, since the card paces the
+    /// capture and the detector has to keep measuring.
+    pub fn set_analog(&mut self, open: OpenCapture) {
+        if let Idle::Off { .. } = self.idle {
+            eprintln!("aas: the analog input keeps the output open, idle = \"off\" does not apply");
+        }
+        self.analog = Some(AnalogInput {
+            open,
+            active: None,
+            unanswered: 0,
+            reading: false,
+            retry_at: None,
+            failing: false,
+        });
     }
 
     /// Takes over the output volume, at the level the state file keeps.
@@ -299,10 +371,14 @@ impl Control {
     }
 
     /// Opens the output at the default rate. Until a client plays it sends
-    /// zeros, and the idle rule applies from now.
+    /// zeros, and the idle rule applies from now, unless the analog input
+    /// is on.
     pub fn start(&mut self, now: Instant) {
         let mut batch = vec![Command::SetGain(self.volume.gain())];
-        self.open_output(&mut batch);
+        if self.analog.is_some() {
+            batch.push(Command::SetAnalogGain(self.analog_gain));
+        }
+        self.open_output(now, &mut batch);
         self.idle_since = Some(now);
         self.send(batch);
     }
@@ -781,15 +857,17 @@ impl Control {
             }
         };
         if reopen {
-            self.open_output(batch);
+            self.open_output(now, batch);
         } else {
             self.sync_resamplers(batch);
         }
     }
 
     /// Opens or reopens the output at the rate the rules want. Resamplers
-    /// for the new rate go first, so that they take effect with it.
-    fn open_output(&mut self, batch: &mut Vec<Command>) {
+    /// and chains for the new rate go first, so that they take effect with
+    /// it. The audio thread closes the capture first; a new one is opened
+    /// once the output is open.
+    fn open_output(&mut self, now: Instant, batch: &mut Vec<Command>) {
         let rate = self.policy.current();
         let period = period_frames(rate, self.latency_ms);
         eprintln!("aas: output at {rate} Hz, {period} frames per period");
@@ -797,7 +875,135 @@ impl Control {
         self.reopening += 1;
         self.switch_at = None;
         self.sync_resamplers(batch);
+        self.sync_chains(rate, batch);
+        if let Some(analog) = &mut self.analog {
+            analog.reading = false;
+            analog.retry_at = None;
+            // The input plays at the output's rate, whatever it is.
+            if analog.active.is_some_and(|r| r != rate) {
+                analog.active = Some(rate);
+                self.policy.client_started(ANALOG, rate, now - self.epoch);
+            }
+        }
         batch.push(Command::Reconfigure { rate, period });
+    }
+
+    /// The places that get a chain: those the config lists plugins at, and
+    /// the analog input, which always has its detector.
+    fn chain_places(&self) -> Vec<PluginPlace> {
+        let places = [PluginPlace::Analog, PluginPlace::Mix, PluginPlace::Output];
+        places
+            .into_iter()
+            .filter(|&place| match place {
+                PluginPlace::Analog => self.analog.is_some(),
+                _ => self.plugins.iter().any(|p| p.place == place),
+            })
+            .collect()
+    }
+
+    /// Sends chains built for `rate`, unless those in place are. So a
+    /// reopen at the same rate keeps them, and their state.
+    fn sync_chains(&mut self, rate: u32, batch: &mut Vec<Command>) {
+        if self.chains_rate == Some(rate) {
+            return;
+        }
+        self.chains_rate = Some(rate);
+        let mut ready = self.ready.take().filter(|c| c.rate == rate);
+        for place in self.chain_places() {
+            let chain = match &mut ready {
+                Some(chains) => chains.take(place),
+                None => self.build(place, rate),
+            };
+            batch.push(Command::SetChain(engine_place(place), Box::new(chain)));
+        }
+    }
+
+    /// The chain at `place` for `rate`. One that cannot be built, such as a
+    /// library plugin refusing the rate, is left out with a log line; the
+    /// analog input then keeps only its detector.
+    fn build(&mut self, place: PluginPlace, rate: u32) -> Chain {
+        let format = self.format;
+        match build_chain(&self.plugins, place, rate, format, &mut self.libraries) {
+            Ok(chain) => chain,
+            Err(e) => {
+                let name = match place {
+                    PluginPlace::Analog => "analog",
+                    PluginPlace::Mix => "mix",
+                    PluginPlace::Output => "output",
+                };
+                eprintln!("aas: {e}; the {name} chain runs without its plugins at {rate} Hz");
+                build_chain(&[], place, rate, format, &mut self.libraries)
+                    .unwrap_or_else(|_| Chain::empty())
+            }
+        }
+    }
+
+    /// Opens the capture for the output and hands it to the audio thread,
+    /// once the output is open and if it has none that works. One that
+    /// will not open is tried again a second later.
+    fn open_capture(&mut self, now: Instant, batch: &mut Vec<Command>) {
+        let (Some((rate, period)), 0) = (self.output, self.reopening) else {
+            return;
+        };
+        let Some(analog) = &mut self.analog else {
+            return;
+        };
+        if analog.reading {
+            return;
+        }
+        match (analog.open)(rate, period) {
+            Ok(capture) => {
+                batch.push(Command::SetCapture(Some(capture)));
+                analog.unanswered += 1;
+                analog.reading = true;
+                analog.retry_at = None;
+                if std::mem::take(&mut analog.failing) {
+                    eprintln!("aas: the analog input works again");
+                }
+            }
+            Err(e) => {
+                if !std::mem::replace(&mut analog.failing, true) {
+                    eprintln!("aas: the analog input: {e}, trying again every second");
+                }
+                analog.retry_at = Some(now + CAPTURE_RETRY);
+            }
+        }
+    }
+
+    /// The audio thread reports that the capture failed and is closed. A
+    /// report that comes before the answer to a newer capture is about the
+    /// one that capture replaced, so it changes nothing.
+    fn capture_failed(&mut self, now: Instant) {
+        let Some(analog) = &mut self.analog else {
+            return;
+        };
+        if analog.unanswered > 0 || !analog.reading {
+            return;
+        }
+        analog.reading = false;
+        if !std::mem::replace(&mut analog.failing, true) {
+            eprintln!("aas: the analog input failed, trying again every second");
+        }
+        analog.retry_at = Some(now + CAPTURE_RETRY);
+    }
+
+    /// The analog input has signal or not. With signal it is a client of
+    /// the rate rules at the output's rate, and the rate is decided again
+    /// as for a player that starts or stops.
+    fn input_signal(&mut self, on: bool, now: Instant, batch: &mut Vec<Command>) {
+        let Some(analog) = &mut self.analog else {
+            return;
+        };
+        let t = now - self.epoch;
+        if on {
+            let rate = self.output.map_or(self.policy.current(), |(r, _)| r);
+            analog.active = Some(rate);
+            self.policy.client_started(ANALOG, rate, t);
+        } else {
+            analog.active = None;
+            self.policy.client_stopped(ANALOG, t);
+        }
+        self.decide(now, false, batch);
     }
 
     /// Gives each source at another rate than the output a resampler for
@@ -861,11 +1067,18 @@ impl Control {
                 Event::Dropped(_)
                 | Event::Replaced(_)
                 | Event::OldTable(_)
-                | Event::OldChain(_)
-                | Event::OldCapture(_) => {}
-                // The control thread does not run the analog input yet.
-                Event::InputSignal(_) | Event::CaptureFailed => {}
-                Event::Reconfigured => self.reopening = self.reopening.saturating_sub(1),
+                | Event::OldChain(_) => {}
+                Event::OldCapture(_) => {
+                    if let Some(analog) = &mut self.analog {
+                        analog.unanswered = analog.unanswered.saturating_sub(1);
+                    }
+                }
+                Event::InputSignal(on) => self.input_signal(on, now, &mut batch),
+                Event::CaptureFailed => self.capture_failed(now),
+                Event::Reconfigured => {
+                    self.reopening = self.reopening.saturating_sub(1);
+                    self.open_capture(now, &mut batch);
+                }
                 Event::DopStarted(id, claim) => {
                     // The events can come in another order than the claims
                     // were made, when the queue was full meanwhile. The
@@ -920,7 +1133,17 @@ impl Control {
             self.drained(id, now, &mut batch);
         }
         self.decide(now, settled, &mut batch);
-        if let (Idle::Off { delay_s }, Some(since)) = (self.idle, self.idle_since) {
+        let retry = self.analog.as_ref().and_then(|a| a.retry_at);
+        if retry.is_some_and(|at| now >= at) {
+            self.open_capture(now, &mut batch);
+        }
+        // The analog input keeps the output open.
+        let idle = if self.analog.is_some() {
+            Idle::Zeros
+        } else {
+            self.idle
+        };
+        if let (Idle::Off { delay_s }, Some(since)) = (idle, self.idle_since) {
             let delay = Duration::from_secs(u64::from(delay_s));
             if self.output.is_some() && now >= since + delay {
                 eprintln!("aas: output off after {delay_s} s idle");
@@ -992,7 +1215,10 @@ pub(crate) fn eventfd() -> io::Result<OwnedFd> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capture::MemoryCapture;
     use crate::config::{self, Format, Quality};
+    use crate::plugin::chain::Chain;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn a_drain_reported_before_its_request_is_answered_at_once() {
@@ -1413,6 +1639,458 @@ mod tests {
         control.handle_events(t);
         control.tick(t + Duration::from_millis(1000));
         assert_eq!(control.take_replies(), vec![(1, Reply::Ok)]);
+    }
+
+    /// Opens `MemoryCapture`s for the control thread and records the rate
+    /// and period of each open. The next `fails` opens fail.
+    #[derive(Clone, Default)]
+    struct Opener {
+        asked: Arc<Mutex<Vec<(u32, u32)>>>,
+        fails: Arc<Mutex<u32>>,
+    }
+
+    impl Opener {
+        fn open(&self) -> OpenCapture {
+            let me = self.clone();
+            Box::new(move |rate, period| {
+                me.asked.lock().unwrap().push((rate, period));
+                let mut fails = me.fails.lock().unwrap();
+                if *fails > 0 {
+                    *fails -= 1;
+                    return Err("no such device".into());
+                }
+                let (capture, _feed) = MemoryCapture::new();
+                Ok(Box::new(capture) as Box<dyn Capture>)
+            })
+        }
+
+        fn asked(&self) -> Vec<(u32, u32)> {
+            self.asked.lock().unwrap().clone()
+        }
+
+        fn fail(&self, times: u32) {
+            *self.fails.lock().unwrap() = times;
+        }
+    }
+
+    /// The audio thread as far as the control thread can tell: it takes the
+    /// commands, answers each as the engine does, and names them.
+    struct FakeEngine {
+        commands: rtrb::Consumer<Command>,
+        events: rtrb::Producer<Event>,
+        capture: Option<Box<dyn Capture>>,
+    }
+
+    impl FakeEngine {
+        /// Takes every queued command and answers it. A reopen answers at
+        /// once only with `opened`.
+        fn take(&mut self, opened: bool) -> Vec<String> {
+            let mut seen = Vec::new();
+            while let Ok(command) = self.commands.pop() {
+                let (name, answer) = match command {
+                    Command::Add(_) => ("Add".into(), None),
+                    Command::Remove(_) => ("Remove".into(), None),
+                    Command::SetRunning(id, on) => (format!("SetRunning {id} {on}"), None),
+                    Command::Flush(id) => (format!("Flush {id}"), Some(Event::Flushed(id))),
+                    Command::SetResampler(id, r) => (
+                        format!("SetResampler {id} {}", r.is_some()),
+                        Some(Event::Replaced(r)),
+                    ),
+                    Command::Reconfigure { rate, period } => (
+                        format!("Reconfigure {rate} {period}"),
+                        opened.then_some(Event::Reconfigured),
+                    ),
+                    Command::CloseOutput => ("CloseOutput".into(), None),
+                    Command::SetGain(_) => ("SetGain".into(), None),
+                    Command::Grow(t) => ("Grow".into(), Some(Event::OldTable(t))),
+                    Command::SetChain(place, chain) => {
+                        let names: Vec<&str> = chain.names().collect();
+                        let name = format!("SetChain {place:?} {}", names.join(","));
+                        (name, Some(Event::OldChain(chain)))
+                    }
+                    Command::SetParam { .. } => ("SetParam".into(), None),
+                    Command::SetCapture(c) => {
+                        let old = std::mem::replace(&mut self.capture, c);
+                        let name = format!("SetCapture {}", self.capture.is_some());
+                        (name, Some(Event::OldCapture(old)))
+                    }
+                    Command::SetAnalogGain(g) => (format!("SetAnalogGain {g}"), None),
+                    Command::Shutdown => ("Shutdown".into(), None),
+                };
+                seen.push(name);
+                if let Some(event) = answer {
+                    assert!(self.events.push(event).is_ok());
+                }
+            }
+            seen
+        }
+
+        fn send(&mut self, event: Event) {
+            assert!(self.events.push(event).is_ok());
+        }
+    }
+
+    /// A started control thread with one client said hello on connection
+    /// 1, the analog input on if `opener` is given, and the fake engine.
+    fn started(config: &Config, opener: Option<&Opener>) -> (Control, FakeEngine, Instant) {
+        let (commands, engine_commands) = rtrb::RingBuffer::new(256);
+        let (engine_events, events) = rtrb::RingBuffer::new(256);
+        let audio = std::thread::current();
+        let mut control = Control::new(config, 12.0, Vec::new(), commands, events, audio);
+        if let Some(opener) = opener {
+            control.set_analog(opener.open());
+        }
+        let now = Instant::now();
+        control.start(now);
+        let engine = FakeEngine {
+            commands: engine_commands,
+            events: engine_events,
+            capture: None,
+        };
+        (control, engine, now)
+    }
+
+    /// Connects a client on `conn` and has it play at `rate`.
+    fn play(control: &mut Control, conn: ConnId, rate: u32, now: Instant) {
+        control.connected(conn, "test".into());
+        let hello = Request::Hello {
+            version: proto::VERSION,
+        };
+        control.request(conn, Some(hello), now);
+        let buffer = min_buffer_frames(rate, 12.0);
+        let answer = control.request(conn, Some(configure(rate, buffer)), now);
+        assert_eq!(answer.reply, Some(Reply::Configured));
+        let start = control.request(conn, Some(Request::Start), now);
+        assert_eq!(start.reply, Some(Reply::Ok));
+    }
+
+    fn has(seen: &[String], what: &str) -> bool {
+        seen.iter().any(|s| s.starts_with(what))
+    }
+
+    fn analog_config() -> Config {
+        Config {
+            analog: config::Analog {
+                enabled: true,
+                volume_db: -20.0,
+            },
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn with_the_analog_input_on_the_output_opens_at_startup() {
+        let opener = Opener::default();
+        let (mut control, mut engine, now) = started(&analog_config(), Some(&opener));
+        let seen = engine.take(true);
+        let gain = crate::format::db_to_gain(-20.0);
+        assert_eq!(
+            seen,
+            [
+                "SetGain".to_string(),
+                format!("SetAnalogGain {gain}"),
+                "SetChain Analog detect".into(),
+                "Reconfigure 48000 256".into(),
+            ]
+        );
+        // The capture opens once the output is open, not before.
+        assert!(opener.asked().is_empty());
+        control.handle_events(now);
+        assert_eq!(opener.asked(), [(48000, 256)]);
+        assert_eq!(engine.take(true), ["SetCapture true"]);
+        control.handle_events(now);
+        assert!(engine.take(true).is_empty());
+    }
+
+    #[test]
+    fn with_the_analog_input_on_the_output_stays_open_when_idle() {
+        let config = Config {
+            idle: Idle::Off { delay_s: 1 },
+            ..analog_config()
+        };
+        let opener = Opener::default();
+        let (mut control, mut engine, now) = started(&config, Some(&opener));
+        engine.take(true);
+        control.handle_events(now);
+        engine.take(true);
+        // A player comes and goes, and the input has signal for a while.
+        play(&mut control, 1, 48000, now);
+        engine.send(Event::InputSignal(true));
+        control.handle_events(now);
+        let stop = control.request(1, Some(Request::Stop), now);
+        assert_eq!(stop.reply, Some(Reply::Ok));
+        engine.send(Event::InputSignal(false));
+        control.handle_events(now);
+        control.tick(now + Duration::from_secs(120));
+        assert!(control.output_is_open());
+        assert!(!has(&engine.take(true), "CloseOutput"));
+        // Without the input the same config closes it.
+        let config = Config {
+            idle: Idle::Off { delay_s: 1 },
+            ..Config::default()
+        };
+        let (mut control, mut engine, now) = started(&config, None);
+        control.tick(now + Duration::from_secs(120));
+        assert!(has(&engine.take(true), "CloseOutput"));
+    }
+
+    #[test]
+    fn the_capture_is_opened_after_each_reconfigure_at_its_rate() {
+        let opener = Opener::default();
+        let (mut control, mut engine, now) = started(&analog_config(), Some(&opener));
+        // The card's rates come before the first open is done: two opens
+        // are under way, and the capture waits for the last.
+        control.set_supported(vec![44100, 96000], now);
+        let seen = engine.take(false);
+        assert!(has(&seen, "Reconfigure 48000"));
+        assert!(has(&seen, "Reconfigure 44100 256"));
+        engine.send(Event::Reconfigured);
+        control.handle_events(now);
+        assert!(opener.asked().is_empty());
+        engine.send(Event::Reconfigured);
+        control.handle_events(now);
+        assert_eq!(opener.asked(), [(44100, 256)]);
+        assert_eq!(engine.take(true), ["SetCapture true"]);
+        control.handle_events(now);
+        // The next rate the card takes moves the output, and the capture
+        // follows it. The old one comes back to be dropped here.
+        control.set_supported(vec![96000], now);
+        let seen = engine.take(true);
+        assert!(has(&seen, "Reconfigure 96000 512"));
+        control.handle_events(now);
+        assert_eq!(opener.asked(), [(44100, 256), (96000, 512)]);
+        assert_eq!(engine.take(true), ["SetCapture true"]);
+    }
+
+    #[test]
+    fn an_active_analog_input_is_the_first_client() {
+        let opener = Opener::default();
+        let (mut control, mut engine, now) = started(&analog_config(), Some(&opener));
+        engine.take(true);
+        control.handle_events(now);
+        engine.take(true);
+        engine.send(Event::InputSignal(true));
+        control.handle_events(now);
+        // A player at 96 kHz arriving while it plays at 48 kHz is resampled.
+        play(&mut control, 1, 96000, now);
+        let seen = engine.take(true);
+        assert!(has(&seen, "SetResampler 1 true"), "{seen:?}");
+        assert!(!has(&seen, "Reconfigure"), "{seen:?}");
+        control.tick(now + Duration::from_secs(5));
+        assert!(!has(&engine.take(true), "Reconfigure"));
+        assert_eq!(opener.asked(), [(48000, 256)]);
+    }
+
+    #[test]
+    fn a_silent_analog_input_does_not_hold_the_rate() {
+        let opener = Opener::default();
+        let (mut control, mut engine, now) = started(&analog_config(), Some(&opener));
+        engine.take(true);
+        control.handle_events(now);
+        engine.take(true);
+        // A player at 96 kHz arriving then sets 96 kHz.
+        play(&mut control, 1, 96000, now);
+        let seen = engine.take(true);
+        assert!(has(&seen, "Reconfigure 96000 512"), "{seen:?}");
+        // The resampler it was given while it was only configured goes.
+        let resampler = seen.iter().rfind(|s| s.starts_with("SetResampler 1"));
+        assert_eq!(resampler.map(String::as_str), Some("SetResampler 1 false"));
+        // And the capture reopens at it.
+        control.handle_events(now);
+        assert_eq!(opener.asked(), [(48000, 256), (96000, 512)]);
+        assert_eq!(engine.take(true), ["SetCapture true"]);
+    }
+
+    #[test]
+    fn the_analog_input_going_quiet_lets_the_remaining_player_take_the_rate() {
+        let opener = Opener::default();
+        let (mut control, mut engine, now) = started(&analog_config(), Some(&opener));
+        engine.take(true);
+        control.handle_events(now);
+        engine.take(true);
+        engine.send(Event::InputSignal(true));
+        control.handle_events(now);
+        play(&mut control, 1, 96000, now);
+        engine.take(true);
+        engine.send(Event::InputSignal(false));
+        control.handle_events(now);
+        // The rate settles first, as for a player that stops.
+        let ms = Duration::from_millis;
+        control.tick(now + ms(400));
+        assert!(!has(&engine.take(true), "Reconfigure"));
+        control.tick(now + ms(600));
+        let seen = engine.take(true);
+        assert!(has(&seen, "Reconfigure 96000 512"), "{seen:?}");
+        // The player needs no resampler at its own rate.
+        assert!(has(&seen, "SetResampler 1 false"), "{seen:?}");
+        control.handle_events(now + ms(600));
+        assert_eq!(opener.asked(), [(48000, 256), (96000, 512)]);
+        // Signal again: the input runs at the output's rate, 96 kHz now.
+        // When the player stops, the input holds that rate.
+        engine.take(true);
+        engine.send(Event::InputSignal(true));
+        control.handle_events(now + ms(700));
+        let stop = control.request(1, Some(Request::Stop), now + ms(700));
+        assert_eq!(stop.reply, Some(Reply::Ok));
+        control.tick(now + ms(5000));
+        assert!(!has(&engine.take(true), "Reconfigure"));
+        assert_eq!(control.policy.current(), 96000);
+    }
+
+    #[test]
+    fn a_failed_capture_is_retried_every_second() {
+        let opener = Opener::default();
+        opener.fail(2);
+        let (mut control, mut engine, now) = started(&analog_config(), Some(&opener));
+        engine.take(true);
+        let ms = Duration::from_millis;
+        // The open after the output opens fails, and so does the next.
+        control.handle_events(now);
+        assert_eq!(opener.asked().len(), 1);
+        assert!(engine.take(true).is_empty());
+        control.tick(now + ms(900));
+        assert_eq!(opener.asked().len(), 1);
+        control.tick(now + ms(1000));
+        assert_eq!(opener.asked().len(), 2);
+        assert!(engine.take(true).is_empty());
+        control.tick(now + ms(1500));
+        assert_eq!(opener.asked().len(), 2);
+        control.tick(now + ms(2000));
+        assert_eq!(opener.asked().len(), 3);
+        assert_eq!(engine.take(true), ["SetCapture true"]);
+        control.handle_events(now + ms(2000));
+        // It fails while it runs. The engine has closed it.
+        engine.send(Event::CaptureFailed);
+        control.handle_events(now + ms(3000));
+        assert_eq!(opener.asked().len(), 3);
+        control.tick(now + ms(3900));
+        assert_eq!(opener.asked().len(), 3);
+        control.tick(now + ms(4000));
+        assert_eq!(opener.asked().len(), 4);
+        // A failure that comes before the answer to the new capture is the
+        // old one's. The new one is kept, and not opened again.
+        engine.send(Event::CaptureFailed);
+        control.handle_events(now + ms(4000));
+        assert_eq!(engine.take(true), ["SetCapture true"]);
+        control.handle_events(now + ms(4000));
+        control.tick(now + ms(10000));
+        assert_eq!(opener.asked().len(), 4);
+        assert!(engine.take(true).is_empty());
+    }
+
+    #[test]
+    fn chains_are_rebuilt_at_the_new_rate() {
+        let mix = config::PluginConfig {
+            place: config::PluginPlace::Mix,
+            kind: "balance".into(),
+            path: None,
+            params: Default::default(),
+        };
+        let config = Config {
+            idle: Idle::Off { delay_s: 1 },
+            plugins: vec![mix],
+            ..Config::default()
+        };
+        let (mut control, mut engine, now) = started(&config, None);
+        // Without the analog input only the places with plugins get one.
+        assert_eq!(
+            engine.take(true),
+            ["SetGain", "SetChain Mix balance", "Reconfigure 48000 256"]
+        );
+        control.handle_events(now);
+        play(&mut control, 1, 96000, now);
+        let seen = engine.take(true);
+        let at = |what: &str| seen.iter().position(|s| s.starts_with(what));
+        let (chain, reopen) = (at("SetChain Mix"), at("Reconfigure 96000"));
+        assert!(chain.is_some() && chain < reopen, "{seen:?}");
+        control.handle_events(now);
+        // An idle close and a reopen at the same rate keep the chains, so
+        // their filters keep their state.
+        let stop = control.request(1, Some(Request::Stop), now);
+        assert_eq!(stop.reply, Some(Reply::Ok));
+        control.tick(now + Duration::from_secs(2));
+        assert!(has(&engine.take(true), "CloseOutput"));
+        let start = control.request(1, Some(Request::Start), now + Duration::from_secs(3));
+        assert_eq!(start.reply, Some(Reply::Ok));
+        let seen = engine.take(true);
+        assert!(has(&seen, "Reconfigure 96000"), "{seen:?}");
+        assert!(!has(&seen, "SetChain"), "{seen:?}");
+        // Without plugins no chain is ever sent.
+        let (mut control, mut engine, now) = started(&Config::default(), None);
+        control.handle_events(now);
+        play(&mut control, 1, 96000, now);
+        assert!(!has(&engine.take(true), "SetChain"));
+    }
+
+    #[test]
+    fn a_chain_that_cannot_be_built_at_a_rate_runs_without_its_plugins() {
+        // Startup checks every chain, so only a plugin that refuses a later
+        // rate gets here. A parameter it does not have stands in for that.
+        let plugin = |place, params: &[(&str, f64)]| config::PluginConfig {
+            place,
+            kind: "balance".into(),
+            path: None,
+            params: params.iter().map(|&(k, v)| (k.into(), v)).collect(),
+        };
+        let config = Config {
+            plugins: vec![
+                plugin(config::PluginPlace::Analog, &[("nope", 1.0)]),
+                plugin(config::PluginPlace::Mix, &[("nope", 1.0)]),
+                plugin(config::PluginPlace::Output, &[]),
+            ],
+            ..analog_config()
+        };
+        let opener = Opener::default();
+        let (_control, mut engine, _now) = started(&config, Some(&opener));
+        let seen = engine.take(true);
+        // The analog input keeps its detector, the others what they can.
+        let chains: Vec<&str> = seen
+            .iter()
+            .filter(|s| s.starts_with("SetChain"))
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            chains,
+            [
+                "SetChain Analog detect",
+                "SetChain Mix ",
+                "SetChain Output balance"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_chains_built_at_startup_are_sent_at_the_first_open() {
+        let mix = config::PluginConfig {
+            place: config::PluginPlace::Mix,
+            kind: "balance".into(),
+            path: None,
+            params: Default::default(),
+        };
+        let config = Config {
+            plugins: vec![mix],
+            ..Config::default()
+        };
+        let (commands, engine_commands) = rtrb::RingBuffer::new(256);
+        let (engine_events, events) = rtrb::RingBuffer::new(256);
+        let audio = std::thread::current();
+        let mut control = Control::new(&config, 12.0, Vec::new(), commands, events, audio);
+        let mut libraries = Libraries::default();
+        let mut chains =
+            Chains::build(&config.plugins, 48000, Format::F32, &mut libraries).unwrap();
+        // A chain built ahead stands out by what it holds.
+        chains.mix = Chain::empty();
+        control.set_plugins(libraries, chains);
+        control.start(Instant::now());
+        let mut engine = FakeEngine {
+            commands: engine_commands,
+            events: engine_events,
+            capture: None,
+        };
+        assert_eq!(
+            engine.take(true),
+            ["SetGain", "SetChain Mix ", "Reconfigure 48000 256"]
+        );
     }
 
     #[test]

@@ -6,6 +6,7 @@
 //! block.
 
 pub mod balance;
+pub mod build;
 pub mod builtin;
 pub mod chain;
 pub mod detect;

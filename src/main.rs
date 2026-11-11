@@ -144,7 +144,7 @@ fn main() -> ExitCode {
     let hardware = hardware_volume(&config);
     let probe = Some(card_probe(&config));
     let (socket, state) = (&args.socket, &args.state);
-    match server::run_probing(config, sink, socket, state, hardware, probe, shutdown) {
+    match server::run_probing(config, sink, socket, state, hardware, probe, None, shutdown) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("aas: {e}");
