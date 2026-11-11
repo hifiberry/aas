@@ -118,13 +118,15 @@ fn hardware_volume(config: &Config) -> Option<OpenVolume> {
 /// ADC aas knows, the open fails and the control thread tries again.
 #[cfg(feature = "alsa-output")]
 fn analog_input(config: &Config) -> Option<aas::control::OpenCapture> {
-    use aas::capture::Capture;
+    use aas::capture::{Capture, OpenError};
     use aas::sink_alsa::{AlsaCapture, AnalogCard, analog_card, capture_card, cards_text};
     match analog_card(&cards_text(), config) {
         AnalogCard::Off => None,
         AnalogCard::Present { card, driver } => {
             let open: aas::control::OpenCapture = Box::new(move |rate, period| {
-                AlsaCapture::open(&card, rate, period).map(|c| Box::new(c) as Box<dyn Capture>)
+                AlsaCapture::open(&card, rate, period)
+                    .map(|c| Box::new(c) as Box<dyn Capture>)
+                    .map_err(OpenError::Again)
             });
             server::analog_capture(config, &driver, open)
         }
@@ -133,7 +135,9 @@ fn analog_input(config: &Config) -> Option<aas::control::OpenCapture> {
             let wanted = config.card.clone();
             Some(Box::new(move |rate, period| {
                 let card = capture_card(&cards_text(), wanted.as_deref())?;
-                AlsaCapture::open(&card, rate, period).map(|c| Box::new(c) as Box<dyn Capture>)
+                AlsaCapture::open(&card, rate, period)
+                    .map(|c| Box::new(c) as Box<dyn Capture>)
+                    .map_err(OpenError::Again)
             }))
         }
     }

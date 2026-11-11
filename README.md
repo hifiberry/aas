@@ -131,9 +131,13 @@ input starts at: once the API can change the input volume (stage 4), that
 volume is kept in the state file like the output volume, and the config gives
 only its value on a fresh install. The input is off unless
 enabled, and it works only on cards with an ADC that `aas` knows: today the
-DAC+ ADC and the DAC+ ADC Pro. On any other card it logs one line and opens
-nothing. While the input is enabled the output never closes, and `idle = "off"`
-is ignored. The input plays only while its level is above a threshold, -50 dBFS
+DAC+ ADC and the DAC+ ADC Pro. On any other card it logs one line, opens
+nothing, and the output's idle rule applies as configured. While the input
+runs, on a card with an ADC `aas` knows, the output never closes and
+`idle = "off"` does not apply. A card that is not there at the start is
+looked for every second; if it turns out to have no ADC `aas` knows, the
+input stops there with one line in the log, and `idle = "off"` applies again.
+The input plays only while its level is above a threshold, -50 dBFS
 by default, and stays on for a hold time, 3 s by default, after it falls below.
 For 1 s after the capture starts, and after each change of rate, it is silent.
 
@@ -165,7 +169,8 @@ plays is recorded except through the card's input. With no signal at the input,
 with the input disabled, or on a card without an ADC, it records silence. With
 the input disabled and `idle = "off"`, the output closes `idle_delay_s` after
 the last player stops, and a recording then gets nothing and waits until a
-player opens the output again. With the input enabled the output stays open.
+player opens the output again. While the analog input runs the output stays
+open.
 
 `pcm.aas` records S32 stereo at the rate the daemon's output runs at, and
 nothing else. `plug` in the `default` device converts that to what the recorder

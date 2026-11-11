@@ -8,6 +8,37 @@ use crate::sink::SinkError;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+/// Why a capture could not be opened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpenError {
+    /// It may open later: the card is not there yet, or another program
+    /// holds it. Tried again every second.
+    Again(String),
+    /// It never will: the card has no analog input aas knows. The analog
+    /// input stays off from then on.
+    Never(String),
+}
+
+impl From<String> for OpenError {
+    fn from(why: String) -> OpenError {
+        OpenError::Again(why)
+    }
+}
+
+impl From<&str> for OpenError {
+    fn from(why: &str) -> OpenError {
+        OpenError::Again(why.into())
+    }
+}
+
+impl std::fmt::Display for OpenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OpenError::Again(why) | OpenError::Never(why) => f.write_str(why),
+        }
+    }
+}
+
 /// A device that delivers S32 stereo frames. None of the calls waits.
 pub trait Capture: Send {
     /// Frames queued for reading.

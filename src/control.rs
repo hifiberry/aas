@@ -5,7 +5,7 @@
 //! back is freed here. Commands that belong together go into the queue in
 //! one commit, so the audio thread never sees half a decision.
 
-use crate::capture::Capture;
+use crate::capture::{Capture, OpenError};
 use crate::config::{Config, Format, Idle, PluginConfig, PluginPlace, Quality};
 use crate::dop;
 use crate::engine::{Command, Event, INITIAL_SOURCES, INITIAL_TAPS, Source, Tap};
@@ -40,7 +40,11 @@ pub type ConnId = u64;
 /// It must not wait: while it runs, no client request is served. A device
 /// that another process holds must make it fail at once, not block until
 /// the device is free. A failed open is tried again a second later.
-pub type OpenCapture = Box<dyn FnMut(u32, u32) -> Result<Box<dyn Capture>, String>>;
+///
+/// An `OpenError::Never`, for a card found to have no analog input aas
+/// knows, ends the analog input: it is not tried again, and the idle rule
+/// of the config applies again.
+pub type OpenCapture = Box<dyn FnMut(u32, u32) -> Result<Box<dyn Capture>, OpenError>>;
 
 /// The name the analog input has in the rate rules while it is a client.
 pub const ANALOG: ClientId = ClientId::MAX;
@@ -1329,7 +1333,11 @@ impl Control {
                     eprintln!("aas: the analog input works again");
                 }
             }
-            Err(e) => {
+            Err(OpenError::Never(e)) => {
+                eprintln!("aas: the analog input: {e}; it stays off");
+                self.analog = None;
+            }
+            Err(OpenError::Again(e)) => {
                 if !std::mem::replace(&mut analog.failing, true) {
                     eprintln!("aas: the analog input: {e}, trying again every second");
                 }
@@ -2805,6 +2813,40 @@ mod tests {
         engine.send(Event::CaptureFailed(Box::new(capture)));
         control.handle_events(now);
         assert!(feed.closed());
+    }
+
+    #[test]
+    fn a_late_card_without_an_adc_ends_the_analog_input_and_idle_applies_again() {
+        let config = Config {
+            idle: Idle::Off { delay_s: 1 },
+            ..analog_config()
+        };
+        let (commands, engine_commands) = rtrb::RingBuffer::new(256);
+        let (engine_events, events) = rtrb::RingBuffer::new(256);
+        let audio = std::thread::current();
+        let mut control = Control::new(&config, 12.0, Vec::new(), commands, events, audio);
+        let asked = Arc::new(Mutex::new(0u32));
+        let counted = asked.clone();
+        control.set_analog(Box::new(move |_, _| {
+            *counted.lock().unwrap() += 1;
+            Err(crate::capture::OpenError::Never(
+                "the card has no ADC".into(),
+            ))
+        }));
+        let now = Instant::now();
+        control.start(now);
+        let mut engine = FakeEngine {
+            commands: engine_commands,
+            events: engine_events,
+            capture: None,
+        };
+        engine.take(true);
+        control.handle_events(now);
+        assert_eq!(*asked.lock().unwrap(), 1);
+        // Never tried again, and the output closes when idle once more.
+        control.tick(now + Duration::from_secs(5));
+        assert_eq!(*asked.lock().unwrap(), 1);
+        assert!(has(&engine.take(true), "CloseOutput"));
     }
 
     #[test]

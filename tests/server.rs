@@ -25,7 +25,8 @@ const PERIOD: u32 = 64;
 const PATIENCE: Duration = Duration::from_secs(20);
 
 /// Opens a capture. `Send`, so that it can go to the daemon's thread.
-type SendCapture = Box<dyn FnMut(u32, u32) -> Result<Box<dyn Capture>, String> + Send>;
+type SendCapture =
+    Box<dyn FnMut(u32, u32) -> Result<Box<dyn Capture>, aas::capture::OpenError> + Send>;
 
 /// Decides, on the daemon's thread and from its config, whether the
 /// daemon gets a capture, as `main` does.

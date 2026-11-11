@@ -4,6 +4,7 @@
 //! are tested everywhere. `AlsaSink`, `AlsaCapture` and `AlsaVolume` need
 //! the `alsa-output` feature.
 
+use crate::capture::OpenError;
 use crate::config::Config;
 use std::fs;
 
@@ -91,16 +92,18 @@ pub fn analog_card(text: &str, config: &Config) -> AnalogCard {
 
 /// The id of the card to capture from, for a card that was not there at
 /// the start: the card to play to, if it is there now and has an ADC aas
-/// knows.
-pub fn capture_card(text: &str, card: Option<&str>) -> Result<String, String> {
+/// knows. A card that is there without one never will have one.
+pub fn capture_card(text: &str, card: Option<&str>) -> Result<String, OpenError> {
     let Some((id, driver)) = card_driver(text, card) else {
-        return Err(match card {
+        return Err(OpenError::Again(match card {
             Some(card) => format!("card {card} not found"),
             None => "no sound card found".to_string(),
-        });
+        }));
     };
     if !crate::cards::has_adc(&driver) {
-        return Err(format!("the card {driver} has no analog input aas knows"));
+        return Err(OpenError::Never(format!(
+            "the card {driver} has no analog input aas knows"
+        )));
     }
     Ok(id)
 }
@@ -1078,11 +1081,11 @@ mod tests {
     fn a_late_card_opens_once_it_is_there_and_has_an_adc() {
         assert_eq!(
             capture_card("--- no soundcards ---\n", None),
-            Err("no sound card found".to_string())
+            Err(OpenError::Again("no sound card found".to_string()))
         );
         assert_eq!(
             capture_card(CARDS_TEXT, Some("DAC")),
-            Err("card DAC not found".to_string())
+            Err(OpenError::Again("card DAC not found".to_string()))
         );
         assert_eq!(
             capture_card(CARDS_TEXT, None),
@@ -1090,7 +1093,9 @@ mod tests {
         );
         assert_eq!(
             capture_card(CARDS_TEXT, Some("Headphones")),
-            Err("the card bcm2835 Headphones has no analog input aas knows".to_string())
+            Err(OpenError::Never(
+                "the card bcm2835 Headphones has no analog input aas knows".to_string()
+            ))
         );
     }
 
