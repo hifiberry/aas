@@ -538,7 +538,9 @@ The first plugin, placed on the analog input. It is built into the daemon as
 - It has a threshold. Below the threshold it sends no audio at all.
 - It is always in the analog chain. There is no way to run the analog input
   without it. When the analog input is off, the ADC stays off.
-- There is no mode where analog input passes audio regardless of level.
+- There is no mode where analog input passes audio regardless of level. The
+  engine holds to that by itself too: an analog chain without plugins passes
+  nothing.
 
 Further behaviour *(call)*:
 

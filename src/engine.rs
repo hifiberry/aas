@@ -535,9 +535,9 @@ impl<P: Processing> Analog<P> {
             return;
         }
         if self.chain.is_empty() {
-            // Nothing to measure it with, so it counts as signal.
-            self.audible = true;
-            self.signal = true;
+            // Nothing measures it, so it has no signal: the analog input
+            // never passes ungated. The control thread always sends a
+            // chain with a detector.
             return;
         }
         // Into the processing format as the mix does it.
@@ -5431,12 +5431,31 @@ mod tests {
 
     // The analog input.
 
-    /// A rig with a capture handed over, not yet cycled.
+    /// A rig with a capture handed over, not yet cycled, and an analog
+    /// chain that always has signal and alters nothing.
     fn with_capture<P: Processing>(mode: BitPerfect) -> (Rig<P>, CaptureFeed) {
         let mut rig = Rig::<P>::new(mode);
         let (capture, feed) = MemoryCapture::new();
         rig.send(Command::SetCapture(Some(Box::new(capture))));
+        set_chain(&mut rig, Place::Analog, vec![times(1.0).neutral()]);
         (rig, feed)
+    }
+
+    #[test]
+    fn without_a_chain_the_analog_input_is_silent() {
+        let mut rig = Rig::<I32>::new(BitPerfect::Auto);
+        let (capture, feed) = MemoryCapture::new();
+        rig.send(Command::SetCapture(Some(Box::new(capture))));
+        let recorder = add_tap(&mut rig, 5);
+        for _ in 0..3 {
+            feed.push(&frames(1 << 28, PERIOD));
+            rig.cycle();
+        }
+        // Nothing measures it, so nothing of it passes.
+        assert_eq!(rig.last_periods(3), frames(0, 3 * PERIOD));
+        assert_eq!(recorder.take(), frames(0, 3 * PERIOD));
+        assert!(signals(&rig.events()).is_empty());
+        assert_eq!(feed.queued(), 0);
     }
 
     /// Frames that differ from each other, with the low bits set.
@@ -5864,6 +5883,10 @@ mod tests {
         });
         engine.cycle().unwrap();
         // As the control thread does, after the output is open.
+        send(Command::SetChain(
+            Place::Analog,
+            chain_of::<F32>(vec![times(1.0).neutral()]),
+        ));
         send(Command::SetCapture(Some(Box::new(capture))));
         feed.push(&frames(1000, PERIOD));
         engine.cycle().unwrap();
@@ -5927,6 +5950,9 @@ mod tests {
     #[test]
     fn a_full_event_queue_delays_the_input_signal_without_losing_it() {
         let mut rig = Rig::<I32>::with_event_slots(BitPerfect::Auto, 1);
+        set_chain(&mut rig, Place::Analog, vec![times(1.0).neutral()]);
+        rig.cycle();
+        assert!(matches!(rig.events.pop(), Ok(Event::OldChain(_))));
         let (capture, feed) = MemoryCapture::new();
         rig.send(Command::SetCapture(Some(Box::new(capture))));
         feed.push(&frames(1, PERIOD));
