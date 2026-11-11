@@ -529,14 +529,17 @@ Details *(call)*:
   A shortfall is padded with zeros at the front, and anything over two periods is
   dropped. Both are counted. Capture overruns are not counted on their own, they
   show as padded frames.
-- A capture delivers silence for 1 s after each start. The ADC of the DAC+ ADC
+- A capture delivers silence for 1 s after each open. The ADC of the DAC+ ADC
   Pro starts with a transient that stays above -50 dBFS for up to 700 ms, and
   would open the input by itself. The DAC+ ADC on the Pi 3 test board never
   went above -50 dBFS at a start, its loudest 50 ms being -83.8 dBFS
   (`doc/measurements.md`, Stage 3a). So the 1 s is needed for the Pro only, but
   it applies to every card, so that the cards behave alike *(call: the owner
   to confirm)*. The cost is that the analog input is muted for 1 s at every
-  start and every rate change.
+  start and every rate change. A restart after a capture overrun prepares and
+  starts the stream without closing it; on the Pro that brings no transient
+  (nothing above -98 dBFS in 24 restarts, `doc/measurements.md`), so it is not
+  muted.
 - The engine tells the control thread whether the input has signal, by sending
   the current state when its event queue has room. If the queue is full while the
   input opens and closes again, no event is sent for that pair.

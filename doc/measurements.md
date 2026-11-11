@@ -1066,6 +1066,26 @@ From a card at rest the DAC+ ADC delivers exact zeros for the first 150 ms at
 spare at 44.1 kHz, and costs the DAC+ ADC a second of input it would not have
 to lose. The constant was left as it is.
 
+### The ADC after a capture overrun
+
+`aas` recovers a capture overrun by preparing and starting the stream again,
+without closing it. Whether that brings the start transient of the DAC+ ADC
+Pro back, which would call for the 1 s mute again, was measured on the CM5
+test board with the daemon stopped and the input quiet: a small program read
+`hw:sndrpihifiberry` as S32 stereo with a buffer of about 85 ms, stalled for
+300 ms to overrun it, recovered with `snd_pcm_prepare` and `snd_pcm_start`,
+and measured the first 700 ms after each restart: the loudest 50 ms window
+(RMS over both channels) and the peak. Twelve restarts at 44.1 kHz and twelve
+at 48 kHz.
+
+| | First open | Restarts, loudest 50 ms | Restarts, peak |
+|---|---|---|---|
+| 44.1 kHz | -26.8 dBFS | -102.4 to -97.9 dBFS | -92.3 to -90.5 dBFS |
+| 48 kHz | -27.7 dBFS | -102.8 to -98.5 dBFS | -92.7 to -90.0 dBFS |
+
+The transient comes with the open, not with a start: no restart came within
+48 dB of the detector's -50 dBFS. So a restart after an overrun is not muted.
+
 ### Idle output with the analog input on
 
 With the analog input on, `aas` keeps the playback open and writes exact zeros
