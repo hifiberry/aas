@@ -135,6 +135,20 @@ pub(crate) fn errno(e: &io::Error) -> c_int {
     }
 }
 
+/// What to print when the daemon and the plugin speak different protocol
+/// versions, or `None` for any other error. The daemon refuses a version
+/// it does not speak with `EPROTONOSUPPORT` and names none. A daemon that
+/// answers with a version of its own is reported by the client.
+fn version_mismatch(e: &io::Error) -> Option<String> {
+    if e.raw_os_error() == Some(libc::EPROTONOSUPPORT) {
+        return Some(format!(
+            "the daemon does not speak protocol {}, which this plugin does",
+            proto::VERSION
+        ));
+    }
+    (e.kind() == io::ErrorKind::Unsupported).then(|| e.to_string())
+}
+
 /// Runs a callback body. A panic becomes `-EIO`, an `Err(n)` becomes `-n`.
 pub(crate) fn guard<T: From<c_int>>(body: impl FnOnce() -> Result<T, c_int>) -> T {
     match catch_unwind(AssertUnwindSafe(body)) {
@@ -385,15 +399,17 @@ unsafe extern "C" fn hw_params(io: Io, _params: *mut snd_pcm_hw_params_t) -> c_i
     guard(|| unsafe { with(io, |inner| inner.set_up(io).map(|_| 0)) })
 }
 
-/// Gives the stream up: its ring is unmapped and its positions are
-/// forgotten. libasound calls this in SETUP or PREPARED, where the daemon's
-/// side is stopped already. The daemon keeps that side, idle, until the
+/// Gives the stream up: it is stopped, its ring is unmapped and its
+/// positions are forgotten. The daemon keeps its side, idle, until the
 /// next hw_params replaces it or the PCM closes. The wake-up is armed, so
 /// a player that still polls finds the PCM without a stream.
 unsafe extern "C" fn hw_free(io: Io) -> c_int {
     guard(|| unsafe {
         with(io, |inner| {
             inner.stream = None;
+            // For a player that frees a PCM it has not stopped. Without
+            // it the daemon would go on playing a ring nobody writes.
+            let _ = inner.client.stop();
             inner.client.release();
             inner.arm();
             Ok(0)
@@ -449,6 +465,12 @@ unsafe extern "C" fn sw_params(io: Io, params: *mut snd_pcm_sw_params_t) -> c_in
 /// as libasound has released its own, so another thread can drop, write
 /// or ask for the position meanwhile. A drop from another thread cancels
 /// the drain on the daemon, which answers it, and the drain returns.
+///
+/// What it returns then matters: after a 0, libasound drops the stream
+/// unless the PCM is in SETUP. So 0 is for a drain that is done and for a
+/// PCM a drop has left in SETUP. A PCM that another thread has dropped and
+/// prepared again is in neither, and gets `-EBADFD`, which leaves its new
+/// stream alone.
 unsafe extern "C" fn drain(io: Io) -> c_int {
     guard(|| unsafe {
         let nonblock = (*io).nonblock != 0;
@@ -457,13 +479,14 @@ unsafe extern "C" fn drain(io: Io) -> c_int {
             Ok(inner.client.poll_fds()[1])
         })?;
         loop {
-            // Read before the plugin's lock is taken, see `state`.
-            let draining = state(io) == SND_PCM_STATE_DRAINING;
             let done = with(io, |inner| inner.client.poll_drain().map_err(|e| errno(&e)))?;
-            // A PCM that is no longer draining was dropped meanwhile. The
-            // drop took the drain's reply, so `done` says the same.
-            if done || !draining {
-                return Ok(0);
+            // Read with the plugin's lock released, see `state`, and after
+            // the reply: a drop that took the reply has set the state.
+            match state(io) {
+                SND_PCM_STATE_SETUP => return Ok(0),
+                SND_PCM_STATE_DRAINING if done => return Ok(0),
+                SND_PCM_STATE_DRAINING => {}
+                _ => return Err(libc::EBADFD),
             }
             if nonblock {
                 return Err(libc::EAGAIN);
@@ -560,6 +583,7 @@ unsafe extern "C" fn poll_revents(
             std::slice::from_raw_parts(pfd, nfds as usize)
         };
         let state = state(io);
+        let seen = state;
         let (events, next) = with(io, |inner| {
             let socket = inner.client.poll_fds()[1];
             let hangup = libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
@@ -611,8 +635,20 @@ unsafe extern "C" fn poll_revents(
             let xrun = state == SND_PCM_STATE_RUNNING && events == libc::POLLERR;
             Ok((events, xrun.then_some(SND_PCM_STATE_XRUN)))
         })?;
-        if let Some(next) = next {
-            snd_pcm_ioplug_set_state(io, next);
+        // The state was read before the plugin's lock was taken, and
+        // another thread may have dropped or prepared the PCM since. Its
+        // state is the newer one and stays. A daemon that has gone is
+        // gone in any state. libasound's lock cannot be held from here to
+        // the write, nor taken inside the plugin's, so the state is read
+        // again as late as it can be.
+        match next {
+            Some(SND_PCM_STATE_DISCONNECTED) => {
+                snd_pcm_ioplug_set_state(io, SND_PCM_STATE_DISCONNECTED);
+            }
+            Some(next) if self::state(io) == seen => {
+                snd_pcm_ioplug_set_state(io, next);
+            }
+            _ => {}
         }
         *revents = events as c_ushort;
         Ok(0)
@@ -727,8 +763,8 @@ unsafe fn open(
         return Err(libc::EINVAL);
     }
     let client = Client::connect(proto::default_socket_path()).map_err(|e| {
-        if e.kind() == io::ErrorKind::Unsupported {
-            eprintln!("aas: {e}");
+        if let Some(why) = version_mismatch(&e) {
+            eprintln!("aas: {why}");
         }
         errno(&e)
     })?;
@@ -807,3 +843,27 @@ pub unsafe extern "C" fn _snd_pcm_aas_open(
 #[unsafe(no_mangle)]
 #[allow(non_upper_case_globals)]
 pub static __snd_pcm_aas_open_dlsym_pcm_001: c_char = 0;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_refused_protocol_version_is_worth_a_line() {
+        // What the daemon answers to a Hello of a version it does not speak.
+        let refused = io::Error::from_raw_os_error(libc::EPROTONOSUPPORT);
+        let line = version_mismatch(&refused).expect("a line");
+        assert!(line.contains(&proto::VERSION.to_string()), "{line}");
+        assert_eq!(errno(&refused), libc::EPROTONOSUPPORT);
+        // What the client makes of a daemon that names another version.
+        let other = io::Error::new(io::ErrorKind::Unsupported, "the daemon speaks protocol 9");
+        assert_eq!(
+            version_mismatch(&other).as_deref(),
+            Some("the daemon speaks protocol 9")
+        );
+        assert_eq!(errno(&other), libc::EPROTONOSUPPORT);
+        // No line for a daemon that is not there.
+        let away = io::Error::from_raw_os_error(libc::ECONNREFUSED);
+        assert_eq!(version_mismatch(&away), None);
+    }
+}
