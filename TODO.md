@@ -7,12 +7,23 @@ The Pi 4 still needs a test board. Then run the same probes, confirm or reject 4
 and confirm that `high` resampling fits. Without a Pi 4, the design's 4 ms claim
 for it stays unconfirmed.
 
-## Prove that a late wake-up does not drop audio
+## Shorten the outage after a late DMA interrupt on the CM5
 
-On the Pi 3 under load, a 4.05 ms wake-up gap with a 2.67 ms buffer gave no xrun.
-ALSA can miss an underrun when the interrupt is late, so it is unknown whether audio
-broke. Write a probe that plays a steady tone through the cable and reports breaks
-in the capture. Both test boards have the cable connected.
+Found with `tone-probe` and `stall`, see "Late wake-ups and the tone" in
+`doc/measurements.md`. On the CM5 test board, so on the RP1 and the Pi 5 too, a
+late DMA interrupt can stop the card with no ALSA error. The kernel logs
+`dma dma2chan2: Bad descriptor submitted`, the daemon's 500 ms wait for the card
+runs out, a restart of the stream does not bring the card back, and the card is
+reopened a second later. The tone is gone for about 1.5 s. It happened 76 times
+in the test, each time after a stall made on purpose by firing thousands of
+timers on the CPU that serves the card's interrupt. It did not happen in 15
+minutes of full load, or on the Pi 3, which has another DMA controller.
+
+Two things to do. In the daemon: reopen the card at once when the wait times out,
+and judge whether 500 ms can be shorter, so the outage is a fraction of a second.
+In the kernel: find why the descriptor is refused after a late interrupt, in the
+RP1 DMA driver, and report it. First step: `stall --mode irq` on the CM5 while
+`tone-probe` runs, with the kernel log streamed off the board.
 
 ## Measure the sound of medium resampling
 
