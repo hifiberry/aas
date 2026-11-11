@@ -1103,8 +1103,10 @@ fn a_card_that_comes_back_gets_the_volume_again() {
     let before = mixers.lock().unwrap().len();
     present.store(true, Ordering::Relaxed);
     log.fail(None);
+    // The new control is listed when it is opened, and set just after:
+    // wait for the setting, as the test before does.
     assert!(wait_for(|| mixers.lock().unwrap().len() > before));
-    assert_eq!(last_set(&mixers), Some(-36.0));
+    assert!(wait_for(|| last_set(&mixers) == Some(-36.0)));
 }
 
 /// How often the wake-up was written since it was last read, and whether
