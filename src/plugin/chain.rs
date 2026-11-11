@@ -18,7 +18,8 @@ pub struct Chain {
 }
 
 impl Chain {
-    /// A chain for blocks in `format` of up to `max_frames` frames.
+    /// A chain for blocks in `format` of up to `max_frames` frames. A longer
+    /// block given to `process` panics.
     pub fn new(plugins: Vec<Box<dyn Plugin>>, format: Format, max_frames: usize) -> Chain {
         let convert = plugins
             .iter()
@@ -42,7 +43,9 @@ impl Chain {
         }
     }
 
-    /// Runs the plugins in order on `block`, which is in the chain's format.
+    /// Runs the plugins in order on `block`, which must be in the chain's
+    /// format (only a debug build checks that) and at most `max_frames`
+    /// frames long (a longer block panics).
     /// `no_signal` is set if any plugin reported it.
     pub fn process(&mut self, mut block: Block<'_>) -> Status {
         debug_assert!(self.plugins.is_empty() || block.format() == self.format);
@@ -70,8 +73,8 @@ impl Chain {
         self.plugins.iter().map(|p| p.latency_frames()).sum()
     }
 
-    /// Sets parameter `index` of plugin `plugin`. Either that is not there
-    /// is ignored.
+    /// Sets parameter `index` of plugin `plugin`. An unknown plugin or
+    /// parameter index is ignored.
     pub fn set_param(&mut self, plugin: usize, index: usize, value: f64) {
         if let Some(p) = self.plugins.get_mut(plugin)
             && index < p.params().len()

@@ -364,15 +364,8 @@ mod tests {
 
     #[test]
     fn every_s24_value_survives_the_block_round_trip_in_f32() {
-        let v = [
-            i32::MIN,
-            -0x0123_4500,
-            -256,
-            0,
-            256,
-            0x0123_4500,
-            0x7FFF_FF00,
-        ];
+        // Every S24 value, left aligned in an S32 sample.
+        let v: Vec<i32> = (-(1 << 23)..(1 << 23)).map(|k| k << 8).collect();
         let got = block_round_trip::<F32>(&v, |block| {
             let Block::F32(b) = block else {
                 panic!("not an f32 block")
