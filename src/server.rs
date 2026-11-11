@@ -249,14 +249,16 @@ impl Server {
     /// read everything sent to it before. So notifications never fill its
     /// socket, its replies always fit, and a subscriber that has not read
     /// for a while still gets the current volume. What cannot be sent now
-    /// is tried again at the next step, within the tick.
+    /// is tried again at the next step, within the tick. If the socket
+    /// cannot tell what is unread, the notice is sent rather than kept for
+    /// good.
     fn notify(&mut self) {
         self.notices.extend(self.control.take_notices());
         self.notices.retain(|conn, notice| {
             let Some(fd) = self.conns.get(conn) else {
                 return false;
             };
-            if unread_bytes(fd) != Some(0) {
+            if !notice_is_due(fd) {
                 return true;
             }
             // A connection that has gone is closed by the next poll.
@@ -409,6 +411,12 @@ fn unread_bytes(fd: &OwnedFd) -> Option<usize> {
     (rc == 0).then_some(queued as usize)
 }
 
+/// Whether a subscriber's notice can go out now: it has read everything
+/// sent before, or the socket cannot tell.
+fn notice_is_due(fd: &OwnedFd) -> bool {
+    !matches!(unread_bytes(fd), Some(unread) if unread > 0)
+}
+
 /// The client's process name, from its credentials, for the log.
 fn peer_name(fd: &OwnedFd) -> String {
     // SAFETY: an all-zero ucred is valid, and getsockopt fills at most len.
@@ -505,5 +513,40 @@ fn raise_file_limit() {
     {
         limit.rlim_cur = limit.rlim_max;
         unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn socket_pair() -> (OwnedFd, OwnedFd) {
+        let mut fds = [0; 2];
+        let kind = libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC;
+        // SAFETY: fds has room for the two descriptors.
+        let rc = unsafe { libc::socketpair(libc::AF_UNIX, kind, 0, fds.as_mut_ptr()) };
+        assert_eq!(rc, 0);
+        unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) }
+    }
+
+    #[test]
+    fn a_notice_waits_until_the_subscriber_has_read_what_was_sent() {
+        let (ours, theirs) = socket_pair();
+        assert!(notice_is_due(&ours));
+        send_reply(&ours, &Reply::Ok, &[]).unwrap();
+        assert!(!notice_is_due(&ours));
+        let mut buf = [0u8; 64];
+        // SAFETY: the buffer is valid for its length.
+        let n = unsafe { libc::recv(theirs.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0) };
+        assert!(n > 0);
+        assert!(notice_is_due(&ours));
+    }
+
+    #[test]
+    fn a_notice_is_sent_when_the_unread_bytes_cannot_be_told() {
+        // The ioctl fails on a descriptor that is no socket.
+        let file = OwnedFd::from(fs::File::open("/dev/null").unwrap());
+        assert_eq!(unread_bytes(&file), None);
+        assert!(notice_is_due(&file));
     }
 }
