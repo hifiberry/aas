@@ -144,6 +144,12 @@ impl RatePolicy {
         self.drop_unneeded_switch();
     }
 
+    /// The rate the ordinary rules set, whatever rate a DoP stream holds
+    /// the output at.
+    pub fn base(&self) -> u32 {
+        self.base
+    }
+
     /// The output rate.
     pub fn current(&self) -> u32 {
         self.dop
@@ -324,6 +330,19 @@ mod tests {
         assert_eq!(p.current(), 44100);
         assert!(!p.needs_resampling(1));
         assert!(p.needs_resampling(2));
+    }
+
+    #[test]
+    fn the_base_rate_ignores_dop() {
+        let mut p = policy();
+        p.client_started(1, 44100, T0);
+        assert_eq!(p.base(), 44100);
+        p.client_started(2, 192000, T0);
+        p.dop_started(2);
+        assert_eq!(p.current(), 192000);
+        assert_eq!(p.base(), 44100);
+        p.dop_stopped(2);
+        assert_eq!(p.base(), 44100);
     }
 
     #[test]
