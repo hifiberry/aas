@@ -1,7 +1,10 @@
 //! A client's side of the daemon: the socket, the ring and the wake-up.
 //!
 //! The socket carries setup and teardown only. Audio goes through the ring.
-//! Every call that talks to the daemon waits for its reply.
+//! Every call that talks to the daemon waits for its reply, for at most
+//! `TIMEOUT`. A reply that does not come in time would answer the next
+//! request instead, so the connection is lost then: every later call fails
+//! as for a daemon that has gone.
 
 use crate::convert::{ClientFormat, to_stereo_s32};
 use crate::proto::{self, Reply, Request};
@@ -11,11 +14,15 @@ use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::atomic::{Ordering, fence};
+use std::time::Duration;
 
 /// Descriptors a reply may carry: the ring and the wake-up.
 const MAX_FDS: usize = 2;
 /// Frames converted per step of `write`. Kept on the stack.
 const CHUNK: usize = 512;
+/// How long a request waits for the daemon's answer. A drain waits as long
+/// as the audio takes to play.
+const TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The address of a Unix socket at `path`, and its length.
 pub fn socket_address(path: &Path) -> io::Result<(libc::sockaddr_un, libc::socklen_t)> {
@@ -50,6 +57,10 @@ fn daemon_gone() -> io::Error {
     io::Error::from_raw_os_error(libc::ECONNRESET)
 }
 
+fn timed_out() -> io::Error {
+    io::Error::from_raw_os_error(libc::ETIMEDOUT)
+}
+
 struct Stream {
     ring: Ring,
     wake: OwnedFd,
@@ -63,28 +74,66 @@ pub struct Client {
     stream: Option<Stream>,
     /// A drain sent by `start_drain` whose reply has not been read.
     drain_pending: bool,
+    /// A request failed on the socket, so replies are out of step.
+    lost: bool,
 }
 
 impl Client {
     /// Connects and checks that the daemon speaks this protocol version.
     pub fn connect(path: impl AsRef<Path>) -> io::Result<Client> {
-        let (addr, len) = socket_address(path.as_ref())?;
+        Client::connect_with(path.as_ref(), TIMEOUT)
+    }
+
+    /// Connects. Requests wait at most `timeout` for their reply.
+    fn connect_with(path: &Path, timeout: Duration) -> io::Result<Client> {
+        let (addr, len) = socket_address(path)?;
         // SAFETY: plain syscalls; the descriptor is owned at once.
         let raw =
             unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0) };
         check(raw as isize)?;
         let socket = unsafe { OwnedFd::from_raw_fd(raw) };
+        let timeout = libc::timeval {
+            tv_sec: timeout.as_secs() as libc::time_t,
+            tv_usec: timeout.subsec_micros() as libc::suseconds_t,
+        };
+        for option in [libc::SO_RCVTIMEO, libc::SO_SNDTIMEO] {
+            // SAFETY: the option value is a timeval of the size given.
+            let rc = unsafe {
+                libc::setsockopt(
+                    socket.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    option,
+                    (&raw const timeout).cast(),
+                    size_of::<libc::timeval>() as libc::socklen_t,
+                )
+            };
+            check(rc as isize)?;
+        }
         let rc = unsafe { libc::connect(socket.as_raw_fd(), (&raw const addr).cast(), len) };
         check(rc as isize)?;
         let mut client = Client {
             socket,
             stream: None,
             drain_pending: false,
+            lost: false,
         };
-        client.call(&Request::Hello {
+        let hello = Request::Hello {
             version: proto::VERSION,
-        })?;
-        Ok(client)
+        };
+        match client.call(&hello)?.0 {
+            Reply::Hello { version } if version == proto::VERSION => Ok(client),
+            Reply::Hello { version } => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "the daemon speaks protocol {version}, this client {}",
+                    proto::VERSION
+                ),
+            )),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unexpected reply to hello",
+            )),
+        }
     }
 
     fn send(&self, request: &Request) -> io::Result<()> {
@@ -101,6 +150,7 @@ impl Client {
             };
             match check(rc) {
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Err(timed_out()),
                 Err(e) if e.raw_os_error() == Some(libc::EPIPE) => return Err(daemon_gone()),
                 Err(e) => return Err(e),
                 Ok(_) => return Ok(()),
@@ -108,13 +158,14 @@ impl Client {
         }
     }
 
-    /// Waits for one reply and the descriptors that came with it.
+    /// Waits for one reply and the descriptors that came with it, for as
+    /// long as the socket's timeout.
     fn receive(&self) -> io::Result<(Reply, Vec<OwnedFd>)> {
-        self.receive_flags(0)?
-            .ok_or_else(|| io::Error::from(io::ErrorKind::WouldBlock))
+        self.receive_flags(0)?.ok_or_else(timed_out)
     }
 
-    /// Reads one reply. With `MSG_DONTWAIT` it is `None` if none is there.
+    /// Reads one reply. It is `None` if none is there: at once with
+    /// `MSG_DONTWAIT`, else after the socket's timeout.
     fn receive_flags(&self, flags: libc::c_int) -> io::Result<Option<(Reply, Vec<OwnedFd>)>> {
         let mut data = [0u8; 64];
         let mut iov = libc::iovec {
@@ -169,17 +220,28 @@ impl Client {
 
     /// Sends a request and waits for its reply. `Reply::Error` becomes the
     /// error it names. A drain still waiting is answered first, finished or
-    /// cancelled by this request, and its reply is set aside.
+    /// cancelled by this request, and its reply is set aside. A failure of
+    /// the socket, a reply that does not come in time among them, loses the
+    /// connection.
     fn call(&mut self, request: &Request) -> io::Result<(Reply, Vec<OwnedFd>)> {
+        if self.lost {
+            return Err(daemon_gone());
+        }
+        let answer = self.exchange(request);
+        self.lost = answer.is_err();
+        match answer? {
+            (Reply::Error { code }, _) => Err(io::Error::from_raw_os_error(code as i32)),
+            answer => Ok(answer),
+        }
+    }
+
+    fn exchange(&mut self, request: &Request) -> io::Result<(Reply, Vec<OwnedFd>)> {
         self.send(request)?;
         if self.drain_pending {
             self.receive()?;
             self.drain_done();
         }
-        match self.receive()? {
-            (Reply::Error { code }, _) => Err(io::Error::from_raw_os_error(code as i32)),
-            answer => Ok(answer),
-        }
+        self.receive()
     }
 
     fn stream(&self) -> io::Result<&Stream> {
@@ -241,8 +303,16 @@ impl Client {
     /// stopped afterwards.
     pub fn drain(&mut self) -> io::Result<()> {
         self.start_drain()?;
-        let reply = self.receive();
+        // The audio may take longer to play than a request may take.
+        let reply = loop {
+            match self.receive_flags(0) {
+                Ok(None) => continue,
+                Ok(Some(reply)) => break Ok(reply),
+                Err(e) => break Err(e),
+            }
+        };
         self.drain_done();
+        self.lost |= reply.is_err();
         match reply? {
             (Reply::Error { code }, _) => Err(io::Error::from_raw_os_error(code as i32)),
             _ => Ok(()),
@@ -255,11 +325,15 @@ impl Client {
         if self.drain_pending {
             return Ok(());
         }
+        if self.lost {
+            return Err(daemon_gone());
+        }
         let stream = self.stream()?;
         // After the last frames, which the daemon relies on.
         stream.ring.header().draining.store(1, Ordering::Release);
         if let Err(e) = self.send(&Request::Drain) {
             self.drain_done();
+            self.lost = true;
             return Err(e);
         }
         self.drain_pending = true;
@@ -277,6 +351,7 @@ impl Client {
             other => other,
         };
         self.drain_done();
+        self.lost |= reply.is_err();
         match reply?.map(|(reply, _)| reply) {
             Some(Reply::Error { code }) => Err(io::Error::from_raw_os_error(code as i32)),
             _ => Ok(true),
@@ -373,8 +448,12 @@ impl Client {
         [wake, self.socket.as_raw_fd()]
     }
 
-    /// Fails if the daemon has closed the connection.
+    /// Fails if the daemon has closed the connection, or the connection
+    /// is lost.
     pub fn check_alive(&self) -> io::Result<()> {
+        if self.lost {
+            return Err(daemon_gone());
+        }
         let mut pfd = libc::pollfd {
             fd: self.socket.as_raw_fd(),
             events: libc::POLLIN | libc::POLLRDHUP,
@@ -387,5 +466,196 @@ impl Client {
             return Err(daemon_gone());
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicU32;
+    use std::thread::JoinHandle;
+    use std::time::Instant;
+
+    const SHORT: Duration = Duration::from_millis(100);
+
+    /// A daemon played by `script`, which gets the one connection it
+    /// accepts. Returns its socket and the thread to join.
+    fn fake_daemon(script: impl FnOnce(OwnedFd) + Send + 'static) -> (PathBuf, JoinHandle<()>) {
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let name = format!("aas-client-test-{}-{n}.sock", std::process::id());
+        let path = std::env::temp_dir().join(name);
+        let _ = std::fs::remove_file(&path);
+        let (addr, len) = socket_address(&path).unwrap();
+        // SAFETY: plain syscalls; the descriptor is owned at once.
+        let listener = unsafe {
+            let raw = libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0);
+            assert!(raw >= 0);
+            let listener = OwnedFd::from_raw_fd(raw);
+            assert_eq!(libc::bind(raw, (&raw const addr).cast(), len), 0);
+            assert_eq!(libc::listen(raw, 1), 0);
+            listener
+        };
+        let unlink = path.clone();
+        let thread = std::thread::spawn(move || {
+            // SAFETY: accept on the listener; the descriptor is owned at once.
+            let conn = unsafe {
+                let raw = libc::accept(
+                    listener.as_raw_fd(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                );
+                assert!(raw >= 0);
+                OwnedFd::from_raw_fd(raw)
+            };
+            let _ = std::fs::remove_file(unlink);
+            script(conn);
+        });
+        (path, thread)
+    }
+
+    /// The next request, or `None` once the client has hung up.
+    fn request(conn: &OwnedFd) -> Option<Request> {
+        let mut data = [0u8; 64];
+        // SAFETY: the buffer is valid for its length.
+        let n = unsafe { libc::recv(conn.as_raw_fd(), data.as_mut_ptr().cast(), data.len(), 0) };
+        (n > 0).then(|| proto::decode_request(&data[..n as usize]).expect("a request"))
+    }
+
+    fn answer(conn: &OwnedFd, reply: Reply, fds: &[RawFd]) {
+        let mut data = proto::encode_reply(&reply);
+        let mut iov = libc::iovec {
+            iov_base: data.as_mut_ptr().cast(),
+            iov_len: data.len(),
+        };
+        let mut control = [0u64; 8];
+        // SAFETY: an all-zero msghdr is valid; the pointers set below live
+        // until sendmsg returns, and the control buffer holds the header
+        // and the descriptors.
+        unsafe {
+            let mut msg: libc::msghdr = std::mem::zeroed();
+            msg.msg_iov = &mut iov;
+            msg.msg_iovlen = 1;
+            if !fds.is_empty() {
+                let bytes = size_of_val(fds);
+                msg.msg_control = control.as_mut_ptr().cast();
+                msg.msg_controllen = libc::CMSG_SPACE(bytes as u32) as _;
+                let cmsg = libc::CMSG_FIRSTHDR(&msg);
+                (*cmsg).cmsg_level = libc::SOL_SOCKET;
+                (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+                (*cmsg).cmsg_len = libc::CMSG_LEN(bytes as u32) as _;
+                std::ptr::copy_nonoverlapping(
+                    fds.as_ptr().cast::<u8>(),
+                    libc::CMSG_DATA(cmsg),
+                    bytes,
+                );
+            }
+            assert_eq!(
+                libc::sendmsg(conn.as_raw_fd(), &msg, 0),
+                data.len() as isize
+            );
+        }
+    }
+
+    fn greet(conn: &OwnedFd) {
+        let hello = Request::Hello {
+            version: proto::VERSION,
+        };
+        assert_eq!(request(conn), Some(hello));
+        let said = Reply::Hello {
+            version: proto::VERSION,
+        };
+        answer(conn, said, &[]);
+    }
+
+    /// Answers a configure with a ring and a wake-up, which it returns.
+    fn configure(conn: &OwnedFd) -> (Ring, OwnedFd) {
+        assert!(matches!(request(conn), Some(Request::Configure { .. })));
+        let (ring, memfd) = Ring::create(1024).unwrap();
+        // SAFETY: a plain syscall; the descriptor is owned at once.
+        let wake = unsafe { OwnedFd::from_raw_fd(libc::eventfd(0, libc::EFD_CLOEXEC)) };
+        let fds = [memfd.as_raw_fd(), wake.as_raw_fd()];
+        answer(conn, Reply::Configured, &fds);
+        (ring, wake)
+    }
+
+    #[test]
+    fn connect_takes_the_version_from_the_reply_to_hello() {
+        let (path, daemon) = fake_daemon(|conn| {
+            assert!(request(&conn).is_some());
+            let other = Reply::Hello {
+                version: proto::VERSION + 1,
+            };
+            answer(&conn, other, &[]);
+        });
+        let err = Client::connect(&path).err().expect("another version");
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+        assert!(err.to_string().contains(&(proto::VERSION + 1).to_string()));
+        daemon.join().unwrap();
+
+        // A reply that names no version is not taken for a match.
+        let (path, daemon) = fake_daemon(|conn| {
+            assert!(request(&conn).is_some());
+            answer(&conn, Reply::Ok, &[]);
+        });
+        let err = Client::connect(&path).err().expect("no version");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        daemon.join().unwrap();
+
+        let (path, daemon) = fake_daemon(|conn| greet(&conn));
+        assert!(Client::connect(&path).is_ok());
+        daemon.join().unwrap();
+    }
+
+    #[test]
+    fn a_request_without_a_reply_times_out_and_loses_the_connection() {
+        let (path, daemon) = fake_daemon(|conn| {
+            greet(&conn);
+            // Reads the requests and answers none, until the client goes.
+            while request(&conn).is_some() {}
+        });
+        let mut client = Client::connect_with(&path, SHORT).unwrap();
+        assert!(client.check_alive().is_ok());
+        let start = Instant::now();
+        let err = client.configure(48000, ClientFormat::S16, 2, 1024);
+        let took = start.elapsed();
+        assert_eq!(
+            err.err().and_then(|e| e.raw_os_error()),
+            Some(libc::ETIMEDOUT)
+        );
+        assert!(took >= SHORT && took < SHORT * 10, "took {took:?}");
+        // A late reply would answer the next request, so there is none.
+        let start = Instant::now();
+        let err = client.configure(48000, ClientFormat::S16, 2, 1024);
+        assert_eq!(
+            err.err().and_then(|e| e.raw_os_error()),
+            Some(libc::ECONNRESET)
+        );
+        assert!(start.elapsed() < SHORT);
+        assert!(client.check_alive().is_err());
+        drop(client);
+        daemon.join().unwrap();
+    }
+
+    #[test]
+    fn a_drain_waits_longer_than_a_request_may_take() {
+        let (path, daemon) = fake_daemon(|conn| {
+            greet(&conn);
+            let _stream = configure(&conn);
+            assert_eq!(request(&conn), Some(Request::Drain));
+            std::thread::sleep(SHORT * 3);
+            answer(&conn, Reply::Ok, &[]);
+            assert_eq!(request(&conn), Some(Request::Stop));
+            answer(&conn, Reply::Ok, &[]);
+        });
+        let mut client = Client::connect_with(&path, SHORT).unwrap();
+        client.configure(48000, ClientFormat::S16, 2, 1024).unwrap();
+        let start = Instant::now();
+        client.drain().unwrap();
+        assert!(start.elapsed() >= SHORT * 3);
+        // The connection is in step: the next request gets its own reply.
+        client.stop().unwrap();
+        daemon.join().unwrap();
     }
 }
