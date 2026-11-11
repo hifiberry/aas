@@ -655,13 +655,18 @@ Details *(call)*:
   and the state file.
 - Plugins form an ordered chain at each place, defined in the config. Nothing
   rewires them on its own, and a chain never runs without one of its plugins.
-- A rate at which any chain cannot be built, such as one a library plugin
-  refuses, is not a rate the output uses. The rate rules take the nearest rate
-  every chain accepts, as for a rate the card does not take, and clients are
-  resampled to it. It is found when a chain is first built at that rate. If no
-  rate works, the output stays as it is and this is logged; at startup a
-  chain that cannot be built at any rate the card takes stops the daemon. The
-  analog chain has no fallback to its detector alone.
+- A plugin's `create` tells a rate it does not support from a failure. A rate
+  some chain does not support is not a rate the output uses. The rate rules
+  take the nearest rate every chain accepts, as for a rate the card does not
+  take, and clients are resampled to it. It is found when a chain is first
+  built at that rate. If no rate works, the output stays as it is and this is
+  logged; at startup a chain that cannot be built at any rate the card takes
+  stops the daemon. The analog chain has no fallback to its detector alone.
+- A plugin that fails, rather than not support the rate, does not cost the
+  rate. At startup the failure stops the daemon. At run time it is logged with
+  the plugin's name, the output keeps what it has, and the rate is tried again
+  at the next rate decision, that is the next change of clients, of the
+  analog input or of the card, never more often.
 - Plugins see stereo blocks in the processing format. Float blocks are scaled so
   full scale is 1.0 and are not clipped between plugins, and the analog chain's
   output keeps that headroom until the mix. In `i32` a block is clipped before
@@ -806,8 +811,10 @@ All of this is *(call)*:
   input goes quiet, the control thread is told, and it tries again every second.
   A suspended or disconnected capture is reported gone.
 - A recorder that stops reading loses only its own audio.
-- If a chain cannot be built at a rate, the daemon logs it and does not use
-  that rate (see Plugins). It never runs a chain short of its plugins.
+- If a chain cannot be built at a rate, the daemon logs it. A rate a plugin
+  does not support is not used; a plugin that failed is tried again at the
+  next rate decision (see Plugins). It never runs a chain short of its
+  plugins.
 - The daemon locks each client's ring in memory, so that the audio thread never
   waits for a page. A ring is at most 8 MiB, for the largest buffer a client may
   ask for, and the control thread adds one page for its view of the header.

@@ -6,10 +6,11 @@
 //! what it reports into Rust values when it is built, so the calls on the
 //! audio thread allocate nothing.
 
-use super::{Block, Formats, Param, ParamKind, Plugin, Status};
+use super::{Block, BuildError, Failure, Formats, Param, ParamKind, Plugin, Status};
 use aas_plugin::{
-    ABI, DESCRIPTOR_SIZE, Descriptor, FORMAT_F32, FORMAT_F64, FORMAT_I32, PARAM_ENUMERATION,
-    PARAM_FLOAT, PARAM_INFO_SIZE, PARAM_INTEGER, PARAM_SWITCH, ParamInfo, STATUS_NO_SIGNAL,
+    ABI, CREATE_OK, CREATE_UNSUPPORTED, DESCRIPTOR_SIZE, Descriptor, FORMAT_F32, FORMAT_F64,
+    FORMAT_I32, PARAM_ENUMERATION, PARAM_FLOAT, PARAM_INFO_SIZE, PARAM_INTEGER, PARAM_SWITCH,
+    ParamInfo, STATUS_NO_SIGNAL,
 };
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::os::unix::ffi::OsStrExt;
@@ -146,19 +147,46 @@ impl Library {
     /// Builds an instance for `rate` Hz and blocks of up to `max_frames`
     /// frames, with its parameters at their defaults. Runs on the control
     /// thread.
-    pub fn create(&self, rate: u32, max_frames: usize) -> Result<Box<dyn Plugin>, String> {
-        let fail = |why: &str| format!("plugin {} from {}: {why}", self.name, self.path);
-        let frames = match u32::try_from(max_frames) {
-            Ok(0) => return Err(fail("blocks of no frames")),
-            Ok(n) => n,
-            Err(_) => return Err(fail("blocks too long")),
+    ///
+    /// A plugin that does not support `rate` gives a `Failure::Unsupported`
+    /// error; one that failed, or answered something the ABI does not
+    /// allow, a `Failure::Failed` one.
+    pub fn create(&self, rate: u32, max_frames: usize) -> Result<Box<dyn Plugin>, BuildError> {
+        let fail = |kind, why: &str| {
+            BuildError::new(
+                kind,
+                format!("plugin {} from {}: {why}", self.name, self.path),
+            )
         };
-        let instance = (self.fns.create)(rate, frames);
-        if instance.is_null() {
-            return Err(fail(&format!(
-                "it refused or failed at {rate} Hz (create returned null), so that rate is \
-                 not used while the daemon runs"
-            )));
+        let frames = match u32::try_from(max_frames) {
+            Ok(0) => return Err(fail(Failure::Failed, "blocks of no frames")),
+            Ok(n) => n,
+            Err(_) => return Err(fail(Failure::Failed, "blocks too long")),
+        };
+        let mut instance = std::ptr::null_mut();
+        let status = (self.fns.create)(rate, frames, &mut instance);
+        match status {
+            CREATE_OK if !instance.is_null() => {}
+            CREATE_OK => {
+                return Err(fail(
+                    Failure::Failed,
+                    &format!("its create at {rate} Hz succeeded but gave no instance"),
+                ));
+            }
+            CREATE_UNSUPPORTED => {
+                return Err(fail(
+                    Failure::Unsupported,
+                    &format!(
+                        "it does not support {rate} Hz, which is not used while the daemon runs"
+                    ),
+                ));
+            }
+            _ => {
+                return Err(fail(
+                    Failure::Failed,
+                    &format!("its create failed at {rate} Hz (status {status})"),
+                ));
+            }
         }
         Ok(Box::new(Native {
             fns: self.fns,
@@ -178,7 +206,7 @@ const MAX_PARAMS: u32 = 4096;
 /// The functions of a descriptor, each checked to be there.
 #[derive(Clone, Copy)]
 struct Fns {
-    create: extern "C" fn(u32, u32) -> *mut c_void,
+    create: extern "C" fn(u32, u32, *mut *mut c_void) -> u32,
     destroy: extern "C" fn(*mut c_void),
     set_param: extern "C" fn(*mut c_void, u32, f64),
     neutral: extern "C" fn(*const c_void) -> u32,

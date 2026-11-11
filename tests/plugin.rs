@@ -112,7 +112,9 @@ fn with_fixture(test: &str, case: &str, body: impl FnOnce(&Path)) {
 /// which is given the message and the path.
 fn refused_fixture(test: &str, case: &str, check: impl FnOnce(&str, &str)) {
     with_fixture(test, case, |path| {
-        let msg = unwrap_err(Library::open(path).and_then(|l| l.create(48000, 1024)));
+        let created =
+            Library::open(path).and_then(|l| l.create(48000, 1024).map_err(|e| e.message));
+        let msg = unwrap_err(created);
         check(&msg, path.to_str().unwrap());
     });
 }
@@ -490,4 +492,67 @@ fn reset_clears_a_plugins_state_and_is_optional() {
     let mut g = gain();
     g.reset();
     assert!(g.neutral());
+}
+
+#[test]
+fn create_tells_an_unsupported_rate_from_a_failure() {
+    use aas::plugin::Failure;
+    let created = |path: &Path| {
+        Library::open(path)
+            .unwrap()
+            .create(48000, 1024)
+            .err()
+            .unwrap()
+    };
+    with_fixture(
+        "create_tells_an_unsupported_rate_from_a_failure",
+        "unsupported",
+        |path| {
+            let e = created(path);
+            assert_eq!(e.kind, Failure::Unsupported, "{e}");
+            assert!(e.message.contains("does not support 48000 Hz"), "{e}");
+        },
+    );
+}
+
+#[test]
+fn a_failed_create_or_one_without_an_instance_is_a_failure() {
+    use aas::plugin::Failure;
+    let created = |path: &Path| {
+        Library::open(path)
+            .unwrap()
+            .create(48000, 1024)
+            .err()
+            .unwrap()
+    };
+    with_fixture(
+        "a_failed_create_or_one_without_an_instance_is_a_failure",
+        "null",
+        |path| {
+            let e = created(path);
+            assert_eq!(e.kind, Failure::Failed, "{e}");
+            assert!(
+                e.message.contains("fixture") && e.message.contains("failed"),
+                "{e}"
+            );
+        },
+    );
+}
+
+#[test]
+fn a_create_that_succeeds_without_an_instance_is_a_failure() {
+    use aas::plugin::Failure;
+    with_fixture(
+        "a_create_that_succeeds_without_an_instance_is_a_failure",
+        "noinstance",
+        |path| {
+            let e = Library::open(path)
+                .unwrap()
+                .create(48000, 1024)
+                .err()
+                .unwrap();
+            assert_eq!(e.kind, Failure::Failed, "{e}");
+            assert!(e.message.contains("gave no instance"), "{e}");
+        },
+    );
 }

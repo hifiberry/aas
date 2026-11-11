@@ -4,8 +4,8 @@
 //! At 0 dB it is neutral and leaves the audio alone.
 
 use aas_plugin::{
-    ABI, DESCRIPTOR_SIZE, Descriptor, FORMAT_F32, FORMAT_F64, PARAM_FLOAT, PARAM_INFO_SIZE,
-    ParamInfo,
+    ABI, CREATE_OK, DESCRIPTOR_SIZE, Descriptor, FORMAT_F32, FORMAT_F64, PARAM_FLOAT,
+    PARAM_INFO_SIZE, ParamInfo,
 };
 use std::ffi::c_void;
 
@@ -66,12 +66,14 @@ unsafe fn gain<'a>(p: *mut c_void) -> &'a mut Gain {
     unsafe { &mut *p.cast::<Gain>() }
 }
 
-extern "C" fn create(_rate: u32, _max_frames: u32) -> *mut c_void {
-    Box::into_raw(Box::new(Gain {
+extern "C" fn create(_rate: u32, _max_frames: u32, instance: *mut *mut c_void) -> u32 {
+    let gain = Box::new(Gain {
         db: 0.0,
         factor: 1.0,
-    }))
-    .cast()
+    });
+    // SAFETY: the ABI passes a place for the instance.
+    unsafe { *instance = Box::into_raw(gain).cast() };
+    CREATE_OK
 }
 
 extern "C" fn destroy(p: *mut c_void) {

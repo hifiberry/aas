@@ -87,6 +87,50 @@ pub enum ParamKind {
     Enumeration(Vec<String>),
 }
 
+/// Why a plugin, or a chain, could not be built.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildError {
+    pub kind: Failure,
+    pub message: String,
+}
+
+/// What kind of failure a `BuildError` is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Failure {
+    /// A plugin does not support the rate. The rate is not used while the
+    /// daemon runs.
+    Unsupported,
+    /// A plugin failed, for a reason that may pass, such as memory. Tried
+    /// again at the next rate decision.
+    Failed,
+    /// The config does not fit the plugins: a missing library, an unknown
+    /// parameter, a value a plugin refuses.
+    Config,
+}
+
+impl BuildError {
+    pub fn new(kind: Failure, message: impl Into<String>) -> BuildError {
+        BuildError {
+            kind,
+            message: message.into(),
+        }
+    }
+
+    /// The same error, its message after `prefix`.
+    pub fn context(self, prefix: &str) -> BuildError {
+        BuildError {
+            kind: self.kind,
+            message: format!("{prefix}{}", self.message),
+        }
+    }
+}
+
+impl std::fmt::Display for BuildError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
 /// What a plugin reports about the block it processed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Status {

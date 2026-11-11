@@ -1,9 +1,9 @@
 //! Chains built from the config, on the control thread.
 
-use super::Plugin;
 use super::builtin;
 use super::chain::Chain;
 use super::native::Library;
+use super::{BuildError, Failure, Plugin};
 use crate::config::{Format, PluginConfig, PluginPlace};
 use crate::engine::Place;
 use crate::latency::MAX_PERIOD;
@@ -50,28 +50,52 @@ pub fn build_chain(
     rate: u32,
     format: Format,
     libraries: &mut Libraries,
-) -> Result<Chain, String> {
+) -> Result<Chain, BuildError> {
+    let config_error = |m: String| BuildError::new(Failure::Config, m);
     let max_frames = MAX_PERIOD as usize;
     let mut plugins = Vec::new();
     let listed = config.iter().enumerate().filter(|(_, p)| p.place == place);
     for (i, p) in listed {
         let n = i + 1;
+        let prefix = format!("plugin {n}: ");
         let mut plugin: Box<dyn Plugin> = match (p.kind.as_str(), &p.path) {
-            ("library", Some(path)) => libraries
-                .get(path)
-                .and_then(|library| library.create(rate, max_frames))
-                .map_err(|e| format!("plugin {n}: {e}"))?,
-            ("library", None) => return Err(format!("plugin {n}: type \"library\" needs a path")),
-            (kind, _) => builtin::create(kind, rate)
-                .ok_or_else(|| format!("plugin {n}: there is no plugin of type \"{kind}\""))?,
+            ("library", Some(path)) => {
+                let library = libraries
+                    .get(path)
+                    .map_err(|e| config_error(format!("{prefix}{e}")))?;
+                library
+                    .create(rate, max_frames)
+                    .map_err(|e| e.context(&prefix))?
+            }
+            ("library", None) => {
+                return Err(config_error(format!(
+                    "{prefix}type \"library\" needs a path"
+                )));
+            }
+            (kind, _) => match builtin::create(kind, rate) {
+                Some(Ok(plugin)) => plugin,
+                Some(Err(failure)) => {
+                    let what = match failure {
+                        Failure::Unsupported => "does not support",
+                        _ => "failed at",
+                    };
+                    let m = format!("{prefix}type \"{kind}\" {what} {rate} Hz");
+                    return Err(BuildError::new(failure, m));
+                }
+                None => {
+                    return Err(config_error(format!(
+                        "{prefix}there is no plugin of type \"{kind}\""
+                    )));
+                }
+            },
         };
         for (name, &value) in &p.params {
             let index = plugin.params().iter().position(|q| q.name == *name);
             let Some(index) = index else {
-                return Err(format!(
+                return Err(config_error(format!(
                     "plugin {n}: type \"{}\" has no parameter {name}",
                     p.kind
-                ));
+                )));
             };
             plugin.set_param(index, value);
         }
@@ -81,7 +105,8 @@ pub fn build_chain(
         .iter()
         .any(|p| p.place == place && p.kind == "detect");
     if place == PluginPlace::Analog && !has_detect {
-        plugins.push(builtin::create("detect", rate).expect("detect is built in"));
+        let detect = builtin::create("detect", rate).and_then(Result::ok);
+        plugins.push(detect.expect("detect is built in and takes every rate"));
     }
     if plugins.is_empty() {
         return Ok(Chain::empty());
@@ -105,7 +130,7 @@ impl Chains {
         rate: u32,
         format: Format,
         libraries: &mut Libraries,
-    ) -> Result<Chains, String> {
+    ) -> Result<Chains, BuildError> {
         let mut build = |place| build_chain(config, place, rate, format, libraries);
         Ok(Chains {
             rate,
@@ -115,11 +140,11 @@ impl Chains {
         })
     }
 
-    /// Builds every chain at `rate` for the start of the daemon. A chain
-    /// that cannot be built there but can at one of `others` is a plugin
-    /// refusing `rate`, which the control thread handles as for a rate the
-    /// card refuses: that gives None. A chain that cannot be built at any
-    /// of them is an error, which stops the start.
+    /// Builds every chain at `rate` for the start of the daemon. A plugin
+    /// that does not support `rate` but whose chains build at one of
+    /// `others` is handled by the control thread as for a rate the card
+    /// refuses: that gives None. Any other failure, and chains that build
+    /// at none of the rates, is an error, which stops the start.
     pub fn build_for_start(
         config: &[PluginConfig],
         rate: u32,
@@ -129,15 +154,20 @@ impl Chains {
     ) -> Result<Option<Chains>, String> {
         let e = match Chains::build(config, rate, format, libraries) {
             Ok(chains) => return Ok(Some(chains)),
-            Err(e) => e,
+            Err(e) if e.kind == Failure::Unsupported => e,
+            Err(e) => return Err(e.message),
         };
         for &other in others.iter().filter(|&&r| r != rate) {
-            if Chains::build(config, other, format, libraries).is_ok() {
-                eprintln!("aas: {e}; the output does not run at {rate} Hz");
-                return Ok(None);
+            match Chains::build(config, other, format, libraries) {
+                Ok(_) => {
+                    eprintln!("aas: {e}; the output does not run at {rate} Hz");
+                    return Ok(None);
+                }
+                Err(e) if e.kind == Failure::Unsupported => {}
+                Err(e) => return Err(e.message),
             }
         }
-        Err(e)
+        Err(e.message)
     }
 
     /// Takes the chain at `place` out, leaving an empty one.
@@ -171,7 +201,7 @@ mod tests {
 
     fn build(config: &[PluginConfig], place: PluginPlace) -> Result<Chain, String> {
         let mut libraries = Libraries::default();
-        build_chain(config, place, 48000, Format::F32, &mut libraries)
+        build_chain(config, place, 48000, Format::F32, &mut libraries).map_err(|e| e.message)
     }
 
     #[test]
@@ -250,7 +280,8 @@ mod tests {
         let mut libraries = Libraries::default();
         let e = Chains::build(&config, 48000, Format::F32, &mut libraries)
             .err()
-            .unwrap();
+            .unwrap()
+            .message;
         // Named by its place in the file, as every other plugin error.
         assert!(e.starts_with("plugin 2: "), "{e}");
         assert!(e.contains("/nonexistent/libnothing.so"), "{e}");
@@ -264,6 +295,14 @@ mod tests {
             Chains::build_for_start(config, 96000, &[44100, 96000], Format::F32, libraries)
         };
         assert!(matches!(start(&refuses, &mut libraries), Ok(None)));
+        // A plugin that fails, rather than not support the rate, stops the
+        // start, whatever other rates would do.
+        let fails = [plugin(PluginPlace::Mix, "fails-above-48k", &[])];
+        let e = start(&fails, &mut libraries).err().unwrap();
+        assert!(
+            e.contains("plugin 1") && e.contains("failed at 96000 Hz"),
+            "{e}"
+        );
         // A plugin that fails at every rate stops the start.
         let broken = [plugin(PluginPlace::Mix, "balance", &[("nope", 1.0)])];
         let e = start(&broken, &mut libraries).err().unwrap();

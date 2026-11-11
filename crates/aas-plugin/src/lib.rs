@@ -41,10 +41,12 @@
 //!
 //! # Rates
 //!
-//! `create` returning null means the instance cannot run at that rate,
-//! whether it refuses the rate or fails. The daemon logs it and takes the
-//! rate as not usable for as long as it runs: it moves the output to the
-//! nearest rate every chain accepts.
+//! `create` tells a rate it does not support ([`CREATE_UNSUPPORTED`]) from
+//! a failure ([`CREATE_FAILED`]). A rate a plugin does not support is not
+//! used while the daemon runs: it moves the output to the nearest rate
+//! every chain accepts. A failure is logged with the plugin's name and the
+//! rate is tried again at the next rate decision; at startup it stops the
+//! daemon.
 //!
 //! The daemon may call `aas_plugin` more than once. It must return the
 //! same descriptor every time.
@@ -116,7 +118,7 @@
 //! pub extern "C" fn aas_plugin() -> *const Descriptor {
 //!     &DESCRIPTOR
 //! }
-//! # extern "C" fn create(_: u32, _: u32) -> *mut c_void { std::ptr::null_mut() }
+//! # extern "C" fn create(_: u32, _: u32, _: *mut *mut c_void) -> u32 { 2 }
 //! # extern "C" fn destroy(_: *mut c_void) {}
 //! # extern "C" fn set_param(_: *mut c_void, _: u32, _: f64) {}
 //! # extern "C" fn neutral(_: *const c_void) -> u32 { 1 }
@@ -137,6 +139,15 @@ pub const FORMAT_I32: u32 = 1;
 pub const FORMAT_F32: u32 = 2;
 /// 64 bit float samples.
 pub const FORMAT_F64: u32 = 4;
+
+/// `create` built an instance and stored it.
+pub const CREATE_OK: u32 = 0;
+/// `create` does not support the rate, the format or the block size it was
+/// asked for. Nothing is stored.
+pub const CREATE_UNSUPPORTED: u32 = 1;
+/// `create` failed, such as for want of memory. Nothing is stored. Any
+/// other value counts as this too.
+pub const CREATE_FAILED: u32 = 2;
 
 /// Status bit of `process`: the block carried no signal worth sending on.
 pub const STATUS_NO_SIGNAL: u32 = 1;
@@ -208,10 +219,12 @@ pub struct Descriptor {
     /// takes at most 4096.
     pub params: *const ParamInfo,
     /// Builds an instance for `rate` Hz and blocks of up to `max_frames`
-    /// frames, with every parameter at its default. Null means the
-    /// instance cannot run at `rate`, refused or failed; the daemon then
-    /// does not use that rate for as long as it runs.
-    pub create: Option<extern "C" fn(rate: u32, max_frames: u32) -> *mut c_void>,
+    /// frames, with every parameter at its default, and stores it at
+    /// `instance`. Returns [`CREATE_OK`], [`CREATE_UNSUPPORTED`] or
+    /// [`CREATE_FAILED`], and stores an instance, not null, only with
+    /// `CREATE_OK`.
+    pub create:
+        Option<extern "C" fn(rate: u32, max_frames: u32, instance: *mut *mut c_void) -> u32>,
     /// Frees an instance `create` returned.
     pub destroy: Option<extern "C" fn(*mut c_void)>,
     /// Sets parameter `index` to `value`. The daemon passes only indices

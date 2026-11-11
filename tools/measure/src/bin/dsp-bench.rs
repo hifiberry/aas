@@ -124,7 +124,7 @@ fn mix_case_i32(sources: usize, frames: usize, cycles: usize) -> Summary {
 
 /// The built-in plugin `kind` at `rate`, with the parameters it is timed with.
 fn plugin_for(kind: &str, rate: u32) -> Option<Box<dyn Plugin>> {
-    let mut plugin = builtin::create(kind, rate)?;
+    let mut plugin = builtin::create(kind, rate)?.ok()?;
     if kind == "balance" {
         plugin.set_param(0, BALANCE);
     }

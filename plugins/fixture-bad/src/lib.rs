@@ -3,8 +3,9 @@
 //!
 //! `aas_plugin` reads `AAS_FIXTURE` when it is called and picks the case:
 //! `abi` has ABI version 99, `mono` takes one channel, `null` has a
-//! `create` that fails, `nofn` has no `process`, `default` has a parameter
-//! whose default lies outside its range, and `chunks` is a working `f32`
+//! `create` that fails, `unsupported` one that supports no rate,
+//! `noinstance` one that succeeds without an instance, `nofn` has no
+//! `process`, `default` has a parameter whose default lies outside its range, and `chunks` is a working `f32`
 //! plugin that writes the frame count of each `process` call into the
 //! samples it is given and reports no signal when that count is odd.
 //! `typed` has one parameter of each type. `badkind` has a parameter of
@@ -20,8 +21,9 @@
 //! Anything else, `nodesc` among them, returns no descriptor at all.
 
 use aas_plugin::{
-    ABI, DESCRIPTOR_SIZE, Descriptor, FORMAT_F32, PARAM_ENUMERATION, PARAM_FLOAT, PARAM_INFO_SIZE,
-    PARAM_INTEGER, PARAM_SWITCH, ParamInfo, STATUS_NO_SIGNAL, ValueNames,
+    ABI, CREATE_FAILED, CREATE_OK, CREATE_UNSUPPORTED, DESCRIPTOR_SIZE, Descriptor, FORMAT_F32,
+    PARAM_ENUMERATION, PARAM_FLOAT, PARAM_INFO_SIZE, PARAM_INTEGER, PARAM_SWITCH, ParamInfo,
+    STATUS_NO_SIGNAL, ValueNames,
 };
 use std::ffi::c_void;
 
@@ -49,7 +51,15 @@ const fn fixture(abi: u32, channels_in: u32) -> Descriptor {
 static ABI_99: Descriptor = fixture(99, 2);
 static MONO: Descriptor = fixture(ABI, 1);
 static NULL_CREATE: Descriptor = Descriptor {
-    create: Some(create_null),
+    create: Some(create_failed),
+    ..fixture(ABI, 2)
+};
+static UNSUPPORTED: Descriptor = Descriptor {
+    create: Some(create_unsupported),
+    ..fixture(ABI, 2)
+};
+static NO_INSTANCE: Descriptor = Descriptor {
+    create: Some(create_ok_without_instance),
     ..fixture(ABI, 2)
 };
 static NO_FN: Descriptor = Descriptor {
@@ -228,6 +238,8 @@ pub extern "C" fn aas_plugin() -> *const Descriptor {
         Ok("abi") => &ABI_99,
         Ok("mono") => &MONO,
         Ok("null") => &NULL_CREATE,
+        Ok("unsupported") => &UNSUPPORTED,
+        Ok("noinstance") => &NO_INSTANCE,
         Ok("nofn") => &NO_FN,
         Ok("default") => &DEFAULT,
         Ok("typed") => &TYPED,
@@ -249,12 +261,22 @@ pub extern "C" fn aas_plugin() -> *const Descriptor {
 }
 
 /// An instance with no state: a pointer that is not null and never read.
-extern "C" fn create(_: u32, _: u32) -> *mut c_void {
-    std::ptr::NonNull::<u8>::dangling().as_ptr().cast()
+extern "C" fn create(_: u32, _: u32, instance: *mut *mut c_void) -> u32 {
+    // SAFETY: the ABI passes a place for the instance.
+    unsafe { *instance = std::ptr::NonNull::<u8>::dangling().as_ptr().cast() };
+    CREATE_OK
 }
 
-extern "C" fn create_null(_: u32, _: u32) -> *mut c_void {
-    std::ptr::null_mut()
+extern "C" fn create_failed(_: u32, _: u32, _: *mut *mut c_void) -> u32 {
+    CREATE_FAILED
+}
+
+extern "C" fn create_unsupported(_: u32, _: u32, _: *mut *mut c_void) -> u32 {
+    CREATE_UNSUPPORTED
+}
+
+extern "C" fn create_ok_without_instance(_: u32, _: u32, _: *mut *mut c_void) -> u32 {
+    CREATE_OK
 }
 
 extern "C" fn destroy(_: *mut c_void) {}
@@ -286,8 +308,10 @@ extern "C" fn latency_max(_: *const c_void) -> u32 {
 
 /// An instance of `stateful`: the `process` calls since `create` or
 /// `reset`.
-extern "C" fn create_counter(_: u32, _: u32) -> *mut c_void {
-    Box::into_raw(Box::new(0u32)).cast()
+extern "C" fn create_counter(_: u32, _: u32, instance: *mut *mut c_void) -> u32 {
+    // SAFETY: the ABI passes a place for the instance.
+    unsafe { *instance = Box::into_raw(Box::new(0u32)).cast() };
+    CREATE_OK
 }
 
 extern "C" fn destroy_counter(p: *mut c_void) {

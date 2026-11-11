@@ -13,6 +13,7 @@ use crate::format::db_to_gain;
 use crate::latency::{PERIODS, period_frames};
 use crate::plugin::build::{Chains, Libraries, build_chain, engine_place};
 use crate::plugin::chain::Chain;
+use crate::plugin::{BuildError, Failure};
 use crate::rate::{ClientId, MAX_RATE, MIN_RATE, RatePolicy, SETTLE, STANDARD_RATES};
 use crate::resample::Resampler;
 use crate::state::{Saver, State};
@@ -315,6 +316,9 @@ pub struct Control {
     analog_refused: Vec<u32>,
     /// No rate works for every chain, and that has been logged.
     stuck: bool,
+    /// A chain failed at this rate, DoP or not, in this rate decision. It
+    /// is tried again at the next one, not before.
+    failed: Option<(u32, bool)>,
     /// The gain of the analog input, from the config.
     analog_gain: f32,
     /// None unless the config enables the input and the card has an ADC.
@@ -369,6 +373,7 @@ impl Control {
             refused: Vec::new(),
             analog_refused: Vec::new(),
             stuck: false,
+            failed: None,
             analog_gain: db_to_gain(config.analog.volume_db),
             analog: None,
         }
@@ -718,6 +723,7 @@ impl Control {
     /// Starts the stream. A stream that cannot be sealed is not trusted, and
     /// the client is dropped.
     fn start_stream(&mut self, conn: ConnId, now: Instant) -> Answer {
+        self.new_rate_decision();
         let urgent = self.running_count() == 0;
         let Some(stream) = self.stream_mut(conn) else {
             return Answer::error(libc::EBADFD);
@@ -790,6 +796,7 @@ impl Control {
 
     /// Stops a running stream and settles what follows from that.
     fn stop(&mut self, id: ClientId, now: Instant, batch: &mut Vec<Command>) {
+        self.new_rate_decision();
         let Some(stream) = self.stream_by_id(id) else {
             return;
         };
@@ -857,6 +864,7 @@ impl Control {
     }
 
     fn remove_stream(&mut self, stream: Stream, now: Instant, batch: &mut Vec<Command>) {
+        self.new_rate_decision();
         if stream.running {
             self.policy.client_stopped(stream.id, now - self.epoch);
         }
@@ -1080,6 +1088,7 @@ impl Control {
             }
         }
         self.dop_owner = owner;
+        self.new_rate_decision();
         self.sync_analog_client(now);
         if owner.is_some() {
             self.decide(now, true, batch);
@@ -1124,6 +1133,8 @@ impl Control {
             self.idle_since.get_or_insert(now);
         }
         let Some(want) = self.usable_rate() else {
+            // The output stays as it is; the clients follow it.
+            self.sync_resamplers(batch);
             return;
         };
         let reopen = match self.output {
@@ -1165,8 +1176,9 @@ impl Control {
             } else {
                 &self.refused
             };
-            if known.contains(&rate) {
-                // Refused already, and nothing else works.
+            if known.contains(&rate) || self.failed == Some((rate, dop)) {
+                // Refused already, and nothing else works; or failed in
+                // this rate decision.
                 return None;
             }
             let spare = self.spare.as_ref();
@@ -1177,6 +1189,15 @@ impl Control {
                 Ok(chains) => {
                     self.spare = Some(Spare { rate, dop, chains });
                     return Some(rate);
+                }
+                Err((_, e)) if e.kind != Failure::Unsupported => {
+                    // Not the rate's fault: it is not refused, and the
+                    // next rate decision tries again.
+                    eprintln!(
+                        "aas: {e}; the output stays as it is until the next change of clients"
+                    );
+                    self.failed = Some((rate, dop));
+                    return None;
                 }
                 Err((place, e)) => {
                     eprintln!("aas: {e}; the output does not run at {rate} Hz");
@@ -1203,7 +1224,7 @@ impl Control {
         &mut self,
         rate: u32,
         dop: bool,
-    ) -> Result<Vec<(PluginPlace, Chain)>, (PluginPlace, String)> {
+    ) -> Result<Vec<(PluginPlace, Chain)>, (PluginPlace, BuildError)> {
         let mut ready = self.ready.take().filter(|c| c.rate == rate);
         let mut chains = Vec::new();
         for place in self.chain_places() {
@@ -1218,6 +1239,12 @@ impl Control {
             chains.push((place, chain));
         }
         Ok(chains)
+    }
+
+    /// A change of clients or of the card: a chain that failed is tried
+    /// again, once, at the next rate the rules want.
+    fn new_rate_decision(&mut self) {
+        self.failed = None;
     }
 
     /// Whether a mix or output chain with plugins on the audio thread is
@@ -1332,6 +1359,7 @@ impl Control {
     /// the rate rules, see `sync_analog_client`, and the rate is decided
     /// again as for a player that starts or stops.
     fn input_signal(&mut self, on: bool, now: Instant, batch: &mut Vec<Command>) {
+        self.new_rate_decision();
         let Some(analog) = &mut self.analog else {
             return;
         };
@@ -1375,6 +1403,7 @@ impl Control {
     /// The card's rates have changed, such as when a card that was missing
     /// is found. The output moves at once to a rate the card takes.
     pub fn set_supported(&mut self, rates: Vec<u32>, now: Instant) {
+        self.new_rate_decision();
         eprintln!("aas: the card takes the rates {rates:?}");
         self.supported = rates;
         // New rates are a new chance, and a new failure is worth a line.
@@ -2876,6 +2905,37 @@ mod tests {
     fn sent(engine: &mut FakeEngine) -> Vec<String> {
         let seen = engine.take(true);
         seen.into_iter().filter(|s| s != "SetGain").collect()
+    }
+
+    #[test]
+    fn a_plugin_that_fails_at_a_rate_does_not_ban_it_and_is_tried_once_per_decision() {
+        use crate::plugin::builtin::FAILS_TRIED;
+        use std::sync::atomic::Ordering::Relaxed;
+        let config = Config {
+            plugins: vec![entry(config::PluginPlace::Mix, "fails-above-48k")],
+            ..Config::default()
+        };
+        let (mut control, mut engine, now) = started(&config, None);
+        control.set_supported(vec![48000, 96000], now);
+        engine.take(true);
+        control.handle_events(now);
+        let before = FAILS_TRIED.load(Relaxed);
+        play(&mut control, 1, 96000, now);
+        // The output keeps what it has, and the player follows it.
+        let seen = sent(&mut engine);
+        assert!(!has(&seen, "Reconfigure"), "{seen:?}");
+        assert!(has(&seen, "SetResampler 1 true"), "{seen:?}");
+        assert!(!control.refused.contains(&96000));
+        assert_eq!(FAILS_TRIED.load(Relaxed) - before, 1);
+        // Ticks are no rate decision: no new attempt.
+        for k in 1..20 {
+            control.tick(now + Duration::from_millis(100 * k));
+        }
+        assert_eq!(FAILS_TRIED.load(Relaxed) - before, 1);
+        // A change of clients is: one more attempt.
+        play(&mut control, 2, 96000, now + Duration::from_secs(3));
+        assert_eq!(FAILS_TRIED.load(Relaxed) - before, 2);
+        assert!(!has(&sent(&mut engine), "Reconfigure"));
     }
 
     #[test]
