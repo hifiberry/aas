@@ -178,6 +178,12 @@ fn main() -> ExitCode {
     if let Err(e) = rt::lock_memory() {
         eprintln!("aas: warning: memory not locked: {e}");
     }
+    if rt::compaction_moves_locked_pages() == Some(true) {
+        eprintln!(
+            "aas: warning: vm.compact_unevictable_allowed is 1: memory compaction can stall \
+             the audio thread; install dist/90-aas.conf in /etc/sysctl.d"
+        );
+    }
     let shutdown = Arc::new(AtomicBool::new(false));
     handle_signals(shutdown.clone());
     let sink = output(&config);

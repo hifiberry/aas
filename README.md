@@ -66,10 +66,18 @@ On the board, from the repository root:
 ```sh
 sudo install -m 0755 target/release/aas /usr/bin/aas
 sudo install -m 0644 dist/aas.service /etc/systemd/system/aas.service
+sudo install -m 0644 dist/90-aas.conf /etc/sysctl.d/90-aas.conf
+sudo sysctl --system
 sudo systemctl daemon-reload
 sudo systemctl enable --now aas
 sh dist/install-plugin.sh
 ```
+
+`dist/90-aas.conf` sets `vm.compact_unevictable_allowed = 0`, system-wide, so
+that the kernel does not move the daemon's locked memory when it compacts
+memory. Without it a Pi 3 under load has dropouts about once an hour; the
+daemon logs a warning at start while the setting is 1. `doc/measurements.md`
+has the measurement.
 
 The unit runs the daemon as a dynamic user in group `audio`, with real-time
 rights. Its socket is `/run/aas/aas.sock`, and a player must be in group `audio`
