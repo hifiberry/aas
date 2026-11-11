@@ -57,7 +57,10 @@ pub fn build_chain(
     for (i, p) in listed {
         let n = i + 1;
         let mut plugin: Box<dyn Plugin> = match (p.kind.as_str(), &p.path) {
-            ("library", Some(path)) => libraries.get(path)?.create(rate, max_frames)?,
+            ("library", Some(path)) => libraries
+                .get(path)
+                .and_then(|library| library.create(rate, max_frames))
+                .map_err(|e| format!("plugin {n}: {e}"))?,
             ("library", None) => return Err(format!("plugin {n}: type \"library\" needs a path")),
             (kind, _) => builtin::create(kind, rate)
                 .ok_or_else(|| format!("plugin {n}: there is no plugin of type \"{kind}\""))?,
@@ -210,16 +213,21 @@ mod tests {
 
     #[test]
     fn a_library_that_cannot_be_loaded_is_an_error() {
-        let config = [PluginConfig {
-            place: PluginPlace::Output,
-            kind: "library".into(),
-            path: Some("/nonexistent/libnothing.so".into()),
-            params: BTreeMap::new(),
-        }];
+        let config = [
+            plugin(PluginPlace::Output, "balance", &[]),
+            PluginConfig {
+                place: PluginPlace::Output,
+                kind: "library".into(),
+                path: Some("/nonexistent/libnothing.so".into()),
+                params: BTreeMap::new(),
+            },
+        ];
         let mut libraries = Libraries::default();
         let e = Chains::build(&config, 48000, Format::F32, &mut libraries)
             .err()
             .unwrap();
+        // Named by its place in the file, as every other plugin error.
+        assert!(e.starts_with("plugin 2: "), "{e}");
         assert!(e.contains("/nonexistent/libnothing.so"), "{e}");
     }
 

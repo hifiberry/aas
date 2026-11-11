@@ -35,6 +35,10 @@ pub type ConnId = u64;
 
 /// Opens the card's capture at a rate and period. Called on the control
 /// thread, after the output has opened at them.
+///
+/// It must not wait: while it runs, no client request is served. A device
+/// that another process holds must make it fail at once, not block until
+/// the device is free. A failed open is tried again a second later.
 pub type OpenCapture = Box<dyn FnMut(u32, u32) -> Result<Box<dyn Capture>, String>>;
 
 /// Smallest period the latency rule gives.
@@ -920,22 +924,37 @@ impl Control {
 
     /// The chain at `place` for `rate`. One that cannot be built, such as a
     /// library plugin refusing the rate, is left out with a log line; the
-    /// analog input then keeps only its detector.
+    /// analog input then keeps only its detector, with the settings the
+    /// config gives it.
     fn build(&mut self, place: PluginPlace, rate: u32) -> Chain {
         let format = self.format;
-        match build_chain(&self.plugins, place, rate, format, &mut self.libraries) {
-            Ok(chain) => chain,
-            Err(e) => {
-                let name = match place {
-                    PluginPlace::Analog => "analog",
-                    PluginPlace::Mix => "mix",
-                    PluginPlace::Output => "output",
-                };
-                eprintln!("aas: {e}; the {name} chain runs without its plugins at {rate} Hz");
-                build_chain(&[], place, rate, format, &mut self.libraries)
-                    .unwrap_or_else(|_| Chain::empty())
-            }
-        }
+        let e = match build_chain(&self.plugins, place, rate, format, &mut self.libraries) {
+            Ok(chain) => return chain,
+            Err(e) => e,
+        };
+        let name = match place {
+            PluginPlace::Analog => "analog",
+            PluginPlace::Mix => "mix",
+            PluginPlace::Output => "output",
+        };
+        let (kept, dropped): (Vec<_>, Vec<_>) = self
+            .plugins
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.place == place)
+            .partition(|(_, p)| place == PluginPlace::Analog && p.kind == "detect");
+        let dropped: Vec<String> = dropped
+            .iter()
+            .map(|(i, p)| format!("plugin {} ({})", i + 1, p.kind))
+            .collect();
+        eprintln!(
+            "aas: {e}; at {rate} Hz the {name} chain runs without {}",
+            dropped.join(", ")
+        );
+        let kept: Vec<PluginConfig> = kept.into_iter().map(|(_, p)| p.clone()).collect();
+        build_chain(&kept, place, rate, format, &mut self.libraries)
+            .or_else(|_| build_chain(&[], place, rate, format, &mut self.libraries))
+            .unwrap_or_else(|_| Chain::empty())
     }
 
     /// Opens the capture for the output and hands it to the audio thread,
@@ -1938,6 +1957,51 @@ mod tests {
     }
 
     #[test]
+    fn an_active_analog_input_follows_the_output_to_a_dop_rate() {
+        let opener = Opener::default();
+        let (mut control, mut engine, now) = started(&analog_config(), Some(&opener));
+        engine.take(true);
+        control.handle_events(now);
+        engine.take(true);
+        engine.send(Event::InputSignal(true));
+        control.handle_events(now);
+        // A player at 176.4 kHz is resampled to the input's 48 kHz.
+        play(&mut control, 1, 176400, now);
+        assert!(!has(&engine.take(true), "Reconfigure"));
+        // Then it plays DoP, which takes the output at its rate.
+        engine.send(Event::DopStarted(1, 1));
+        control.handle_events(now);
+        let seen = engine.take(false);
+        assert!(has(&seen, "Reconfigure 176400 1024"), "{seen:?}");
+        // The input's rate in the rules follows the output.
+        assert_eq!(control.analog.as_ref().unwrap().active, Some(176400));
+        assert!(!control.policy.needs_resampling(ANALOG));
+        // The reopen closes the capture, so the input goes quiet, and the
+        // capture opens again at the new rate.
+        let ms = Duration::from_millis;
+        engine.send(Event::InputSignal(false));
+        engine.send(Event::Reconfigured);
+        control.handle_events(now + ms(10));
+        assert_eq!(opener.asked(), [(48000, 256), (176400, 1024)]);
+        assert_eq!(engine.take(true), ["SetCapture true"]);
+        // Signal again on the new capture: the rate stays where it is.
+        engine.send(Event::InputSignal(true));
+        control.handle_events(now + ms(100));
+        assert_eq!(control.analog.as_ref().unwrap().active, Some(176400));
+        control.tick(now + ms(700));
+        assert!(!has(&engine.take(true), "Reconfigure"));
+        assert_eq!(control.policy.current(), 176400);
+        // Once the DoP stream stops, the output stays at that rate while
+        // the input has signal.
+        engine.send(Event::DopStopped(1));
+        control.handle_events(now + ms(800));
+        control.tick(now + ms(5000));
+        assert!(!has(&engine.take(true), "Reconfigure"));
+        assert_eq!(control.policy.current(), 176400);
+        assert_eq!(opener.asked().len(), 2);
+    }
+
+    #[test]
     fn a_failed_capture_is_retried_every_second() {
         let opener = Opener::default();
         opener.fail(2);
@@ -2057,6 +2121,31 @@ mod tests {
                 "SetChain Output balance"
             ]
         );
+    }
+
+    #[test]
+    fn a_listed_detector_keeps_its_settings_when_the_analog_chain_falls_back() {
+        let entry = |kind: &str, params: &[(&str, f64)]| config::PluginConfig {
+            place: config::PluginPlace::Analog,
+            kind: kind.into(),
+            path: None,
+            params: params.iter().map(|&(k, v)| (k.into(), v)).collect(),
+        };
+        let config = Config {
+            plugins: vec![
+                entry("balance", &[("nope", 1.0)]),
+                entry("detect", &[("threshold", -10.0)]),
+            ],
+            ..analog_config()
+        };
+        let opener = Opener::default();
+        let (mut control, _engine, _now) = started(&config, Some(&opener));
+        let mut chain = control.build(config::PluginPlace::Analog, 96000);
+        assert_eq!(chain.names().collect::<Vec<_>>(), ["detect"]);
+        // At -20 dBFS a default detector opens; one at -10 dBFS does not.
+        let mut block = vec![[0.1f32; 2]; 9600];
+        let status = chain.process(crate::plugin::Block::F32(&mut block));
+        assert!(status.no_signal);
     }
 
     #[test]

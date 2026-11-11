@@ -27,6 +27,10 @@ const PATIENCE: Duration = Duration::from_secs(20);
 /// Opens a capture. `Send`, so that it can go to the daemon's thread.
 type SendCapture = Box<dyn FnMut(u32, u32) -> Result<Box<dyn Capture>, String> + Send>;
 
+/// Decides, on the daemon's thread and from its config, whether the
+/// daemon gets a capture, as `main` does.
+type CaptureSetup = Box<dyn FnOnce(&Config) -> Option<OpenCapture> + Send>;
+
 struct Daemon {
     _dir: tempfile::TempDir,
     path: PathBuf,
@@ -65,8 +69,8 @@ impl Daemon {
         Daemon::start_all(config, sink, dir, state, None, Some(probe), None)
     }
 
-    /// A daemon with the analog input, which `capture` opens.
-    fn start_analog(config: Config, sink: Box<dyn Sink>, capture: SendCapture) -> Daemon {
+    /// A daemon with the capture that `capture` decides on.
+    fn start_analog(config: Config, sink: Box<dyn Sink>, capture: CaptureSetup) -> Daemon {
         let dir = tempfile::tempdir().unwrap();
         let state = dir.path().join("state.toml");
         Daemon::start_all(config, sink, dir, state, None, None, Some(capture))
@@ -89,14 +93,14 @@ impl Daemon {
         state: PathBuf,
         hardware: Option<OpenVolume>,
         probe: Option<CardProbe>,
-        capture: Option<SendCapture>,
+        capture: Option<CaptureSetup>,
     ) -> Daemon {
         let path = dir.path().join("aas.sock");
         let shutdown = Arc::new(AtomicBool::new(false));
         let thread = {
             let (path, shutdown) = (path.clone(), shutdown.clone());
             thread::spawn(move || {
-                let capture = capture.map(|c| c as OpenCapture);
+                let capture = capture.and_then(|setup| setup(&config));
                 server::run_probing(
                     config, sink, &path, &state, hardware, probe, capture, shutdown,
                 )
@@ -1246,7 +1250,8 @@ fn the_analog_input_plays_through_the_daemon() {
         opened.lock().unwrap().push((rate, period, feed));
         Ok(Box::new(capture) as Box<dyn Capture>)
     });
-    let _daemon = Daemon::start_analog(analog_config(), sink, capture);
+    let setup: CaptureSetup = Box::new(move |_| Some(capture as OpenCapture));
+    let _daemon = Daemon::start_analog(analog_config(), sink, setup);
     // The output opens without a client, and the capture after it.
     assert!(wait_for(|| !feeds.lock().unwrap().is_empty()));
     let (rate, period, feed) = feeds.lock().unwrap()[0].clone();
@@ -1303,29 +1308,41 @@ fn a_plugin_that_cannot_be_loaded_stops_the_start() {
 
 #[test]
 fn an_enabled_input_on_a_card_without_an_adc_opens_nothing() {
-    let asked: Arc<Mutex<Vec<(u32, u32)>>> = Arc::default();
-    let open = || -> OpenCapture {
-        let asked = asked.clone();
-        Box::new(move |rate, period| {
-            asked.lock().unwrap().push((rate, period));
-            Err("no capture in this test".into())
-        })
-    };
     let config = Config {
         idle: Idle::Off { delay_s: 1 },
         ..analog_config()
     };
-    // The card table decides, and only an enabled input counts.
+    // Only an enabled input counts.
+    let refused: OpenCapture = Box::new(|_, _| Err("unused".into()));
     let adc = "snd_rpi_hifiberry_dacplusadc";
-    assert!(server::analog_capture(&config, adc, open()).is_some());
-    assert!(server::analog_capture(&default_config(), adc, open()).is_none());
-    assert!(server::analog_capture(&config, "snd_some_other_card", open()).is_none());
-    let capture = server::analog_capture(&config, "snd_rpi_hifiberry_digi", open());
-    assert!(capture.is_none());
-    // So the daemon runs as without the input: the output goes off when
-    // idle, and no capture is opened.
-    let (sink, log) = memory_sink();
-    let _daemon = Daemon::start(config, sink);
-    assert!(wait_for(|| log.closes() >= 1), "the output never went off");
-    assert!(asked.lock().unwrap().is_empty());
+    assert!(server::analog_capture(&default_config(), adc, refused).is_none());
+    // A daemon on a card with this driver, with an opener that records its
+    // calls and fails, so that the output is left alone.
+    let start = |driver: &'static str| {
+        let asked: Arc<Mutex<Vec<(u32, u32)>>> = Arc::default();
+        let calls = asked.clone();
+        let open: SendCapture = Box::new(move |rate, period| {
+            calls.lock().unwrap().push((rate, period));
+            Err("no capture in this test".into())
+        });
+        let setup: CaptureSetup =
+            Box::new(move |config| server::analog_capture(config, driver, open as OpenCapture));
+        let (sink, log) = memory_sink();
+        let daemon = Daemon::start_analog(config.clone(), sink, setup);
+        (daemon, log, asked)
+    };
+    // A Digi and an unknown card have no ADC: no capture is opened, and
+    // the output goes off when idle as without the input.
+    for driver in ["snd_rpi_hifiberry_digi", "snd_some_other_card"] {
+        let (daemon, log, asked) = start(driver);
+        assert!(wait_for(|| log.closes() >= 1), "{driver}: never went off");
+        assert!(asked.lock().unwrap().is_empty(), "{driver}");
+        drop(daemon);
+    }
+    // A card with an ADC gets its capture opened once the output is open.
+    let (daemon, log, asked) = start(adc);
+    assert!(wait_for(|| !asked.lock().unwrap().is_empty()));
+    assert_eq!(asked.lock().unwrap()[0], (48000, PERIOD));
+    assert_eq!(log.closes(), 0);
+    drop(daemon);
 }
