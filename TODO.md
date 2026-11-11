@@ -52,6 +52,95 @@ load in `doc/measurements.md` with ftrace's `irqsoff` and `wakeup_rt` tracers, m
 in RAM, and match the daemon's logged gap times (CLOCK_MONOTONIC) to the trace.
 Timing the parts of a cycle comes after, if the time turns out to be the engine's.
 
+## Owner decisions left by stage 3a
+
+Stage 3a built each of these one way and marked it *(call)* in
+`doc/design.md`. Each needs the owner's yes or no. A no is a change to the
+code and the design.
+
+### Should a running recorder keep the output open?
+
+A recorder is not a client: it cannot hold the rate or keep the output open.
+With the analog input off and `idle = "off"`, the output closes
+`idle_delay_s` after the last player stops, and a recording then gets no frames
+and waits for ever, until a player opens the output again. No real card behaves
+like this. Missing: the decision. If yes, first step: let a running capture
+stream count as activity in the idle rule in `src/control.rs` (search for
+`idle`), without letting it hold the rate.
+
+### Is the analog input off unless the config turns it on?
+
+Today it needs `[analog] enabled = true`, because it keeps the card's capture
+open and the output never closes while it is on. Missing: the decision. If the
+default should be on for cards with an ADC, first step: change the default in
+`Analog::default` in `src/config.rs` and its test
+`the_analog_input_is_off_by_default`, and the README's key description.
+
+### The 1 s of silence after a capture starts
+
+A capture delivers silence for 1 s after each start, `SETTLE_MS` in
+`src/sink_alsa.rs`, because the DAC+ ADC Pro's ADC starts with a DC offset of
+about -28 dBFS that would open the input for about 650 ms. It mutes the analog
+input for 1 s at every start and every rate change. The figure is measured on
+that card only. Missing: whether 1 s stays, and whether it becomes a value per
+card in `src/cards.rs`. First step: measure the offset after a start on the
+DAC+ ADC on the Pi 3 test board, as was done on the CM5 test board.
+
+## Let the capture PCM ask for the daemon's rate without a stream
+
+The capture PCM learns the daemon's rate at open by setting up a one-frame
+capture stream and replacing it at `hw_params` (`rate` in
+`crates/aas-alsa/src/pcm/capture.rs`). So every open, also one that only asks
+for capabilities, costs a ring, a memfd, an eventfd and two commands to the
+audio thread. Missing: a read-only request for the rate in the protocol. First
+step: add a request to `crates/aas-client/src/proto.rs` that answers the output
+rate, bump the protocol version, and use it in `rate`.
+
+## Plugins not built yet
+
+Stage 3a built chains at `analog`, `mix` and `output`, the ABI version 1 with
+stereo plugins, and the built-ins `detect` and `balance`. Still missing:
+
+- The limiter plugin. Without it, mixed clients that sum above full scale clip.
+- Chains on a single client's input. `PluginPlace` in `src/config.rs` has no
+  place for one.
+- Plugins with other channel counts. The loader refuses anything but two in and
+  two out; this comes with the matrix (stage 3b).
+- `input-processor` as a native plugin (stage 3c): RIAA, subsonic, gain,
+  declick and notch, at 44.1 to 192 kHz. See "Input processor plugin" in
+  `doc/design.md`.
+
+## Add cards to the ADC table
+
+`src/cards.rs` lists the cards whose capture `aas` opens. Only
+`snd_rpi_hifiberry_dacplusadc` and `snd_rpi_hifiberry_dacplusadcpro` are
+verified on hardware, and the Digi is listed as having no ADC. Any other card
+gets no analog input. Missing: the other HiFiBerry cards with an ADC, each
+verified on a board. First step: list the HiFiBerry drivers with an ADC, then
+for each run `ANALOG=1 sh dist/test-plugin.sh` on a board with that card and a
+cable from output to input, and add a row.
+
+## Verify the capture's failure paths on a board
+
+Tested only off the board: a capture that is suspended or disconnected (it
+should be reported gone and retried every second), a card that appears after
+the daemon starts (whether it has an ADC is then decided at each open), and a
+card without an ADC (one log line, nothing opened). All need a driver unbind or
+a card the test boards do not have. First step: on the Pi 3 test board, unbind
+the card's driver through sysfs while the analog input plays, and check the log
+and that the input comes back after the bind.
+
+## Open minor findings from stage 3a
+
+- `crates/aas-alsa/src/pcm/capture.rs`: the position arithmetic mixes an
+  unwrapped count with ALSA's wrapping application pointer. Correct on 64-bit,
+  the only target. With a 32-bit `long` it would misfire after about 6 hours at
+  48 kHz. Fix: reduce both to the boundary before comparing them.
+- `dist/test-plugin.sh`: the analog tone is not yet checked through `plug` with a
+  conversion (`arecord -D default -f S16_LE -r 44100`). Fix: add a case that
+  records that way and checks level and purity. Also two cases set `Master` to
+  100% without putting it back. Fix: restore the level the run found.
+
 ## Open minor findings from stage 2
 
 Found in the stage 2 reviews and left for later. None of them breaks playback as

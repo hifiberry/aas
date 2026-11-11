@@ -14,6 +14,8 @@ Raspberry Pi.
 - `crates/aas-client`, the client side of the shared ring and the socket
   protocol.
 - `crates/aas-alsa`, the ALSA PCM and control plugin, one library.
+- `crates/aas-plugin`, the C ABI of audio plugins, and `plugins/gain`, an
+  example plugin.
 - `tools/measure`, probes that measure the hardware. Not part of the daemon.
 - `dist/`, the systemd unit, the ALSA configuration, and the install and board
   test scripts.
@@ -125,12 +127,22 @@ gain = -3
 
 `[analog]` turns on the card's analog input (`enabled`, default `false`) and sets
 its level (`volume_db`, from -60 to 0, default 0). The input is off unless
-enabled, and it works only on cards with an ADC that `aas` knows.
+enabled, and it works only on cards with an ADC that `aas` knows: today the
+DAC+ ADC and the DAC+ ADC Pro. On any other card it logs one line and opens
+nothing. While the input is enabled the output never closes, and `idle = "off"`
+is ignored. The input plays only while its level is above a threshold, -50 dBFS
+by default, and stays on for a hold time, 3 s by default, after it falls below.
+For 1 s after the capture starts, and after each change of rate, it is silent.
 
 Each `[[plugin]]` table adds one plugin to the chain at `place`, in the order of
-the file. `type` is a built-in (`detect`, which runs only at `analog` and may
-appear once, or `balance`) or `library` with a `path`, which is absolute. Every
-other key is a parameter and must be a finite number.
+the file. `analog` runs on the analog input before it is mixed, `mix` on the mix
+and `output` last. Both `mix` and `output` run after the output volume. `type`
+is a built-in (`detect`, which runs only at `analog` and may appear once, or
+`balance`) or `library` with a `path`, which is absolute. Every other key is a
+parameter and must be a finite number. `detect` takes `threshold` in dBFS and
+`hold` in seconds. Without a `detect` table it runs last at `analog` with its
+defaults. `balance` takes `balance`, from -1 (left) to 1 (right). A plugin that
+cannot be loaded stops the daemon with an error.
 
 ### Recording
 
@@ -153,7 +165,9 @@ nothing else. `plug` in the `default` device converts that to what the recorder
 asks for. When the output changes rate, a recording that is open ends with an
 error, `No such device`, and the recorder has to open the device again. A new
 recording runs at the new rate. With the analog input enabled the rate does not
-change while the input has signal, so only silence is cut.
+change while the input has signal, except for a DoP stream, so otherwise only
+silence is cut. A recorder that falls behind loses only its own frames, and
+sees an overrun.
 
 ### After a daemon restart
 
@@ -178,6 +192,34 @@ sudo rm /usr/lib/aarch64-linux-gnu/alsa-lib/libasound_module_*_aas.so
 ```
 
 Then move `/etc/asound.conf.before-aas` back, if there is one.
+
+## Writing a plugin
+
+A plugin is a shared library built against `crates/aas-plugin`, which describes
+the C ABI. `plugins/gain` is a complete example, a gain in dB. The library
+exports one function, `aas_plugin`, that returns its descriptor. In Rust the
+crate type is `cdylib`:
+
+```toml
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+aas-plugin = { path = "../../crates/aas-plugin" }
+```
+
+Build the example and install it where the config above expects it:
+
+```sh
+cargo build --release -p aas-plugin-gain
+sudo install -D -m 0644 target/release/libaas_gain.so /usr/lib/aas/libaas_gain.so
+```
+
+`process`, `set_param`, `neutral` and `latency` run on the audio thread and
+must not allocate, lock or block. A panic that leaves one of the plugin's
+functions aborts the daemon, so a plugin in Rust must not panic there, or must
+catch the panic with `std::panic::catch_unwind`. The crate's documentation
+(`cargo doc -p aas-plugin --open`) has the rest.
 
 ## Testing
 
