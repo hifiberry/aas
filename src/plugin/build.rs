@@ -115,6 +115,31 @@ impl Chains {
         })
     }
 
+    /// Builds every chain at `rate` for the start of the daemon. A chain
+    /// that cannot be built there but can at one of `others` is a plugin
+    /// refusing `rate`, which the control thread handles as for a rate the
+    /// card refuses: that gives None. A chain that cannot be built at any
+    /// of them is an error, which stops the start.
+    pub fn build_for_start(
+        config: &[PluginConfig],
+        rate: u32,
+        others: &[u32],
+        format: Format,
+        libraries: &mut Libraries,
+    ) -> Result<Option<Chains>, String> {
+        let e = match Chains::build(config, rate, format, libraries) {
+            Ok(chains) => return Ok(Some(chains)),
+            Err(e) => e,
+        };
+        for &other in others.iter().filter(|&&r| r != rate) {
+            if Chains::build(config, other, format, libraries).is_ok() {
+                eprintln!("aas: {e}; the output does not run at {rate} Hz");
+                return Ok(None);
+            }
+        }
+        Err(e)
+    }
+
     /// Takes the chain at `place` out, leaving an empty one.
     pub fn take(&mut self, place: PluginPlace) -> Chain {
         let chain = match place {
@@ -229,6 +254,24 @@ mod tests {
         // Named by its place in the file, as every other plugin error.
         assert!(e.starts_with("plugin 2: "), "{e}");
         assert!(e.contains("/nonexistent/libnothing.so"), "{e}");
+    }
+
+    #[test]
+    fn at_the_start_a_plugin_that_refuses_the_default_rate_is_no_error_if_another_works() {
+        let mut libraries = Libraries::default();
+        let refuses = [plugin(PluginPlace::Mix, "only-up-to-48k", &[])];
+        let start = |config: &[PluginConfig], libraries: &mut Libraries| {
+            Chains::build_for_start(config, 96000, &[44100, 96000], Format::F32, libraries)
+        };
+        assert!(matches!(start(&refuses, &mut libraries), Ok(None)));
+        // A plugin that fails at every rate stops the start.
+        let broken = [plugin(PluginPlace::Mix, "balance", &[("nope", 1.0)])];
+        let e = start(&broken, &mut libraries).err().unwrap();
+        assert!(e.starts_with("plugin 1: "), "{e}");
+        // And one that takes the default rate gives the chains for it.
+        let fine = [plugin(PluginPlace::Mix, "balance", &[])];
+        let chains = start(&fine, &mut libraries).unwrap().unwrap();
+        assert_eq!(chains.rate, 96000);
     }
 
     #[test]

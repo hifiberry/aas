@@ -9,6 +9,7 @@ use crate::counters::Counters;
 use crate::engine::Engine;
 use crate::format::{F32, F64, I32, Processing};
 use crate::plugin::build::{Chains, Libraries};
+use crate::rate::STANDARD_RATES;
 use crate::rt;
 use crate::sink::{CardSearch, CardWatch, FallbackSink, RETRY, RatesWatch, Sink};
 use crate::volume::{OpenVolume, OutputVolume};
@@ -111,16 +112,22 @@ pub fn run_probing(
         .latency_ms
         .unwrap_or_else(|| board::detect().default_latency_ms());
     // Before the socket, so that a failure here leaves no socket file.
+    let supported = sink.supported_rates();
+    let others = if supported.is_empty() {
+        &STANDARD_RATES[..]
+    } else {
+        &supported[..]
+    };
     let mut libraries = Libraries::default();
-    let chains = Chains::build(
+    let chains = Chains::build_for_start(
         &config.plugins,
         config.default_rate,
+        others,
         config.format,
         &mut libraries,
     )?;
     let notify = eventfd().map_err(|e| format!("eventfd: {e}"))?;
     let listener = listen(socket).map_err(|e| format!("{}: {e}", socket.display()))?;
-    let supported = sink.supported_rates();
     let mut sink = FallbackSink::new(sink);
     let rates = sink.rates_watch();
     let card = sink.card_watch();

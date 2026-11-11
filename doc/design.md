@@ -208,6 +208,9 @@ Further rules *(call)*:
 - The settle time is 500 ms.
 - If the card does not support a client's rate, the output uses the nearest
   supported rate and the client is resampled. In a tie, the lower rate wins.
+- A rate at which a plugin chain cannot be built counts as a rate the card does
+  not support (see Plugins). A DoP stream needs only the analog chain, so only
+  that one can refuse it a rate.
 - A source that reports no signal (see Analog input) does not count as active.
 - The analog input takes part in these rules at the rate the output runs at, so
   it never sets a rate. If it has signal first it counts as the first client,
@@ -628,7 +631,14 @@ Details *(call)*:
   volume stays in the mix, so both run after it. Chains on a single client's
   input are not built yet.
 - Plugins form an ordered chain at each place, defined in the config. Nothing
-  rewires them on its own.
+  rewires them on its own, and a chain never runs without one of its plugins.
+- A rate at which any chain cannot be built, such as one a library plugin
+  refuses, is not a rate the output uses. The rate rules take the nearest rate
+  every chain accepts, as for a rate the card does not take, and clients are
+  resampled to it. It is found when a chain is first built at that rate. If no
+  rate works, the output stays as it is and this is logged; at startup a
+  chain that cannot be built at any rate the card takes stops the daemon. The
+  analog chain has no fallback to its detector alone.
 - Plugins see stereo blocks in the processing format. Float blocks are scaled so
   full scale is 1.0 and are not clipped between plugins, and the analog chain's
   output keeps that headroom until the mix. In `i32` a block is clipped before
@@ -658,7 +668,10 @@ Details *(call)*:
 - Chains are built on the control thread. A rate change builds new instances
   there. The chains for a new rate are sent just before the reopen and take
   effect with it, as resamplers do. When the rate does not change the chains
-  stay, so filters keep their state.
+  stay, so filters keep their state. A DoP stream bypasses the mix and output
+  chains, so they are not built for its rate and keep their state through it;
+  only the analog chain, which keeps measuring, is. If the output stays at the
+  DoP rate afterwards, the others are built for it then, without a reopen.
 
 Built in are `detect`, the input detection plugin, and `balance`, from -1 (left)
 to 1 (right). Balance and the limiter are plugins, not engine features. Balance
@@ -745,9 +758,8 @@ All of this is *(call)*:
   input goes quiet, the control thread is told, and it tries again every second.
   A suspended or disconnected capture is reported gone.
 - A recorder that stops reading loses only its own audio.
-- If a chain cannot be built at a later rate, the daemon logs it and runs that
-  place without its plugins. The analog chain keeps its detector, with the
-  configured threshold and hold.
+- If a chain cannot be built at a rate, the daemon logs it and does not use
+  that rate (see Plugins). It never runs a chain short of its plugins.
 - The daemon locks each client's ring in memory, so that the audio thread never
   waits for a page. A ring is at most 8 MiB, for the largest buffer a client may
   ask for, and the control thread adds one page for its view of the header.

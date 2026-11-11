@@ -10,6 +10,13 @@ pub type ClientId = u64;
 pub const MIN_RATE: u32 = 8000;
 pub const MAX_RATE: u32 = 384000;
 
+/// The rates a card is asked about. They stand for "any rate" where a list
+/// is needed and the card has not given one.
+pub const STANDARD_RATES: [u32; 14] = [
+    8000, 11025, 16000, 22050, 32000, 44100, 48000, 64000, 88200, 96000, 176400, 192000, 352800,
+    384000,
+];
+
 /// How long a lone remaining client waits before the output follows its rate.
 pub const SETTLE: Duration = Duration::from_millis(500);
 
@@ -21,6 +28,8 @@ struct Active {
 /// Decides the output sample rate from the active clients.
 pub struct RatePolicy {
     supported: Vec<u32>,
+    /// The rates a DoP stream may set, if not those in `supported`.
+    dop_supported: Option<Vec<u32>>,
     /// The rate set by the ordinary rules, ignoring DoP.
     base: u32,
     clients: Vec<Active>,
@@ -33,6 +42,7 @@ impl RatePolicy {
     pub fn new(default_rate: u32, supported: Vec<u32>) -> Self {
         RatePolicy {
             supported,
+            dop_supported: None,
             base: default_rate,
             clients: Vec::new(),
             dop: None,
@@ -101,7 +111,7 @@ impl RatePolicy {
             return;
         }
         if self.clients.is_empty() {
-            self.base = output;
+            self.base = self.nearest(output);
             self.switch_at = None;
             return;
         }
@@ -124,7 +134,8 @@ impl RatePolicy {
     }
 
     fn is_supported(&self, rate: u32) -> bool {
-        self.supported.is_empty() || self.supported.contains(&rate)
+        let rates = self.dop_supported.as_ref().unwrap_or(&self.supported);
+        rates.is_empty() || rates.contains(&rate)
     }
 
     pub fn dop_stopped(&mut self, id: ClientId) {
@@ -151,12 +162,24 @@ impl RatePolicy {
         self.drop_unneeded_switch();
     }
 
-    /// The output rate.
-    pub fn current(&self) -> u32 {
+    /// The rates a DoP stream may set, when they are not those of
+    /// `set_supported`: DoP bypasses the plugins on the mix and the output,
+    /// so a rate one of them refuses can still carry it. None goes back to
+    /// those of `set_supported`. Empty takes any.
+    pub fn set_dop_supported(&mut self, rates: Option<Vec<u32>>) {
+        self.dop_supported = rates;
+    }
+
+    /// The rate a DoP stream holds the output at, if one does.
+    pub fn dop_rate(&self) -> Option<u32> {
         self.dop
             .and_then(|id| self.rate_of(id))
             .filter(|r| self.is_supported(*r))
-            .unwrap_or(self.base)
+    }
+
+    /// The output rate.
+    pub fn current(&self) -> u32 {
+        self.dop_rate().unwrap_or(self.base)
     }
 
     /// Whether the client's audio must be resampled to the output rate.
@@ -424,6 +447,26 @@ mod tests {
         p.client_stopped(2, T0 + ms(100));
         p.tick(T0 + ms(5000));
         assert_eq!(p.current(), 44100);
+    }
+
+    #[test]
+    fn dop_may_use_a_rate_kept_from_pcm_and_the_card_leaves_it_after() {
+        let mut p = RatePolicy::new(48000, vec![48000]);
+        p.set_dop_supported(Some(vec![48000, 176400]));
+        p.client_started(1, 48000, T0);
+        p.client_started(2, 176400, T0);
+        p.dop_started(2);
+        assert_eq!(p.current(), 176400);
+        // When it stops last, the output goes to the nearest rate that
+        // PCM may use.
+        p.client_stopped(1, T0);
+        p.client_stopped(2, T0);
+        assert_eq!(p.current(), 48000);
+        // Without a list of its own, DoP takes the rates PCM does.
+        p.set_dop_supported(None);
+        p.client_started(2, 176400, T0);
+        p.dop_started(2);
+        assert_eq!(p.current(), 48000);
     }
 
     #[test]

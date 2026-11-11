@@ -13,7 +13,7 @@ use crate::format::db_to_gain;
 use crate::latency::{PERIODS, period_frames};
 use crate::plugin::build::{Chains, Libraries, build_chain, engine_place};
 use crate::plugin::chain::Chain;
-use crate::rate::{ClientId, MAX_RATE, MIN_RATE, RatePolicy, SETTLE};
+use crate::rate::{ClientId, MAX_RATE, MIN_RATE, RatePolicy, SETTLE, STANDARD_RATES};
 use crate::resample::Resampler;
 use crate::state::{Saver, State};
 use crate::volume::{HardwareVolume, OutputVolume};
@@ -60,6 +60,23 @@ const SAVE_DELAY: Duration = Duration::from_secs(1);
 const CAPTURE_RETRY: Duration = Duration::from_secs(1);
 /// Periods of the output a capture stream's ring holds at least.
 const RECORDER_PERIODS: u32 = 4;
+
+/// Chains built for a rate, not yet sent to the audio thread.
+struct Spare {
+    rate: u32,
+    /// Built for a DoP stream: the analog chain only.
+    dop: bool,
+    chains: Vec<(PluginPlace, Chain)>,
+}
+
+/// Where a place's chain is kept in `Control::built`.
+fn slot(place: PluginPlace) -> usize {
+    match place {
+        PluginPlace::Analog => 0,
+        PluginPlace::Mix => 1,
+        PluginPlace::Output => 2,
+    }
+}
 
 /// Frames a client's ring holds at least, so that one period's input fits
 /// whatever rate the output runs at. One period takes at most what the
@@ -280,9 +297,20 @@ pub struct Control {
     libraries: Libraries,
     /// Chains built ahead, sent at the first open if it is at their rate.
     ready: Option<Chains>,
-    /// The rate the chains sent to the audio thread were built for. None
-    /// before any are sent.
-    chains_rate: Option<u32>,
+    /// The rate each place's chain on the audio thread was built for, by
+    /// `slot`. None before one is sent.
+    built: [Option<u32>; 3],
+    /// Chains built for the rate the rules want, sent when the output runs
+    /// at it.
+    spare: Option<Spare>,
+    /// Rates at which a chain could not be built. The output never runs at
+    /// one, and the rules take the nearest other rate.
+    refused: Vec<u32>,
+    /// Of those, the rates the analog chain refused. A DoP stream needs
+    /// only that chain, so it may run at the others.
+    analog_refused: Vec<u32>,
+    /// No rate works for every chain, and that has been logged.
+    stuck: bool,
     /// The gain of the analog input, from the config.
     analog_gain: f32,
     /// None unless the config enables the input and the card has an ADC.
@@ -332,18 +360,22 @@ impl Control {
             plugins: config.plugins.clone(),
             libraries: Libraries::default(),
             ready: None,
-            chains_rate: None,
+            built: [None; 3],
+            spare: None,
+            refused: Vec::new(),
+            analog_refused: Vec::new(),
+            stuck: false,
             analog_gain: db_to_gain(config.analog.volume_db),
             analog: None,
         }
     }
 
     /// Takes over the libraries loaded at startup, and the chains built
-    /// then. Call before `start`. Without this the chains are built at the
-    /// first open.
-    pub fn set_plugins(&mut self, libraries: Libraries, chains: Chains) {
+    /// then, if any. Call before `start`. Without them the chains are built
+    /// at the first open.
+    pub fn set_plugins(&mut self, libraries: Libraries, chains: Option<Chains>) {
         self.libraries = libraries;
-        self.ready = Some(chains);
+        self.ready = chains;
     }
 
     /// Runs the analog input, which `open` opens. Call before `start`, and
@@ -983,8 +1015,41 @@ impl Control {
         self.streams().filter(|s| s.running).count()
     }
 
+    /// Whether a DoP stream at `rate` can have the output: the card takes
+    /// the rate, and the analog chain, if any, can be built at it.
     fn is_supported(&self, rate: u32) -> bool {
-        self.supported.is_empty() || self.supported.contains(&rate)
+        let card = self.supported.is_empty() || self.supported.contains(&rate);
+        card && !self.analog_refused.contains(&rate)
+    }
+
+    /// The card's rates, without `refused`. Empty takes any rate, as the
+    /// card's list does, only while nothing has been refused.
+    fn usable(&self, refused: &[u32]) -> Vec<u32> {
+        if refused.is_empty() {
+            return self.supported.clone();
+        }
+        let all = if self.supported.is_empty() {
+            &STANDARD_RATES[..]
+        } else {
+            &self.supported[..]
+        };
+        all.iter()
+            .copied()
+            .filter(|r| !refused.contains(r))
+            .collect()
+    }
+
+    /// Gives the rules the rates the card takes and the chains can be built
+    /// at. Returns false, and leaves the rules as they are, if there is none.
+    fn update_rates(&mut self) -> bool {
+        let pcm = self.usable(&self.refused);
+        if pcm.is_empty() && !self.refused.is_empty() {
+            return false;
+        }
+        let dop = (!self.analog_refused.is_empty()).then(|| self.usable(&self.analog_refused));
+        self.policy.set_supported(pcm);
+        self.policy.set_dop_supported(dop);
+        true
     }
 
     /// Makes the rate rules follow the audio thread's DoP owner: the oldest
@@ -1035,7 +1100,9 @@ impl Control {
         } else {
             self.idle_since.get_or_insert(now);
         }
-        let want = self.policy.current();
+        let Some(want) = self.usable_rate() else {
+            return;
+        };
         let reopen = match self.output {
             None => running,
             Some((rate, _)) if rate == want => {
@@ -1054,6 +1121,90 @@ impl Control {
             self.open_output(batch);
         } else {
             self.sync_resamplers(batch);
+            // Chains for the rate the output already runs at, such as when
+            // it stays at the rate a DoP stream set.
+            if self.output.is_some_and(|(rate, _)| rate == want) {
+                self.send_spare(batch);
+            }
+        }
+    }
+
+    /// The rate the rules want, once chains are built for it. A rate at
+    /// which one cannot be built is refused: the rules then take the
+    /// nearest other rate, and the chains are built for that. None if no
+    /// rate works, which is logged once; the output then stays as it is.
+    fn usable_rate(&mut self) -> Option<u32> {
+        loop {
+            let rate = self.policy.current();
+            let dop = self.policy.dop_rate().is_some();
+            let known = if dop {
+                &self.analog_refused
+            } else {
+                &self.refused
+            };
+            if known.contains(&rate) {
+                // Refused already, and nothing else works.
+                return None;
+            }
+            let spare = self.spare.as_ref();
+            if spare.is_some_and(|s| s.rate == rate && s.dop == dop) {
+                return Some(rate);
+            }
+            match self.chains_for(rate, dop) {
+                Ok(chains) => {
+                    self.spare = Some(Spare { rate, dop, chains });
+                    return Some(rate);
+                }
+                Err((place, e)) => {
+                    eprintln!("aas: {e}; the output does not run at {rate} Hz");
+                    self.refused.push(rate);
+                    if place == PluginPlace::Analog {
+                        self.analog_refused.push(rate);
+                    }
+                    if !self.update_rates() || self.policy.current() == rate {
+                        if !std::mem::replace(&mut self.stuck, true) {
+                            eprintln!("aas: no rate works for every plugin chain");
+                        }
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Builds the chains `rate` needs that are not on the audio thread
+    /// already: for a DoP stream the analog chain only, since DoP bypasses
+    /// the others and they keep their state. Fails with the place whose
+    /// chain could not be built.
+    fn chains_for(
+        &mut self,
+        rate: u32,
+        dop: bool,
+    ) -> Result<Vec<(PluginPlace, Chain)>, (PluginPlace, String)> {
+        let mut ready = self.ready.take().filter(|c| c.rate == rate);
+        let mut chains = Vec::new();
+        for place in self.chain_places() {
+            if (dop && place != PluginPlace::Analog) || self.built[slot(place)] == Some(rate) {
+                continue;
+            }
+            let chain = match &mut ready {
+                Some(ready) => ready.take(place),
+                None => build_chain(&self.plugins, place, rate, self.format, &mut self.libraries)
+                    .map_err(|e| (place, e))?,
+            };
+            chains.push((place, chain));
+        }
+        Ok(chains)
+    }
+
+    /// Sends the spare chains, which take effect from the next command on.
+    fn send_spare(&mut self, batch: &mut Vec<Command>) {
+        let Some(spare) = self.spare.take() else {
+            return;
+        };
+        for (place, chain) in spare.chains {
+            self.built[slot(place)] = Some(spare.rate);
+            batch.push(Command::SetChain(engine_place(place), Box::new(chain)));
         }
     }
 
@@ -1062,14 +1213,16 @@ impl Control {
     /// it. The audio thread closes the capture first; a new one is opened
     /// once the output is open.
     fn open_output(&mut self, batch: &mut Vec<Command>) {
-        let rate = self.policy.current();
+        let Some(rate) = self.usable_rate() else {
+            return;
+        };
         let period = period_frames(rate, self.latency_ms);
         eprintln!("aas: output at {rate} Hz, {period} frames per period");
         self.output = Some((rate, period));
         self.reopening += 1;
         self.switch_at = None;
         self.sync_resamplers(batch);
-        self.sync_chains(rate, batch);
+        self.send_spare(batch);
         if let Some(analog) = &mut self.analog {
             analog.reading = false;
             analog.retry_at = None;
@@ -1089,58 +1242,6 @@ impl Control {
                 _ => self.plugins.iter().any(|p| p.place == place),
             })
             .collect()
-    }
-
-    /// Sends chains built for `rate`, unless those in place are. So a
-    /// reopen at the same rate keeps them, and their state.
-    fn sync_chains(&mut self, rate: u32, batch: &mut Vec<Command>) {
-        if self.chains_rate == Some(rate) {
-            return;
-        }
-        self.chains_rate = Some(rate);
-        let mut ready = self.ready.take().filter(|c| c.rate == rate);
-        for place in self.chain_places() {
-            let chain = match &mut ready {
-                Some(chains) => chains.take(place),
-                None => self.build(place, rate),
-            };
-            batch.push(Command::SetChain(engine_place(place), Box::new(chain)));
-        }
-    }
-
-    /// The chain at `place` for `rate`. One that cannot be built, such as a
-    /// library plugin refusing the rate, is left out with a log line; the
-    /// analog input then keeps only its detector, with the settings the
-    /// config gives it.
-    fn build(&mut self, place: PluginPlace, rate: u32) -> Chain {
-        let format = self.format;
-        let e = match build_chain(&self.plugins, place, rate, format, &mut self.libraries) {
-            Ok(chain) => return chain,
-            Err(e) => e,
-        };
-        let name = match place {
-            PluginPlace::Analog => "analog",
-            PluginPlace::Mix => "mix",
-            PluginPlace::Output => "output",
-        };
-        let (kept, dropped): (Vec<_>, Vec<_>) = self
-            .plugins
-            .iter()
-            .enumerate()
-            .filter(|(_, p)| p.place == place)
-            .partition(|(_, p)| place == PluginPlace::Analog && p.kind == "detect");
-        let dropped: Vec<String> = dropped
-            .iter()
-            .map(|(i, p)| format!("plugin {} ({})", i + 1, p.kind))
-            .collect();
-        eprintln!(
-            "aas: {e}; at {rate} Hz the {name} chain runs without {}",
-            dropped.join(", ")
-        );
-        let kept: Vec<PluginConfig> = kept.into_iter().map(|(_, p)| p.clone()).collect();
-        build_chain(&kept, place, rate, format, &mut self.libraries)
-            .or_else(|_| build_chain(&[], place, rate, format, &mut self.libraries))
-            .unwrap_or_else(|_| Chain::empty())
     }
 
     /// Opens the capture for the output and hands it to the audio thread,
@@ -1250,8 +1351,10 @@ impl Control {
     /// is found. The output moves at once to a rate the card takes.
     pub fn set_supported(&mut self, rates: Vec<u32>, now: Instant) {
         eprintln!("aas: the card takes the rates {rates:?}");
-        self.supported = rates.clone();
-        self.policy.set_supported(rates);
+        self.supported = rates;
+        if !self.update_rates() {
+            eprintln!("aas: no rate the card takes works for every plugin chain");
+        }
         let mut batch = Vec::new();
         self.update_dop(now, &mut batch);
         self.decide(now, true, &mut batch);
@@ -2467,66 +2570,196 @@ mod tests {
         assert!(!has(&engine.take(true), "SetChain"));
     }
 
-    #[test]
-    fn a_chain_that_cannot_be_built_at_a_rate_runs_without_its_plugins() {
-        // Startup checks every chain, so only a plugin that refuses a later
-        // rate gets here. A parameter it does not have stands in for that.
-        let plugin = |place, params: &[(&str, f64)]| config::PluginConfig {
+    fn entry(place: config::PluginPlace, kind: &str) -> config::PluginConfig {
+        config::PluginConfig {
             place,
-            kind: "balance".into(),
+            kind: kind.into(),
             path: None,
-            params: params.iter().map(|&(k, v)| (k.into(), v)).collect(),
-        };
+            params: Default::default(),
+        }
+    }
+
+    /// What the engine was sent, without the volume.
+    fn sent(engine: &mut FakeEngine) -> Vec<String> {
+        let seen = engine.take(true);
+        seen.into_iter().filter(|s| s != "SetGain").collect()
+    }
+
+    #[test]
+    fn a_rate_a_chain_cannot_be_built_at_is_not_used() {
         let config = Config {
-            plugins: vec![
-                plugin(config::PluginPlace::Analog, &[("nope", 1.0)]),
-                plugin(config::PluginPlace::Mix, &[("nope", 1.0)]),
-                plugin(config::PluginPlace::Output, &[]),
-            ],
+            plugins: vec![entry(config::PluginPlace::Mix, "only-up-to-48k")],
+            ..Config::default()
+        };
+        let (mut control, mut engine, now) = started(&config, None);
+        control.set_supported(vec![44100, 48000, 96000], now);
+        engine.take(true);
+        control.handle_events(now);
+        // A player at 96 kHz: the nearest rate the chain takes is 48 kHz,
+        // and the player is resampled to it.
+        play(&mut control, 1, 96000, now);
+        let seen = sent(&mut engine);
+        assert!(!has(&seen, "Reconfigure"), "{seen:?}");
+        assert!(has(&seen, "SetResampler 1 true"), "{seen:?}");
+        control.tick(now + Duration::from_secs(5));
+        assert!(!has(&engine.take(true), "Reconfigure"));
+        assert_eq!(control.policy.current(), 48000);
+    }
+
+    #[test]
+    fn with_any_rate_the_card_takes_a_refused_one_moves_to_the_nearest_that_works() {
+        let config = Config {
+            plugins: vec![entry(config::PluginPlace::Output, "only-up-to-48k")],
+            ..Config::default()
+        };
+        let (mut control, mut engine, now) = started(&config, None);
+        engine.take(true);
+        control.handle_events(now);
+        play(&mut control, 1, 96000, now);
+        let seen = sent(&mut engine);
+        // 96, 88.2 and 64 kHz are refused in turn, and nothing is sent for
+        // them: the output stays at 48 kHz, with its chain.
+        assert!(!has(&seen, "Reconfigure"), "{seen:?}");
+        assert!(!has(&seen, "SetChain"), "{seen:?}");
+        assert!(has(&seen, "SetResampler 1 true"), "{seen:?}");
+        assert_eq!(control.policy.current(), 48000);
+    }
+
+    #[test]
+    fn a_chain_is_never_sent_short_of_its_plugins() {
+        // A parameter the plugin does not have fails at every rate.
+        let mut nope = entry(config::PluginPlace::Mix, "balance");
+        nope.params.insert("nope".into(), 1.0);
+        let config = Config {
+            plugins: vec![nope, entry(config::PluginPlace::Output, "balance")],
             ..analog_config()
         };
         let opener = Opener::default();
-        let (_control, mut engine, _now) = started(&config, Some(&opener));
-        let seen = engine.take(true);
-        // The analog input keeps its detector, the others what they can.
-        let chains: Vec<&str> = seen
-            .iter()
-            .filter(|s| s.starts_with("SetChain"))
-            .map(String::as_str)
-            .collect();
-        assert_eq!(
-            chains,
-            [
-                "SetChain Analog detect",
-                "SetChain Mix ",
-                "SetChain Output balance"
-            ]
+        let (mut control, mut engine, now) = started(&config, Some(&opener));
+        // No rate works, so the output is not opened at all.
+        let seen = sent(&mut engine);
+        assert!(!has(&seen, "SetChain"), "{seen:?}");
+        assert!(!has(&seen, "Reconfigure"), "{seen:?}");
+        play(&mut control, 1, 44100, now);
+        let seen = sent(&mut engine);
+        assert!(
+            !has(&seen, "SetChain") && !has(&seen, "Reconfigure"),
+            "{seen:?}"
         );
     }
 
     #[test]
-    fn a_listed_detector_keeps_its_settings_when_the_analog_chain_falls_back() {
-        let entry = |kind: &str, params: &[(&str, f64)]| config::PluginConfig {
-            place: config::PluginPlace::Analog,
-            kind: kind.into(),
-            path: None,
-            params: params.iter().map(|&(k, v)| (k.into(), v)).collect(),
+    fn the_analog_chain_has_no_fallback_either() {
+        let config = Config {
+            plugins: vec![entry(config::PluginPlace::Analog, "only-up-to-48k")],
+            ..analog_config()
         };
+        let opener = Opener::default();
+        let (mut control, mut engine, now) = started(&config, Some(&opener));
+        control.set_supported(vec![48000, 96000], now);
+        let seen = sent(&mut engine);
+        assert!(has(&seen, "SetChain Analog balance,detect"), "{seen:?}");
+        control.handle_events(now);
+        engine.take(true);
+        play(&mut control, 1, 96000, now);
+        let seen = sent(&mut engine);
+        assert!(
+            !has(&seen, "Reconfigure") && !has(&seen, "SetChain"),
+            "{seen:?}"
+        );
+    }
+
+    #[test]
+    fn dop_rebuilds_only_the_analog_chain_and_the_others_keep_their_state() {
+        let config = Config {
+            plugins: vec![entry(config::PluginPlace::Mix, "balance")],
+            ..analog_config()
+        };
+        let opener = Opener::default();
+        let (mut control, mut engine, now) = started(&config, Some(&opener));
+        engine.take(true);
+        control.handle_events(now);
+        engine.take(true);
+        play(&mut control, 1, 48000, now);
+        play(&mut control, 2, 176400, now);
+        engine.take(true);
+        engine.send(Event::DopStarted(2, 1));
+        control.handle_events(now);
+        let seen = sent(&mut engine);
+        assert!(has(&seen, "Reconfigure 176400"), "{seen:?}");
+        assert!(has(&seen, "SetChain Analog detect"), "{seen:?}");
+        assert!(!has(&seen, "SetChain Mix"), "{seen:?}");
+        control.handle_events(now);
+        engine.take(true);
+        // DoP stops, and the 48 kHz player has the output back: the mix
+        // chain is the one it had, and the analog chain is built again.
+        let stop = control.request(2, Some(Request::Stop), now);
+        assert_eq!(stop.reply, Some(Reply::Ok));
+        control.tick(now + Duration::from_secs(1));
+        let seen = sent(&mut engine);
+        assert!(has(&seen, "Reconfigure 48000"), "{seen:?}");
+        assert!(has(&seen, "SetChain Analog detect"), "{seen:?}");
+        assert!(!has(&seen, "SetChain Mix"), "{seen:?}");
+    }
+
+    #[test]
+    fn dop_at_a_rate_the_analog_chain_refuses_does_not_take_the_output() {
         let config = Config {
             plugins: vec![
-                entry("balance", &[("nope", 1.0)]),
-                entry("detect", &[("threshold", -10.0)]),
+                entry(config::PluginPlace::Analog, "only-up-to-48k"),
+                entry(config::PluginPlace::Mix, "balance"),
             ],
             ..analog_config()
         };
         let opener = Opener::default();
-        let (mut control, _engine, _now) = started(&config, Some(&opener));
-        let mut chain = control.build(config::PluginPlace::Analog, 96000);
-        assert_eq!(chain.names().collect::<Vec<_>>(), ["detect"]);
-        // At -20 dBFS a default detector opens; one at -10 dBFS does not.
-        let mut block = vec![[0.1f32; 2]; 9600];
-        let status = chain.process(crate::plugin::Block::F32(&mut block));
-        assert!(status.no_signal);
+        let (mut control, mut engine, now) = started(&config, Some(&opener));
+        control.set_supported(vec![48000, 176400], now);
+        engine.take(true);
+        control.handle_events(now);
+        engine.take(true);
+        play(&mut control, 1, 176400, now);
+        engine.send(Event::DopStarted(1, 1));
+        control.handle_events(now);
+        let seen = sent(&mut engine);
+        assert!(!has(&seen, "Reconfigure 176400"), "{seen:?}");
+        assert_eq!(control.policy.current(), 48000);
+    }
+
+    #[test]
+    fn the_card_kept_at_a_dop_rate_gets_chains_for_it_when_pcm_plays_there() {
+        let ms = Duration::from_millis;
+        let config = Config {
+            plugins: vec![entry(config::PluginPlace::Mix, "balance")],
+            ..analog_config()
+        };
+        let opener = Opener::default();
+        let (mut control, mut engine, now) = started(&config, Some(&opener));
+        engine.take(true);
+        control.handle_events(now);
+        engine.take(true);
+        // The mix chain is built for a player at 48 kHz, then DoP takes
+        // the output to its rate.
+        play(&mut control, 1, 48000, now);
+        play(&mut control, 2, 176400, now);
+        engine.send(Event::DopStarted(2, 1));
+        control.handle_events(now);
+        let seen = sent(&mut engine);
+        assert!(has(&seen, "Reconfigure 176400"), "{seen:?}");
+        assert!(!has(&seen, "SetChain Mix"), "{seen:?}");
+        control.handle_events(now);
+        engine.take(true);
+        // DoP ends with no client left: the card keeps its rate, and the
+        // analog input, back after its mute, plays there through the mix.
+        let stop = control.request(1, Some(Request::Stop), now + ms(50));
+        assert_eq!(stop.reply, Some(Reply::Ok));
+        let stop = control.request(2, Some(Request::Stop), now + ms(100));
+        assert_eq!(stop.reply, Some(Reply::Ok));
+        engine.send(Event::InputSignal(true));
+        control.handle_events(now + SIGNAL_BACK);
+        control.tick(now + SIGNAL_BACK);
+        let seen = sent(&mut engine);
+        assert!(!has(&seen, "Reconfigure"), "{seen:?}");
+        assert!(has(&seen, "SetChain Mix balance"), "{seen:?}");
     }
 
     #[test]
@@ -2550,7 +2783,7 @@ mod tests {
             Chains::build(&config.plugins, 48000, Format::F32, &mut libraries).unwrap();
         // A chain built ahead stands out by what it holds.
         chains.mix = Chain::empty();
-        control.set_plugins(libraries, chains);
+        control.set_plugins(libraries, Some(chains));
         control.start(Instant::now());
         let mut engine = FakeEngine {
             commands: engine_commands,

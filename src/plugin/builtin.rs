@@ -10,6 +10,9 @@ pub fn create(kind: &str, rate: u32) -> Option<Box<dyn Plugin>> {
     match kind {
         "detect" => Some(Box::new(Detect::new(rate))),
         "balance" => Some(Box::new(Balance::new())),
+        // Stands in for a library plugin that refuses the higher rates.
+        #[cfg(test)]
+        "only-up-to-48k" if rate <= 48_000 => Some(Box::new(Balance::new())),
         _ => None,
     }
 }
