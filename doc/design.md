@@ -566,8 +566,8 @@ All of this is *(call)*:
   reports an error to the client, and the client reconnects by reopening the
   device, as ALSA players do after a write error. The PCM does not reconnect
   an open handle by itself. The control does: a mixer that holds it open is
-  told once that the daemon has gone, and its next read or write of the volume
-  connects again.
+  woken with an error when the daemon goes, and its next read or write of the
+  volume connects again.
 - If the card is missing at startup, the daemon keeps running and waits for it.
   Meanwhile audio goes to a timed null sink, so players keep running in real
   time rather than hanging, and the daemon retries the card every second

@@ -93,13 +93,14 @@ board. The keys are in `src/config.rs`. The volume is kept in
 A player that is playing gets an error from its next write and must reopen the
 device, which ALSA players do.
 
-The control connects again by itself. A mixer that holds it open is told once
-that the daemon has gone, as for a card that is unplugged: its poll reports an
-error and reading an event fails. Its next read or write of the volume connects
-again, and from then on it gets events as before, starting with one for the
-volume, which may have changed meanwhile. While the daemon is away, reads and
-writes fail. A mixer that quits when a card is unplugged still has to be
-started again.
+The control connects again by itself. A mixer that holds it open and waits for
+events is woken when the daemon goes, as for a card that is unplugged: its poll
+reports an error and reading an event fails. After that its descriptor is
+quiet, and reading an event keeps failing, until a read or write of the volume
+connects again. From then on it gets events as before, starting with one for
+the volume, which may have changed meanwhile. While the daemon is away, reads
+and writes of the volume fail. A mixer that quits when a card is unplugged
+still has to be started again.
 
 ### Removing
 

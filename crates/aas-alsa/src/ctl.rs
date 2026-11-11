@@ -20,9 +20,9 @@
 //! next request connects again, and fails with `-ENODEV` if it cannot. A
 //! request looks for a hang-up before it is sent, so the first one after
 //! the daemon has restarted connects again too, and does not fail. The
-//! poll descriptor stays the same, notices are asked for again if they
-//! were before, and one change is reported, since the volume may have
-//! moved meanwhile.
+//! poll descriptor stays the same, notices are asked for again if the
+//! client ever asked for them, and one change is reported, since the
+//! volume may have moved meanwhile.
 
 use crate::ffi::*;
 use crate::pcm::{check_config, errno, guard};
@@ -68,6 +68,9 @@ struct Daemon {
     wake: OwnedFd,
     /// Whether the daemon sends this connection volume notices.
     subscribed: bool,
+    /// The client has asked for notices. Kept across connections, so that
+    /// each new one asks the daemon again, whatever became of the last.
+    wanted: bool,
     /// A notice has come that no event has reported yet.
     changed: bool,
     /// The connection is lost. Its socket has left the epoll set.
@@ -204,6 +207,7 @@ impl Daemon {
             poll,
             wake,
             subscribed: false,
+            wanted: false,
             changed: false,
             gone: Arc::new(AtomicBool::new(false)),
             path: None,
@@ -234,17 +238,27 @@ impl Daemon {
     }
 
     /// Connects again after the connection was lost. The epoll set stays,
-    /// so the descriptor a client polls is the same. Notices are asked for
-    /// again, and one change is reported: the volume may have moved while
-    /// nothing was listening.
+    /// so the descriptor a client polls is the same. If the client has
+    /// asked for notices, they are asked for again, and one change is
+    /// reported: the volume may have moved while nothing was listening.
+    /// Whatever stops it, to the client the daemon is not there: `ENODEV`.
+    /// A connection that cannot be given its notices is lost again, so the
+    /// next request starts over and a client in poll is not left deaf.
     fn reconnect(&mut self) -> Result<(), c_int> {
         let path = self.path.as_ref().ok_or(libc::ENODEV)?;
-        // Whatever stops it, to the client the daemon is not there.
         self.socket = dial(path, self.timeout).map_err(|_| libc::ENODEV)?;
+        self.subscribed = false;
         self.watch().map_err(|_| libc::ENODEV)?;
         self.gone.store(false, Ordering::Release);
-        if std::mem::take(&mut self.subscribed) {
-            self.subscribe()?;
+        if self.wanted {
+            // Not through `call`, which would connect again from here.
+            let asked = self
+                .send(&Request::SubscribeVolume)
+                .and_then(|()| self.reply());
+            if !matches!(asked, Ok(Reply::Volume { .. })) {
+                return Err(self.lost(libc::ENODEV));
+            }
+            self.subscribed = true;
             self.changed = true;
             self.wake();
         }
@@ -259,13 +273,12 @@ impl Daemon {
             unsafe { libc::write(self.wake.as_raw_fd(), (&raw const one).cast::<c_void>(), 8) };
         // A full counter is readable already. Anything else would leave a
         // client asleep on a change, so it is worth a line.
-        if let Err(e) = check(rc)
-            && e != libc::EAGAIN
-        {
-            eprintln!(
+        match check(rc) {
+            Ok(_) | Err(libc::EAGAIN) => {}
+            Err(e) => eprintln!(
                 "aas: control: no wake-up for a volume change: {}",
                 io::Error::from_raw_os_error(e)
-            );
+            ),
         }
     }
 
@@ -381,6 +394,7 @@ impl Daemon {
     /// Asks for notices. The daemon has no way to stop them, so they are
     /// asked for once on each connection and read until it ends.
     fn subscribe(&mut self) -> Result<(), c_int> {
+        self.wanted = true;
         if self.subscribed {
             return Ok(());
         }
@@ -1019,6 +1033,42 @@ mod tests {
         // SAFETY: one valid pollfd.
         assert_eq!(unsafe { libc::poll(&mut pfd, 1, 5000) }, 1);
         assert_eq!(daemon.set_volume(60), Ok(()));
+        drop(daemon);
+        served.join().unwrap();
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_reconnect_that_fails_keeps_the_wish_for_notices() {
+        let (path, served) = listener(|listener| {
+            let first = accept(&listener);
+            assert_eq!(request(&first), Some(Request::SubscribeVolume));
+            answer(&first, Reply::Volume { percent: 50 });
+            drop(first);
+            // The daemon goes again before it has answered the subscription.
+            let second = accept(&listener);
+            assert_eq!(request(&second), Some(Request::SubscribeVolume));
+            drop(second);
+            let third = accept(&listener);
+            assert_eq!(request(&third), Some(Request::SubscribeVolume));
+            answer(&third, Reply::Volume { percent: 70 });
+            assert_eq!(request(&third), Some(Request::GetVolume));
+            answer(&third, Reply::Volume { percent: 70 });
+            assert_eq!(request(&third), None);
+        });
+        let mut daemon = Daemon::connect(path.clone(), Duration::from_secs(5)).unwrap();
+        let poll = daemon.poll.as_raw_fd();
+        daemon.subscribe().unwrap();
+        while !daemon.hung_up() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // Whatever stops a reconnect, the daemon is not there.
+        assert_eq!(daemon.volume(), Err(libc::ENODEV));
+        assert!(!readable(poll), "the poll still wakes");
+        // The next one asks for notices again, and reports a change.
+        assert_eq!(daemon.volume(), Ok(70));
+        assert!(readable(poll), "no wake-up after the reconnect");
+        assert_eq!(daemon.next_change(), Ok(true));
         drop(daemon);
         served.join().unwrap();
         let _ = std::fs::remove_file(path);
