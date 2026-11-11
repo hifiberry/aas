@@ -846,7 +846,7 @@ bit-perfect and to plugin library paths, which change nothing measured here.
 | `detect` and `balance` under 1% of a period on the Pi 3 | p99.9 at most 0.3% at 48 kHz and 0.8% at 192 kHz and 256 frames. 1.0% at 192 kHz and 64 frames | p99.9 at most 0.1% | Pass, except p99.9 at 192 kHz and 64 frames on the Pi 3, which reads 1.0% |
 | Shared clock: an hour with a tone and the input open, padding and dropping stay at their start-up value | 256 frames padded, all at the start, 0 dropped, 0 xruns, 0 wake-up gaps | 64 frames padded, all at the start, 0 dropped, 0 xruns, 0 wake-up gaps | Pass on both |
 | Analog path, at most three periods and the converters | 720 frames, 15.00 ms, against 799 | 222 frames, 4.625 ms, against 242 | Pass on both |
-| One hour at 44.1 kHz, full load | **2 xruns, 2 wake-up gaps, 27.1 and 33.1 ms against an 11.6 ms buffer.** Repeated: **1 xrun**, 0 wake-up gaps, worst gap 11.09 ms, 278 frames dropped | 0 xruns, 0 wake-up gaps, worst gap 1.54 ms against 2.90 ms | **Fail** on the Pi 3, twice. Pass on the CM5 |
+| One hour at 44.1 kHz, full load | **2 xruns, 2 wake-up gaps, 27.1 and 33.1 ms against an 11.6 ms buffer.** Repeated: **1 xrun**, 0 wake-up gaps, worst gap 11.09 ms, 278 frames dropped | 0 xruns, 0 wake-up gaps, worst gap 1.54 ms against 2.90 ms | **Fail** on the Pi 3, twice, from memory compaction moving the daemon's locked pages, not from the input. Pass on the CM5 |
 | One hour at 96 kHz, full load | 0 xruns, 0 wake-up gaps, worst gap 10.16 ms against 10.67 ms | 0 xruns, 0 wake-up gaps, worst gap 1.45 ms against 2.67 ms | Pass on both, with little room on the Pi 3 |
 | One hour at 44.1 kHz with a second client at 96 kHz, full load | 0 xruns, 0 wake-up gaps, worst gap 6.82 ms against 11.61 ms | 0 xruns, 0 wake-up gaps, worst gap 1.59 ms against 2.90 ms | Pass on both |
 | Detection: opens within 100 ms, closes 3.0 to 3.1 s after the tone | Opens 4 to 52 ms after, closes 3.012 to 3.055 s after, 20 of 20 | Opens 3 to 51 ms after, closes 3.001 to 3.041 s after, 20 of 20 | Pass on both |
@@ -994,17 +994,144 @@ cannot be matched to the load.
 
 In stage 2 the same run without the analog input passed, with a worst gap of
 7.44 ms and a worst cycle of 0.83 ms. With the input on, both 44.1 kHz runs
-had worst cycles of 3.8 and 3.9 ms. **So the Pi 3 does not hold 44.1 kHz at
-256 frames under full load with the analog input on.** What the input adds is
-a second DMA stream and its interrupts, a capture read and the detector in
-each cycle. The detector costs about 0.1% of a period, so the time more
-likely goes to the interrupts or to the read, but that was not measured. The
-board was throttled to 496 to 603 MHz at 86 to 87 °C, a worst case.
+had worst cycles of 3.8 and 3.9 ms. **So the Pi 3 did not hold 44.1 kHz at
+256 frames under full load with the analog input on.** The board was throttled
+to 496 to 603 MHz at 86 to 87 °C, a worst case. The cause was found later and
+is not the analog input: see
+[Why the 44.1 kHz hour failed on the Pi 3](#why-the-441-khz-hour-failed-on-the-pi-3).
 
 The 96 kHz run passed, but its worst gap, 10.16 ms against a 10.67 ms buffer,
 leaves 0.5 ms. In stage 2 the same run without the analog input had 6.60 ms.
 When in the hour that gap fell is not known: the daemon logs only gaps over the
 buffer.
+
+#### Why the 44.1 kHz hour failed on the Pi 3
+
+The analog input is not the cause. The audio thread stalls when the kernel
+migrates one of the daemon's pages while compacting memory, and that happens
+with or without the input, and with the stage 2 daemon as well.
+
+The daemon locks all its memory with `mlockall`, so none of its pages can be
+swapped out or dropped. They can still be moved: with
+`vm.compact_unevictable_allowed = 1`, the default on this kernel, compaction
+also migrates locked pages. While a page is being moved its entries point to a
+migration entry, and a thread that touches it waits in
+`migration_entry_wait` until the move is done. The move is done by
+`kcompactd` or by whatever task asked for the compaction, at normal priority,
+and under full load it shares its CPU with a `sha256sum`. The audio thread at
+`SCHED_FIFO` 70 waits behind it. The full load's 128 MB written and deleted
+every 22 s keeps compaction busy on this 1 GB board: the kernel had migrated
+5.9 million pages in the 6 days since its boot, about 39000 an hour, a sixth
+of the board's memory.
+
+Measured with temporary instrumentation in the daemon: a histogram of the
+wake-up gaps and of the cycles, the worst time of each phase of the cycle, and
+the audio thread's page faults from `getrusage` after every cycle. A kernel
+trace of the scheduler, the interrupts, the audio thread's system calls and
+its faults ran in a ring buffer, and the daemon stopped it after any gap over
+9 ms or cycle over 2 ms, so that each trace ends at the event. All runs at
+44.1 kHz, 256 frames, the stage 1 full load, the board throttled at 86 to 87 °C
+and 549 to 603 MHz, the same music from RAM as the hour runs.
+
+Ten minutes per run, full load, without forcing anything:
+
+| Daemon | Analog input | Xruns | Gaps over the buffer | Worst gap | Cycles over 1 ms |
+|---|---|---|---|---|---|
+| stage 3a | on | 0 | 0 | 8.36 ms | 2, the worst 4.56 ms |
+| stage 3a | off | 0 | 0 | 6.91 ms | 1 |
+| stage 2, a777850 | none | 0 | 0 | 6.75 ms | 0 |
+| stage 3a | on | 0 | 0 | 6.93 ms | 0 |
+
+Ten minutes does not reproduce the failure, and the histograms show no
+difference that matters: with the input on most cycles take 0.1 to 0.2 ms
+instead of under 0.1 ms, against a period of 5.8 ms. The worst cycles of 3.8
+and 3.9 ms in the hour runs are not the input's steady cost: single cycles of
+that size came with faults, below.
+
+To make the event frequent, a full compaction was also asked for every 3 s
+(`echo 1 > /proc/sys/vm/compact_memory`), on top of the same load, five
+minutes per run, each daemon fresh:
+
+| Daemon | Analog input | Xruns | Gaps over the buffer | Faults of the audio thread | Worst gap with a fault / without |
+|---|---|---|---|---|---|
+| stage 3a | on | 4 | 4, up to 21.3 ms | 11 in 5 cycles | 21.3 / 8.8 ms |
+| stage 3a | off | 0 | 0 | 2 | 5.9 / 6.7 ms |
+| stage 2 | none | 0 | 0 | 2 | 6.4 / 6.8 ms |
+| stage 2 | none | 3 | 3, up to 31.3 ms | 7 in 3 cycles | 31.3 / 6.9 ms |
+| stage 3a | off | 1 | 1, 33.9 ms | 5 in 3 cycles | 33.9 / 6.8 ms |
+| stage 3a | on | 2 | 1, 14.8 ms | 5 in 3 cycles | 14.8 / 6.7 ms |
+| stage 3a | on | 2 | 2, 14.8 ms | 10 in 5 cycles | 14.8 / 7.0 ms |
+
+Every gap over the buffer and every xrun fell on a cycle in which the audio
+thread had faulted, and no cycle without a fault came near the buffer: the
+worst gap without one was 8.8 ms, and 7.0 ms in all but the first run. The
+stage 2 daemon, which has no analog input, failed the same way. The traces
+show each time the same chain: the audio thread faults on a page of its heap,
+its stack or the daemon's code, enters `migration_entry_wait`, sleeps
+uninterruptibly, and runs again when the migrating task finishes, 0.05 to
+8.7 ms later per page, for up to seven pages in a row. 22 such faults were
+traced. In 10 of them the migrating task was `kcompactd`, compacting on its
+own, not the forced compaction. The first three rows were one session, in
+that order, and the last four another. The stage 2 daemon ran last in the
+first and first in the second, and failed in the second, so which daemon
+failed follows when compaction caught it, not the daemon.
+
+The same with `vm.compact_unevictable_allowed = 0`, which keeps locked pages
+out of compaction, again with a full compaction every 3 s, 115 of them:
+
+| Daemon | Analog input | Xruns | Gaps over the buffer | Worst gap | Faults of the audio thread |
+|---|---|---|---|---|---|
+| stage 3a | on | 0 | 0 | 6.77 ms | 0 |
+| stage 2 | none | 0 | 0 | 6.64 ms | 0 |
+| stage 3a | on | 0 | 0 | 8.01 ms | 0 |
+
+Then the acceptance run itself, twice, without forcing compaction: an hour at
+44.1 kHz under the full load with the analog input on, the stage 3a daemon,
+first as the kernel is set, then with `vm.compact_unevictable_allowed = 0`.
+
+| Setting | Xruns | Gaps over the buffer | Worst gap | Worst cycle | Faults of the audio thread | Pages migrated in the hour |
+|---|---|---|---|---|---|---|
+| 1, as set | **2** | **3, up to 22.8 ms** | **22.82 / 11.61 ms** | 8.44 ms | 21 in 7 cycles | 29109 |
+| 0 | 0 | 0 | 7.44 / 11.61 ms | 0.60 ms | 0 | 209128 |
+
+The first hour failed as the stage 3a hours did, and both traced events were
+`kcompactd` moving the audio thread's pages, 12 faults in all, the second
+0.07 s after a 128 MB write and its delete had ended. Without a fault its worst
+gap was 6.93 ms and its worst cycle 0.86 ms. The failures came within 25 s of
+the daemon's start, when its pages were new. The second hour passed, with
+seven times as many pages migrated around the daemon, and with figures close
+to stage 2's hour at 44.1 kHz without the input: 7.44 ms and 0.83 ms then,
+7.44 ms and 0.60 ms now.
+
+Why the failures came in pairs: after an xrun the daemon restarts the card
+with `snd_pcm_prepare` on the audio thread, and on the DAC+ ADC that prepare
+took 11.6 to 15.7 ms in the traces, longer than the 11.6 ms buffer. The
+codec driver mutes and powers its outputs on a prepare over I²C, and waits
+for the bus each time. So one late wake-up becomes two gaps, as in the first
+hour run, 27.1 and 33.1 ms. The capture's prepare took about 1.6 ms.
+
+What this means for the earlier results:
+
+- **The analog input does not make the Pi 3 fail.** It adds a little work and
+  a few pages to the cycle, and so perhaps a little to the chance that a
+  migrated page is one the cycle touches, but the stage 2 daemon fails the
+  same way when compaction runs. That stage 2 passed its hour and stage 3a
+  failed two is within what a rare event gives.
+- **44.1 kHz is not special.** At 44.1 kHz a cycle may be 5.8 ms late before
+  the card runs dry, at 96 kHz 5.3 ms. The gaps the migrated pages caused
+  were 15 to 34 ms, so whether a run fails depends on whether compaction moves a page the
+  cycle needs in that hour, not on the rate. The 96 kHz hour's worst gap of
+  10.16 ms was likely such a stall that ended in time.
+- **Why the CM5 passes** was not measured. It writes the load to an NVMe
+  drive, so the load may leave it less to compact, and its faster cores
+  finish a migration sooner.
+- **What would fix it** is the setting, `vm.compact_unevictable_allowed = 0`,
+  which is what kernels built for real time default to for this reason. It is
+  a setting of the whole system, so how `aas` gets it there, a file in
+  `/etc/sysctl.d` installed with the daemon or the daemon setting it at its
+  start, is still to be decided. Locking alone cannot keep the pages in place,
+  and a process has no other way to. Memory taken for the contiguous
+  allocator can still move locked pages; that was not tested.
 
 ### Detection
 
