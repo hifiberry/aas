@@ -149,6 +149,16 @@ Then move `/etc/asound.conf.before-aas` back, if there is one.
   `--capture` it reports the delay after the player's own buffer. Run it once
   more against `hw:` directly, with `--capture` naming the same card another way,
   and subtract: the difference is what `aas` adds.
+- `tone-probe --seconds 300` plays a steady sine through `default` and captures
+  it from the card's input through the same cable. It prints every break in the
+  tone with its time on `CLOCK_MONOTONIC`, the clock of the daemon's wake-up gap
+  log, and its length, and counts its own capture overruns apart. `--device
+  hw:0,0` with the daemon stopped gives the card alone.
+- `stall` makes a wake-up late on purpose, to see what `tone-probe` hears.
+  `stall --mode thread --cpu 2 --ms 3` keeps an audio thread pinned to that CPU
+  from running. `stall --mode irq --cpu 0 --timers 40000` keeps the CPU that
+  serves the card's interrupt in the kernel with interrupts off. On a Pi 3 the
+  interrupt goes to any CPU, so name them all: `--cpu 0,1,2,3`.
 
 `doc/measurements.md` has the method and the results.
 
