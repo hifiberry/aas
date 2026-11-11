@@ -25,14 +25,15 @@ pub const VERSION: u32 = 2;
 const DATA_OFFSET: usize = 64;
 const FRAME_BYTES: usize = std::mem::size_of::<[i32; 2]>();
 
-/// The first three fields are plain words in memory the peer can write.
-/// They are read once, in `Ring::map`, with a volatile read, and never
-/// through a reference to the header.
+/// Every field is an atomic, because the peer can write any of them at
+/// any time, and a reference to the header must stay sound whatever it
+/// does. The first three are fixed at creation. They are read once, in
+/// `Ring::map`, so what is checked is what is used.
 #[repr(C)]
 pub struct Header {
-    magic: u32,
-    version: u32,
-    capacity_frames: u32,
+    magic: AtomicU32,
+    version: AtomicU32,
+    capacity_frames: AtomicU32,
     /// Frames written since creation. Never wraps back.
     pub write_pos: AtomicU64,
     /// Frames consumed since creation. Never wraps back.
@@ -47,6 +48,20 @@ pub struct Header {
 }
 
 const _: () = assert!(std::mem::size_of::<Header>() <= DATA_OFFSET);
+// The layout both sides have agreed on. A change here is a new version.
+const _: () = {
+    use std::mem::offset_of;
+    assert!(offset_of!(Header, magic) == 0);
+    assert!(offset_of!(Header, version) == 4);
+    assert!(offset_of!(Header, capacity_frames) == 8);
+    assert!(offset_of!(Header, write_pos) == 16);
+    assert!(offset_of!(Header, read_pos) == 24);
+    assert!(offset_of!(Header, underruns) == 32);
+    assert!(offset_of!(Header, output_delay_frames) == 40);
+    assert!(offset_of!(Header, draining) == 44);
+    assert!(offset_of!(Header, wake_at) == 48);
+    assert!(std::mem::size_of::<Header>() == 56);
+};
 
 pub struct Ring {
     base: NonNull<u8>,
@@ -92,19 +107,17 @@ impl Ring {
             return Err(io::Error::last_os_error());
         }
         let base = Self::mmap(fd.as_raw_fd(), len)?;
-        // SAFETY: the mapping is at least DATA_OFFSET bytes, page aligned and
-        // zero filled. We are the only holder until the fd is passed on.
-        unsafe {
-            let h = base.as_ptr() as *mut Header;
-            (&raw mut (*h).magic).write(MAGIC);
-            (&raw mut (*h).version).write(VERSION);
-            (&raw mut (*h).capacity_frames).write(capacity_frames);
-        }
         let ring = Ring {
             base,
             map_len: len,
             capacity: capacity_frames as usize,
         };
+        // The mapping is zero filled, and ours alone until the fd is
+        // passed on.
+        let h = ring.header();
+        h.magic.store(MAGIC, Ordering::Relaxed);
+        h.version.store(VERSION, Ordering::Relaxed);
+        h.capacity_frames.store(capacity_frames, Ordering::Relaxed);
         Ok((ring, fd))
     }
 
@@ -130,15 +143,10 @@ impl Ring {
         };
         // The peer can write these words at any time. Each is read once,
         // so what is checked is what is used.
-        // SAFETY: the mapping is at least DATA_OFFSET bytes and aligned.
-        let (magic, version, capacity) = unsafe {
-            let h = ring.base.as_ptr() as *const Header;
-            (
-                (&raw const (*h).magic).read_volatile(),
-                (&raw const (*h).version).read_volatile(),
-                (&raw const (*h).capacity_frames).read_volatile(),
-            )
-        };
+        let h = ring.header();
+        let magic = h.magic.load(Ordering::Relaxed);
+        let version = h.version.load(Ordering::Relaxed);
+        let capacity = h.capacity_frames.load(Ordering::Relaxed);
         if magic != MAGIC {
             return Err(bad("bad ring magic"));
         }
@@ -202,7 +210,8 @@ impl Ring {
 
     pub fn header(&self) -> &Header {
         // SAFETY: the mapping is at least DATA_OFFSET bytes, aligned, and
-        // lives as long as self. Atomic fields tolerate concurrent access.
+        // lives as long as self. Every field is an atomic, so a peer that
+        // writes any of them does not break the reference.
         unsafe { &*(self.base.as_ptr() as *const Header) }
     }
 
@@ -424,12 +433,10 @@ mod tests {
             map_len: 128,
             capacity: 0,
         };
-        unsafe {
-            let h = ring.base.as_ptr() as *mut Header;
-            (&raw mut (*h).magic).write(MAGIC);
-            (&raw mut (*h).version).write(VERSION);
-            (&raw mut (*h).capacity_frames).write(1000);
-        }
+        let h = ring.header();
+        h.magic.store(MAGIC, Ordering::Relaxed);
+        h.version.store(VERSION, Ordering::Relaxed);
+        h.capacity_frames.store(1000, Ordering::Relaxed);
         assert!(Ring::map(small.as_fd()).is_err());
         assert!(Ring::map(fd.as_fd()).is_ok());
     }
