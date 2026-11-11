@@ -5,7 +5,10 @@
 //! and run on the audio thread, so `process` must not allocate, lock or
 //! block.
 
+pub mod balance;
+pub mod builtin;
 pub mod chain;
+pub mod detect;
 
 use crate::config::Format;
 
