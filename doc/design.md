@@ -335,7 +335,9 @@ turns it into loud noise. While a DoP stream plays:
 How a DoP stream ends and what fills its gaps:
 
 - A DoP stream that underruns keeps the output for 100 ms and sends DoP silence:
-  the markers are kept and the payload is `0x69`. Then it releases the output.
+  the markers are kept and the payload is `0x69`. Then it releases the output
+  and counts as stopped, so the rate rules apply again as if it had. Its next
+  frames start it anew, behind any DoP stream that started meanwhile.
   Stopping or disconnecting releases it at once. So a stalled DoP client costs
   other clients at most 100 ms of audio.
 - A short DoP period is padded with DoP silence, not zeros. Zeros drop the

@@ -88,6 +88,12 @@ pub struct Source {
     next_marker: u8,
     /// Output frames since a DoP stream last had any of its own.
     dop_dry_frames: usize,
+    /// A DoP stream that held the output has had no frames for the grace
+    /// time. It has given up its claim and is reported stopped, so that
+    /// the output does not stay at its rate. Its next frames make a new
+    /// claim. Kept as a flag, since the grace time in frames changes with
+    /// the output rate, and a stream must not come back to life by that.
+    stalled: bool,
     /// What a discard left over of a frame, in units of the output rate.
     discard_remainder: u64,
     dop_reported: bool,
@@ -123,6 +129,7 @@ impl Source {
             dropped: 0,
             next_marker: 0x05,
             dop_dry_frames: 0,
+            stalled: false,
             discard_remainder: 0,
             dop_reported: false,
             drained_reported: false,
@@ -151,6 +158,7 @@ impl Source {
         self.dropped = 0;
         self.next_marker = 0x05;
         self.dop_dry_frames = 0;
+        self.stalled = false;
         self.discard_remainder = 0;
         self.drained_reported = false;
     }
@@ -294,12 +302,22 @@ impl Source {
     /// Whether this DoP stream holds the output this cycle. One that has run
     /// dry keeps it for the grace time, unless it has ended.
     fn holds_output(&self, output_rate: u32) -> bool {
-        let grace = (output_rate * DOP_GRACE_MS / 1000) as usize;
-        let dry_for_now = self.dop_dry_frames < grace && !self.draining();
+        let dry_for_now = !self.stalled && !self.draining();
         self.running
             && self.stream == Stream::Dop
             && self.rate == output_rate
             && (self.ready > 0 || dry_for_now)
+    }
+
+    /// Notes whether a DoP stream has stalled, from what this cycle's scan
+    /// found. Frames end a stall, and so does the end of the DoP stream.
+    fn note_stall(&mut self, output_rate: u32) {
+        let grace = (output_rate * DOP_GRACE_MS / 1000) as usize;
+        if self.stream != Stream::Dop || self.ready > 0 {
+            self.stalled = false;
+        } else if self.dop_dry_frames >= grace {
+            self.stalled = true;
+        }
     }
 
     /// Drops one period's worth of input at the client's own rate, carrying
@@ -325,6 +343,11 @@ impl Source {
             self.cut_run = dop::marked_run(&last) > 0;
         } else {
             self.ring.consume(n);
+            if n > 0 {
+                // A DoP stream with frames of its own is not stalled, even
+                // while it is not the one that plays.
+                self.dop_dry_frames = 0;
+            }
         }
         self.note_shortfall(n, want);
     }
@@ -804,10 +827,12 @@ impl<P: Processing, S: Sink> Engine<P, S> {
 
     /// Gives each stream newly seen as DoP the next claim, in table order
     /// within a cycle, as `report` sends `DopStarted`. A stream that is no
-    /// longer DoP gives its claim up.
+    /// longer DoP, or has stalled, gives its claim up.
     fn order_claims(&mut self) {
+        let rate = self.rate;
         for source in self.table.iter_mut() {
-            if source.stream != Stream::Dop {
+            source.note_stall(rate);
+            if source.stream != Stream::Dop || source.stalled {
                 source.dop_claim = 0;
             } else if source.dop_claim == 0 {
                 self.claims += 1;
@@ -918,7 +943,7 @@ impl<P: Processing, S: Sink> Engine<P, S> {
             return;
         }
         for source in self.table.iter_mut() {
-            let dop = source.stream == Stream::Dop;
+            let dop = source.stream == Stream::Dop && !source.stalled;
             if dop != source.dop_reported {
                 let event = if dop {
                     Event::DopStarted(source.id, source.dop_claim)
@@ -1787,6 +1812,113 @@ mod tests {
         pcm.ring.write(&frames(1000, PERIOD));
         rig.cycle();
         assert_eq!(rig.last_periods(1), frames(1000, PERIOD));
+    }
+
+    #[test]
+    fn a_stalled_dop_stream_is_reported_stopped_when_it_releases_the_output() {
+        let (mut rig, dop, pcm) = dop_with_a_second_client();
+        for _ in 0..75 {
+            pcm.ring.write(&frames(1000, PERIOD));
+            rig.cycle();
+        }
+        assert!(rig.events().is_empty());
+        // The grace time has passed: the rate rules must hear of it, or the
+        // output stays at the rate of a stream that plays nothing.
+        pcm.ring.write(&frames(1000, PERIOD));
+        rig.cycle();
+        assert_eq!(rig.last_periods(1), frames(1000, PERIOD));
+        assert!(matches!(rig.events()[..], [Event::DopStopped(1)]));
+        for _ in 0..10 {
+            pcm.ring.write(&frames(1000, PERIOD));
+            rig.cycle();
+            assert_eq!(rig.last_periods(1), frames(1000, PERIOD));
+        }
+        assert!(rig.events().is_empty());
+        // When it plays again it is a new claim, and takes the output back.
+        dop.ring.write(&dop_frames(PERIOD));
+        pcm.ring.write(&frames(1000, PERIOD));
+        rig.cycle();
+        assert_eq!(rig.last_periods(1), dop_frames(PERIOD));
+        assert!(matches!(rig.events()[..], [Event::DopStarted(1, 2)]));
+    }
+
+    #[test]
+    fn a_dop_stream_that_stalled_ranks_behind_one_that_started_meanwhile() {
+        let mut rig = Rig::<I32>::new(BitPerfect::Auto);
+        let (mut stalls, mut other) = (client(1), client(2));
+        rig.add(&mut stalls);
+        rig.add(&mut other);
+        stalls.ring.write(&dop_frames(PERIOD));
+        rig.cycle();
+        for _ in 0..76 {
+            rig.cycle();
+        }
+        let theirs: Vec<[i32; 2]> = dop_frames(PERIOD)
+            .iter()
+            .map(|f| [f[0] ^ 0x00AB_0000, f[1] ^ 0x00AB_0000])
+            .collect();
+        other.ring.write(&theirs);
+        rig.cycle();
+        assert!(matches!(
+            rig.events()[..],
+            [
+                Event::DopStarted(1, 1),
+                Event::DopStopped(1),
+                Event::DopStarted(2, 2)
+            ]
+        ));
+        // Both have frames now. The one that kept playing holds the output.
+        stalls.ring.write(&dop_frames(PERIOD));
+        other.ring.write(&theirs);
+        rig.cycle();
+        assert_eq!(rig.last_periods(1), theirs);
+        assert!(matches!(rig.events()[..], [Event::DopStarted(1, 3)]));
+    }
+
+    #[test]
+    fn a_stalled_dop_stream_resuming_at_another_output_rate_claims_once() {
+        let (mut rig, dop, _pcm) = dop_with_a_second_client();
+        for _ in 0..76 {
+            rig.cycle();
+        }
+        assert!(matches!(rig.events()[..], [Event::DopStopped(1)]));
+        // The rate rules have moved the output on meanwhile.
+        rig.send(Command::Reconfigure {
+            rate: 2 * RATE,
+            period: PERIOD as u32,
+        });
+        rig.cycle();
+        rig.cycle();
+        // The grace time is longer in frames at this rate. The stream is
+        // no less stalled for that.
+        assert!(matches!(rig.events()[..], [Event::Reconfigured]));
+        // It plays again, in pieces with cycles between that find nothing.
+        // That is one claim, until the output is at its rate again.
+        for _ in 0..5 {
+            dop.ring.write(&dop_frames(PERIOD / 2));
+            rig.cycle();
+            rig.cycle();
+        }
+        assert!(matches!(rig.events()[..], [Event::DopStarted(1, 2)]));
+    }
+
+    #[test]
+    fn a_muted_dop_stream_that_runs_dry_keeps_its_claim() {
+        // At another rate than the output it never holds the output, so no
+        // grace time runs for it, and a cycle without frames ends nothing.
+        let mut rig = Rig::<F32>::new(BitPerfect::Auto);
+        let mut a = client_at(1, 2 * RATE);
+        rig.add(&mut a);
+        a.ring.write(&dop_frames(2 * PERIOD));
+        rig.cycle();
+        assert!(matches!(rig.events()[..], [Event::DopStarted(1, 1)]));
+        for _ in 0..100 {
+            rig.cycle();
+        }
+        a.ring.write(&dop_frames(2 * PERIOD));
+        rig.cycle();
+        rig.cycle();
+        assert!(rig.events().is_empty());
     }
 
     #[test]
