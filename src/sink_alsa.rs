@@ -204,7 +204,7 @@ pub fn decode(format: CardFormat, bytes: &[u8], out: &mut [[i32; 2]]) {
 }
 
 /// How long a capture delivers zeros after it starts. The ADC of the DAC+
-/// ADC Pro starts with a DC offset that its high-pass filter takes this
+/// ADC Pro starts with a transient that its high-pass filter takes this
 /// long to bring below -60 dBFS: measured on the CM5 test board, it
 /// stays above the detector's -50 dBFS for up to 650 ms at 44.1 kHz,
 /// less at higher rates. Played through, it would open the analog input

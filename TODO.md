@@ -90,7 +90,7 @@ default should be on for cards with an ADC, first step: change the default in
 ### The 1 s of silence after a capture starts
 
 A capture delivers silence for 1 s after each start, `SETTLE_MS` in
-`src/sink_alsa.rs`, because the DAC+ ADC Pro's ADC starts with a DC offset of
+`src/sink_alsa.rs`, because the DAC+ ADC Pro's ADC starts with a transient of
 about -28 dBFS that would open the input for about 650 ms. It mutes the analog
 input for 1 s at every start and every rate change. The figure is measured on
 that card only. Missing: whether 1 s stays, and whether it becomes a value per

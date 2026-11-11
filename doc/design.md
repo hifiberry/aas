@@ -524,7 +524,7 @@ Details *(call)*:
   dropped. Both are counted. Capture overruns are not counted on their own, they
   show as padded frames.
 - A capture delivers silence for 1 s after each start. The ADC of the DAC+ ADC
-  Pro starts with a DC offset that stays above -50 dBFS for up to 700 ms, and
+  Pro starts with a transient that stays above -50 dBFS for up to 700 ms, and
   would open the input by itself. The DAC+ ADC on the Pi 3 test board never
   went above -50 dBFS at a start, its loudest 50 ms being -83.8 dBFS
   (`doc/measurements.md`, Stage 3a). So the 1 s is needed for the Pro only, but
