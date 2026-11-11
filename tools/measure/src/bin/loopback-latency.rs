@@ -53,8 +53,16 @@ struct Args {
     period: usize,
     #[arg(long, default_value_t = 2)]
     periods: u32,
-    #[arg(long, default_value_t = 20)]
+    #[arg(long, default_value_t = 20, value_parser = at_least_one)]
     repeats: usize,
+}
+
+fn at_least_one(text: &str) -> Result<usize, String> {
+    match text.parse() {
+        Ok(0) => Err("must be at least 1".into()),
+        Ok(n) => Ok(n),
+        Err(e) => Err(format!("{e}")),
+    }
 }
 
 /// Play the chirp and return the left channel of what came back.
@@ -278,6 +286,13 @@ fn run(args: &Args) -> Result<(), String> {
             ));
         }
         let delay = found as i64 - CHIRP_START as i64;
+        if delay < 0 {
+            return Err(format!(
+                "repeat {repeat}: the chirp was found {} frames before it was played, \
+                 so the match is false",
+                -delay
+            ));
+        }
         let ms = delay as f64 / f64::from(args.rate) * 1000.0;
         println!("repeat {repeat}: converters {delay} frames, {ms:.3} ms, peak {level:.1} dBFS");
         delays.push(delay);

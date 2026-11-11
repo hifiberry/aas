@@ -2,7 +2,7 @@
 
 use aas::config::{Config, Idle};
 use aas::rate::SETTLE;
-use aas::server;
+use aas::server::{self, CardProbe};
 use aas::sink::{MemorySink, Sink, SinkError, SinkLog};
 use aas::volume::{HardwareVolume, OpenVolume};
 use aas_client::client::Client;
@@ -53,6 +53,13 @@ impl Daemon {
         Daemon::start_full(config, sink, dir, state, Some(hardware))
     }
 
+    /// A daemon whose control thread looks for the card with `probe`.
+    fn start_probing(config: Config, sink: Box<dyn Sink>, probe: CardProbe) -> Daemon {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state.toml");
+        Daemon::start_all(config, sink, dir, state, None, Some(probe))
+    }
+
     fn start_full(
         config: Config,
         sink: Box<dyn Sink>,
@@ -60,11 +67,24 @@ impl Daemon {
         state: PathBuf,
         hardware: Option<OpenVolume>,
     ) -> Daemon {
+        Daemon::start_all(config, sink, dir, state, hardware, None)
+    }
+
+    fn start_all(
+        config: Config,
+        sink: Box<dyn Sink>,
+        dir: tempfile::TempDir,
+        state: PathBuf,
+        hardware: Option<OpenVolume>,
+        probe: Option<CardProbe>,
+    ) -> Daemon {
         let path = dir.path().join("aas.sock");
         let shutdown = Arc::new(AtomicBool::new(false));
         let thread = {
             let (path, shutdown) = (path.clone(), shutdown.clone());
-            thread::spawn(move || server::run(config, sink, &path, &state, hardware, shutdown))
+            thread::spawn(move || {
+                server::run_probing(config, sink, &path, &state, hardware, probe, shutdown)
+            })
         };
         let daemon = Daemon {
             _dir: dir,
@@ -555,6 +575,29 @@ fn a_gone_sink_falls_back_to_null_and_retries() {
 }
 
 #[test]
+fn a_gone_sink_is_tried_again_only_once_the_card_is_seen() {
+    let (sink, log) = memory_sink();
+    log.fail(Some(SinkError::Gone));
+    let present = Arc::new(AtomicBool::new(false));
+    let seen = present.clone();
+    let probe = Box::new(move || seen.load(Ordering::Relaxed));
+    let daemon = Daemon::start_probing(default_config(), sink, probe);
+    let mut client = daemon.client_at(48000, 262144);
+    write_all(&mut client, &vec![[0x100, 0x100]; 192000]);
+    client.start().unwrap();
+    wait_played(&client, 4800);
+    // The sink would open now, but the control thread sees no card, so
+    // the audio thread is not asked to try.
+    log.fail(None);
+    thread::sleep(Duration::from_millis(2500));
+    assert!(log.opens().is_empty());
+    assert!(log.frames().is_empty());
+    present.store(true, Ordering::Relaxed);
+    assert!(wait_for(|| log.frames().contains(&[0x100, 0x100])));
+    assert_eq!(last_open(&log), Some((48000, PERIOD)));
+}
+
+#[test]
 fn a_card_that_appears_later_brings_its_rates() {
     let (sink, log) = memory_sink();
     log.fail(Some(SinkError::Gone));
@@ -779,7 +822,10 @@ fn volume_client(daemon: &Daemon) -> OwnedFd {
             version: proto::VERSION,
         },
     );
-    assert_eq!(receive_raw(&fd, PATIENCE), Some(Reply::Ok));
+    let said = Reply::Hello {
+        version: proto::VERSION,
+    };
+    assert_eq!(receive_raw(&fd, PATIENCE), Some(said));
     fd
 }
 

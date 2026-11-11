@@ -88,6 +88,12 @@ pub struct Source {
     next_marker: u8,
     /// Output frames since a DoP stream last had any of its own.
     dop_dry_frames: usize,
+    /// A DoP stream that held the output has had no frames for the grace
+    /// time. It has given up its claim and is reported stopped, so that
+    /// the output does not stay at its rate. Its next frames make a new
+    /// claim. Kept as a flag, since the grace time in frames changes with
+    /// the output rate, and a stream must not come back to life by that.
+    stalled: bool,
     /// What a discard left over of a frame, in units of the output rate.
     discard_remainder: u64,
     dop_reported: bool,
@@ -123,6 +129,7 @@ impl Source {
             dropped: 0,
             next_marker: 0x05,
             dop_dry_frames: 0,
+            stalled: false,
             discard_remainder: 0,
             dop_reported: false,
             drained_reported: false,
@@ -151,6 +158,7 @@ impl Source {
         self.dropped = 0;
         self.next_marker = 0x05;
         self.dop_dry_frames = 0;
+        self.stalled = false;
         self.discard_remainder = 0;
         self.drained_reported = false;
     }
@@ -294,12 +302,22 @@ impl Source {
     /// Whether this DoP stream holds the output this cycle. One that has run
     /// dry keeps it for the grace time, unless it has ended.
     fn holds_output(&self, output_rate: u32) -> bool {
-        let grace = (output_rate * DOP_GRACE_MS / 1000) as usize;
-        let dry_for_now = self.dop_dry_frames < grace && !self.draining();
+        let dry_for_now = !self.stalled && !self.draining();
         self.running
             && self.stream == Stream::Dop
             && self.rate == output_rate
             && (self.ready > 0 || dry_for_now)
+    }
+
+    /// Notes whether a DoP stream has stalled, from what this cycle's scan
+    /// found. Frames end a stall, and so does the end of the DoP stream.
+    fn note_stall(&mut self, output_rate: u32) {
+        let grace = (output_rate * DOP_GRACE_MS / 1000) as usize;
+        if self.stream != Stream::Dop || self.ready > 0 {
+            self.stalled = false;
+        } else if self.dop_dry_frames >= grace {
+            self.stalled = true;
+        }
     }
 
     /// Drops one period's worth of input at the client's own rate, carrying
@@ -325,6 +343,11 @@ impl Source {
             self.cut_run = dop::marked_run(&last) > 0;
         } else {
             self.ring.consume(n);
+            if n > 0 {
+                // A DoP stream with frames of its own is not stalled, even
+                // while it is not the one that plays.
+                self.dop_dry_frames = 0;
+            }
         }
         self.note_shortfall(n, want);
     }
@@ -413,10 +436,15 @@ pub enum Event {
     Dropped(Box<Source>),
     Replaced(Option<Box<Resampler>>),
     OldTable(Vec<Box<Source>>),
-    DopStarted(ClientId),
+    /// The client plays DoP, with the number of its claim on the output.
+    /// The lowest number among the claims is the oldest, whatever order
+    /// the events arrive in.
+    DopStarted(ClientId, u64),
     DopStopped(ClientId),
     Drained(ClientId),
     Flushed(ClientId),
+    /// One for every `Reconfigure`: when the sink is open, or when a later
+    /// `Reconfigure`, a close or the shutdown has taken its place.
     Reconfigured,
 }
 
@@ -523,15 +551,21 @@ impl<P: Processing, S: Sink> Engine<P, S> {
             self.render(true, start)
         } else {
             self.drain_commands();
-            if self.reopen.is_some() {
-                self.apply_reopen()?;
-                // Opening the card is not part of the cycle's work.
-                start = Instant::now();
-            }
-            if self.open {
-                self.render(false, start)
-            } else {
-                Ok(())
+            let reopening = self.reopen.is_some();
+            match self.apply_reopen() {
+                // The sources are still reported below.
+                Err(e) => Err(e),
+                Ok(()) => {
+                    if reopening {
+                        // Opening the card is not part of the cycle's work.
+                        start = Instant::now();
+                    }
+                    if self.open {
+                        self.render(false, start)
+                    } else {
+                        Ok(())
+                    }
+                }
             }
         };
         self.report();
@@ -612,20 +646,32 @@ impl<P: Processing, S: Sink> Engine<P, S> {
                 self.emit(Event::Replaced(replaced));
             }
             Command::Reconfigure { rate, period } => {
-                self.reopen = Some((rate, period.min(MAX_PERIOD)));
+                let overtaken = self.reopen.replace((rate, period.min(MAX_PERIOD)));
                 self.faded = false;
+                if overtaken.is_some() {
+                    self.emit(Event::Reconfigured);
+                }
             }
             Command::CloseOutput => {
-                self.reopen = None;
+                self.cancel_reopen();
                 self.close();
             }
             Command::SetGain(gain) => self.set_gain(gain),
             Command::Grow(table) => self.grow(table),
             Command::Shutdown => {
-                self.reopen = None;
+                self.cancel_reopen();
                 self.close();
                 self.stopped = true;
             }
+        }
+    }
+
+    /// Drops an open that is still waiting. It is answered like one that
+    /// was done, so that the control thread, which counts them, is never
+    /// left waiting for an answer.
+    fn cancel_reopen(&mut self) {
+        if self.reopen.take().is_some() {
+            self.emit(Event::Reconfigured);
         }
     }
 
@@ -648,6 +694,10 @@ impl<P: Processing, S: Sink> Engine<P, S> {
             source.drained_reported = false;
             return;
         }
+        // The credit for a dropped tail belongs to the stream that ends
+        // here. The memory of a cut run stays: frames left in the ring can
+        // be the rest of that run, and must not be mixed after a restart.
+        source.dropped = 0;
         if source.stream == Stream::Dop {
             if source.ring.available() > 0 {
                 source.in_dop_run = true;
@@ -781,6 +831,11 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         }
         let work = before_write - start + after_write.elapsed();
         self.record_timing(start, work.as_nanos() as u64);
+        if self.sink.switched() {
+            // The write opened another device. The next cycle has nothing
+            // to measure from, as after any open.
+            self.last_start = None;
+        }
         result
     }
 
@@ -795,10 +850,12 @@ impl<P: Processing, S: Sink> Engine<P, S> {
 
     /// Gives each stream newly seen as DoP the next claim, in table order
     /// within a cycle, as `report` sends `DopStarted`. A stream that is no
-    /// longer DoP gives its claim up.
+    /// longer DoP, or has stalled, gives its claim up.
     fn order_claims(&mut self) {
+        let rate = self.rate;
         for source in self.table.iter_mut() {
-            if source.stream != Stream::Dop {
+            source.note_stall(rate);
+            if source.stream != Stream::Dop || source.stalled {
                 source.dop_claim = 0;
             } else if source.dop_claim == 0 {
                 self.claims += 1;
@@ -909,10 +966,10 @@ impl<P: Processing, S: Sink> Engine<P, S> {
             return;
         }
         for source in self.table.iter_mut() {
-            let dop = source.stream == Stream::Dop;
+            let dop = source.stream == Stream::Dop && !source.stalled;
             if dop != source.dop_reported {
                 let event = if dop {
-                    Event::DopStarted(source.id)
+                    Event::DopStarted(source.id, source.dop_claim)
                 } else {
                     Event::DopStopped(source.id)
                 };
@@ -1362,7 +1419,7 @@ mod tests {
         assert!(periods().any(|p| p == silence), "the grace time");
         let released = log.last().unwrap();
         assert!(released[0].abs() >= 1000, "output after the release");
-        assert!(matches!(rig.events()[..], [Event::DopStarted(_), ..]));
+        assert!(matches!(rig.events()[..], [Event::DopStarted(_, _), ..]));
     }
 
     #[test]
@@ -1665,7 +1722,7 @@ mod tests {
         assert!(resampled.ring.available() < 1000);
         let events = rig.events();
         assert_eq!(events.len(), 1);
-        assert!(matches!(events[0], Event::DopStarted(2)));
+        assert!(matches!(events[0], Event::DopStarted(2, _)));
         // The stream turns back into PCM, and mixing resumes.
         dop.ring.write(&frames(500, PERIOD));
         rig.cycle();
@@ -1689,17 +1746,49 @@ mod tests {
             .collect();
         first.ring.write(&dop_frames(PERIOD));
         rig.cycle();
-        assert!(matches!(rig.events()[..], [Event::DopStarted(2)]));
+        assert!(matches!(rig.events()[..], [Event::DopStarted(2, _)]));
         first.ring.write(&dop_frames(PERIOD));
         later.ring.write(&other);
         rig.cycle();
         assert_eq!(rig.last_periods(1), dop_frames(PERIOD));
-        assert!(matches!(rig.events()[..], [Event::DopStarted(1)]));
+        assert!(matches!(rig.events()[..], [Event::DopStarted(1, _)]));
         // Once the first claim stops, the next one takes over.
         rig.send(Command::SetRunning(2, false));
         later.ring.write(&other);
         rig.cycle();
         assert_eq!(rig.last_periods(1), other);
+    }
+
+    #[test]
+    fn a_dop_start_sent_late_carries_the_number_of_its_claim() {
+        // One slot, so that an unread event keeps the next from being sent.
+        let mut rig = Rig::<I32>::with_event_slots(BitPerfect::Auto, 1);
+        let (mut later, mut first) = (client(1), client(2));
+        rig.add(&mut later);
+        rig.add(&mut first);
+        rig.send(Command::Flush(99));
+        rig.cycle();
+        // Both claims are made while the queue is full.
+        first.ring.write(&dop_frames(PERIOD));
+        rig.cycle();
+        first.ring.write(&dop_frames(PERIOD));
+        later.ring.write(&dop_frames(PERIOD));
+        rig.cycle();
+        assert!(matches!(rig.events()[..], [Event::Flushed(99)]));
+        // They are sent in table order, the later claim first.
+        let mut claims = Vec::new();
+        for _ in 0..2 {
+            first.ring.write(&dop_frames(PERIOD));
+            later.ring.write(&dop_frames(PERIOD));
+            rig.cycle();
+            match rig.events()[..] {
+                [Event::DopStarted(id, claim)] => claims.push((id, claim)),
+                _ => panic!("no DopStarted"),
+            }
+        }
+        assert_eq!(claims[0].0, 1);
+        assert_eq!(claims[1].0, 2);
+        assert!(claims[1].1 < claims[0].1, "{claims:?}");
     }
 
     /// A DoP stream that has played, with a PCM client waiting behind it.
@@ -1746,6 +1835,113 @@ mod tests {
         pcm.ring.write(&frames(1000, PERIOD));
         rig.cycle();
         assert_eq!(rig.last_periods(1), frames(1000, PERIOD));
+    }
+
+    #[test]
+    fn a_stalled_dop_stream_is_reported_stopped_when_it_releases_the_output() {
+        let (mut rig, dop, pcm) = dop_with_a_second_client();
+        for _ in 0..75 {
+            pcm.ring.write(&frames(1000, PERIOD));
+            rig.cycle();
+        }
+        assert!(rig.events().is_empty());
+        // The grace time has passed: the rate rules must hear of it, or the
+        // output stays at the rate of a stream that plays nothing.
+        pcm.ring.write(&frames(1000, PERIOD));
+        rig.cycle();
+        assert_eq!(rig.last_periods(1), frames(1000, PERIOD));
+        assert!(matches!(rig.events()[..], [Event::DopStopped(1)]));
+        for _ in 0..10 {
+            pcm.ring.write(&frames(1000, PERIOD));
+            rig.cycle();
+            assert_eq!(rig.last_periods(1), frames(1000, PERIOD));
+        }
+        assert!(rig.events().is_empty());
+        // When it plays again it is a new claim, and takes the output back.
+        dop.ring.write(&dop_frames(PERIOD));
+        pcm.ring.write(&frames(1000, PERIOD));
+        rig.cycle();
+        assert_eq!(rig.last_periods(1), dop_frames(PERIOD));
+        assert!(matches!(rig.events()[..], [Event::DopStarted(1, 2)]));
+    }
+
+    #[test]
+    fn a_dop_stream_that_stalled_ranks_behind_one_that_started_meanwhile() {
+        let mut rig = Rig::<I32>::new(BitPerfect::Auto);
+        let (mut stalls, mut other) = (client(1), client(2));
+        rig.add(&mut stalls);
+        rig.add(&mut other);
+        stalls.ring.write(&dop_frames(PERIOD));
+        rig.cycle();
+        for _ in 0..76 {
+            rig.cycle();
+        }
+        let theirs: Vec<[i32; 2]> = dop_frames(PERIOD)
+            .iter()
+            .map(|f| [f[0] ^ 0x00AB_0000, f[1] ^ 0x00AB_0000])
+            .collect();
+        other.ring.write(&theirs);
+        rig.cycle();
+        assert!(matches!(
+            rig.events()[..],
+            [
+                Event::DopStarted(1, 1),
+                Event::DopStopped(1),
+                Event::DopStarted(2, 2)
+            ]
+        ));
+        // Both have frames now. The one that kept playing holds the output.
+        stalls.ring.write(&dop_frames(PERIOD));
+        other.ring.write(&theirs);
+        rig.cycle();
+        assert_eq!(rig.last_periods(1), theirs);
+        assert!(matches!(rig.events()[..], [Event::DopStarted(1, 3)]));
+    }
+
+    #[test]
+    fn a_stalled_dop_stream_resuming_at_another_output_rate_claims_once() {
+        let (mut rig, dop, _pcm) = dop_with_a_second_client();
+        for _ in 0..76 {
+            rig.cycle();
+        }
+        assert!(matches!(rig.events()[..], [Event::DopStopped(1)]));
+        // The rate rules have moved the output on meanwhile.
+        rig.send(Command::Reconfigure {
+            rate: 2 * RATE,
+            period: PERIOD as u32,
+        });
+        rig.cycle();
+        rig.cycle();
+        // The grace time is longer in frames at this rate. The stream is
+        // no less stalled for that.
+        assert!(matches!(rig.events()[..], [Event::Reconfigured]));
+        // It plays again, in pieces with cycles between that find nothing.
+        // That is one claim, until the output is at its rate again.
+        for _ in 0..5 {
+            dop.ring.write(&dop_frames(PERIOD / 2));
+            rig.cycle();
+            rig.cycle();
+        }
+        assert!(matches!(rig.events()[..], [Event::DopStarted(1, 2)]));
+    }
+
+    #[test]
+    fn a_muted_dop_stream_that_runs_dry_keeps_its_claim() {
+        // At another rate than the output it never holds the output, so no
+        // grace time runs for it, and a cycle without frames ends nothing.
+        let mut rig = Rig::<F32>::new(BitPerfect::Auto);
+        let mut a = client_at(1, 2 * RATE);
+        rig.add(&mut a);
+        a.ring.write(&dop_frames(2 * PERIOD));
+        rig.cycle();
+        assert!(matches!(rig.events()[..], [Event::DopStarted(1, 1)]));
+        for _ in 0..100 {
+            rig.cycle();
+        }
+        a.ring.write(&dop_frames(2 * PERIOD));
+        rig.cycle();
+        rig.cycle();
+        assert!(rig.events().is_empty());
     }
 
     #[test]
@@ -1819,7 +2015,7 @@ mod tests {
         want.extend(dop_silence(0x05, PERIOD - 40));
         assert_eq!(rig.last_periods(1), want);
         assert_eq!(underruns(&a), 0);
-        assert!(matches!(rig.events()[..], [Event::DopStarted(1)]));
+        assert!(matches!(rig.events()[..], [Event::DopStarted(1, _)]));
         // What follows the markers is PCM again.
         rig.cycle();
         assert!(matches!(rig.events()[..], [Event::DopStopped(1)]));
@@ -1841,7 +2037,7 @@ mod tests {
         rig.cycle();
         rig.cycle();
         assert_eq!(rig.last_periods(2), block);
-        assert!(matches!(rig.events()[..], [Event::DopStarted(1)]));
+        assert!(matches!(rig.events()[..], [Event::DopStarted(1, _)]));
     }
 
     #[test]
@@ -1885,7 +2081,7 @@ mod tests {
             rig.cycle();
         }
         assert!(rig.log.frames().iter().all(|f| *f == [0, 0]));
-        assert!(matches!(rig.events()[..], [Event::DopStarted(1)]));
+        assert!(matches!(rig.events()[..], [Event::DopStarted(1, _)]));
     }
 
     #[test]
@@ -1900,7 +2096,7 @@ mod tests {
         let events = rig.events();
         assert!(matches!(
             events[..],
-            [Event::DopStarted(1), Event::DopStopped(1)]
+            [Event::DopStarted(1, _), Event::DopStopped(1)]
         ));
         rig.send(Command::SetRunning(1, true));
         rig.cycle();
@@ -1910,7 +2106,7 @@ mod tests {
         assert!(matches!(
             events[..],
             [
-                Event::DopStarted(1),
+                Event::DopStarted(1, _),
                 Event::DopStopped(1),
                 Event::Dropped(_)
             ]
@@ -1929,7 +2125,7 @@ mod tests {
         // Muted, but discarded in real time. Other clients keep playing.
         assert_eq!(rig.last_periods(1), frames(1000, PERIOD));
         assert_eq!(dop.ring.available(), 300 - 235);
-        assert!(matches!(rig.events()[..], [Event::DopStarted(1)]));
+        assert!(matches!(rig.events()[..], [Event::DopStarted(1, _)]));
         rig.send(Command::Reconfigure {
             rate: 176400,
             period: PERIOD as u32,
@@ -2200,7 +2396,7 @@ mod tests {
         b.ring.header().draining.store(1, Release);
         rig.cycle();
         rig.cycle();
-        assert!(matches!(rig.events.pop(), Ok(Event::DopStarted(1))));
+        assert!(matches!(rig.events.pop(), Ok(Event::DopStarted(1, _))));
         rig.cycle();
         assert!(matches!(rig.events.pop(), Ok(Event::Drained(2))));
         rig.cycle();
@@ -2275,6 +2471,119 @@ mod tests {
         rig.cycle();
         assert!(!rig.engine.is_closed());
         assert!(matches!(rig.events()[..], [Event::Reconfigured]));
+    }
+
+    #[test]
+    fn a_failed_reopen_still_reports_what_the_sources_did() {
+        let mut rig = Rig::<F32>::new(BitPerfect::Auto);
+        let mut a = client(1);
+        rig.add(&mut a);
+        rig.send(Command::Reconfigure {
+            rate: 96000,
+            period: 128,
+        });
+        rig.cycle();
+        rig.events();
+        // The stream ends while the card cannot be opened.
+        rig.log.fail(Some(SinkError::Gone));
+        a.ring.header().draining.store(1, Release);
+        assert_eq!(rig.engine.cycle(), Err(SinkError::Gone));
+        assert!(matches!(rig.events()[..], [Event::Drained(1)]));
+    }
+
+    /// A sink that moves to another device inside one `write`, which takes
+    /// far longer than its buffer lasts, as opening a card does.
+    struct Switching {
+        took: Duration,
+        switch_next: bool,
+        reports: bool,
+        switched: bool,
+    }
+
+    impl Sink for Switching {
+        fn open(&mut self, _rate: u32, _period: u32) -> Result<(), SinkError> {
+            Ok(())
+        }
+
+        fn write(&mut self, _frames: &[[i32; 2]]) -> Result<(), SinkError> {
+            if std::mem::take(&mut self.switch_next) {
+                std::thread::sleep(self.took);
+                self.switched = self.reports;
+            }
+            Ok(())
+        }
+
+        fn close(&mut self) {}
+
+        fn delay_frames(&self) -> u32 {
+            0
+        }
+
+        fn supported_rates(&self) -> Vec<u32> {
+            Vec::new()
+        }
+
+        fn switched(&mut self) -> bool {
+            std::mem::take(&mut self.switched)
+        }
+    }
+
+    /// Wake-up gaps counted over a switch of the device in the third cycle.
+    fn gaps_over_a_switch(reports: bool) -> u64 {
+        // A buffer of 200 ms, so that only the switch is longer.
+        let (rate, period) = (48000, 4800);
+        let sink = Switching {
+            took: Duration::from_millis(300),
+            switch_next: false,
+            reports,
+            switched: false,
+        };
+        let (mut commands, consumer) = RingBuffer::new(16);
+        let (producer, _events) = RingBuffer::new(16);
+        let counters = Arc::new(Counters::default());
+        let mut engine =
+            Engine::<F32, _>::new(sink, consumer, producer, counters.clone(), BitPerfect::Auto);
+        assert!(commands.push(Command::Reconfigure { rate, period }).is_ok());
+        for cycle in 0..5 {
+            engine.sink.switch_next = cycle == 2;
+            engine.cycle().unwrap();
+        }
+        counters.wake_gaps.load(Relaxed)
+    }
+
+    #[test]
+    fn the_time_a_sink_takes_to_switch_devices_is_not_a_wake_up_gap() {
+        assert_eq!(gaps_over_a_switch(true), 0);
+        // The same wait inside a write that switches nothing is one.
+        assert_eq!(gaps_over_a_switch(false), 1);
+    }
+
+    #[test]
+    fn every_reconfigure_is_answered_even_if_it_never_opens_the_sink() {
+        let reconfigure = |rate| Command::Reconfigure { rate, period: 64 };
+        // Two in one cycle: the first is overtaken, the second opens.
+        let mut rig = Rig::<F32>::closed(BitPerfect::Auto, 16);
+        rig.send(reconfigure(44100));
+        rig.send(reconfigure(96000));
+        rig.cycle();
+        assert_eq!(rig.log.opens(), [(96000, 64)]);
+        assert!(matches!(
+            rig.events()[..],
+            [Event::Reconfigured, Event::Reconfigured]
+        ));
+        // One taken back by a close before the sink could be opened.
+        rig.send(reconfigure(48000));
+        rig.cycle();
+        rig.log.fail(Some(SinkError::Gone));
+        assert_eq!(rig.engine.cycle(), Err(SinkError::Gone));
+        assert!(rig.events().is_empty());
+        rig.send(Command::CloseOutput);
+        rig.cycle();
+        assert!(matches!(rig.events()[..], [Event::Reconfigured]));
+        // A close with nothing waiting says nothing.
+        rig.send(Command::CloseOutput);
+        rig.cycle();
+        assert!(rig.events().is_empty());
     }
 
     #[test]
@@ -2912,7 +3221,7 @@ mod tests {
             }
             let events = rig.events();
             if fuzz.tone_second {
-                false_starts += count(&events, |e| matches!(e, Event::DopStarted(2)));
+                false_starts += count(&events, |e| matches!(e, Event::DopStarted(2, _)));
             }
             if fuzz.stops && random.next(4) == 0 {
                 if random.next(2) == 0 {
@@ -2956,7 +3265,7 @@ mod tests {
             rig.cycle();
         }
         if fuzz.tone_second {
-            false_starts += count(&rig.events(), |e| matches!(e, Event::DopStarted(2)));
+            false_starts += count(&rig.events(), |e| matches!(e, Event::DopStarted(2, _)));
         }
         let log = rig.log.frames();
         let output = log[start..].iter();
@@ -3249,7 +3558,7 @@ mod tests {
         }
         assert!(rig.log.frames().iter().all(|f| *f == [0, 0]));
         let events = rig.events();
-        assert_eq!(count(&events, |e| matches!(e, Event::DopStarted(1))), 1);
+        assert_eq!(count(&events, |e| matches!(e, Event::DopStarted(1, _))), 1);
         assert_eq!(count(&events, |e| matches!(e, Event::Drained(1))), 1);
     }
 
@@ -3443,7 +3752,7 @@ mod tests {
     fn pcm_after_a_cut_run_is_not_taken_for_dop() {
         let (mut rig, _a, b, _start) = a_run_cut_by_a_discard(client(2), 60, 18);
         rig.cycle();
-        assert!(matches!(rig.events()[..], [Event::DopStarted(1)]));
+        assert!(matches!(rig.events()[..], [Event::DopStarted(1, _)]));
         // Past the run, and with nothing marked left to find.
         b.ring.consume(b.ring.available());
         b.ring.write(&frames(1000, PERIOD));
@@ -3480,9 +3789,9 @@ mod tests {
         assert!(matches!(
             events[..],
             [
-                Event::DopStarted(1),
+                Event::DopStarted(1, _),
                 Event::DopStopped(1),
-                Event::DopStarted(1)
+                Event::DopStarted(1, _)
             ]
         ));
     }
@@ -3544,8 +3853,8 @@ mod tests {
         let log = rig.log.frames();
         assert_eq!(first_difference(&log[start..], &dop), None);
         let events = rig.events();
-        assert_eq!(count(&events, |e| matches!(e, Event::DopStarted(2))), 0);
-        assert_eq!(count(&events, |e| matches!(e, Event::DopStarted(1))), 1);
+        assert_eq!(count(&events, |e| matches!(e, Event::DopStarted(2, _))), 0);
+        assert_eq!(count(&events, |e| matches!(e, Event::DopStarted(1, _))), 1);
     }
 
     /// An engine at a gain of 0.1 and this format.
@@ -3601,7 +3910,7 @@ mod tests {
             b.ring.write(&block);
             written_b += want;
             rig.cycle();
-            starts += count(&rig.events(), |e| matches!(e, Event::DopStarted(2)));
+            starts += count(&rig.events(), |e| matches!(e, Event::DopStarted(2, _)));
         }
         starts
     }
@@ -3627,13 +3936,13 @@ mod tests {
         let dop = dop_frames(3 * PERIOD);
         a.ring.write(&dop);
         rig.cycle();
-        assert!(matches!(rig.events()[..], [Event::DopStarted(1)]));
+        assert!(matches!(rig.events()[..], [Event::DopStarted(1, _)]));
         rig.send(Command::SetRunning(1, false));
         rig.send(Command::SetRunning(1, true));
         rig.cycle();
         assert!(matches!(
             rig.events()[..],
-            [Event::DopStopped(1), Event::DopStarted(1)]
+            [Event::DopStopped(1), Event::DopStarted(1, _)]
         ));
         assert_eq!(rig.last_periods(1), dop[PERIOD..2 * PERIOD]);
     }
@@ -3690,9 +3999,45 @@ mod tests {
             let (mut rig, start) = a_run_split_by_a_discard(24, tail);
             assert_clean(&rig, start);
             assert_eq!(rig.last_periods(2), frames(0, 2 * PERIOD), "tail {tail}");
-            let starts = count(&rig.events(), |e| matches!(e, Event::DopStarted(2)));
+            let starts = count(&rig.events(), |e| matches!(e, Event::DopStarted(2, _)));
             assert_eq!(starts, 0, "tail {tail}");
         }
+    }
+
+    #[test]
+    fn the_credit_for_a_dropped_tail_ends_with_the_stream() {
+        let mut rig = rig_at_gain::<F32>(0.1);
+        let (mut a, mut b) = (client(1), client(2));
+        rig.add(&mut a);
+        rig.add(&mut b);
+        rig.cycle();
+        // The discard cuts a run of client 2, and the owner stops.
+        a.ring.write(&dop_frames(PERIOD));
+        let run = dop_frames(32);
+        let mut block = frames(0, 40);
+        block.extend(&run[..24]);
+        b.ring.write(&block);
+        rig.cycle();
+        rig.send(Command::SetRunning(1, false));
+        // The tail of 8 is dropped, with no discard after it to credit.
+        let mut next = run[24..].to_vec();
+        next.extend(frames(0, 3 * PERIOD));
+        b.ring.write(&next);
+        rig.cycle();
+        rig.cycle();
+        // Client 2 stops and starts: a new stream, in real time from here.
+        rig.send(Command::SetRunning(2, false));
+        rig.cycle();
+        rig.send(Command::SetRunning(2, true));
+        rig.send(Command::SetRunning(1, true));
+        a.ring.write(&dop_frames(PERIOD));
+        b.ring.write(&frames(0, 2 * PERIOD));
+        let before = b.ring.header().read_pos.load(Relaxed);
+        rig.cycle();
+        assert_eq!(rig.last_periods(1), dop_frames(PERIOD));
+        // A whole period is discarded, not one short of the old tail.
+        let taken = b.ring.header().read_pos.load(Relaxed) - before;
+        assert_eq!(taken, PERIOD as u64);
     }
 
     #[test]
@@ -3794,7 +4139,7 @@ mod tests {
         let dop = dop_frames(4 * PERIOD);
         c.ring.write(&dop);
         rig.cycle();
-        assert!(matches!(rig.events()[..], [Event::DopStarted(3)]));
+        assert!(matches!(rig.events()[..], [Event::DopStarted(3, _)]));
         let start = rig.log.frames().len();
         rig.send(Command::SetRunning(1, true));
         a.ring.write(&pcm_in_the_band());

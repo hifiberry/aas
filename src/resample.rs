@@ -117,7 +117,7 @@ where
 /// S32 to float, by the exact scaling of the processing format.
 fn to_float<P: Processing>(sample: i32) -> P::Acc {
     let mut acc = P::zero();
-    P::accumulate(&mut acc, sample, 1.0);
+    P::accumulate(&mut acc, sample, P::gain(1.0));
     acc
 }
 

@@ -121,8 +121,11 @@ pub fn report_cases(done: usize, planned: usize) -> String {
     format!("run {state}: {done} of {planned} cases")
 }
 
-pub fn report_header(planned: Duration, actual: Duration) -> String {
-    let state = if actual < planned {
+///
+/// `recorded` is the number of values behind the figures. A run that ended
+/// inside its warm-up has none, and is not complete either.
+pub fn report_header(planned: Duration, actual: Duration, recorded: u64) -> String {
+    let state = if actual < planned || recorded == 0 {
         "INCOMPLETE"
     } else {
         "complete"
@@ -132,6 +135,18 @@ pub fn report_header(planned: Duration, actual: Duration) -> String {
         planned.as_secs_f64(),
         actual.as_secs_f64()
     )
+}
+
+/// Whether a period run held: complete, no xrun, and no wake-up interval
+/// longer than the buffer, which ALSA may not report as an xrun.
+pub fn verdict(complete: bool, xruns: u64, worst_ns: u64, buffer_ns: u64) -> &'static str {
+    if !complete {
+        "INCOMPLETE"
+    } else if xruns == 0 && worst_ns <= buffer_ns {
+        "PASS"
+    } else {
+        "FAIL"
+    }
 }
 
 #[cfg(test)]
@@ -170,10 +185,25 @@ mod tests {
 
     #[test]
     fn header_shows_an_interrupted_run() {
-        let h = report_header(Duration::from_secs(3600), Duration::from_secs(10));
+        let h = report_header(Duration::from_secs(3600), Duration::from_secs(10), 1);
         assert!(h.contains("INCOMPLETE"));
         assert!(
-            !report_header(Duration::from_secs(5), Duration::from_secs(5)).contains("INCOMPLETE")
+            !report_header(Duration::from_secs(5), Duration::from_secs(5), 1)
+                .contains("INCOMPLETE")
         );
+    }
+
+    #[test]
+    fn a_run_with_nothing_recorded_is_not_complete() {
+        let h = report_header(Duration::from_secs(1), Duration::from_secs(1), 0);
+        assert!(h.contains("INCOMPLETE"));
+    }
+
+    #[test]
+    fn a_wake_up_longer_than_the_buffer_fails_the_verdict() {
+        assert_eq!(verdict(true, 0, 2_000_000, 2_666_666), "PASS");
+        assert_eq!(verdict(true, 0, 2_700_000, 2_666_666), "FAIL");
+        assert_eq!(verdict(true, 1, 2_000_000, 2_666_666), "FAIL");
+        assert_eq!(verdict(false, 0, 2_000_000, 2_666_666), "INCOMPLETE");
     }
 }

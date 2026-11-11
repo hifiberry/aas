@@ -243,8 +243,10 @@ costs 1.35 to 1.7 times as much in `f64` as in `f32`.
 
 - Mixing sums in a 64-bit accumulator and saturates once at the end, so a sum that
   briefly goes over full scale in the middle of the mix does not clip *(call)*.
-- Volume multiplies in 64 bits and rounds once per stage *(call)*. The rounding
-  error is near -194 dBFS, far below the noise of any DAC.
+- Volume multiplies in 64 bits and rounds once per stage *(call)*. An exact half
+  rounds away from zero, as in the float formats, so the negative of a signal
+  gives the negative of the result. The rounding error is near -194 dBFS, far
+  below the noise of any DAC.
 - It has no headroom between stages, unlike float. A stage that goes over full
   scale clips there.
 - The resampler only works on float, so a resampled client is resampled in `f32`
@@ -333,7 +335,9 @@ turns it into loud noise. While a DoP stream plays:
 How a DoP stream ends and what fills its gaps:
 
 - A DoP stream that underruns keeps the output for 100 ms and sends DoP silence:
-  the markers are kept and the payload is `0x69`. Then it releases the output.
+  the markers are kept and the payload is `0x69`. Then it releases the output
+  and counts as stopped, so the rate rules apply again as if it had. Its next
+  frames start it anew, behind any DoP stream that started meanwhile.
   Stopping or disconnecting releases it at once. So a stalled DoP client costs
   other clients at most 100 ms of audio.
 - A short DoP period is padded with DoP silence, not zeros. Zeros drop the
@@ -423,13 +427,18 @@ Latency added by a plugin counts on top of the budget, and `aas` reports it.
 
 The target counts as met when one hour of playback at 44.1 kHz and at 96 kHz runs
 on the test board with no xruns and no wake-up gap longer than the buffer, on an
-otherwise idle system *(call)*. The xrun count alone is not enough, because ALSA can
-miss an underrun when the interrupt itself is late.
+otherwise idle system *(call)*. The xrun count alone is not enough, because ALSA
+misses an underrun when the interrupt itself is late. A tone played through the
+cable on both test boards showed that every gap longer than the buffer is a
+break in the sound, and that ALSA counted only some of them. The gap alone is
+not enough either: on the Pi 3 some underruns came with a gap just under the
+buffer, and those ALSA did count.
 
 Stage 2 made these runs under full load instead, which is harder, on both test
 boards. All passed on the Pi 3. On the CM5 one 96 kHz run had one wake-up gap over
-the buffer, 4.0 ms against 2.7 ms, and the same run repeated passed. No run has
-been made on an idle system yet.
+the buffer, 4.0 ms against 2.7 ms, and the same run repeated passed. A gap with
+those figures, made on purpose later, played one buffer of old audio again. No
+run has been made on an idle system yet.
 
 ## Analog input
 
@@ -540,7 +549,8 @@ Details *(call)*:
   plugin, against the time available. This shows how close the system is to a
   dropout.
 - **Dropouts:** xruns per output and underruns per client, with timestamps, and
-  wake-up gaps longer than the buffer, which ALSA may not report as xruns.
+  wake-up gaps longer than the buffer, each of which is a break in the sound
+  and which ALSA does not always report as xruns.
 - **Latency:** the real current latency per client and output.
 - **Buffers:** fill level per client and per output.
 - **Resampling:** which clients and outputs are resampled, and the current
@@ -564,14 +574,22 @@ All of this is *(call)*:
   thread.
 - The daemon runs under systemd and restarts if it crashes. The ALSA plugin
   reports an error to the client, and the client reconnects by reopening the
-  device, as ALSA players do after a write error. The plugin does not reconnect
-  an open handle by itself. Neither does the control, so a mixer that holds it
-  open must be restarted.
+  device, as ALSA players do after a write error. The PCM does not reconnect
+  an open handle by itself. The control does: a mixer that holds it open is
+  woken with an error when the daemon goes, and its next read or write of the
+  volume connects again.
 - If the card is missing at startup, the daemon keeps running and waits for it.
   Meanwhile audio goes to a timed null sink, so players keep running in real
-  time rather than hanging, and the daemon retries the card every second
-  *(call)*.
+  time rather than hanging, and the daemon looks for the card every second
+  *(call)*. The control thread does the looking. The audio thread opens the
+  card once it is there, and does nothing for it before.
 - After an xrun on the card, the daemon recovers without client involvement.
+- The daemon locks each client's ring in memory, so that the audio thread never
+  waits for a page. A ring is at most 8 MiB, for the largest buffer a client may
+  ask for, and the control thread adds one page for its view of the header.
+  There is no bound over all clients, and the unit sets `LimitMEMLOCK=infinity`.
+  This follows the rule that no client is refused: many clients with large
+  buffers cost memory that cannot be swapped, not a refusal.
 
 ## Bluetooth
 

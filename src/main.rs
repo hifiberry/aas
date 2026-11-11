@@ -8,6 +8,7 @@ use aas::state;
 #[cfg(feature = "alsa-output")]
 use aas::volume::HardwareVolume;
 use aas::volume::OpenVolume;
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,19 +25,21 @@ extern "C" fn on_signal(_: libc::c_int) {
     }
 }
 
+#[derive(Debug, PartialEq)]
 struct Args {
     config: PathBuf,
     socket: PathBuf,
     state: PathBuf,
 }
 
-fn parse_args() -> Result<Args, String> {
+/// Reads the command line, without the program's name.
+fn parse_args(given: impl IntoIterator<Item = OsString>) -> Result<Args, String> {
     let mut args = Args {
         config: PathBuf::from(config::DEFAULT_PATH),
         socket: aas_client::proto::default_socket_path(),
         state: PathBuf::from(state::DEFAULT_PATH),
     };
-    let mut given = std::env::args_os().skip(1);
+    let mut given = given.into_iter();
     while let Some(arg) = given.next() {
         let slot = match arg.to_str() {
             Some("--config") => &mut args.config,
@@ -101,12 +104,23 @@ fn hardware_volume(config: &Config) -> Option<OpenVolume> {
 }
 
 #[cfg(not(feature = "alsa-output"))]
-fn hardware_volume(_config: &Config) -> Option<OpenVolume> {
+fn hardware_volume(config: &Config) -> Option<OpenVolume> {
+    if config.volume_mode == Some(config::VolumeMode::Hardware) {
+        eprintln!("aas: warning: built without ALSA, volume_mode = \"hardware\" is ignored");
+    }
     None
 }
 
+/// Looks for the card on the control thread while it is gone, so that the
+/// audio thread tries to open it only once it is there. A build without
+/// ALSA never asks: its output is never gone.
+fn card_probe(config: &Config) -> server::CardProbe {
+    let card = config.card.clone();
+    Box::new(move || aas::sink_alsa::card_is_present(card.as_deref()))
+}
+
 fn main() -> ExitCode {
-    let args = match parse_args() {
+    let args = match parse_args(std::env::args_os().skip(1)) {
         Ok(args) => args,
         Err(e) => {
             eprintln!("aas: {e}\n{USAGE}");
@@ -128,11 +142,85 @@ fn main() -> ExitCode {
     handle_signals(shutdown.clone());
     let sink = output(&config);
     let hardware = hardware_volume(&config);
-    match server::run(config, sink, &args.socket, &args.state, hardware, shutdown) {
+    let probe = Some(card_probe(&config));
+    let (socket, state) = (&args.socket, &args.state);
+    match server::run_probing(config, sink, socket, state, hardware, probe, shutdown) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("aas: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<Args, String> {
+        parse_args(args.iter().map(OsString::from))
+    }
+
+    #[test]
+    fn no_arguments_give_the_default_paths() {
+        let args = parse(&[]).unwrap();
+        assert_eq!(args.config, PathBuf::from(config::DEFAULT_PATH));
+        assert_eq!(args.socket, aas_client::proto::default_socket_path());
+        assert_eq!(args.state, PathBuf::from(state::DEFAULT_PATH));
+    }
+
+    #[test]
+    fn each_flag_sets_its_own_path() {
+        let defaults = parse(&[]).unwrap();
+        let args = parse(&["--config", "/a/c.toml"]).unwrap();
+        assert_eq!(args.config, PathBuf::from("/a/c.toml"));
+        assert_eq!(
+            (&args.socket, &args.state),
+            (&defaults.socket, &defaults.state)
+        );
+        let args = parse(&["--socket", "/a/s.sock"]).unwrap();
+        assert_eq!(args.socket, PathBuf::from("/a/s.sock"));
+        assert_eq!(
+            (&args.config, &args.state),
+            (&defaults.config, &defaults.state)
+        );
+        let args = parse(&["--state", "/a/state.toml"]).unwrap();
+        assert_eq!(args.state, PathBuf::from("/a/state.toml"));
+        assert_eq!(
+            (&args.config, &args.socket),
+            (&defaults.config, &defaults.socket)
+        );
+    }
+
+    #[test]
+    fn the_flags_combine_in_any_order_and_the_last_one_wins() {
+        let args = parse(&[
+            "--state", "s1", "--config", "c1", "--socket", "k1", "--config", "c2",
+        ])
+        .unwrap();
+        assert_eq!(
+            args,
+            Args {
+                config: PathBuf::from("c2"),
+                socket: PathBuf::from("k1"),
+                state: PathBuf::from("s1"),
+            }
+        );
+    }
+
+    #[test]
+    fn a_flag_without_its_path_is_an_error() {
+        for flag in ["--config", "--socket", "--state"] {
+            assert_eq!(parse(&[flag]), Err(format!("{flag} needs a path")));
+            assert!(parse(&["--config", "c", flag]).is_err());
+        }
+    }
+
+    #[test]
+    fn an_unknown_argument_is_an_error() {
+        for arg in ["--help", "-c", "aas.toml", "--config=/a/c.toml", ""] {
+            assert_eq!(parse(&[arg]), Err(format!("unknown argument {arg}")));
+        }
+        assert!(parse(&["--config", "c", "extra"]).is_err());
     }
 }

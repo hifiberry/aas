@@ -55,6 +55,9 @@ pub fn open(
 /// Open `device` as S32 stereo at exactly `rate`, with the period and
 /// buffer nearest to those asked for. For a device that sets its own
 /// limits, such as a plugin. Returns the period and buffer in frames.
+///
+/// The setup repeats what the daemon does in `AlsaSink::try_open`
+/// (`src/sink_alsa.rs`). A change to one belongs in the other too.
 pub fn open_near(
     device: &str,
     direction: Direction,

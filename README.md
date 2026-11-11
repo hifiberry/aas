@@ -41,8 +41,21 @@ cargo build --release -p aas-alsa
 cargo build --release -p measure --features alsa-probes --bins
 ```
 
-On a Pi 3, add `-j2`, or the build can run out of memory. `cargo test
---workspace` also runs the plugin's tests, which need `cc` and the ALSA headers.
+On a Pi 3, add `-j2`, or the build can run out of memory.
+
+The plugin's own tests run where it builds, on the board:
+
+```sh
+cargo test -p aas-alsa
+```
+
+A plain `cargo test` skips them on every machine, because the crate is not a
+default member. `cargo test --workspace` includes them. They need `cc` and the
+ALSA headers: they compare the hand-written declarations in
+`crates/aas-alsa/src/ffi.rs` with the installed headers, and play the daemon on
+a socket for the control. On a machine without `libasound2-dev`,
+`cargo check -p aas-alsa --tests` and `cargo clippy -p aas-alsa --all-targets`
+still compile the crate and its tests, since neither links.
 
 ## Installing
 
@@ -72,14 +85,35 @@ not this one is kept as `/etc/asound.conf.before-aas`. After that:
 
 The daemon reads `/etc/aas/aas.toml` if it exists. Every key is optional.
 Without the file the daemon finds the card itself and picks the latency for the
-board. The keys are in `src/config.rs`. The volume is kept in
-`/var/lib/aas/state.toml`.
+board. An unknown key or a bad value stops the daemon with an error. The volume
+is kept in `/var/lib/aas/state.toml`.
+
+| Key | Values | Default | Meaning |
+|---|---|---|---|
+| `latency_ms` | a number above 0 | 4 on a Pi 5 or CM5, 12 elsewhere | Target for the latency of the card's buffer. The period is the largest power of two that keeps two periods within it. |
+| `card` | an ALSA card id or index | the first card that is not `Loopback`, `Headphones` or HDMI | The card to play to. |
+| `format` | `"f32"`, `"f64"`, `"i32"` | `"f32"` | The arithmetic used to mix and to apply volume. |
+| `resampling` | `"high"`, `"medium"` | `"high"` | Quality of the resampler for a client at another rate than the output. |
+| `bit_perfect` | `"auto"`, `"forced"`, `"off"` | `"auto"` | `auto` copies the samples untouched while one client plays at the output rate with no software volume. `forced` also ignores the software volume. `off` always mixes. |
+| `idle` | `"off"`, `"zeros"` | `"off"` | What the output does when nothing plays: close the card after a delay, or keep it open and send zeros. |
+| `idle_delay_s` | whole seconds | 60 | The delay before `idle = "off"` closes the card. An error with `idle = "zeros"`. |
+| `volume_mode` | `"hardware"`, `"software"` | the card's control if it has one | Who applies the volume: the card's mixer, or the daemon. `hardware` on a card without a control warns and uses software. |
+| `volume_control` | a mixer control name | the first of `Digital`, `Master`, `PCM` | The card's control that carries the volume. |
+| `default_rate` | 8000 to 384000 | 48000 | The rate the output opens at before the first client plays. |
 
 ### After a daemon restart
 
 A player that is playing gets an error from its next write and must reopen the
-device, which ALSA players do. A mixer that holds the control open, such as
-`alsamixer`, does not reconnect. It has to be restarted.
+device, which ALSA players do.
+
+The control connects again by itself. A mixer that holds it open and waits for
+events is woken when the daemon goes, as for a card that is unplugged: its poll
+reports an error and reading an event fails. After that its descriptor is
+quiet, and reading an event keeps failing, until a read or write of the volume
+connects again. From then on it gets events as before, starting with one for
+the volume, which may have changed meanwhile. While the daemon is away, reads
+and writes of the volume fail. A mixer that quits when a card is unplugged
+still has to be started again.
 
 ### Removing
 
@@ -98,7 +132,11 @@ Then move `/etc/asound.conf.before-aas` back, if there is one.
 - `sh dist/test-plugin.sh` on the board, with the unit running and the plugin
   installed. It needs `aplay`, `amixer`, `alsactl`, `cc` and `libasound2-dev`,
   and `mpd`, `mpc` and `python3` for the mixer case. It prints PASS or FAIL for
-  each case.
+  each case. Case names as arguments run only those. On a board whose output is
+  wired to its input, `AAS_TEST_CAPTURE=plughw:<card> sh dist/test-plugin.sh`
+  also records what each sample format plays and checks the tone's level and
+  purity.
+- `cargo test -p aas-alsa` on the board, for the plugin's own tests.
 - `bit-check` proves that what a player sends reaches the card unchanged. Load
   `snd-aloop`, set `card = "Loopback"` and `latency_ms = 48` in the daemon's
   config, then run for example
@@ -111,6 +149,16 @@ Then move `/etc/asound.conf.before-aas` back, if there is one.
   `--capture` it reports the delay after the player's own buffer. Run it once
   more against `hw:` directly, with `--capture` naming the same card another way,
   and subtract: the difference is what `aas` adds.
+- `tone-probe --seconds 300` plays a steady sine through `default` and captures
+  it from the card's input through the same cable. It prints every break in the
+  tone with its time on `CLOCK_MONOTONIC`, the clock of the daemon's wake-up gap
+  log, and its length, and counts its own capture overruns apart. `--device
+  hw:0,0` with the daemon stopped gives the card alone.
+- `stall` makes a wake-up late on purpose, to see what `tone-probe` hears.
+  `stall --mode thread --cpu 2 --ms 3` keeps an audio thread pinned to that CPU
+  from running. `stall --mode irq --cpu 0 --timers 40000` keeps the CPU that
+  serves the card's interrupt in the kernel with interrupts off. On a Pi 3 the
+  interrupt goes to any CPU, so name them all: `--cpu 0,1,2,3`.
 
 `doc/measurements.md` has the method and the results.
 
