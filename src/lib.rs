@@ -9,6 +9,7 @@ pub mod dop;
 pub mod engine;
 pub mod format;
 pub mod latency;
+pub mod plugin;
 pub mod rate;
 pub mod resample;
 pub mod rt;
