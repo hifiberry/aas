@@ -8,6 +8,8 @@ license = "MIT"
 publish = false
 
 [dependencies]
+# The built-in plugins, timed as the daemon runs them.
+aas = { path = "../.." }
 alsa = { version = "0.12.1", optional = true }
 audioadapter-buffers = "4.0"
 clap = { version = "4.6.7", features = ["derive"] }
