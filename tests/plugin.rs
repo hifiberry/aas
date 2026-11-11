@@ -402,3 +402,44 @@ fn an_enumeration_without_a_name_for_each_value_is_refused() {
         |msg, _| assert!(msg.contains("curve") && msg.contains("names"), "{msg}"),
     );
 }
+
+#[test]
+fn value_names_on_a_parameter_that_is_no_enumeration_are_refused() {
+    refused_fixture(
+        "value_names_on_a_parameter_that_is_no_enumeration_are_refused",
+        "namesonfloat",
+        |msg, _| {
+            assert!(
+                msg.contains("level") && msg.contains("only an enumeration"),
+                "{msg}"
+            )
+        },
+    );
+}
+
+#[test]
+fn an_enumeration_whose_range_is_not_its_values_is_refused() {
+    refused_fixture(
+        "an_enumeration_whose_range_is_not_its_values_is_refused",
+        "enumrange",
+        |msg, _| assert!(msg.contains("curve") && msg.contains("0 to 2"), "{msg}"),
+    );
+}
+
+#[test]
+fn an_enumeration_of_more_than_4096_values_is_refused() {
+    refused_fixture(
+        "an_enumeration_of_more_than_4096_values_is_refused",
+        "manyvalues",
+        |msg, _| assert!(msg.contains("curve") && msg.contains("5000"), "{msg}"),
+    );
+}
+
+#[test]
+fn an_enumeration_with_a_null_name_is_refused() {
+    refused_fixture(
+        "an_enumeration_with_a_null_name_is_refused",
+        "nullname",
+        |msg, _| assert!(msg.contains("value 1") && msg.contains("null"), "{msg}"),
+    );
+}

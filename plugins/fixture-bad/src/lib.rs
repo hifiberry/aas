@@ -9,7 +9,10 @@
 //! samples it is given and reports no signal when that count is odd.
 //! `typed` has one parameter of each type. `badkind` has a parameter of
 //! type 9, `badint` an integer with a fraction, `badswitch` a switch from
-//! 0 to 2, and `badenum` an enumeration without names.
+//! 0 to 2, and `badenum` an enumeration without names. `namesonfloat` has
+//! value names on a float, `enumrange` an enumeration of three values from
+//! 0 to 3, `manyvalues` one of 5000 values, and `nullname` one with a null
+//! name in its list.
 //! Anything else, `nodesc` among them, returns no descriptor at all.
 
 use aas_plugin::{
@@ -110,6 +113,43 @@ one_param!(
     BAD_SWITCH,
     param(c"bypass", PARAM_SWITCH, (0.0, 2.0, 0.0))
 );
+static WITH_NULL: ValueNames<3> = ValueNames([c"a".as_ptr(), std::ptr::null(), c"c".as_ptr()]);
+one_param!(
+    NAMES_PARAMS,
+    NAMES_ON_FLOAT,
+    ParamInfo {
+        value_count: 3,
+        value_names: CURVES.as_ptr(),
+        ..param(c"level", PARAM_FLOAT, (0.0, 2.0, 0.0))
+    }
+);
+one_param!(
+    RANGE_PARAMS,
+    ENUM_RANGE,
+    ParamInfo {
+        value_count: 3,
+        value_names: CURVES.as_ptr(),
+        ..param(c"curve", PARAM_ENUMERATION, (0.0, 3.0, 0.0))
+    }
+);
+one_param!(
+    MANY_PARAMS,
+    MANY_VALUES,
+    ParamInfo {
+        value_count: 5000,
+        value_names: CURVES.as_ptr(),
+        ..param(c"curve", PARAM_ENUMERATION, (0.0, 4999.0, 0.0))
+    }
+);
+one_param!(
+    NULL_PARAMS,
+    NULL_NAME,
+    ParamInfo {
+        value_count: 3,
+        value_names: WITH_NULL.as_ptr(),
+        ..param(c"curve", PARAM_ENUMERATION, (0.0, 2.0, 0.0))
+    }
+);
 one_param!(
     ENUM_PARAMS,
     BAD_ENUM,
@@ -133,6 +173,10 @@ pub extern "C" fn aas_plugin() -> *const Descriptor {
         Ok("badint") => &BAD_INT,
         Ok("badswitch") => &BAD_SWITCH,
         Ok("badenum") => &BAD_ENUM,
+        Ok("namesonfloat") => &NAMES_ON_FLOAT,
+        Ok("enumrange") => &ENUM_RANGE,
+        Ok("manyvalues") => &MANY_VALUES,
+        Ok("nullname") => &NULL_NAME,
         Ok("chunks") => &CHUNKS,
         _ => std::ptr::null(),
     }

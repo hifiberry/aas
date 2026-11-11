@@ -5807,16 +5807,40 @@ mod tests {
         analog: Vec<Box<dyn Plugin>>,
         client: bool,
     ) -> (Vec<[i32; 2]>, usize) {
-        let (mut rig, feed) = with_capture::<P>(mode);
+        open_and_close_at::<P>(RATE, mode, analog, client)
+    }
+
+    /// `open_and_close` with the output at `rate`.
+    fn open_and_close_at<P: Processing>(
+        rate: u32,
+        mode: BitPerfect,
+        analog: Vec<Box<dyn Plugin>>,
+        client: bool,
+    ) -> (Vec<[i32; 2]>, usize) {
+        let mut rig = Rig::<P>::new(mode);
+        if rate != RATE {
+            rig.send(Command::Reconfigure {
+                rate,
+                period: PERIOD as u32,
+            });
+            rig.cycle();
+            rig.cycle();
+        }
+        // After the reopen, which closes a capture, as the control thread
+        // does it.
+        let (capture, feed) = MemoryCapture::new();
+        rig.send(Command::SetCapture(Some(Box::new(capture))));
         let chain = Chain::new(analog, format_of::<P>(), MAX_PERIOD as usize);
         rig.send(Command::SetChain(Place::Analog, Box::new(chain)));
-        let mut a = client.then(|| client_at(1, RATE));
+        let mut a = client.then(|| client_at(1, rate));
         if let Some(a) = a.as_mut() {
             rig.add(a);
         }
+        // 200 ms of each at 48 kHz, as long at any rate.
+        let half = (150 * rate as usize).div_ceil(RATE as usize);
         let mut out = Vec::new();
-        for round in 0..300 {
-            let value = if round < 150 { LOUD } else { QUIET };
+        for round in 0..2 * half {
+            let value = if round < half { LOUD } else { QUIET };
             feed.push(&frames(value, PERIOD));
             if let Some(a) = &a {
                 a.ring.write(&frames(0, PERIOD));
@@ -5824,7 +5848,7 @@ mod tests {
             rig.cycle();
             out.extend(rig.last_periods(1));
         }
-        (out, 150 * PERIOD)
+        (out, half * PERIOD)
     }
 
     /// -6 dBFS, and just below -30 dBFS.
@@ -5832,7 +5856,11 @@ mod tests {
     const QUIET: i32 = 1 << 26;
 
     fn gate(with: Option<Probe>) -> Vec<Box<dyn Plugin>> {
-        let mut detect = Detect::new(RATE);
+        gate_at(RATE, with)
+    }
+
+    fn gate_at(rate: u32, with: Option<Probe>) -> Vec<Box<dyn Plugin>> {
+        let mut detect = Detect::new(rate);
         detect.set_param(0, -30.0);
         detect.set_param(1, 0.0);
         let mut plugins: Vec<Box<dyn Plugin>> = Vec::new();
@@ -5846,9 +5874,13 @@ mod tests {
     /// No step is larger than a 10 ms ramp to the level allows, the first
     /// frame heard is near zero, and once closed the output is exact zeros.
     fn check_fades(out: &[[i32; 2]], quiet_at: usize, what: &str) {
+        check_fades_at(RATE, out, quiet_at, what)
+    }
+
+    fn check_fades_at(rate: u32, out: &[[i32; 2]], quiet_at: usize, what: &str) {
         // One step of a 10 ms ramp to `level`, give or take the rounding
         // of a gain in `f32`.
-        let ramp = |level: i32| f64::from(level) / f64::from(RATE * FADE_MS / 1000) * 1.001 + 2.0;
+        let ramp = |level: i32| f64::from(level) / f64::from(rate * FADE_MS / 1000) * 1.001 + 2.0;
         let first = out.iter().position(|f| f[0] != 0).expect(what);
         assert!(f64::from(out[first][0]) <= ramp(LOUD), "{what}");
         let opening = largest_step(&out[..quiet_at]);
@@ -5859,6 +5891,45 @@ mod tests {
         assert!(out[out.len() - 10 * PERIOD..].iter().all(|f| *f == [0, 0]));
         // It did open, to the full level.
         assert!(out[..quiet_at].iter().any(|f| f[0] == LOUD), "{what}");
+    }
+
+    #[test]
+    fn input_detection_fades_over_10_ms_at_44_1_and_192_khz() {
+        for rate in [44100, 192000] {
+            let auto = BitPerfect::Auto;
+            let (out, at) = open_and_close_at::<F32>(rate, auto, gate_at(rate, None), false);
+            check_fades_at(rate, &out, at, &format!("copy at {rate}"));
+            let (out, at) = open_and_close_at::<F32>(rate, auto, gate_at(rate, None), true);
+            check_fades_at(rate, &out, at, &format!("mix at {rate}"));
+            let forced = BitPerfect::Forced;
+            let gate = gate_at(rate, Some(times(1.0)));
+            let (out, at) = open_and_close_at::<F32>(rate, forced, gate, false);
+            check_fades_at(rate, &out, at, &format!("forced at {rate}"));
+        }
+    }
+
+    #[test]
+    fn the_copy_path_is_bit_exact_again_once_the_fade_is_over() {
+        fn check<P: Processing>() {
+            let (mut rig, feed) = with_capture::<P>(BitPerfect::Auto);
+            let chain = Chain::new(gate(None), format_of::<P>(), MAX_PERIOD as usize);
+            rig.send(Command::SetChain(Place::Analog, Box::new(chain)));
+            // Loud, with the low bits set, through the open and its fade.
+            let loud: Vec<[i32; 2]> = (0..75 * PERIOD as i32)
+                .map(|i| [(1 << 28) + 7 * i + 1, -(1 << 28) - i])
+                .collect();
+            for period in loud.chunks(PERIOD) {
+                feed.push(period);
+                rig.cycle();
+            }
+            let n = loud.len();
+            assert_eq!(decide(&rig.engine.situation()), Ok(()));
+            let f = format_of::<P>();
+            assert_eq!(rig.last_periods(20), loud[n - 20 * PERIOD..], "{f:?}");
+        }
+        check::<I32>();
+        check::<F32>();
+        check::<F64>();
     }
 
     #[test]
