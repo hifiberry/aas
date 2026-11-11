@@ -382,11 +382,12 @@ impl Source {
     /// sleeps through the periods before it, and costs no call here.
     fn notify(&mut self, sink_delay: u32, output_rate: u32) {
         let filter = self.resampler.as_ref().map_or(0, |r| r.delay_frames());
-        let delay = u64::from(sink_delay + filter) * u64::from(self.rate) / u64::from(output_rate);
+        let delay = (u64::from(sink_delay) + u64::from(filter)) * u64::from(self.rate)
+            / u64::from(output_rate);
         let header = self.ring.header();
         header
             .output_delay_frames
-            .store(delay as u32, Ordering::Relaxed);
+            .store(delay.min(u64::from(u32::MAX)) as u32, Ordering::Relaxed);
         // The client stores the position it waits for and then loads ours.
         // With a full barrier on both sides, one of the two sees the other.
         fence(Ordering::SeqCst);
@@ -1459,11 +1460,13 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         // What the plugins hold back plays after the ring too, in the
         // cycles they ran in.
         let plugins = if chains_ran {
-            self.mix.latency_frames() + self.output.latency_frames()
+            self.mix
+                .latency_frames()
+                .saturating_add(self.output.latency_frames())
         } else {
             0
         };
-        let delay = self.sink.delay_frames() + plugins;
+        let delay = self.sink.delay_frames().saturating_add(plugins);
         for source in self.table.iter_mut().filter(|s| s.running) {
             source.notify(delay, rate);
         }
@@ -5633,6 +5636,26 @@ mod tests {
         rig.cycle();
         assert_eq!(rig.last_periods(1), dop_frames(PERIOD));
         assert_eq!(delay(&a), 128);
+    }
+
+    #[test]
+    fn a_huge_plugin_latency_does_not_overflow_the_delay() {
+        let mut rig = Rig::<F32>::new(BitPerfect::Auto);
+        let mut a = client(1);
+        rig.add(&mut a);
+        let mut b = client_at(2, 24000);
+        let r = Resampler::new(24000, RATE, PERIOD as u32, Quality::High, Format::F32);
+        let filter = u64::from(r.delay_frames());
+        b.source.as_mut().unwrap().resampler = Some(Box::new(r));
+        rig.add(&mut b);
+        set_chain(&mut rig, Place::Mix, vec![plus(0).latency(u32::MAX)]);
+        set_chain(&mut rig, Place::Output, vec![plus(0).latency(u32::MAX)]);
+        rig.log.set_delay(128);
+        a.ring.write(&frames(1, PERIOD));
+        rig.cycle();
+        let delay = |c: &Client| c.ring.header().output_delay_frames.load(Relaxed);
+        assert_eq!(delay(&a), u32::MAX);
+        assert_eq!(u64::from(delay(&b)), (u64::from(u32::MAX) + filter) / 2);
     }
 
     #[test]

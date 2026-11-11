@@ -117,7 +117,9 @@ impl Chain {
 
     /// The delay of all plugins together.
     pub fn latency_frames(&self) -> u32 {
-        self.plugins.iter().map(|p| p.latency_frames()).sum()
+        self.plugins
+            .iter()
+            .fold(0u32, |sum, p| sum.saturating_add(p.latency_frames()))
     }
 
     /// Sets parameter `index` of plugin `plugin`. An unknown plugin or

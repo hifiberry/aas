@@ -465,7 +465,9 @@ the wait takes effect in that cycle, so the stream does not play one period more
 Resampling adds roughly 1 to 2 ms. A resampled client may exceed 4 ms, in
 preference to reducing resampling quality *(call)*.
 
-Latency added by a plugin counts on top of the budget, and `aas` reports it. The
+Latency added by a plugin counts on top of the budget, and `aas` reports it. A
+library plugin's reported latency is taken as at most 10 s at its rate, with a
+line in the log, and latencies add up without overflowing. The
 reported delay includes it only in cycles where the chains ran, not on the
 bit-perfect copy path or while a DoP stream plays *(call)*. The analog chain's
 latency, in the cycles its output is used, goes into a recorder's delay and

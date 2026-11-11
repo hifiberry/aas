@@ -651,3 +651,11 @@ fn a_text_parameter_without_a_name_is_refused() {
         |msg, _| assert!(msg.contains("name is null"), "{msg}"),
     );
 }
+
+#[test]
+fn a_latency_beyond_10_s_is_capped() {
+    with_fixture("a_latency_beyond_10_s_is_capped", "slow", |path| {
+        let p = Library::open(path).unwrap().create(48000, 64).unwrap();
+        assert_eq!(p.latency_frames(), 480_000);
+    });
+}

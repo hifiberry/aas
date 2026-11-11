@@ -194,9 +194,19 @@ impl Library {
                 ));
             }
         }
+        let max_latency = rate.saturating_mul(MAX_LATENCY_S);
+        let latency = (self.fns.latency)(instance);
+        if latency > max_latency {
+            eprintln!(
+                "aas: plugin {} from {} reports a latency of {latency} frames; taken as \
+                 {MAX_LATENCY_S} s, {max_latency} frames at {rate} Hz",
+                self.name, self.path
+            );
+        }
         Ok(Box::new(Native {
             fns: self.fns,
             instance,
+            max_latency,
             name: self.name.clone(),
             formats: self.formats,
             params: self.params.clone(),
@@ -204,6 +214,10 @@ impl Library {
         }))
     }
 }
+
+/// The longest latency a plugin is taken to have, in seconds. A longer one
+/// is a plugin's error, and would only make the reported delay absurd.
+const MAX_LATENCY_S: u32 = 10;
 
 /// The most parameters a plugin may have. Far more than any needs; a
 /// larger count is a broken descriptor.
@@ -403,6 +417,8 @@ struct Native {
     params: Vec<Param>,
     /// Not 0, and fits in a `u32`: `create` checked both.
     max_frames: usize,
+    /// `MAX_LATENCY_S` in frames at the instance's rate.
+    max_latency: u32,
 }
 
 impl Native {
@@ -486,8 +502,11 @@ impl Plugin for Native {
         }
     }
 
+    /// At most `MAX_LATENCY_S` at the rate the instance was built for. A
+    /// longer one was logged when it was built, if it was reported then; on
+    /// the audio thread it is capped without a word.
     fn latency_frames(&self) -> u32 {
-        (self.fns.latency)(self.instance)
+        (self.fns.latency)(self.instance).min(self.max_latency)
     }
 
     /// A block in a format the plugin did not name never reaches it and is
