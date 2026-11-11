@@ -1088,12 +1088,12 @@ impl Control {
 
     /// Makes the analog input a client of the rate rules while it has
     /// signal and no DoP stream owns the output, and not otherwise. It
-    /// joins at the rate the rules run at, by the rules for any client:
+    /// joins at the rate the card runs at, by the rules for any client:
     /// it never asks for a rate of its own, it holds the running rate as a
     /// client at it does, and its joining cancels a pending switch away
     /// from that rate. While DoP owns the output the input is not played,
-    /// so it is not a client; it joins when DoP ends, at the rate the
-    /// rules then run at.
+    /// so it is not a client; it joins when DoP ends, at the rate the card
+    /// then runs at.
     fn sync_analog_client(&mut self, now: Instant) {
         let t = now - self.epoch;
         let dop = self.dop_owner.is_some();
@@ -1102,7 +1102,9 @@ impl Control {
         };
         let want = analog.active && !dop;
         if want && !analog.registered {
-            let rate = self.policy.current();
+            // The rate the card runs at, which the rules may not have
+            // settled on yet, such as just after a DoP stream.
+            let rate = self.output.map_or(self.policy.current(), |(r, _)| r);
             self.policy.client_started(ANALOG, rate, t);
         } else if !want && analog.registered {
             self.policy.client_stopped(ANALOG, t);
@@ -2642,6 +2644,53 @@ mod tests {
         assert_eq!(analog_rate(&control), Some(176400));
     }
 
+    /// A 48 kHz player, a DoP stream at 176.4 kHz owning the output, and
+    /// the input with signal. The player stops, and the DoP stream turns to
+    /// PCM `x` ms later and plays on. Returns what was sent after that, the
+    /// output's rate, and whether the stream is resampled.
+    fn dop_turns_to_pcm_after_the_player_left(x: u64) -> (Vec<String>, u32, bool) {
+        let ms = Duration::from_millis;
+        let opener = Opener::default();
+        let (mut control, mut engine, now) = started(&analog_config(), Some(&opener));
+        engine.take(true);
+        control.handle_events(now);
+        engine.take(true);
+        play(&mut control, 1, 48000, now);
+        play(&mut control, 2, 176400, now);
+        engine.take(true);
+        engine.send(Event::DopStarted(2, 1));
+        control.handle_events(now);
+        engine.take(false);
+        engine.send(Event::InputSignal(false));
+        engine.send(Event::Reconfigured);
+        control.handle_events(now + ms(10));
+        engine.take(true);
+        engine.send(Event::InputSignal(true));
+        control.handle_events(now + ms(10) + SIGNAL_BACK);
+        engine.take(true);
+        let t = now + ms(3000);
+        let stop = control.request(1, Some(Request::Stop), t);
+        assert_eq!(stop.reply, Some(Reply::Ok));
+        control.tick(t);
+        engine.take(true);
+        control.tick(t + ms(x));
+        engine.send(Event::DopStopped(2));
+        control.handle_events(t + ms(x));
+        let seen = run_for(&mut control, &mut engine, t + ms(x), 3);
+        let rate = control.output.unwrap().0;
+        (seen, rate, control.policy.needs_resampling(2))
+    }
+
+    #[test]
+    fn the_input_joins_at_the_rate_the_card_runs_at_whatever_the_timing() {
+        for x in [200, 800] {
+            let (seen, rate, resampled) = dop_turns_to_pcm_after_the_player_left(x);
+            assert!(!has(&seen, "Reconfigure"), "{x}: {seen:?}");
+            assert_eq!(rate, 176400, "{x}");
+            assert!(!resampled, "{x}");
+        }
+    }
+
     #[test]
     fn a_dop_stream_that_is_the_first_client_leaves_the_analog_input_at_its_rate() {
         let ms = Duration::from_millis;
@@ -2689,17 +2738,29 @@ mod tests {
         engine.send(Event::InputSignal(true));
         control.handle_events(back);
         assert_eq!(analog_rate(&control), None);
-        // DoP stops: the 48 kHz player takes the output back, and the
-        // input joins at that rate.
+        // DoP stops: the input joins at the rate the card runs at, and the
+        // 48 kHz player, the first client, has the output back after the
+        // settle time, as when DoP ends without the input.
         let stop = control.request(2, Some(Request::Stop), back + ms(100));
         assert_eq!(stop.reply, Some(Reply::Ok));
+        assert_eq!(analog_rate(&control), Some(176400));
         control.tick(back + ms(700));
         assert!(has(&engine.take(true), "Reconfigure 48000 256"));
+        // That reopen mutes the capture: the input goes quiet and leaves,
+        // and joins again at 48 kHz once its signal is back.
+        engine.send(Event::InputSignal(false));
+        engine.send(Event::Reconfigured);
+        control.handle_events(back + ms(710));
+        assert_eq!(analog_rate(&control), None);
+        let again = back + ms(710) + SIGNAL_BACK;
+        engine.send(Event::InputSignal(true));
+        control.handle_events(again);
         assert_eq!(analog_rate(&control), Some(48000));
-        // The player leaves. The input does not move the output.
-        let stop = control.request(1, Some(Request::Stop), back + ms(800));
+        engine.take(true);
+        // The player leaves. The input holds the rate it plays at.
+        let stop = control.request(1, Some(Request::Stop), again + ms(100));
         assert_eq!(stop.reply, Some(Reply::Ok));
-        control.tick(back + ms(10000));
+        control.tick(again + ms(10000));
         assert!(!has(&engine.take(true), "Reconfigure"));
         assert_eq!(control.policy.current(), 48000);
     }

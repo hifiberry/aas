@@ -217,13 +217,15 @@ Further rules *(call)*:
   that one can refuse it a rate.
 - A source that reports no signal (see Analog input) does not count as active.
 - Above threshold, the analog input counts as a client, at the rate the card
-  runs at when it gets signal: it never asks for a rate of its own, and it joins by the rules for any client. If it
-  became active first, it counts as the first client, and a later player at
-  another rate is resampled. Its joining cancels a pending switch away from the
-  rate it joins at. So no PCM rate decision reopens the output while the analog
-  input is audible; only a DoP stream takes the output from it. While DoP owns
-  the output the input is not played and is not a client; it joins when DoP
-  ends, at the rate the rules then run at.
+  runs at when it gets signal: it never asks for a rate of its own, and it joins
+  by the rules for any client. If it became active first, it counts as the first
+  client, and a later player at another rate is resampled. Its joining cancels a
+  pending switch away from the rate it joins at. So no PCM rate decision reopens
+  the output while the analog input is audible; only a DoP stream takes the
+  output from it, and a change of the card (its list of rates changing, or the
+  card coming back with another list) may. While DoP owns the output the input
+  is not played and is not a client; it joins when DoP ends, at the rate the
+  card then runs at.
 - A reopen of the output closes the card's capture and opens it again, so the
   analog input goes quiet for a moment, and is no client until its signal is
   back.
@@ -568,13 +570,15 @@ Further behaviour *(call)*:
   count as a client, does not affect the rate rules and does not block
   bit-perfect.
 - Above threshold, it counts as a client, at the rate the card runs at when it
-  gets signal: it never asks for a rate of its own, and it joins by the rules for any client. If it
-  became active first, it counts as the first client, and a later player at
-  another rate is resampled. Its joining cancels a pending switch away from the
-  rate it joins at. So no PCM rate decision reopens the output while the analog
-  input is audible; only a DoP stream takes the output from it. While DoP owns
-  the output the input is not played and is not a client; it joins when DoP
-  ends, at the rate the rules then run at. (See Sample rate rules.)
+  gets signal: it never asks for a rate of its own, and it joins by the rules
+  for any client. If it became active first, it counts as the first client, and
+  a later player at another rate is resampled. Its joining cancels a pending
+  switch away from the rate it joins at. So no PCM rate decision reopens the
+  output while the analog input is audible; only a DoP stream takes the output
+  from it, and a change of the card (its list of rates changing, or the card
+  coming back with another list) may. While DoP owns the output the input is not
+  played and is not a client; it joins when DoP ends, at the rate the card then
+  runs at. (See Sample rate rules.)
 
 ### Input processor plugin
 
