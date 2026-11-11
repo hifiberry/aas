@@ -1092,6 +1092,8 @@ fn a_card_that_comes_back_gets_the_volume_again() {
     let present = Arc::new(AtomicBool::new(true));
     let (open, mixers) = fake_volume(present.clone());
     let daemon = Daemon::start_with_volume(default_config(), sink, open);
+    // The card is lost only once the output has opened on it.
+    assert!(wait_for(|| last_open(&log).is_some()));
     let control = volume_client(&daemon);
     let set = call_raw(&control, &Request::SetVolume { percent: 40 });
     assert_eq!(set, Some(Reply::Ok));
