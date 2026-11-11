@@ -959,7 +959,7 @@ pub(crate) fn eventfd() -> io::Result<OwnedFd> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Format, Quality};
+    use crate::config::{self, Format, Quality};
 
     #[test]
     fn a_drain_reported_before_its_request_is_answered_at_once() {
@@ -1207,6 +1207,56 @@ mod tests {
         assert!(control.take_replies().is_empty());
         control.tick(t + Duration::from_millis(1000));
         assert_eq!(control.take_replies(), vec![(1, Reply::Ok)]);
+    }
+
+    /// Waits for the helper thread to have written this volume.
+    fn saved(path: &std::path::Path, percent: u8) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if path.exists() && State::load(path).output_percent == percent {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        false
+    }
+
+    #[test]
+    fn the_volume_is_saved_once_it_has_been_left_alone_for_a_second() {
+        let (mut control, _commands, now) = hello();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        let volume = OutputVolume::new(None, config::BitPerfect::Auto);
+        control.restore_volume(volume, path.clone());
+        let set = |percent| Some(Request::SetVolume { percent });
+        control.request(1, set(40), now);
+        // A slider still moving: each change starts the second again.
+        control.request(1, set(30), now + Duration::from_millis(500));
+        control.tick(now + Duration::from_millis(1499));
+        assert!(control.save_at.is_some());
+        assert!(!path.exists());
+        control.tick(now + Duration::from_millis(1500));
+        assert!(control.save_at.is_none());
+        assert!(saved(&path, 30));
+        // Nothing more is written until the next change.
+        std::fs::remove_file(&path).unwrap();
+        control.tick(now + Duration::from_secs(60));
+        control.shutdown();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_volume_still_waiting_is_on_disk_when_shutdown_returns() {
+        let (mut control, _commands, now) = hello();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        let volume = OutputVolume::new(None, config::BitPerfect::Auto);
+        control.restore_volume(volume, path.clone());
+        control.request(1, Some(Request::SetVolume { percent: 20 }), now);
+        control.shutdown();
+        assert_eq!(State::load(&path).output_percent, 20);
+        // Only the state file is left, no temporary one.
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[test]
