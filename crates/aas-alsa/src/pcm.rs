@@ -1,4 +1,5 @@
-//! The playback PCM: libasound's ioplug callbacks over an aas `Client`.
+//! The PCM: libasound's ioplug callbacks over an aas `Client`. This is
+//! playback; `capture` has what differs for a recorder.
 //!
 //! Every callback runs inside `catch_unwind` and returns `-EIO` on a panic,
 //! so a bug here fails one call instead of bringing down the player.
@@ -22,6 +23,8 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr::{null, null_mut};
 use std::sync::Mutex;
+
+mod capture;
 
 const NAME: &CStr = c"aas";
 const FORMATS: [c_uint; 5] = [
@@ -86,7 +89,9 @@ struct Stream {
     boundary: u64,
     /// The daemon's read position at the last prepare.
     base: u64,
-    /// Frames written to the ring since prepare.
+    /// Frames written to the ring since prepare. For capture: frames
+    /// copied out of it, which with mmap access may run ahead of the
+    /// frames the recorder has taken.
     written: u64,
     /// The daemon's underrun count when the stream last started.
     underruns: u64,
@@ -759,15 +764,22 @@ unsafe fn open(
     mode: c_int,
 ) -> Result<c_int, c_int> {
     unsafe { check_config(conf)? };
-    if stream != SND_PCM_STREAM_PLAYBACK {
-        return Err(libc::EINVAL);
-    }
-    let client = Client::connect(proto::default_socket_path()).map_err(|e| {
+    let capture = match stream {
+        SND_PCM_STREAM_PLAYBACK => false,
+        SND_PCM_STREAM_CAPTURE => true,
+        _ => return Err(libc::EINVAL),
+    };
+    let mut client = Client::connect(proto::default_socket_path()).map_err(|e| {
         if let Some(why) = version_mismatch(&e) {
             eprintln!("aas: {why}");
         }
         errno(&e)
     })?;
+    // A recorder gets the daemon's rate only, which has to be known now.
+    let rate = match capture {
+        true => Some(capture::rate(&mut client)?),
+        false => None,
+    };
     let socket = client.poll_fds()[1];
     let wake = eventfd()?;
     let io = Box::into_raw(Box::new(snd_pcm_ioplug_t {
@@ -777,7 +789,10 @@ unsafe fn open(
         poll_fd: socket,
         poll_events: libc::POLLIN as c_uint,
         mmap_rw: 0,
-        callback: &CALLBACKS,
+        callback: match capture {
+            true => &capture::CALLBACKS,
+            false => &CALLBACKS,
+        },
         private_data: null_mut(),
         pcm: null_mut(),
         stream: 0,
@@ -811,7 +826,11 @@ unsafe fn open(
             drop(Box::from_raw(io));
             return Err(-rc);
         }
-        if let Err(e) = constrain(io) {
+        let constrained = match rate {
+            Some(rate) => capture::constrain(io, rate),
+            None => constrain(io),
+        };
+        if let Err(e) = constrained {
             snd_pcm_ioplug_delete(io);
             return Err(e);
         }

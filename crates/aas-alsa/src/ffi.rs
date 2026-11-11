@@ -80,6 +80,7 @@ pub const SND_PCM_IOPLUG_HW_BUFFER_BYTES: c_int = 5;
 pub const SND_PCM_IOPLUG_HW_PERIODS: c_int = 6;
 
 pub const SND_PCM_STREAM_PLAYBACK: snd_pcm_stream_t = 0;
+pub const SND_PCM_STREAM_CAPTURE: snd_pcm_stream_t = 1;
 /// The open mode bit for a non-blocking PCM.
 pub const SND_PCM_NONBLOCK: c_int = 1;
 

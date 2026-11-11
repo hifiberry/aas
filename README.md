@@ -79,6 +79,8 @@ to connect.
 not this one is kept as `/etc/asound.conf.before-aas`. After that:
 
 - ALSA's `default` PCM plays through the daemon. Players need no changes.
+- ALSA's `default` PCM also records the daemon's analog input. See
+  [Recording](#recording).
 - ALSA's `default` control is the daemon's output volume, one element called
   `Master`, 0 to 100. Plain `amixer` shows only `Master`. The card's own
   controls are reached with `amixer -c <card>`.
@@ -130,6 +132,29 @@ the file. `type` is a built-in (`detect`, which runs only at `analog` and may
 appear once, or `balance`) or `library` with a `path`, which is absolute. Every
 other key is a parameter and must be a finite number.
 
+### Recording
+
+The `default` device records the analog input, for example:
+
+```sh
+arecord -D default -f S16_LE -c 2 -r 44100 take.wav
+```
+
+It delivers the analog input after its plugins and before the input volume,
+which belongs to the mix. It never delivers the mix itself, so nothing a player
+plays is recorded except through the card's input. With no signal at the input,
+with the input disabled, or on a card without an ADC, it records silence. With
+the input disabled and `idle = "off"`, the output closes `idle_delay_s` after
+the last player stops, and a recording then gets nothing and waits until a
+player opens the output again. With the input enabled the output stays open.
+
+`pcm.aas` records S32 stereo at the rate the daemon's output runs at, and
+nothing else. `plug` in the `default` device converts that to what the recorder
+asks for. When the output changes rate, a recording that is open ends with an
+error, `No such device`, and the recorder has to open the device again. A new
+recording runs at the new rate. With the analog input enabled the rate does not
+change while the input has signal, so only silence is cut.
+
 ### After a daemon restart
 
 A player that is playing gets an error from its next write and must reopen the
@@ -159,12 +184,13 @@ Then move `/etc/asound.conf.before-aas` back, if there is one.
 - `cargo test` on any machine. The engine and server tests use a null sink, so
   they need no card.
 - `sh dist/test-plugin.sh` on the board, with the unit running and the plugin
-  installed. It needs `aplay`, `amixer`, `alsactl`, `cc` and `libasound2-dev`,
-  and `mpd`, `mpc` and `python3` for the mixer case. It prints PASS or FAIL for
-  each case. Case names as arguments run only those. On a board whose output is
-  wired to its input, `AAS_TEST_CAPTURE=plughw:<card> sh dist/test-plugin.sh`
-  also records what each sample format plays and checks the tone's level and
-  purity.
+  installed. It needs `aplay`, `arecord`, `amixer`, `alsactl`, `cc` and
+  `libasound2-dev`, and `mpd`, `mpc` and `python3` for the mixer case. It
+  prints PASS or FAIL for each case. Case names as arguments run only those. On
+  a board whose output is wired to its input,
+  `AAS_TEST_CAPTURE=plughw:<card> sh dist/test-plugin.sh` also records what each
+  sample format plays and checks the tone's level and purity, and with
+  `ANALOG=1` the cases of the analog input run too.
 - `cargo test -p aas-alsa` on the board, for the plugin's own tests.
 - `bit-check` proves that what a player sends reaches the card unchanged. Load
   `snd-aloop`, set `card = "Loopback"` and `latency_ms = 48` in the daemon's
