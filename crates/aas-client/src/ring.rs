@@ -8,6 +8,10 @@
 //! allocate or block. The mapping is populated and locked when it is made,
 //! so they do not page fault either, as long as mlock is permitted and the
 //! peer calls `seal_writes` before it can punch holes.
+//!
+//! One writer and one reader: a `Ring` may be shared between threads, and
+//! then the caller keeps `write` to one of them and `peek`, `consume` and
+//! `read` to one other. Nothing here checks that.
 
 use std::io;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
@@ -21,11 +25,14 @@ pub const VERSION: u32 = 2;
 const DATA_OFFSET: usize = 64;
 const FRAME_BYTES: usize = std::mem::size_of::<[i32; 2]>();
 
+/// The first three fields are plain words in memory the peer can write.
+/// They are read once, in `Ring::map`, with a volatile read, and never
+/// through a reference to the header.
 #[repr(C)]
 pub struct Header {
-    pub magic: u32,
-    pub version: u32,
-    pub capacity_frames: u32,
+    magic: u32,
+    version: u32,
+    capacity_frames: u32,
     /// Frames written since creation. Never wraps back.
     pub write_pos: AtomicU64,
     /// Frames consumed since creation. Never wraps back.
@@ -49,6 +56,10 @@ pub struct Ring {
 
 // SAFETY: the mapping is plain shared memory and all shared mutable state is
 // accessed through atomics or the single producer and consumer discipline.
+// `Sync` lets the writer and the reader be two threads of one process. It
+// also lets safe code call `write` from two threads, or `read` from two,
+// which loses or repeats frames but stays inside the mapping: positions are
+// taken modulo the capacity and fill levels are clamped.
 unsafe impl Send for Ring {}
 unsafe impl Sync for Ring {}
 
@@ -117,14 +128,24 @@ impl Ring {
             map_len: len,
             capacity: 0,
         };
-        let h = ring.header();
-        if h.magic != MAGIC {
+        // The peer can write these words at any time. Each is read once,
+        // so what is checked is what is used.
+        // SAFETY: the mapping is at least DATA_OFFSET bytes and aligned.
+        let (magic, version, capacity) = unsafe {
+            let h = ring.base.as_ptr() as *const Header;
+            (
+                (&raw const (*h).magic).read_volatile(),
+                (&raw const (*h).version).read_volatile(),
+                (&raw const (*h).capacity_frames).read_volatile(),
+            )
+        };
+        if magic != MAGIC {
             return Err(bad("bad ring magic"));
         }
-        if h.version != VERSION {
+        if version != VERSION {
             return Err(bad("unsupported ring version"));
         }
-        let capacity = h.capacity_frames as usize;
+        let capacity = capacity as usize;
         if capacity == 0 || DATA_OFFSET + capacity * FRAME_BYTES > len {
             return Err(bad("ring capacity does not fit the file"));
         }
@@ -147,24 +168,36 @@ impl Ring {
         if p == libc::MAP_FAILED {
             return Err(io::Error::last_os_error());
         }
-        // Map every page now, for writing, so the audio path never faults.
-        // MAP_POPULATE would map a shared mapping's pages clean. A CPU that
-        // cannot set the dirty bit in hardware, such as the Pi 3's
-        // Cortex-A53, then faults on the first write to each page, and a
-        // later MADV_POPULATE_WRITE does not help: the pages count as
-        // writable already. Populating for writing an empty mapping marks
-        // them dirty, and writes nothing.
         // SAFETY: the range is the mapping just made.
-        if unsafe { libc::madvise(p, len, libc::MADV_POPULATE_WRITE) } < 0 {
+        unsafe {
+            Self::populate(p, len, libc::MADV_POPULATE_WRITE);
+            // Keep the pages resident. A refused mlock only costs latency.
+            libc::mlock(p, len);
+        }
+        NonNull::new(p as *mut u8).ok_or_else(|| io::Error::from(io::ErrorKind::OutOfMemory))
+    }
+
+    /// Maps every page now, so the audio path never faults. `advice` is
+    /// `MADV_POPULATE_WRITE` outside the tests.
+    ///
+    /// # Safety
+    /// `p` and `len` describe a mapping that is readable.
+    unsafe fn populate(p: *mut libc::c_void, len: usize, advice: libc::c_int) {
+        // For writing: MAP_POPULATE would map a shared mapping's pages
+        // clean. A CPU that cannot set the dirty bit in hardware, such as
+        // the Pi 3's Cortex-A53, then faults on the first write to each
+        // page, and a later MADV_POPULATE_WRITE does not help: the pages
+        // count as writable already. Populating for writing an empty
+        // mapping marks them dirty, and writes nothing.
+        if unsafe { libc::madvise(p, len, advice) } < 0 {
             // Before Linux 5.14: map them for reading, as MAP_POPULATE does.
+            // On a CPU without a hardware dirty bit the first write to each
+            // page then faults.
             for offset in (0..len).step_by(4096) {
                 // SAFETY: inside the mapping.
                 unsafe { std::ptr::read_volatile((p as *const u8).add(offset)) };
             }
         }
-        // Keep the pages resident. A refused mlock only costs latency.
-        unsafe { libc::mlock(p, len) };
-        NonNull::new(p as *mut u8).ok_or_else(|| io::Error::from(io::ErrorKind::OutOfMemory))
     }
 
     pub fn header(&self) -> &Header {
@@ -194,7 +227,9 @@ impl Ring {
         }
     }
 
-    /// Frames ready to read.
+    /// Frames ready to read. Exact for the reader. Anyone else reads two
+    /// positions that both move, so the value may be stale, and may be 0
+    /// for a moment on a ring that is not empty.
     pub fn available(&self) -> usize {
         let h = self.header();
         let w = h.write_pos.load(Ordering::Acquire);
@@ -491,6 +526,55 @@ mod tests {
         })
         .join()
         .unwrap();
+    }
+
+    /// A shared mapping of a fresh memfd, not populated and not locked.
+    fn bare_mapping(len: usize) -> (*mut libc::c_void, OwnedFd) {
+        let fd = memfd(len);
+        let prot = libc::PROT_READ | libc::PROT_WRITE;
+        let p = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                prot,
+                libc::MAP_SHARED,
+                fd.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(p, libc::MAP_FAILED);
+        (p, fd)
+    }
+
+    /// How many pages of the mapping are in memory.
+    fn resident(p: *mut libc::c_void, len: usize) -> usize {
+        let mut pages = vec![0u8; len.div_ceil(4096)];
+        assert_eq!(unsafe { libc::mincore(p, len, pages.as_mut_ptr()) }, 0);
+        pages.iter().filter(|&&page| page & 1 == 1).count()
+    }
+
+    #[test]
+    fn a_kernel_without_populate_write_still_gets_every_page_mapped() {
+        const PAGES: usize = 64;
+        const LEN: usize = PAGES * 4096;
+        // An advice the kernel takes and ignores populates nothing. This
+        // is what the fallback is there to prevent.
+        let (p, _fd) = bare_mapping(LEN);
+        unsafe { Ring::populate(p, LEN, libc::MADV_NORMAL) };
+        assert_eq!(resident(p, LEN), 0);
+        unsafe { libc::munmap(p, LEN) };
+
+        // An advice no kernel knows fails as MADV_POPULATE_WRITE does
+        // before Linux 5.14, and the fallback reads every page in.
+        let (p, _fd) = bare_mapping(LEN);
+        unsafe { Ring::populate(p, LEN, -1) };
+        assert_eq!(resident(p, LEN), PAGES);
+        unsafe { libc::munmap(p, LEN) };
+
+        let (p, _fd) = bare_mapping(LEN);
+        unsafe { Ring::populate(p, LEN, libc::MADV_POPULATE_WRITE) };
+        assert_eq!(resident(p, LEN), PAGES);
+        unsafe { libc::munmap(p, LEN) };
     }
 
     #[test]
