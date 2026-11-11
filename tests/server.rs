@@ -1039,3 +1039,126 @@ fn a_card_that_comes_back_gets_the_volume_again() {
     assert!(wait_for(|| mixers.lock().unwrap().len() > before));
     assert_eq!(last_set(&mixers), Some(-36.0));
 }
+
+/// How often the wake-up was written since it was last read, and whether
+/// it is readable within `timeout`.
+fn wake_ups(client: &Client, timeout: Duration) -> u64 {
+    let mut pfd = libc::pollfd {
+        fd: client.poll_fds()[0],
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one valid pollfd; then 8 bytes from a non-blocking eventfd.
+    unsafe {
+        if libc::poll(&mut pfd, 1, timeout.as_millis() as i32) != 1 {
+            return 0;
+        }
+        let mut count = 0u64;
+        libc::read(pfd.fd, (&raw mut count).cast(), 8);
+        count
+    }
+}
+
+#[test]
+fn a_client_waiting_for_a_position_is_woken_once_when_it_is_reached() {
+    let (sink, _log) = memory_sink();
+    let daemon = Daemon::start(default_config(), sink);
+    let mut client = daemon.client_at(48000, 8192);
+    write_all(&mut client, &left_pattern(8192));
+    // Many periods away, so a wake-up after each would come far earlier.
+    assert!(!client.wake_at(6000).unwrap());
+    client.start().unwrap();
+    assert_eq!(wake_ups(&client, PATIENCE), 1);
+    let position = client.hw_position().unwrap();
+    assert!(position >= 6000, "woken at {position}");
+    // The position has had its wake-up: no more come while audio is left.
+    assert!(position < 8192 - 1024, "too late to tell: {position}");
+    assert_eq!(wake_ups(&client, Duration::from_millis(10)), 0);
+    // A position already reached is told at once, and need not wake.
+    assert!(client.wake_at(100).unwrap());
+}
+
+#[test]
+fn a_client_waiting_for_a_position_is_woken_by_an_underrun() {
+    let (sink, _log) = memory_sink();
+    let daemon = Daemon::start(default_config(), sink);
+    let mut client = daemon.client_at(48000, 4096);
+    write_all(&mut client, &left_pattern(2048));
+    // Never reached: the stream runs dry first.
+    assert!(!client.wake_at(1 << 40).unwrap());
+    client.start().unwrap();
+    assert!(wake_ups(&client, PATIENCE) >= 1);
+    assert!(client.underruns() >= 1);
+    assert_eq!(client.hw_position().unwrap(), 2048);
+}
+
+#[test]
+fn without_a_position_the_client_is_woken_after_every_period() {
+    let (sink, _log) = memory_sink();
+    let daemon = Daemon::start(default_config(), sink);
+    let mut client = daemon.client_at(48000, 8192);
+    write_all(&mut client, &left_pattern(8192));
+    client.start().unwrap();
+    assert!(wake_ups(&client, PATIENCE) >= 1);
+    assert!(client.hw_position().unwrap() < 4096);
+}
+
+#[test]
+fn a_reset_empties_the_ring_and_the_stream_plays_on_in_it() {
+    let (sink, log) = memory_sink();
+    let daemon = Daemon::start(default_config(), sink);
+    let mut client = daemon.client_at(48000, 8192);
+    // Reset while playing: what is left is dropped, not played.
+    write_all(&mut client, &left_pattern(8192));
+    client.start().unwrap();
+    wait_played(&client, 1024);
+    client.reset().unwrap();
+    let base = client.hw_position().unwrap();
+    assert_eq!(base, 8192, "the ring is empty after a reset");
+    assert_eq!(client.delay_frames(), 0);
+    thread::sleep(Duration::from_millis(50));
+    let dropped = log.frames().iter().filter(|f| f[0] != 0).count();
+    assert!(dropped < 8192, "all of the old audio played");
+    // The same ring takes the next stream, from its first frame.
+    let next = right_pattern(4096);
+    write_all(&mut client, &next);
+    client.start().unwrap();
+    client.drain().unwrap();
+    assert_eq!(client.hw_position().unwrap(), base + 4096);
+    let played = log.frames();
+    let at = find(&played, &next).expect("the new stream played whole");
+    assert!(played[at..].iter().all(|f| f[0] == 0), "old audio after it");
+    // A reset of a stopped stream with frames in it, and one of an empty one.
+    write_all(&mut client, &left_pattern(1000));
+    client.reset().unwrap();
+    assert_eq!(client.hw_position().unwrap(), base + 5096);
+    client.reset().unwrap();
+    assert_eq!(client.hw_position().unwrap(), base + 5096);
+}
+
+#[test]
+fn a_reset_gives_a_resampled_stream_an_empty_filter() {
+    let (sink, log) = memory_sink();
+    let daemon = Daemon::start(default_config(), sink);
+    // The first client sets the rate, so the second is resampled.
+    let mut first = daemon.client_at(48000, 8192);
+    first.start().unwrap();
+    let mut second = daemon.client_at(44100, 8192);
+    write_all(&mut second, &left_pattern(8192));
+    second.start().unwrap();
+    wait_played(&second, 2048);
+    second.reset().unwrap();
+    // What the filter still held must not come out with the next stream,
+    // which is on the other channel.
+    thread::sleep(Duration::from_millis(50));
+    let before = log.frames().len();
+    write_all(&mut second, &right_pattern(4096));
+    second.start().unwrap();
+    second.drain().unwrap();
+    let after = log.frames();
+    assert!(after[before..].iter().any(|f| f[1] != 0), "nothing played");
+    assert!(
+        after[before..].iter().all(|f| f[0] == 0),
+        "the filter's old audio played after the reset"
+    );
+}

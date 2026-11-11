@@ -18,7 +18,7 @@ use rtrb::{Consumer, Producer, PushError};
 use std::collections::VecDeque;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{Ordering, fence};
 use std::time::Instant;
 
 /// Sources the table of a new engine has room for. The control thread sends
@@ -95,6 +95,10 @@ pub struct Source {
     /// When this stream was first seen as DoP, in the order of all claims.
     /// Zero while it is not DoP. The oldest claim holds the output.
     dop_claim: u64,
+    /// The position in the header's `wake_at` that has had its wake-up.
+    woken_at: u64,
+    /// The underruns the client has been woken for.
+    underruns_told: u64,
 }
 
 impl Source {
@@ -123,7 +127,32 @@ impl Source {
             dop_reported: false,
             drained_reported: false,
             dop_claim: 0,
+            woken_at: 0,
+            underruns_told: 0,
         }
+    }
+
+    /// Empties the ring and forgets everything about the stream so far, so
+    /// that what the client writes next starts a new one.
+    fn flush(&mut self) {
+        self.ring.consume(usize::MAX);
+        if let Some(r) = self.resampler.as_mut() {
+            r.reset();
+        }
+        self.running = false;
+        self.stream = Stream::Unknown;
+        self.ready = 0;
+        self.seen = 0;
+        self.plays = false;
+        self.held = 0;
+        self.settled = false;
+        self.in_dop_run = false;
+        self.cut_run = false;
+        self.dropped = 0;
+        self.next_marker = 0x05;
+        self.dop_dry_frames = 0;
+        self.discard_remainder = 0;
+        self.drained_reported = false;
     }
 
     fn draining(&self) -> bool {
@@ -318,14 +347,29 @@ impl Source {
         rest
     }
 
-    /// Tells the client how much plays after its ring, and that it has moved.
-    fn notify(&self, sink_delay: u32, output_rate: u32) {
+    /// Tells the client how much plays after its ring, and wakes it if it
+    /// is due: after every period, or once the position it waits for is
+    /// reached, and after each underrun. A client that waits for a position
+    /// sleeps through the periods before it, and costs no call here.
+    fn notify(&mut self, sink_delay: u32, output_rate: u32) {
         let filter = self.resampler.as_ref().map_or(0, |r| r.delay_frames());
         let delay = u64::from(sink_delay + filter) * u64::from(self.rate) / u64::from(output_rate);
         let header = self.ring.header();
         header
             .output_delay_frames
             .store(delay as u32, Ordering::Relaxed);
+        // The client stores the position it waits for and then loads ours.
+        // With a full barrier on both sides, one of the two sees the other.
+        fence(Ordering::SeqCst);
+        let wake_at = header.wake_at.load(Ordering::SeqCst);
+        let reached = header.read_pos.load(Ordering::Relaxed) >= wake_at;
+        let underruns = header.underruns.load(Ordering::Relaxed);
+        let due = wake_at == 0 || (reached && wake_at != self.woken_at);
+        if !due && underruns == self.underruns_told {
+            return;
+        }
+        self.woken_at = wake_at;
+        self.underruns_told = underruns;
         let one = 1u64;
         // SAFETY: a plain write of 8 bytes. The fd is non-blocking, and a full
         // counter only means the client has plenty of wake-ups waiting.
@@ -345,6 +389,8 @@ pub enum Command {
     Add(Box<Source>),
     Remove(ClientId),
     SetRunning(ClientId, bool),
+    /// Stops the source and empties its ring. Answered by `Event::Flushed`.
+    Flush(ClientId),
     SetResampler(ClientId, Option<Box<Resampler>>),
     /// Opens the sink, or reopens it after a period of fading out. The fade
     /// comes first even for commands queued ahead of this one, so resamplers
@@ -370,6 +416,7 @@ pub enum Event {
     DopStarted(ClientId),
     DopStopped(ClientId),
     Drained(ClientId),
+    Flushed(ClientId),
     Reconfigured,
 }
 
@@ -550,6 +597,13 @@ impl<P: Processing, S: Sink> Engine<P, S> {
             Command::Add(source) => self.add(source),
             Command::Remove(id) => self.remove(id),
             Command::SetRunning(id, running) => self.set_running(id, running),
+            Command::Flush(id) => {
+                self.set_running(id, false);
+                if let Some(source) = self.find(id) {
+                    source.flush();
+                }
+                self.emit(Event::Flushed(id));
+            }
             Command::SetResampler(id, resampler) => {
                 let replaced = match self.find(id) {
                     Some(source) => std::mem::replace(&mut source.resampler, resampler),
@@ -722,7 +776,7 @@ impl<P: Processing, S: Sink> Engine<P, S> {
             self.counters.xruns.fetch_add(1, Ordering::Relaxed);
         }
         let sink_delay = self.sink.delay_frames();
-        for source in self.table.iter().filter(|s| s.running) {
+        for source in self.table.iter_mut().filter(|s| s.running) {
             source.notify(sink_delay, rate);
         }
         let work = before_write - start + after_write.elapsed();

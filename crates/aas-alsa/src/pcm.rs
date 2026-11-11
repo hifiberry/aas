@@ -3,10 +3,14 @@
 //! Every callback runs inside `catch_unwind` and returns `-EIO` on a panic,
 //! so a bug here fails one call instead of bringing down the player.
 //!
-//! Positions count from when the stream was set up on a fresh ring, by
-//! hw_params or a later prepare. So the frames the daemon has taken from
-//! the ring are ALSA's hw pointer, and the frames written to it are ALSA's
-//! application pointer.
+//! Positions count from the last prepare. The daemon's count of frames
+//! taken from the ring runs on across a prepare, so the stream keeps the
+//! count at that moment as its base: the frames taken since are ALSA's hw
+//! pointer, and the frames written since are ALSA's application pointer.
+//!
+//! A running stream that lacks the room its player waits for tells the daemon the
+//! position at which it will have, and is woken once, when that is reached.
+//! So a player sleeps through the daemon's periods in between.
 
 use crate::ffi::*;
 use aas_client::client::Client;
@@ -63,15 +67,21 @@ struct Inner {
     /// same for the life of the PCM.
     wake: OwnedFd,
     stream: Option<Stream>,
+    /// The free frames the player waits for, once it has set them.
+    avail_min: Option<u64>,
 }
 
 /// The stream on the daemon, set up by hw_params or a later prepare.
 struct Stream {
     frame_bytes: usize,
     buffer: u64,
-    period: u64,
+    /// The free frames the player waits for: its avail_min, or a period
+    /// until it sets one.
+    wanted: u64,
     /// Where ALSA wraps the hw pointer.
     boundary: u64,
+    /// The daemon's read position at the last prepare.
+    base: u64,
     /// Frames written to the ring since prepare.
     written: u64,
     /// The daemon's underrun count when the stream last started.
@@ -81,10 +91,20 @@ struct Stream {
 }
 
 impl Stream {
-    /// Frames the player may write, with `read` frames taken by the daemon.
+    /// Frames the daemon has taken since prepare, at its position `read`.
+    fn played(&self, read: u64) -> u64 {
+        read.saturating_sub(self.base)
+    }
+
+    /// Frames the player may write, with the daemon at position `read`.
     fn avail(&self, read: u64) -> u64 {
         self.buffer
-            .saturating_sub(self.written.saturating_sub(read))
+            .saturating_sub(self.written.saturating_sub(self.played(read)))
+    }
+
+    /// The daemon's position at which the player has the room it waits for.
+    fn room_at(&self) -> u64 {
+        (self.base + self.written + self.wanted).saturating_sub(self.buffer)
     }
 }
 
@@ -202,13 +222,34 @@ impl Inner {
         self.stream = Some(Stream {
             frame_bytes: format.sample_bytes() * channels as usize,
             buffer,
-            period: period.max(1),
+            wanted: self.avail_min.unwrap_or(period).clamp(1, buffer),
             boundary,
+            base: 0,
             written: 0,
             underruns: self.client.underruns(),
             fresh: true,
         });
         self.arm();
+        Ok(())
+    }
+
+    /// Empties the stream for a prepare and keeps its ring, which costs
+    /// the daemon far less than a new stream. Sets up a new one if the
+    /// daemon cannot.
+    ///
+    /// # Safety
+    /// As for `set_up`.
+    unsafe fn renew(&mut self, io: Io) -> Result<(), c_int> {
+        if self.stream.is_none() || self.client.reset().is_err() {
+            return unsafe { self.set_up(io) };
+        }
+        let base = self.client.hw_position().map_err(|e| errno(&e))?;
+        let underruns = self.client.underruns();
+        if let Some(stream) = &mut self.stream {
+            stream.base = base;
+            stream.written = 0;
+            stream.underruns = underruns;
+        }
         Ok(())
     }
 }
@@ -251,6 +292,7 @@ unsafe extern "C" fn start(io: Io) -> c_int {
                 stream.underruns = underruns;
                 stream.fresh = false;
             }
+            inner.arm();
             Ok(0)
         })
     })
@@ -277,7 +319,7 @@ unsafe extern "C" fn pointer(io: Io) -> snd_pcm_sframes_t {
             if running && inner.client.underruns() > stream.underruns {
                 return Err(libc::EPIPE);
             }
-            Ok((read % stream.boundary) as snd_pcm_sframes_t)
+            Ok((stream.played(read) % stream.boundary) as snd_pcm_sframes_t)
         })
     })
 }
@@ -326,18 +368,38 @@ unsafe extern "C" fn hw_params(io: Io, _params: *mut snd_pcm_hw_params_t) -> c_i
 
 /// Starts the stream empty, its positions at zero, as ALSA's are after
 /// prepare. A stream not used since it was set up is kept; any other is
-/// set up again on a fresh ring.
+/// emptied on the daemon, in the ring it has.
 unsafe extern "C" fn prepare(io: Io) -> c_int {
     guard(|| unsafe {
         let boundary = boundary((*io).pcm)?;
         with(io, |inner| {
             if !inner.stream.as_ref().is_some_and(|s| s.fresh) {
-                inner.set_up(io)?;
+                inner.renew(io)?;
             }
             let stream = inner.stream.as_mut().ok_or(libc::EBADFD)?;
             stream.boundary = boundary;
             stream.fresh = false;
             inner.arm();
+            Ok(0)
+        })
+    })
+}
+
+/// Takes the room the player waits for from its software parameters. The
+/// player is then woken when it has that much, not at each period.
+#[allow(clippy::unnecessary_cast)] // c_ulong is 32 bits on some targets.
+unsafe extern "C" fn sw_params(io: Io, params: *mut snd_pcm_sw_params_t) -> c_int {
+    guard(|| unsafe {
+        let mut value = 0;
+        let rc = snd_pcm_sw_params_get_avail_min(params, &mut value);
+        if rc < 0 {
+            return Err(-rc);
+        }
+        with(io, |inner| {
+            inner.avail_min = Some(value as u64);
+            if let Some(stream) = &mut inner.stream {
+                stream.wanted = (value as u64).clamp(1, stream.buffer);
+            }
             Ok(0)
         })
     })
@@ -379,6 +441,7 @@ unsafe extern "C" fn pause(io: Io, enable: c_int) -> c_int {
                 if let Some(stream) = &mut inner.stream {
                     stream.underruns = underruns;
                 }
+                inner.arm();
             }
             Ok(0)
         })
@@ -389,7 +452,7 @@ unsafe extern "C" fn poll_descriptors_count(_io: Io) -> c_int {
     guard(|| Ok(2))
 }
 
-/// The wake-up eventfd, readable after each period the daemon plays, and
+/// The wake-up eventfd, readable when the player has room or the stream needs it, and
 /// the socket, which hangs up when the daemon goes.
 unsafe extern "C" fn poll_descriptors(io: Io, pfd: *mut libc::pollfd, space: c_uint) -> c_int {
     guard(|| unsafe {
@@ -412,9 +475,12 @@ unsafe extern "C" fn poll_descriptors(io: Io, pfd: *mut libc::pollfd, space: c_u
 }
 
 /// Turns what poll saw into what the player may do. A hang-up is
-/// `POLLERR` and the PCM is disconnected. A stream that is not running
-/// gets no wake-up from the daemon, so it keeps the wake-up armed itself
-/// and polls as level triggered, as a card does. While a non-blocking
+/// `POLLERR` and the PCM is disconnected. A stream with the room its player waits for
+/// keeps the wake-up armed itself, so it polls as level triggered, as a
+/// card does. A running one without room asks the daemon for a wake-up at
+/// the position where it has, and sleeps until then. So on every return
+/// either the wake-up is armed or the daemon will write it. Room means the
+/// player's avail_min, so a poll that returns is one the player can use. While a non-blocking
 /// drain waits, the socket brings its reply; then the PCM is set up again,
 /// as alsa-lib's ioplug leaves it after a drain, and may be written.
 unsafe extern "C" fn poll_revents(
@@ -457,9 +523,19 @@ unsafe extern "C" fn poll_revents(
             let avail = stream.avail(read);
             let events = match state {
                 SND_PCM_STATE_RUNNING if inner.client.underruns() > stream.underruns => {
+                    inner.arm();
                     libc::POLLERR
                 }
-                SND_PCM_STATE_RUNNING if avail >= stream.period => libc::POLLOUT,
+                SND_PCM_STATE_RUNNING
+                    if avail >= stream.wanted
+                        || inner
+                            .client
+                            .wake_at(stream.room_at())
+                            .map_err(|e| errno(&e))? =>
+                {
+                    inner.arm();
+                    libc::POLLOUT
+                }
                 SND_PCM_STATE_RUNNING => 0,
                 SND_PCM_STATE_PREPARED | SND_PCM_STATE_PAUSED if avail > 0 => {
                     inner.arm();
@@ -504,7 +580,7 @@ static CALLBACKS: snd_pcm_ioplug_callback_t = snd_pcm_ioplug_callback_t {
     close: Some(close),
     hw_params: Some(hw_params),
     hw_free: None,
-    sw_params: None,
+    sw_params: Some(sw_params),
     prepare: Some(prepare),
     drain: Some(drain),
     pause: Some(pause),
@@ -620,6 +696,7 @@ unsafe fn open(
             client,
             wake,
             stream: None,
+            avail_min: None,
         }),
     }));
     // SAFETY: io and shared are fresh allocations. After create succeeds,

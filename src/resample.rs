@@ -217,6 +217,16 @@ impl Resampler {
         self.padded >= self.tail
     }
 
+    /// Empties the filter, for a stream that starts anew. Does not allocate.
+    pub fn reset(&mut self) {
+        match &mut self.precision {
+            Precision::Single(s) => s.inner.reset(),
+            Precision::Double(s) => s.inner.reset(),
+        }
+        self.padded = self.tail;
+        self.primed = false;
+    }
+
     /// Forgets what is in the filter, as its audio is being discarded.
     pub fn skip(&mut self) {
         self.padded = self.tail;

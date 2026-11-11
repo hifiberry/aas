@@ -342,7 +342,11 @@ impl Control {
         }
         if matches!(
             request,
-            Request::Configure { .. } | Request::Start | Request::Stop | Request::Drain
+            Request::Configure { .. }
+                | Request::Start
+                | Request::Stop
+                | Request::Drain
+                | Request::Reset
         ) {
             self.cancel_drain(conn);
         }
@@ -357,6 +361,7 @@ impl Control {
             Request::Start => self.start_stream(conn, now),
             Request::Stop => self.stop_stream(conn, now),
             Request::Drain => self.drain(conn, now),
+            Request::Reset => self.reset(conn, now),
             Request::GetVolume => self.volume_reply(),
             Request::SetVolume { percent } if percent > 100 => Answer::error(libc::EINVAL),
             Request::SetVolume { percent } => {
@@ -519,6 +524,37 @@ impl Control {
         self.stop(id, now, &mut batch);
         self.send(batch);
         Answer::reply(Reply::Ok)
+    }
+
+    /// Stops the stream and has the audio thread empty its ring. The reply
+    /// comes once it has, so nothing written after the reply is lost.
+    fn reset(&mut self, conn: ConnId, now: Instant) -> Answer {
+        let Some(stream) = self.stream_mut(conn) else {
+            return Answer::error(libc::EBADFD);
+        };
+        let id = stream.id;
+        stream.drain = None;
+        stream.drained = false;
+        let mut batch = Vec::new();
+        self.stop(id, now, &mut batch);
+        batch.push(Command::Flush(id));
+        self.send(batch);
+        Answer {
+            reply: None,
+            fds: Vec::new(),
+            close: false,
+        }
+    }
+
+    /// The audio thread has emptied a stream's ring: its reset is answered.
+    fn flushed(&mut self, id: ClientId) {
+        let conn = self
+            .conns
+            .iter()
+            .find(|(_, c)| c.stream.as_ref().is_some_and(|s| s.id == id));
+        if let Some((&conn, _)) = conn {
+            self.outbox.push((conn, Reply::Ok));
+        }
     }
 
     /// Stops a running stream and settles what follows from that.
@@ -695,17 +731,17 @@ impl Control {
         batch.push(Command::Reconfigure { rate, period });
     }
 
-    /// Gives each running source at another rate than the output a
-    /// resampler for it, and takes it away from the others.
+    /// Gives each source at another rate than the output a resampler for
+    /// it, and takes it away from the others. A stopped source keeps its
+    /// own, so that a pause or a reset does not build a new one, which
+    /// takes far longer than a period.
     fn sync_resamplers(&mut self, batch: &mut Vec<Command>) {
         let output = self.output;
         let (quality, format) = (self.quality, self.format);
         let streams = self.conns.values_mut().filter_map(|c| c.stream.as_mut());
         for stream in streams {
             let want = match output {
-                Some((rate, period)) if stream.running && stream.rate != rate => {
-                    Some((rate, period))
-                }
+                Some((rate, period)) if stream.rate != rate => Some((rate, period)),
                 _ => None,
             };
             if want == stream.resampler {
@@ -767,6 +803,7 @@ impl Control {
                     self.decide(now, false, &mut batch);
                 }
                 Event::Drained(id) => self.drained(id, now, &mut batch),
+                Event::Flushed(id) => self.flushed(id),
             }
         }
         self.send(batch);
