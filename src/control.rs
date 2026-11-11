@@ -38,6 +38,9 @@ const RATIO_HEADROOM: f64 = 1.1;
 /// How long a drain may wait beyond what its ring holds, should the audio
 /// thread never report it drained.
 const DRAIN_SPARE: Duration = Duration::from_millis(500);
+/// How long the control thread waits for room in the command queue before
+/// it says so in the log. It goes on waiting.
+const SEND_WARN: Duration = Duration::from_secs(1);
 /// How long the volume stays unchanged before the state file is written,
 /// so that a volume slider being dragged does not write it many times.
 const SAVE_DELAY: Duration = Duration::from_secs(1);
@@ -920,8 +923,15 @@ impl Control {
     /// Queues the commands in one commit and wakes the audio thread. Waits
     /// for room if needed, taking events out of the other queue meanwhile,
     /// because the audio thread stops taking commands while that is full.
+    ///
+    /// The wait has no limit: a command left out would leave the two
+    /// threads with different ideas of the clients. The audio thread reads
+    /// commands every cycle, so room comes within a period. A wait of a
+    /// second means it is stuck, and is logged once.
     fn send(&mut self, batch: Vec<Command>) {
         let capacity = self.commands.buffer().capacity();
+        let mut waiting_since: Option<Instant> = None;
+        let mut warned = false;
         let mut batch = batch.into_iter().peekable();
         while batch.peek().is_some() {
             // Nobody is left to take them.
@@ -938,6 +948,14 @@ impl Control {
                         self.stash.push(event);
                     }
                     self.audio.unpark();
+                    let since = *waiting_since.get_or_insert_with(Instant::now);
+                    if !warned && since.elapsed() >= SEND_WARN {
+                        warned = true;
+                        eprintln!(
+                            "aas: the audio thread has taken no command for {} s, still waiting",
+                            SEND_WARN.as_secs()
+                        );
+                    }
                     std::thread::sleep(Duration::from_millis(1));
                 }
             }
@@ -1257,6 +1275,36 @@ mod tests {
         assert_eq!(State::load(&path).output_percent, 20);
         // Only the state file is left, no temporary one.
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn a_batch_larger_than_the_queue_arrives_whole_and_in_order() {
+        let (commands, mut engine_commands) = rtrb::RingBuffer::new(4);
+        let (_engine_events, events) = rtrb::RingBuffer::new(4);
+        let audio = std::thread::current();
+        let mut control = Control::new(
+            &Config::default(),
+            12.0,
+            Vec::new(),
+            commands,
+            events,
+            audio,
+        );
+        // The audio thread takes one command now and then.
+        let reader = std::thread::spawn(move || {
+            let mut gains = Vec::new();
+            while gains.len() < 11 {
+                match engine_commands.pop() {
+                    Ok(Command::SetGain(gain)) => gains.push(gain),
+                    Ok(_) => panic!("another command"),
+                    Err(_) => std::thread::sleep(Duration::from_millis(2)),
+                }
+            }
+            gains
+        });
+        control.send((0..11).map(|i| Command::SetGain(i as f32)).collect());
+        let expect: Vec<f32> = (0..11).map(|i| i as f32).collect();
+        assert_eq!(reader.join().unwrap(), expect);
     }
 
     #[test]
