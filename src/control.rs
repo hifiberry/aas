@@ -381,11 +381,16 @@ impl Control {
 
     /// Sets the output volume and tells every subscriber. The state file is
     /// written once the volume has been left alone for a while.
+    ///
+    /// The card's mixer is written even when the percent is the same, so
+    /// that asking again puts back a level another tool has changed. A
+    /// change made outside aas is not read back.
     fn set_volume(&mut self, percent: u8, now: Instant) {
-        if percent == self.volume.percent() {
+        let changed = percent != self.volume.percent();
+        self.volume.set(percent);
+        if !changed {
             return;
         }
-        self.volume.set(percent);
         self.send(vec![Command::SetGain(self.volume.gain())]);
         let subscribers = self.conns.iter().filter(|(_, c)| c.subscribed);
         let notice = Reply::VolumeChanged { percent };
@@ -968,6 +973,49 @@ mod tests {
             }
         }
         panic!("no source added");
+    }
+
+    /// A card's mixer that records what it is set to.
+    struct FakeMixer(std::sync::Arc<std::sync::Mutex<Vec<f32>>>);
+
+    impl HardwareVolume for FakeMixer {
+        fn set_db(&mut self, db: f32) {
+            self.0.lock().unwrap().push(db);
+        }
+
+        fn range_db(&self) -> (f32, f32) {
+            (-103.5, 0.0)
+        }
+
+        fn can_mute(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn the_same_volume_again_is_written_to_the_card_but_not_announced() {
+        let (mut control, mut commands, now) = hello();
+        let set = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        control.card_changed(Some(Box::new(FakeMixer(set.clone()))));
+        let volume = |percent| Some(Request::SetVolume { percent });
+        assert_eq!(
+            control
+                .request(1, Some(Request::SubscribeVolume), now)
+                .reply,
+            Some(Reply::Volume { percent: 100 })
+        );
+        assert_eq!(control.request(1, volume(50), now).reply, Some(Reply::Ok));
+        assert_eq!(*set.lock().unwrap(), [0.0, -30.0]);
+        assert_eq!(control.take_notices().len(), 1);
+        while commands.pop().is_ok() {}
+        // Someone moved the card's mixer with another tool meanwhile. The
+        // same percent again puts it back.
+        assert_eq!(control.request(1, volume(50), now).reply, Some(Reply::Ok));
+        assert_eq!(*set.lock().unwrap(), [0.0, -30.0, -30.0]);
+        // Nothing changed for the subscribers, the engine or the state file.
+        assert!(control.take_notices().is_empty());
+        assert!(commands.pop().is_err());
+        assert!(control.save_at.is_none());
     }
 
     #[test]
