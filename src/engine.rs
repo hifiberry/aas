@@ -441,7 +441,12 @@ pub enum Command {
     #[allow(clippy::vec_box)] // Moving a boxed source moves only a pointer.
     Grow(Vec<Box<Source>>),
     /// Replaces the chain at a place. Answered by `Event::OldChain`. The
-    /// chain is in the engine's processing format and takes a period.
+    /// chain is in the engine's processing format and, if it has a plugin,
+    /// built for `MAX_PERIOD` frames, so that no period change can outgrow
+    /// it. A shorter one is refused: it comes back as the `OldChain` and the
+    /// chain in place stays. The control thread sends the chains for a new
+    /// rate just before its `Reconfigure`, so that they take effect with the
+    /// reopen, as resamplers do.
     SetChain(Place, Box<Chain>),
     /// Sets a parameter of one plugin in a chain. One that is not there is
     /// ignored.
@@ -694,15 +699,12 @@ impl<P: Processing, S: Sink> Engine<P, S> {
             Command::SetGain(gain) => self.set_gain(gain),
             Command::Grow(table) => self.grow(table),
             Command::SetChain(place, mut chain) => {
-                // A chain is built for the period it will run in, which a
-                // queued `Reconfigure` may already have changed.
-                let period = self.reopen.map_or(self.period, |(_, p)| p as usize);
-                debug_assert!(
-                    chain.max_frames() >= period,
-                    "a chain shorter than a period"
-                );
-                // The old chain goes back in the box the new one came in.
-                std::mem::swap(self.chain(place), &mut chain);
+                // A chain that could not take the longest period would fail
+                // after a rate change, so it is sent straight back.
+                if chain.max_frames() >= MAX_PERIOD as usize {
+                    // The old chain goes back in the box the new one came in.
+                    std::mem::swap(self.chain(place), &mut chain);
+                }
                 self.emit(Event::OldChain(chain));
             }
             Command::SetParam {
@@ -878,18 +880,26 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         let holders = self.table.iter().enumerate();
         let holders = holders.filter(|(_, s)| s.holds_output(rate));
         let owner = holders.min_by_key(|(_, s)| s.dop_claim).map(|(i, _)| i);
-        match owner {
-            Some(owner) => self.play_dop(owner),
+        let chains_ran = match owner {
+            Some(owner) => {
+                self.play_dop(owner);
+                false
+            }
             None => self.play_pcm(fade_out),
-        }
+        };
         let before_write = Instant::now();
         let result = self.sink.write(&self.out[..self.period]);
         let after_write = Instant::now();
         if result == Err(SinkError::Xrun) {
             self.counters.xruns.fetch_add(1, Ordering::Relaxed);
         }
-        // What the plugins hold back plays after the ring too.
-        let plugins = self.mix.latency_frames() + self.output.latency_frames();
+        // What the plugins hold back plays after the ring too, in the
+        // cycles they ran in.
+        let plugins = if chains_ran {
+            self.mix.latency_frames() + self.output.latency_frames()
+        } else {
+            0
+        };
         let delay = self.sink.delay_frames() + plugins;
         for source in self.table.iter_mut().filter(|s| s.running) {
             source.notify(delay, rate);
@@ -971,8 +981,9 @@ impl<P: Processing, S: Sink> Engine<P, S> {
     }
 
     /// Mixes the sources, or copies the one that is bit-perfect. A mix then
-    /// runs the mix chain and the output chain, in that order.
-    fn play_pcm(&mut self, fade_out: bool) {
+    /// runs the mix chain and the output chain, in that order. Returns
+    /// whether a chain with plugins ran.
+    fn play_pcm(&mut self, fade_out: bool) -> bool {
         let (rate, period) = (self.rate, self.period);
         let volumes = volumes_apply(self.mode);
         let copy = !fade_out && decide(&self.situation()).is_ok();
@@ -1020,9 +1031,10 @@ impl<P: Processing, S: Sink> Engine<P, S> {
                 }
             }
         }
+        let chains_ran = !copy && (!self.mix.is_empty() || !self.output.is_empty());
         if !copy {
             // Without plugins the mix is not copied for them at all.
-            if !self.mix.is_empty() || !self.output.is_empty() {
+            if chains_ran {
                 let mut block = P::to_block(acc, &mut self.store);
                 self.mix.process(block.reborrow());
                 self.output.process(block.reborrow());
@@ -1032,6 +1044,7 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         }
         self.gain = next_gain;
         self.fade_left -= fade_frames;
+        chains_ran
     }
 
     /// Sends the events that follow from the state of the sources. These need
@@ -4400,14 +4413,26 @@ mod tests {
         P::to_block(&mut [], &mut BlockStore::new(0)).format()
     }
 
-    /// A chain for the rig's period in the processing format of `P`.
+    /// A chain in the processing format of `P`, built for the longest period,
+    /// as the engine takes them.
     fn chain_of<P: Processing>(plugins: Vec<Probe>) -> Box<Chain> {
+        chain_for::<P>(plugins, MAX_PERIOD as usize)
+    }
+
+    fn chain_for<P: Processing>(plugins: Vec<Probe>, max_frames: usize) -> Box<Chain> {
         let plugins = plugins
             .into_iter()
             .map(|p| Box::new(p) as Box<dyn Plugin>)
             .collect();
-        Box::new(Chain::new(plugins, format_of::<P>(), PERIOD))
+        Box::new(Chain::new(plugins, format_of::<P>(), max_frames))
     }
+
+    /// Takes only floats, so an engine in another format converts around it.
+    const F64_ONLY: Formats = Formats {
+        i32: false,
+        f32: false,
+        f64: true,
+    };
 
     fn set_chain<P: Processing>(rig: &mut Rig<P>, place: Place, plugins: Vec<Probe>) {
         rig.send(Command::SetChain(place, chain_of::<P>(plugins)));
@@ -4535,13 +4560,7 @@ mod tests {
         set_chain(&mut rig, Place::Output, vec![plus(0).latency(3)]);
         set_chain(&mut rig, Place::Analog, vec![plus(0).latency(4)]);
         rig.cycle();
-        let latencies = |events: Vec<Event>| -> Vec<Option<u32>> {
-            let old = events.into_iter().map(|e| match e {
-                Event::OldChain(c) => Some(c.latency_frames()),
-                _ => None,
-            });
-            old.collect()
-        };
+        let latencies = old_chains;
         // The engine starts with empty chains.
         assert_eq!(
             latencies(rig.events()),
@@ -4607,6 +4626,125 @@ mod tests {
         rig.cycle();
         assert_eq!(rig.last_periods(1), frames(2000, PERIOD));
         assert!(rig.events().is_empty());
+    }
+
+    /// The latencies of the `OldChain` events, `None` for any other event.
+    fn old_chains(events: Vec<Event>) -> Vec<Option<u32>> {
+        let old = events.into_iter().map(|e| match e {
+            Event::OldChain(c) => Some(c.latency_frames()),
+            _ => None,
+        });
+        old.collect()
+    }
+
+    #[test]
+    fn a_chain_built_for_less_than_the_longest_period_is_refused() {
+        let mut rig = Rig::<I32>::new(BitPerfect::Auto);
+        let mut a = client(1);
+        rig.add(&mut a);
+        set_chain(&mut rig, Place::Mix, vec![times(2.0).latency(1)]);
+        rig.cycle();
+        rig.events();
+        let short = MAX_PERIOD as usize - 1;
+        let refused = chain_for::<I32>(vec![times(3.0).latency(7)], short);
+        rig.send(Command::SetChain(Place::Mix, refused));
+        a.ring.write(&frames(1000, PERIOD));
+        rig.cycle();
+        // The refused chain comes back, and the one in place keeps playing.
+        assert_eq!(old_chains(rig.events()), [Some(7)]);
+        assert_eq!(rig.last_periods(1), frames(2000, PERIOD));
+        // A chain without plugins takes any period.
+        rig.send(Command::SetChain(Place::Mix, Box::new(Chain::empty())));
+        rig.cycle();
+        assert_eq!(old_chains(rig.events()), [Some(1)]);
+    }
+
+    #[test]
+    fn a_reconfigure_to_a_longer_period_keeps_the_chains_working() {
+        fn check<P: Processing>() {
+            const LONGER: usize = 2 * PERIOD;
+            let mut rig = Rig::<P>::new(BitPerfect::Auto);
+            let mut a = client(1);
+            rig.add(&mut a);
+            set_chain(&mut rig, Place::Mix, vec![times(2.0).only(F64_ONLY)]);
+            set_chain(&mut rig, Place::Output, vec![plus(0)]);
+            a.ring.write(&frames(1000, PERIOD));
+            rig.cycle();
+            rig.send(Command::Reconfigure {
+                rate: RATE,
+                period: LONGER as u32,
+            });
+            a.ring.write(&frames(1000, 10 * LONGER));
+            for _ in 0..4 {
+                rig.cycle();
+            }
+            assert_eq!(rig.log.opens().last(), Some(&(RATE, LONGER as u32)));
+            let log = rig.log.frames();
+            let last = &log[log.len() - LONGER..];
+            assert_eq!(last, frames(2000, LONGER), "{:?}", format_of::<P>());
+        }
+        check::<I32>();
+        check::<F32>();
+        check::<F64>();
+    }
+
+    #[test]
+    fn a_chain_sent_just_before_a_reconfigure_takes_effect_with_the_reopen() {
+        const LONGER: usize = 2 * PERIOD;
+        let mut rig = Rig::<I32>::new(BitPerfect::Auto);
+        let mut a = client(1);
+        rig.add(&mut a);
+        set_chain(&mut rig, Place::Output, vec![times(2.0).latency(2)]);
+        a.ring.write(&frames(1000, 20 * PERIOD));
+        rig.cycle();
+        rig.events();
+        rig.send(Command::SetChain(
+            Place::Output,
+            chain_of::<I32>(vec![times(3.0).latency(3)]),
+        ));
+        rig.send(Command::Reconfigure {
+            rate: RATE,
+            period: LONGER as u32,
+        });
+        // The fade before the reopen still runs the old chain. It starts at
+        // full level.
+        rig.cycle();
+        assert_eq!(rig.last_periods(1)[0], [2000, -2000]);
+        assert!(old_chains(rig.events()).is_empty());
+        rig.cycle();
+        let log = rig.log.frames();
+        assert_eq!(log[log.len() - LONGER..], frames(3000, LONGER));
+        let events = old_chains(rig.events());
+        assert!(events.contains(&Some(2)), "{events:?}");
+    }
+
+    #[test]
+    fn the_delay_leaves_out_plugins_that_did_not_run() {
+        let delay = |c: &Client| c.ring.header().output_delay_frames.load(Relaxed);
+        // A bit-perfect copy runs no chain.
+        let mut rig = Rig::<F32>::new(BitPerfect::Auto);
+        let mut a = client(1);
+        rig.add(&mut a);
+        set_chain(
+            &mut rig,
+            Place::Output,
+            vec![times(1.0).neutral().latency(20)],
+        );
+        rig.log.set_delay(128);
+        a.ring.write(&frames(ODD, PERIOD));
+        rig.cycle();
+        assert_eq!(rig.last_periods(1), frames(ODD, PERIOD));
+        assert_eq!(delay(&a), 128);
+        // Nor does DoP.
+        let mut rig = Rig::<F32>::new(BitPerfect::Auto);
+        let mut a = client(1);
+        rig.add(&mut a);
+        set_chain(&mut rig, Place::Mix, vec![times(2.0).latency(20)]);
+        rig.log.set_delay(128);
+        a.ring.write(&dop_frames(PERIOD));
+        rig.cycle();
+        assert_eq!(rig.last_periods(1), dop_frames(PERIOD));
+        assert_eq!(delay(&a), 128);
     }
 
     #[test]
@@ -4678,7 +4816,7 @@ mod tests {
         });
         rig.send(Command::SetChain(
             Place::Output,
-            chain_of::<P>(vec![times(4.0).only(other).latency(8)]),
+            chain_of::<P>(vec![times(3.0).only(other).latency(8)]),
         ));
         rig.send(Command::SetChain(
             Place::Analog,
@@ -4692,9 +4830,16 @@ mod tests {
                 engine.cycle().unwrap();
             }
         });
-        // Two sources at -6 dB, a quarter, then four times: the mix itself.
+        // Two sources at -6 dB, a quarter, then three times. The resampled
+        // source is near its level, not exactly at it.
+        let want = f64::from(1 << 24) * f64::from(db_to_gain(-6.0)) * 2.0 * 0.25 * 3.0;
         let last = rig.log.frames().last().copied().unwrap();
-        assert!(last[0] > 1 << 24, "{last:?} in {:?}", format_of::<P>());
+        let error = (f64::from(last[0]) - want).abs() / want;
+        assert!(
+            error < 1e-3,
+            "{last:?}, want {want} in {:?}",
+            format_of::<P>()
+        );
         // The returned chains are freed here, off the audio thread.
         assert_eq!(rig.events().len(), 2);
     }

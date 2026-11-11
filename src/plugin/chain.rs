@@ -19,7 +19,9 @@ pub struct Chain {
 
 impl Chain {
     /// A chain for blocks in `format` of up to `max_frames` frames. A longer
-    /// block given to `process` panics.
+    /// block given to `process` panics. The engine takes only chains built
+    /// for `crate::latency::MAX_PERIOD`, so that one never depends on the
+    /// period.
     pub fn new(plugins: Vec<Box<dyn Plugin>>, format: Format, max_frames: usize) -> Chain {
         let convert = plugins
             .iter()
