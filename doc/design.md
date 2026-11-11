@@ -335,8 +335,9 @@ is left.
 
 Forced bit-perfect does not bypass input detection, because analog input must
 never pass ungated *(call)*. This is the one exception to plugins being
-bypassed. The analog chain still runs so that the detector can measure, but its
-output is not used: the captured frames are played as they are *(call)*. Past a
+bypassed. The analog chain still runs, so that the detector can measure and a
+recorder gets the input after its plugins (see Capture device), but its output
+is not played: the captured frames are played as they are *(call)*. Past a
 chain that alters them, the engine fades them in and out itself, over 10 ms from
 the start of the period in which the detector opens or has closed, so a few
 frames before the detector opened are heard, rising from silence. Below
@@ -598,7 +599,8 @@ Details *(call)*:
 - The capture device is `pcm.aas` opened for capture, and the ALSA `default`
   device covers both directions.
 - A recorder gets the analog input after its plugins and before the input
-  volume, so it hears the same level whatever the volume is.
+  volume, so it hears the same level whatever the volume is. That holds in
+  forced bit-perfect too, where the card plays the input as captured.
 - It runs at the output rate only, as S32 stereo. `plug` in `default` converts in
   the recorder's process. Capture offers mmap access, which `plug` needs to
   convert. The plugin learns the daemon's rate when the PCM is opened, by setting

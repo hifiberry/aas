@@ -69,8 +69,8 @@ pub fn volumes_apply(mode: BitPerfect) -> bool {
 }
 
 /// Whether plugins act on the audio in this mode. In forced mode they are
-/// bypassed. The analog chain still runs there, for its detector only: its
-/// output is not used.
+/// bypassed. The analog chain still runs there, for its detector and for
+/// the recorders: its output is not played.
 pub fn plugins_apply(mode: BitPerfect) -> bool {
     mode != BitPerfect::Forced
 }
