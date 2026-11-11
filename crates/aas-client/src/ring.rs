@@ -548,13 +548,13 @@ mod tests {
         .unwrap();
     }
 
-    /// A shared mapping of a fresh memfd, not populated and not locked.
     /// The size of a page of memory.
     fn page_size() -> usize {
         // SAFETY: a plain query.
         unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }
     }
 
+    /// A shared mapping of a fresh memfd, not populated and not locked.
     fn bare_mapping(len: usize) -> (*mut libc::c_void, OwnedFd) {
         let fd = memfd(len);
         let prot = libc::PROT_READ | libc::PROT_WRITE;

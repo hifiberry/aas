@@ -1326,13 +1326,13 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         self.emit(Event::OldTable(old));
     }
 
-    /// Closes the capture too: these cards take one rate at a time, so the
-    /// capture must be gone before the output opens at another.
-    /// Closes the capture before the card, and every capture still waiting
-    /// to be handed back, since these cards refuse a second open while one
-    /// is held. One already in the event queue is the control thread's,
-    /// which closes it when it takes it: if that is later than the reopen,
-    /// the new capture's first open fails and is tried again a second later.
+    /// Closes the capture too, and every capture still waiting to be handed
+    /// back: these cards take one rate at a time, so no capture may hold
+    /// the card when the output opens at another. One already in the event
+    /// queue is the control thread's, which closes it when it takes it. If
+    /// that comes after the reopen, the playback open at the new rate can
+    /// fail while that capture holds the card; it is tried again in the
+    /// next cycle.
     fn close(&mut self) {
         self.analog.close();
         for event in self.backlog.iter_mut() {
