@@ -443,6 +443,8 @@ pub enum Event {
     DopStopped(ClientId),
     Drained(ClientId),
     Flushed(ClientId),
+    /// One for every `Reconfigure`: when the sink is open, or when a later
+    /// `Reconfigure`, a close or the shutdown has taken its place.
     Reconfigured,
 }
 
@@ -644,20 +646,32 @@ impl<P: Processing, S: Sink> Engine<P, S> {
                 self.emit(Event::Replaced(replaced));
             }
             Command::Reconfigure { rate, period } => {
-                self.reopen = Some((rate, period.min(MAX_PERIOD)));
+                let overtaken = self.reopen.replace((rate, period.min(MAX_PERIOD)));
                 self.faded = false;
+                if overtaken.is_some() {
+                    self.emit(Event::Reconfigured);
+                }
             }
             Command::CloseOutput => {
-                self.reopen = None;
+                self.cancel_reopen();
                 self.close();
             }
             Command::SetGain(gain) => self.set_gain(gain),
             Command::Grow(table) => self.grow(table),
             Command::Shutdown => {
-                self.reopen = None;
+                self.cancel_reopen();
                 self.close();
                 self.stopped = true;
             }
+        }
+    }
+
+    /// Drops an open that is still waiting. It is answered like one that
+    /// was done, so that the control thread, which counts them, is never
+    /// left waiting for an answer.
+    fn cancel_reopen(&mut self) {
+        if self.reopen.take().is_some() {
+            self.emit(Event::Reconfigured);
         }
     }
 
@@ -2542,6 +2556,34 @@ mod tests {
         assert_eq!(gaps_over_a_switch(true), 0);
         // The same wait inside a write that switches nothing is one.
         assert_eq!(gaps_over_a_switch(false), 1);
+    }
+
+    #[test]
+    fn every_reconfigure_is_answered_even_if_it_never_opens_the_sink() {
+        let reconfigure = |rate| Command::Reconfigure { rate, period: 64 };
+        // Two in one cycle: the first is overtaken, the second opens.
+        let mut rig = Rig::<F32>::closed(BitPerfect::Auto, 16);
+        rig.send(reconfigure(44100));
+        rig.send(reconfigure(96000));
+        rig.cycle();
+        assert_eq!(rig.log.opens(), [(96000, 64)]);
+        assert!(matches!(
+            rig.events()[..],
+            [Event::Reconfigured, Event::Reconfigured]
+        ));
+        // One taken back by a close before the sink could be opened.
+        rig.send(reconfigure(48000));
+        rig.cycle();
+        rig.log.fail(Some(SinkError::Gone));
+        assert_eq!(rig.engine.cycle(), Err(SinkError::Gone));
+        assert!(rig.events().is_empty());
+        rig.send(Command::CloseOutput);
+        rig.cycle();
+        assert!(matches!(rig.events()[..], [Event::Reconfigured]));
+        // A close with nothing waiting says nothing.
+        rig.send(Command::CloseOutput);
+        rig.cycle();
+        assert!(rig.events().is_empty());
     }
 
     #[test]

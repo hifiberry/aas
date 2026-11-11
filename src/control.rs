@@ -196,9 +196,11 @@ pub struct Control {
     /// The rate and period the output was last told to open at. None while
     /// it is closed.
     output: Option<(u32, u32)>,
-    /// The audio thread has been told to open the output and has not yet
-    /// said that it did. Nothing plays meanwhile.
-    reopening: bool,
+    /// How many times the audio thread has been told to open the output
+    /// and has not yet answered. Nothing plays while one is under way. A
+    /// count, since an answer to an earlier open says nothing of a later
+    /// one. The audio thread answers every one, also one it dropped.
+    reopening: u32,
     /// A rate change that waits, so that a stop and a start close together
     /// do not change the rate twice.
     switch_at: Option<Instant>,
@@ -248,7 +250,7 @@ impl Control {
             table_capacity: INITIAL_SOURCES,
             table_len: 0,
             output: None,
-            reopening: false,
+            reopening: 0,
             switch_at: None,
             idle_since: None,
             dop_claims: Vec::new(),
@@ -788,7 +790,7 @@ impl Control {
         let period = period_frames(rate, self.latency_ms);
         eprintln!("aas: output at {rate} Hz, {period} frames per period");
         self.output = Some((rate, period));
-        self.reopening = true;
+        self.reopening += 1;
         self.switch_at = None;
         self.sync_resamplers(batch);
         batch.push(Command::Reconfigure { rate, period });
@@ -853,7 +855,7 @@ impl Control {
             match event {
                 // Freed here, not on the audio thread.
                 Event::Dropped(_) | Event::Replaced(_) | Event::OldTable(_) => {}
-                Event::Reconfigured => self.reopening = false,
+                Event::Reconfigured => self.reopening = self.reopening.saturating_sub(1),
                 Event::DopStarted(id, claim) => {
                     // The events can come in another order than the claims
                     // were made, when the queue was full meanwhile. The
@@ -884,7 +886,7 @@ impl Control {
         self.policy.tick(now - self.epoch);
         let settled = self.policy.current() != before;
         let mut overdue = Vec::new();
-        let reopening = self.reopening;
+        let reopening = self.reopening > 0;
         for stream in self.streams_mut() {
             if !stream.drain.is_some_and(|at| now >= at) {
                 continue;
@@ -913,8 +915,6 @@ impl Control {
             if self.output.is_some() && now >= since + delay {
                 eprintln!("aas: output off after {delay_s} s idle");
                 self.output = None;
-                // A close takes back an open the audio thread has not done.
-                self.reopening = false;
                 self.switch_at = None;
                 batch.push(Command::CloseOutput);
             }
@@ -1350,6 +1350,54 @@ mod tests {
         control.handle_events(now);
         assert_eq!(control.dop_owner, Some(1));
         assert_eq!(control.policy.current(), 176400);
+    }
+
+    #[test]
+    fn a_drain_is_held_until_the_last_of_two_opens_is_done() {
+        let (commands, mut engine_commands) = rtrb::RingBuffer::new(64);
+        let (mut engine_events, events) = rtrb::RingBuffer::new(64);
+        let audio = std::thread::current();
+        let mut control = Control::new(
+            &Config::default(),
+            12.0,
+            Vec::new(),
+            commands,
+            events,
+            audio,
+        );
+        let now = Instant::now();
+        control.connected(1, "test".into());
+        let hello = Request::Hello {
+            version: proto::VERSION,
+        };
+        control.request(1, Some(hello), now);
+        let answer = control.request(1, Some(configure(48000, 4096)), now);
+        assert_eq!(answer.reply, Some(Reply::Configured));
+        let source = added(&mut engine_commands);
+        source.ring.write(&[[1, 1]; 4096]);
+        // The start opens the output, and new rates of the card open it
+        // again at once.
+        control.request(1, Some(Request::Start), now);
+        control.set_supported(vec![44100], now);
+        assert!(
+            control
+                .request(1, Some(Request::Drain), now)
+                .reply
+                .is_none()
+        );
+        // The first open is done. The second is still under way.
+        assert!(engine_events.push(Event::Reconfigured).is_ok());
+        control.handle_events(now);
+        let mut t = now;
+        for _ in 0..20 {
+            t += Duration::from_millis(400);
+            control.tick(t);
+            assert!(control.take_replies().is_empty(), "answered unplayed");
+        }
+        assert!(engine_events.push(Event::Reconfigured).is_ok());
+        control.handle_events(t);
+        control.tick(t + Duration::from_millis(1000));
+        assert_eq!(control.take_replies(), vec![(1, Reply::Ok)]);
     }
 
     #[test]
