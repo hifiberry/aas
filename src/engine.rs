@@ -424,8 +424,9 @@ struct Analog<P: Processing> {
     /// The capture has been closed, for a reopen or after a failure. It is
     /// not read again, and stays until the control thread replaces it.
     closed: bool,
-    /// A capture call failed and `Event::CaptureFailed` is still to be sent.
-    failure_unreported: bool,
+    /// A capture whose call failed, to be handed back in
+    /// `Event::CaptureFailed`, which closes it off the audio thread.
+    failed: Option<Box<dyn Capture>>,
     chain: Chain,
     /// This cycle's period as captured.
     buf: Vec<[i32; 2]>,
@@ -460,7 +461,7 @@ impl<P: Processing> Analog<P> {
         Analog {
             capture: None,
             closed: false,
-            failure_unreported: false,
+            failed: None,
             chain: Chain::empty(),
             buf: vec![[0; 2]; max_frames],
             processed: vec![[P::zero(); 2]; max_frames],
@@ -475,14 +476,16 @@ impl<P: Processing> Analog<P> {
         }
     }
 
-    /// Puts in another capture, and returns the one it replaces.
+    /// Puts in another capture, and returns the one it replaces. That may
+    /// be one that failed and was not reported yet: it goes back as the
+    /// one replaced, and is not reported.
     fn replace(&mut self, capture: Option<Box<dyn Capture>>) -> Option<Box<dyn Capture>> {
         self.closed = false;
-        self.failure_unreported = false;
         self.audible = false;
         self.signal = false;
         self.raw_level = 0.0;
-        std::mem::replace(&mut self.capture, capture)
+        let old = std::mem::replace(&mut self.capture, capture);
+        old.or_else(|| self.failed.take())
     }
 
     /// Stops the capture, once, and silences the input.
@@ -499,7 +502,8 @@ impl<P: Processing> Analog<P> {
     }
 
     /// Reads one period into `buf` and runs the chain on it, which decides
-    /// whether it is audible. A capture that fails is closed and is silent.
+    /// whether it is audible. A capture that fails is put aside, to go back
+    /// to the control thread, and the input is silent.
     /// `store` is the mix's, free until the mix starts. Without `plugins`,
     /// in forced bit-perfect, the frames that play stay as captured, faded
     /// in and out as the detector opens and closes; the chain's output
@@ -524,9 +528,10 @@ impl<P: Processing> Analog<P> {
         }
         let buf = &mut self.buf[..period];
         if fetch(capture.as_mut(), buf, counters).is_err() {
-            capture.close();
+            // Closing a PCM frees memory and can wait, so the control
+            // thread does it.
+            self.failed = self.capture.take();
             self.closed = true;
-            self.failure_unreported = true;
             return;
         }
         if self.chain.is_empty() {
@@ -923,11 +928,11 @@ pub enum Event {
     /// It starts out not mixed. While the queue is full only the latest
     /// state is sent, once there is room.
     InputSignal(bool),
-    /// A capture call failed. The engine has closed the capture and reads
-    /// it no more. Sent once per capture. It names no capture: one that
-    /// arrives before the `OldCapture` answering a `SetCapture` belongs to
-    /// the capture that command replaced.
-    CaptureFailed,
+    /// A capture call failed. The engine reads it no more and hands it
+    /// back, still open, for the control thread to close. Sent once per
+    /// capture. One that arrives before the `OldCapture` answering a
+    /// `SetCapture` belongs to the capture that command replaced.
+    CaptureFailed(Box<dyn Capture>),
     /// A tap removed, or refused for lack of room.
     DroppedTap(Box<Tap>),
     /// The tap table a `GrowTaps` replaced, or the one it brought if that
@@ -1561,11 +1566,15 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         if !self.backlog.is_empty() {
             return;
         }
-        if self.analog.failure_unreported {
-            if self.events.push(Event::CaptureFailed).is_err() {
+        if let Some(capture) = self.analog.failed.take() {
+            if let Err(rtrb::PushError::Full(event)) =
+                self.events.push(Event::CaptureFailed(capture))
+            {
+                if let Event::CaptureFailed(capture) = event {
+                    self.analog.failed = Some(capture);
+                }
                 return;
             }
-            self.analog.failure_unreported = false;
         }
         let audible = self.analog.audible;
         if audible != self.analog.audible_reported {
@@ -5444,7 +5453,7 @@ mod tests {
     }
 
     fn failures(events: &[Event]) -> usize {
-        count(events, |e| matches!(e, Event::CaptureFailed))
+        count(events, |e| matches!(e, Event::CaptureFailed(_)))
     }
 
     fn detect_chain<P: Processing>(hold_s: f64) -> Box<Chain> {
@@ -5796,8 +5805,16 @@ mod tests {
         assert_eq!(decide(&rig.engine.situation()), Ok(()));
         assert_eq!(failures(&events), 1);
         assert_eq!(signals(&events), [true, false]);
-        assert!(feed.closed());
         assert_eq!(rig.counters.analog_open.load(Relaxed), 0);
+        // The audio thread does not close it: it hands it back, and the
+        // control thread closes it.
+        assert!(!feed.closed());
+        let back = events.into_iter().find_map(|e| match e {
+            Event::CaptureFailed(c) => Some(c),
+            _ => None,
+        });
+        back.unwrap().close();
+        assert!(feed.closed());
     }
 
     /// A sink that notes at each open whether the capture was closed by then.
@@ -5919,7 +5936,7 @@ mod tests {
         assert_eq!(rig.counters.analog_open.load(Relaxed), 1);
         feed.fail();
         rig.cycle();
-        assert!(matches!(rig.events.pop(), Ok(Event::CaptureFailed)));
+        assert!(matches!(rig.events.pop(), Ok(Event::CaptureFailed(_))));
         rig.cycle();
         // It opened and closed while the queue was full. That is no change.
         assert!(rig.events.pop().is_err());

@@ -17,8 +17,9 @@ pub trait Capture: Send {
     /// Drops `frames` queued frames.
     fn skip(&mut self, frames: usize) -> Result<(), SinkError>;
     /// Stops the stream and lets go of the device. Called on the audio
-    /// thread, so it frees nothing it can avoid freeing. The capture itself
-    /// is dropped on the control thread.
+    /// thread before the output reopens, so it frees nothing it can avoid
+    /// freeing, and on the control thread for a capture that failed. The
+    /// capture itself is dropped on the control thread.
     fn close(&mut self);
 }
 

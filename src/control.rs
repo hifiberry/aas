@@ -1276,7 +1276,7 @@ impl Control {
         }
     }
 
-    /// The audio thread reports that the capture failed and is closed. A
+    /// The audio thread reports that the capture failed, and it is closed. A
     /// report that comes before the answer to a newer capture is about the
     /// one that capture replaced, so it changes nothing.
     fn capture_failed(&mut self, now: Instant) {
@@ -1399,7 +1399,11 @@ impl Control {
                     }
                 }
                 Event::InputSignal(on) => self.input_signal(on, now, &mut batch),
-                Event::CaptureFailed => self.capture_failed(now),
+                Event::CaptureFailed(mut capture) => {
+                    // Off the audio thread, as the engine leaves it.
+                    capture.close();
+                    self.capture_failed(now);
+                }
                 Event::Reconfigured => {
                     self.reopening = self.reopening.saturating_sub(1);
                     self.open_capture(now, &mut batch);
@@ -2486,6 +2490,19 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_capture_is_closed_here() {
+        let opener = Opener::default();
+        let (mut control, mut engine, now) = started(&analog_config(), Some(&opener));
+        engine.take(true);
+        control.handle_events(now);
+        engine.take(true);
+        let (capture, feed) = MemoryCapture::new();
+        engine.send(Event::CaptureFailed(Box::new(capture)));
+        control.handle_events(now);
+        assert!(feed.closed());
+    }
+
+    #[test]
     fn a_failed_capture_is_retried_every_second() {
         let opener = Opener::default();
         opener.fail(2);
@@ -2508,7 +2525,7 @@ mod tests {
         assert_eq!(engine.take(true), ["SetCapture true"]);
         control.handle_events(now + ms(2000));
         // It fails while it runs. The engine has closed it.
-        engine.send(Event::CaptureFailed);
+        engine.send(Event::CaptureFailed(Box::new(MemoryCapture::new().0)));
         control.handle_events(now + ms(3000));
         assert_eq!(opener.asked().len(), 3);
         control.tick(now + ms(3900));
@@ -2517,7 +2534,7 @@ mod tests {
         assert_eq!(opener.asked().len(), 4);
         // A failure that comes before the answer to the new capture is the
         // old one's. The new one is kept, and not opened again.
-        engine.send(Event::CaptureFailed);
+        engine.send(Event::CaptureFailed(Box::new(MemoryCapture::new().0)));
         control.handle_events(now + ms(4000));
         assert_eq!(engine.take(true), ["SetCapture true"]);
         control.handle_events(now + ms(4000));

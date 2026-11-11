@@ -893,8 +893,9 @@ mod capture {
         /// Stops the stream and closes the device, so that the next
         /// capture can open it, at the output's new rate, before this one
         /// comes back to the control thread. Closing frees the handle on
-        /// the audio thread, as closing the output does. It happens only
-        /// before the output reopens or once the capture has failed.
+        /// the audio thread, as closing the output does. It happens there
+        /// only before the output reopens; a capture that failed comes back
+        /// to the control thread and is closed there.
         fn close(&mut self) {
             if let Some(pcm) = self.pcm.take() {
                 let _ = pcm.drop();
