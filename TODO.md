@@ -54,7 +54,7 @@ Timing the parts of a cycle comes after, if the time turns out to be the engine'
 
 ## Open minor findings from stage 2
 
-Found in the stage 2 reviews. Most were fixed on the branch `fix/stage2-minors`.
+Found in the stage 2 reviews. Most are fixed.
 These are left, each with the reason. None of them breaks playback as measured.
 Search for the name given; line numbers drift.
 
