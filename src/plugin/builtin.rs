@@ -18,7 +18,7 @@ pub fn create(kind: &str, rate: u32) -> Option<Result<Box<dyn Plugin>, Failure>>
         "only-up-to-48k" => Some(Err(Failure::Unsupported)),
         #[cfg(test)]
         "fails-above-48k" => {
-            FAILS_TRIED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            FAILS_TRIED.with(|n| n.set(n.get() + 1));
             if rate <= 48_000 {
                 Some(Ok(Box::new(Balance::new())))
             } else {
@@ -29,9 +29,13 @@ pub fn create(kind: &str, rate: u32) -> Option<Result<Box<dyn Plugin>, Failure>>
     }
 }
 
-/// How often `fails-above-48k` was asked for.
 #[cfg(test)]
-pub static FAILS_TRIED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+thread_local! {
+    /// How often `fails-above-48k` was asked for on this thread. Per
+    /// thread, so that tests running at the same time do not count each
+    /// other's builds.
+    pub static FAILS_TRIED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
 
 #[cfg(test)]
 mod tests {

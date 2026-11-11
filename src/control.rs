@@ -2952,7 +2952,7 @@ mod tests {
     #[test]
     fn a_plugin_that_fails_at_a_rate_does_not_ban_it_and_is_tried_once_per_decision() {
         use crate::plugin::builtin::FAILS_TRIED;
-        use std::sync::atomic::Ordering::Relaxed;
+        let tried = || FAILS_TRIED.with(|n| n.get());
         let config = Config {
             plugins: vec![entry(config::PluginPlace::Mix, "fails-above-48k")],
             ..Config::default()
@@ -2961,22 +2961,22 @@ mod tests {
         control.set_supported(vec![48000, 96000], now);
         engine.take(true);
         control.handle_events(now);
-        let before = FAILS_TRIED.load(Relaxed);
+        let before = tried();
         play(&mut control, 1, 96000, now);
         // The output keeps what it has, and the player follows it.
         let seen = sent(&mut engine);
         assert!(!has(&seen, "Reconfigure"), "{seen:?}");
         assert!(has(&seen, "SetResampler 1 true"), "{seen:?}");
         assert!(!control.refused.contains(&96000));
-        assert_eq!(FAILS_TRIED.load(Relaxed) - before, 1);
+        assert_eq!(tried() - before, 1);
         // Ticks are no rate decision: no new attempt.
         for k in 1..20 {
             control.tick(now + Duration::from_millis(100 * k));
         }
-        assert_eq!(FAILS_TRIED.load(Relaxed) - before, 1);
+        assert_eq!(tried() - before, 1);
         // A change of clients is: one more attempt.
         play(&mut control, 2, 96000, now + Duration::from_secs(3));
-        assert_eq!(FAILS_TRIED.load(Relaxed) - before, 2);
+        assert_eq!(tried() - before, 2);
         assert!(!has(&sent(&mut engine), "Reconfigure"));
     }
 
