@@ -13,7 +13,9 @@ pub enum Board {
 
 /// Classifies a device tree model string.
 pub fn parse_model(model: &str) -> Board {
-    let model = model.trim_end_matches('\0').trim();
+    // The device tree ends the string with a NUL, and a test or another
+    // source may add white space on either side of it. One trim takes both.
+    let model = model.trim_matches(|c: char| c == '\0' || c.is_whitespace());
     if model.starts_with("Raspberry Pi 5") || model.starts_with("Raspberry Pi Compute Module 5") {
         Board::Pi5Class
     } else {
@@ -65,6 +67,18 @@ mod tests {
             "",
         ] {
             assert_eq!(parse_model(m), Board::Other, "{m}");
+        }
+    }
+
+    #[test]
+    fn a_trailing_nul_and_white_space_in_any_order_are_ignored() {
+        for m in [
+            "Raspberry Pi 5 Model B Rev 1.0\0",
+            "Raspberry Pi 5 Model B Rev 1.0\n\0",
+            "Raspberry Pi 5 Model B Rev 1.0\0\n",
+            " \0Raspberry Pi 5 Model B Rev 1.0 \0 \n",
+        ] {
+            assert_eq!(parse_model(m), Board::Pi5Class, "{m:?}");
         }
     }
 
