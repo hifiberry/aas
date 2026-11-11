@@ -858,7 +858,10 @@ impl Control {
         for event in events {
             match event {
                 // Freed here, not on the audio thread.
-                Event::Dropped(_) | Event::Replaced(_) | Event::OldTable(_) => {}
+                Event::Dropped(_)
+                | Event::Replaced(_)
+                | Event::OldTable(_)
+                | Event::OldChain(_) => {}
                 Event::Reconfigured => self.reopening = self.reopening.saturating_sub(1),
                 Event::DopStarted(id, claim) => {
                     // The events can come in another order than the claims

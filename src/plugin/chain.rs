@@ -63,6 +63,20 @@ impl Chain {
         status
     }
 
+    /// True if the chain has no plugins.
+    pub fn is_empty(&self) -> bool {
+        self.plugins.is_empty()
+    }
+
+    /// The longest block `process` takes. A chain without plugins takes any.
+    pub fn max_frames(&self) -> usize {
+        if self.plugins.is_empty() {
+            usize::MAX
+        } else {
+            self.store.i32.len()
+        }
+    }
+
     /// True if every plugin is neutral, and so for an empty chain.
     pub fn neutral(&self) -> bool {
         self.plugins.iter().all(|p| p.neutral())
@@ -423,6 +437,15 @@ mod tests {
                 "{takes:?} in {format:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_chain_tells_whether_it_has_plugins_and_how_long_a_block_it_takes() {
+        assert!(Chain::empty().is_empty());
+        assert_eq!(Chain::empty().max_frames(), usize::MAX);
+        let c = chain(vec![add(0.0)], Format::F32);
+        assert!(!c.is_empty());
+        assert_eq!(c.max_frames(), 16);
     }
 
     #[test]

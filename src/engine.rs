@@ -8,8 +8,9 @@ use crate::bitperfect::{Situation, decide, volumes_apply};
 use crate::config::BitPerfect;
 use crate::counters::Counters;
 use crate::dop;
-use crate::format::{Processing, Ramp, mix_add, mix_clear, mix_finish};
+use crate::format::{BlockStore, Processing, Ramp, mix_add, mix_clear, mix_finish};
 use crate::latency::{MAX_PERIOD, PERIODS};
+use crate::plugin::chain::Chain;
 use crate::rate::ClientId;
 use crate::resample::Resampler;
 use crate::sink::{Sink, SinkError};
@@ -406,6 +407,17 @@ impl Source {
     }
 }
 
+/// Where a chain of plugins runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Place {
+    /// On the analog input, before it is mixed.
+    Analog,
+    /// On the mix of all sources, after the output volume.
+    Mix,
+    /// On what goes to the card, after the mix chain.
+    Output,
+}
+
 /// Decisions from the control thread, carried out in order.
 pub enum Command {
     /// Refused with `Event::Dropped` if the table is full.
@@ -428,6 +440,17 @@ pub enum Command {
     /// An empty table with more capacity. It replaces the current one.
     #[allow(clippy::vec_box)] // Moving a boxed source moves only a pointer.
     Grow(Vec<Box<Source>>),
+    /// Replaces the chain at a place. Answered by `Event::OldChain`. The
+    /// chain is in the engine's processing format and takes a period.
+    SetChain(Place, Box<Chain>),
+    /// Sets a parameter of one plugin in a chain. One that is not there is
+    /// ignored.
+    SetParam {
+        place: Place,
+        plugin: u8,
+        index: u8,
+        value: f64,
+    },
     Shutdown,
 }
 
@@ -436,6 +459,8 @@ pub enum Event {
     Dropped(Box<Source>),
     Replaced(Option<Box<Resampler>>),
     OldTable(Vec<Box<Source>>),
+    /// The chain a `SetChain` replaced, to be freed off the audio thread.
+    OldChain(Box<Chain>),
     /// The client plays DoP, with the number of its claim on the output.
     /// The lowest number among the claims is the oldest, whatever order
     /// the events arrive in.
@@ -463,6 +488,12 @@ pub struct Engine<P: Processing, S: Sink> {
     out: Vec<[i32; 2]>,
     scratch: Vec<[i32; 2]>,
     acc: Vec<[P::Acc; 2]>,
+    /// Where the mix is handed to the plugins.
+    store: BlockStore,
+    /// Stored for the analog input. Not run yet.
+    analog: Chain,
+    mix: Chain,
+    output: Chain,
     rate: u32,
     period: usize,
     open: bool,
@@ -502,6 +533,10 @@ impl<P: Processing, S: Sink> Engine<P, S> {
             out: vec![[0; 2]; frames],
             scratch: vec![[0; 2]; frames * MAX_DOWNSAMPLING + dop::MIN_FRAMES],
             acc: vec![[P::zero(); 2]; frames],
+            store: BlockStore::new(frames),
+            analog: Chain::empty(),
+            mix: Chain::empty(),
+            output: Chain::empty(),
             rate: 0,
             period: 0,
             open: false,
@@ -658,6 +693,26 @@ impl<P: Processing, S: Sink> Engine<P, S> {
             }
             Command::SetGain(gain) => self.set_gain(gain),
             Command::Grow(table) => self.grow(table),
+            Command::SetChain(place, mut chain) => {
+                // A chain is built for the period it will run in, which a
+                // queued `Reconfigure` may already have changed.
+                let period = self.reopen.map_or(self.period, |(_, p)| p as usize);
+                debug_assert!(
+                    chain.max_frames() >= period,
+                    "a chain shorter than a period"
+                );
+                // The old chain goes back in the box the new one came in.
+                std::mem::swap(self.chain(place), &mut chain);
+                self.emit(Event::OldChain(chain));
+            }
+            Command::SetParam {
+                place,
+                plugin,
+                index,
+                value,
+            } => self
+                .chain(place)
+                .set_param(plugin.into(), index.into(), value),
             Command::Shutdown => {
                 self.cancel_reopen();
                 self.close();
@@ -672,6 +727,14 @@ impl<P: Processing, S: Sink> Engine<P, S> {
     fn cancel_reopen(&mut self) {
         if self.reopen.take().is_some() {
             self.emit(Event::Reconfigured);
+        }
+    }
+
+    fn chain(&mut self, place: Place) -> &mut Chain {
+        match place {
+            Place::Analog => &mut self.analog,
+            Place::Mix => &mut self.mix,
+            Place::Output => &mut self.output,
         }
     }
 
@@ -825,9 +888,11 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         if result == Err(SinkError::Xrun) {
             self.counters.xruns.fetch_add(1, Ordering::Relaxed);
         }
-        let sink_delay = self.sink.delay_frames();
+        // What the plugins hold back plays after the ring too.
+        let plugins = self.mix.latency_frames() + self.output.latency_frames();
+        let delay = self.sink.delay_frames() + plugins;
         for source in self.table.iter_mut().filter(|s| s.running) {
-            source.notify(sink_delay, rate);
+            source.notify(delay, rate);
         }
         let work = before_write - start + after_write.elapsed();
         self.record_timing(start, work.as_nanos() as u64);
@@ -901,9 +966,12 @@ impl<P: Processing, S: Sink> Engine<P, S> {
                 && self.target_gain == 1.0
                 && audible().all(|s| s.gain == 1.0),
             resampled: audible().any(|s| s.resampler.is_some()),
+            plugins_neutral: self.mix.neutral() && self.output.neutral(),
         }
     }
 
+    /// Mixes the sources, or copies the one that is bit-perfect. A mix then
+    /// runs the mix chain and the output chain, in that order.
     fn play_pcm(&mut self, fade_out: bool) {
         let (rate, period) = (self.rate, self.period);
         let volumes = volumes_apply(self.mode);
@@ -953,6 +1021,13 @@ impl<P: Processing, S: Sink> Engine<P, S> {
             }
         }
         if !copy {
+            // Without plugins the mix is not copied for them at all.
+            if !self.mix.is_empty() || !self.output.is_empty() {
+                let mut block = P::to_block(acc, &mut self.store);
+                self.mix.process(block.reborrow());
+                self.output.process(block.reborrow());
+                P::from_block(block, acc);
+            }
             mix_finish::<P>(acc, out);
         }
         self.gain = next_gain;
@@ -991,8 +1066,10 @@ impl<P: Processing, S: Sink> Engine<P, S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bitperfect::NotBitPerfect;
     use crate::config::{Format, Quality};
-    use crate::format::{F32, F64, I32, db_to_gain};
+    use crate::format::{BlockStore, F32, F64, I32, db_to_gain};
+    use crate::plugin::{Block, Formats, Param, Plugin, Status as PluginStatus};
     use crate::sink::{MemorySink, SinkLog};
     use aas_client::ring::Ring;
     use assert_no_alloc::assert_no_alloc;
@@ -4191,5 +4268,442 @@ mod tests {
             rig.cycle();
         }
         assert_eq!(first_difference(&rig.last_periods(21), &rest), None);
+    }
+
+    /// What a test plugin does to each sample, seen at full scale 1.0.
+    #[derive(Clone, Copy)]
+    enum Op {
+        Add,
+        Mul,
+        Nan,
+    }
+
+    /// A plugin for the tests, with one parameter, `value`.
+    struct Probe {
+        op: Op,
+        value: f64,
+        neutral: bool,
+        latency: u32,
+        formats: Formats,
+        params: Vec<Param>,
+    }
+
+    const ALL_FORMATS: Formats = Formats {
+        i32: true,
+        f32: true,
+        f64: true,
+    };
+
+    impl Probe {
+        fn new(op: Op, value: f64) -> Probe {
+            Probe {
+                op,
+                value,
+                neutral: false,
+                latency: 0,
+                formats: ALL_FORMATS,
+                params: vec![Param {
+                    name: "value".into(),
+                    unit: String::new(),
+                    min: -100.0,
+                    max: 100.0,
+                    default: value,
+                }],
+            }
+        }
+
+        fn neutral(mut self) -> Probe {
+            self.neutral = true;
+            self
+        }
+
+        fn latency(mut self, frames: u32) -> Probe {
+            self.latency = frames;
+            self
+        }
+
+        fn only(mut self, formats: Formats) -> Probe {
+            self.formats = formats;
+            self
+        }
+
+        fn apply(&self, s: f64) -> f64 {
+            match self.op {
+                Op::Add => s + self.value,
+                Op::Mul => s * self.value,
+                Op::Nan => f64::NAN,
+            }
+        }
+    }
+
+    impl Plugin for Probe {
+        fn name(&self) -> &str {
+            "probe"
+        }
+
+        fn formats(&self) -> Formats {
+            self.formats
+        }
+
+        fn params(&self) -> &[Param] {
+            &self.params
+        }
+
+        fn set_param(&mut self, index: usize, value: f64) {
+            assert_eq!(index, 0);
+            self.value = value;
+        }
+
+        fn neutral(&self) -> bool {
+            self.neutral
+        }
+
+        fn latency_frames(&self) -> u32 {
+            self.latency
+        }
+
+        fn process(&mut self, block: Block<'_>) -> PluginStatus {
+            const FULL: f64 = 2_147_483_648.0;
+            assert!(self.formats.has(block.format()));
+            match block {
+                Block::I32(d) => {
+                    for s in d.iter_mut().flatten() {
+                        *s = (self.apply(f64::from(*s) / FULL) * FULL).round() as i32;
+                    }
+                }
+                Block::F32(d) => {
+                    for s in d.iter_mut().flatten() {
+                        *s = self.apply(f64::from(*s)) as f32;
+                    }
+                }
+                Block::F64(d) => {
+                    for s in d.iter_mut().flatten() {
+                        *s = self.apply(*s);
+                    }
+                }
+            }
+            PluginStatus::default()
+        }
+    }
+
+    /// Adds `frames` of S32 to every sample.
+    fn plus(frames: i32) -> Probe {
+        Probe::new(Op::Add, f64::from(frames) / 2_147_483_648.0)
+    }
+
+    fn times(factor: f64) -> Probe {
+        Probe::new(Op::Mul, factor)
+    }
+
+    /// The format a rig of `P` processes in.
+    fn format_of<P: Processing>() -> Format {
+        P::to_block(&mut [], &mut BlockStore::new(0)).format()
+    }
+
+    /// A chain for the rig's period in the processing format of `P`.
+    fn chain_of<P: Processing>(plugins: Vec<Probe>) -> Box<Chain> {
+        let plugins = plugins
+            .into_iter()
+            .map(|p| Box::new(p) as Box<dyn Plugin>)
+            .collect();
+        Box::new(Chain::new(plugins, format_of::<P>(), PERIOD))
+    }
+
+    fn set_chain<P: Processing>(rig: &mut Rig<P>, place: Place, plugins: Vec<Probe>) {
+        rig.send(Command::SetChain(place, chain_of::<P>(plugins)));
+    }
+
+    #[test]
+    fn a_plugin_on_the_mix_changes_what_reaches_the_sink() {
+        fn check<P: Processing>() {
+            let mut rig = Rig::<P>::new(BitPerfect::Auto);
+            let mut a = client(1);
+            rig.add(&mut a);
+            set_chain(&mut rig, Place::Mix, vec![times(2.0)]);
+            a.ring.write(&frames(1000, PERIOD));
+            rig.cycle();
+            assert_eq!(
+                rig.last_periods(1),
+                frames(2000, PERIOD),
+                "{:?}",
+                format_of::<P>()
+            );
+        }
+        check::<I32>();
+        check::<F32>();
+        check::<F64>();
+    }
+
+    #[test]
+    fn the_mix_chain_runs_before_the_output_chain() {
+        let mut rig = Rig::<F64>::new(BitPerfect::Auto);
+        let mut a = client(1);
+        rig.add(&mut a);
+        set_chain(&mut rig, Place::Output, vec![times(2.0)]);
+        set_chain(&mut rig, Place::Mix, vec![plus(1 << 20)]);
+        a.ring.write(&frames(1 << 20, PERIOD));
+        rig.cycle();
+        // (x + c) * 2, not x * 2 + c.
+        assert_eq!(rig.last_periods(1), vec![[1 << 22, 0]; PERIOD]);
+    }
+
+    #[test]
+    fn a_plugin_that_is_not_neutral_stops_bit_perfect() {
+        for place in [Place::Mix, Place::Output] {
+            let mut rig = Rig::<F32>::new(BitPerfect::Auto);
+            let mut a = client(1);
+            rig.add(&mut a);
+            set_chain(&mut rig, place, vec![times(1.0)]);
+            a.ring.write(&frames(ODD, 2 * PERIOD));
+            rig.cycle();
+            assert_eq!(decide(&rig.engine.situation()), Err(NotBitPerfect::Plugin));
+            // An f32 mix cannot hold all 32 bits.
+            assert_ne!(rig.last_periods(1), frames(ODD, PERIOD));
+        }
+    }
+
+    fn bit_exact_beside_neutral_plugins<P: Processing>() {
+        let mut rig = Rig::<P>::new(BitPerfect::Auto);
+        let mut a = client(1);
+        rig.add(&mut a);
+        set_chain(&mut rig, Place::Mix, vec![times(1.0).neutral()]);
+        set_chain(
+            &mut rig,
+            Place::Output,
+            vec![times(1.0).neutral().latency(4)],
+        );
+        let input: Vec<[i32; 2]> = (0..PERIOD as i32 * 3)
+            .map(|i| [ODD + i, i32::MIN + i])
+            .collect();
+        a.ring.write(&input);
+        for _ in 0..3 {
+            rig.cycle();
+        }
+        assert_eq!(decide(&rig.engine.situation()), Ok(()));
+        assert_eq!(rig.log.frames()[PERIOD..], input, "{:?}", format_of::<P>());
+    }
+
+    #[test]
+    fn a_neutral_plugin_leaves_one_source_bit_exact() {
+        bit_exact_beside_neutral_plugins::<I32>();
+        bit_exact_beside_neutral_plugins::<F32>();
+        bit_exact_beside_neutral_plugins::<F64>();
+    }
+
+    #[test]
+    fn forced_bit_perfect_still_runs_plugins() {
+        let mut rig = Rig::<I32>::new(BitPerfect::Forced);
+        let mut a = client(1);
+        a.source.as_mut().unwrap().gain = 0.25;
+        rig.add(&mut a);
+        set_chain(&mut rig, Place::Output, vec![times(2.0)]);
+        rig.send(Command::SetGain(0.1));
+        a.ring.write(&frames(1000, 2 * PERIOD));
+        rig.cycle();
+        rig.cycle();
+        // The volumes still do not apply, the plugin does.
+        assert_eq!(rig.last_periods(2), frames(2000, 2 * PERIOD));
+    }
+
+    #[test]
+    fn dop_passes_by_every_chain() {
+        fn check<P: Processing>() {
+            let mut rig = Rig::<P>::new(BitPerfect::Auto);
+            let mut a = client(1);
+            rig.add(&mut a);
+            set_chain(&mut rig, Place::Mix, vec![plus(1000), times(0.5)]);
+            set_chain(
+                &mut rig,
+                Place::Output,
+                vec![times(2.0), Probe::new(Op::Nan, 0.0)],
+            );
+            a.ring.write(&dop_frames(2 * PERIOD));
+            rig.cycle();
+            rig.cycle();
+            assert_eq!(rig.last_periods(2), dop_frames(2 * PERIOD));
+        }
+        check::<I32>();
+        check::<F32>();
+        check::<F64>();
+    }
+
+    #[test]
+    fn a_replaced_chain_comes_back() {
+        let mut rig = Rig::<F32>::new(BitPerfect::Auto);
+        set_chain(&mut rig, Place::Mix, vec![plus(0).latency(1)]);
+        set_chain(&mut rig, Place::Mix, vec![plus(0).latency(2)]);
+        set_chain(&mut rig, Place::Output, vec![plus(0).latency(3)]);
+        set_chain(&mut rig, Place::Analog, vec![plus(0).latency(4)]);
+        rig.cycle();
+        let latencies = |events: Vec<Event>| -> Vec<Option<u32>> {
+            let old = events.into_iter().map(|e| match e {
+                Event::OldChain(c) => Some(c.latency_frames()),
+                _ => None,
+            });
+            old.collect()
+        };
+        // The engine starts with empty chains.
+        assert_eq!(
+            latencies(rig.events()),
+            [Some(0), Some(1), Some(0), Some(0)]
+        );
+        // Each place keeps its own.
+        set_chain(&mut rig, Place::Analog, vec![]);
+        set_chain(&mut rig, Place::Output, vec![]);
+        set_chain(&mut rig, Place::Mix, vec![]);
+        rig.cycle();
+        assert_eq!(latencies(rig.events()), [Some(4), Some(3), Some(2)]);
+    }
+
+    #[test]
+    fn a_parameter_set_takes_effect_on_the_next_cycle() {
+        let mut rig = Rig::<I32>::new(BitPerfect::Auto);
+        let mut a = client(1);
+        rig.add(&mut a);
+        set_chain(&mut rig, Place::Mix, vec![plus(0), times(2.0)]);
+        set_chain(&mut rig, Place::Output, vec![plus(0)]);
+        a.ring.write(&frames(1000, 3 * PERIOD));
+        rig.cycle();
+        assert_eq!(rig.last_periods(1), frames(2000, PERIOD));
+        assert_eq!(rig.events().len(), 2);
+        let set = |place, plugin, value| Command::SetParam {
+            place,
+            plugin,
+            index: 0,
+            value,
+        };
+        rig.send(set(Place::Mix, 1, 3.0));
+        rig.cycle();
+        assert_eq!(rig.last_periods(1), frames(3000, PERIOD));
+        rig.send(set(Place::Output, 0, 7.0 / 2_147_483_648.0));
+        rig.cycle();
+        assert_eq!(rig.last_periods(1), vec![[3007, -2993]; PERIOD]);
+        assert!(rig.events().is_empty());
+    }
+
+    #[test]
+    fn a_parameter_for_a_plugin_that_is_not_there_is_ignored() {
+        let mut rig = Rig::<F64>::new(BitPerfect::Auto);
+        let mut a = client(1);
+        rig.add(&mut a);
+        set_chain(&mut rig, Place::Mix, vec![times(2.0)]);
+        rig.cycle();
+        rig.events();
+        a.ring.write(&frames(1000, PERIOD));
+        // The probe panics on any index but 0.
+        for (place, plugin, index) in [
+            (Place::Mix, 0, 1),
+            (Place::Mix, 1, 0),
+            (Place::Output, 0, 0),
+            (Place::Analog, 3, 3),
+        ] {
+            rig.send(Command::SetParam {
+                place,
+                plugin,
+                index,
+                value: 5.0,
+            });
+        }
+        rig.cycle();
+        assert_eq!(rig.last_periods(1), frames(2000, PERIOD));
+        assert!(rig.events().is_empty());
+    }
+
+    #[test]
+    fn plugin_latency_is_added_to_the_published_delay() {
+        let mut rig = Rig::<F32>::new(BitPerfect::Auto);
+        let mut a = client(1);
+        let mut b = client_at(2, 24000);
+        let r = Resampler::new(24000, RATE, PERIOD as u32, Quality::High, Format::F32);
+        let filter = r.delay_frames();
+        b.source.as_mut().unwrap().resampler = Some(Box::new(r));
+        rig.add(&mut a);
+        rig.add(&mut b);
+        set_chain(
+            &mut rig,
+            Place::Mix,
+            vec![plus(0).latency(10), plus(0).latency(2)],
+        );
+        set_chain(&mut rig, Place::Output, vec![plus(0).latency(4)]);
+        // Not run in the output's path, so not part of its delay.
+        set_chain(&mut rig, Place::Analog, vec![plus(0).latency(1000)]);
+        rig.log.set_delay(128);
+        rig.cycle();
+        let delay = |c: &Client| c.ring.header().output_delay_frames.load(Relaxed);
+        assert_eq!(delay(&a), 128 + 16);
+        assert_eq!(delay(&b), (128 + 16 + filter) / 2);
+    }
+
+    #[test]
+    fn a_nan_from_a_plugin_reaches_the_card_as_zero() {
+        fn check<P: Processing>() {
+            let mut rig = Rig::<P>::new(BitPerfect::Auto);
+            let mut a = client(1);
+            rig.add(&mut a);
+            // The output chain gets the NaN, whatever comes after it.
+            set_chain(&mut rig, Place::Mix, vec![Probe::new(Op::Nan, 0.0)]);
+            set_chain(&mut rig, Place::Output, vec![times(2.0)]);
+            a.ring.write(&frames(ODD, PERIOD));
+            rig.cycle();
+            assert_eq!(
+                rig.last_periods(1),
+                frames(0, PERIOD),
+                "{:?}",
+                format_of::<P>()
+            );
+        }
+        check::<F32>();
+        check::<F64>();
+    }
+
+    fn no_allocation_with_chains<P: Processing>(other: Formats) {
+        let mut rig = Rig::<P>::new(BitPerfect::Auto);
+        let (mut a, mut b) = (client(1), client_at(2, 44100));
+        let r = Resampler::new(44100, RATE, PERIOD as u32, Quality::High, format_of::<P>());
+        b.source.as_mut().unwrap().resampler = Some(Box::new(r));
+        rig.add(&mut a);
+        rig.add(&mut b);
+        set_chain(&mut rig, Place::Mix, vec![plus(0), times(0.5).only(other)]);
+        set_chain(&mut rig, Place::Output, vec![times(2.0).only(other)]);
+        rig.cycle();
+        rig.events();
+        let input = frames(1 << 24, PERIOD);
+        // Everything the audio thread will be handed is made out here.
+        rig.send(Command::SetGain(db_to_gain(-6.0)));
+        rig.send(Command::SetParam {
+            place: Place::Mix,
+            plugin: 1,
+            index: 0,
+            value: 0.25,
+        });
+        rig.send(Command::SetChain(
+            Place::Output,
+            chain_of::<P>(vec![times(4.0).only(other).latency(8)]),
+        ));
+        rig.send(Command::SetChain(
+            Place::Analog,
+            chain_of::<P>(vec![plus(0).only(other)]),
+        ));
+        let engine = &mut rig.engine;
+        assert_no_alloc(|| {
+            for _ in 0..200 {
+                a.ring.write(&input);
+                b.ring.write(&input);
+                engine.cycle().unwrap();
+            }
+        });
+        // Two sources at -6 dB, a quarter, then four times: the mix itself.
+        let last = rig.log.frames().last().copied().unwrap();
+        assert!(last[0] > 1 << 24, "{last:?} in {:?}", format_of::<P>());
+        // The returned chains are freed here, off the audio thread.
+        assert_eq!(rig.events().len(), 2);
+    }
+
+    #[test]
+    fn cycles_with_chains_do_not_allocate() {
+        let only = |i32, f32, f64| Formats { i32, f32, f64 };
+        no_allocation_with_chains::<I32>(only(false, false, true));
+        no_allocation_with_chains::<F32>(only(true, false, false));
+        no_allocation_with_chains::<F64>(only(false, true, false));
     }
 }
