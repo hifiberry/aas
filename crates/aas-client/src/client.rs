@@ -289,9 +289,17 @@ impl Client {
     /// runs at. Replaces any stream set up before. `buffer_frames` is what
     /// the ring holds at least; the daemon rounds it up as it needs.
     ///
-    /// The stream ends when the daemon's rate changes: `ended` turns true,
-    /// what the ring holds can still be read, and `start` fails with
-    /// `ENODEV`. A new `configure_capture` gets the new rate.
+    /// The stream carries the analog input after its plugins and before
+    /// the input volume, which belongs to the mix. While the daemon's
+    /// output is closed a running stream gets neither frames nor wake-ups;
+    /// with the analog input enabled the output never closes. A ring that
+    /// is full drops what does not fit, and `underruns` counts the frames
+    /// dropped.
+    ///
+    /// The stream ends when the daemon's rate changes: `ended` turns true
+    /// once nothing more is written, what the ring holds can still be
+    /// read, and `start` fails with `ENODEV`. A new `configure_capture`
+    /// gets the new rate.
     pub fn configure_capture(&mut self, buffer_frames: u32) -> io::Result<u32> {
         self.set_up(0, ClientFormat::S32, 2, buffer_frames, true)
     }

@@ -1452,13 +1452,15 @@ fn a_rate_change_ends_an_open_capture_stream() {
     player.start().unwrap();
     assert!(wait_for(|| last_open(&log) == Some((44100, PERIOD))));
     assert!(wait_for(|| recorder.ended()));
-    let start = recorder.start().err().and_then(|e| e.raw_os_error());
-    assert_eq!(start, Some(libc::ENODEV));
-    // What it had recorded can still be read, and nothing more comes.
-    let mut buf = [[0i32; 2]; 1024];
-    while recorder.read(&mut buf).unwrap() > 0 {}
+    // Once it reads ended, nothing more is written.
     let at = recorder.hw_position().unwrap();
     thread::sleep(Duration::from_millis(20));
+    assert_eq!(recorder.hw_position().unwrap(), at);
+    let start = recorder.start().err().and_then(|e| e.raw_os_error());
+    assert_eq!(start, Some(libc::ENODEV));
+    // What it had recorded can still be read.
+    let mut buf = [[0i32; 2]; 1024];
+    while recorder.read(&mut buf).unwrap() > 0 {}
     assert_eq!(recorder.hw_position().unwrap(), at);
     // Reopened, it records at the new rate.
     assert_eq!(recorder.configure_capture(4096).unwrap(), 44100);
@@ -1492,4 +1494,29 @@ fn a_recorder_does_not_count_as_a_client() {
     player.start().unwrap();
     assert!(wait_for(|| last_open(&log) == Some((44100, PERIOD))));
     assert!(wait_for(|| recorder.ended() && second.ended()));
+}
+
+#[test]
+fn a_recorder_keeps_its_stream_when_the_output_reopens_at_its_rate() {
+    let (sink, log) = memory_sink();
+    let daemon = Daemon::start(config(Idle::Off { delay_s: 1 }), sink);
+    let mut recorder = daemon.client();
+    assert_eq!(recorder.configure_capture(4096).unwrap(), 48000);
+    recorder.start().unwrap();
+    assert_eq!(record(&mut recorder, 256).len(), 256);
+    // The output goes off when idle, and the recorder gets nothing then.
+    assert!(wait_for(|| log.closes() >= 1), "the output never went off");
+    let mut buf = [[0i32; 2]; 1024];
+    while recorder.read(&mut buf).unwrap() > 0 {}
+    let at = recorder.hw_position().unwrap();
+    thread::sleep(Duration::from_millis(20));
+    assert_eq!(recorder.hw_position().unwrap(), at);
+    // A player at the same rate opens it again: the stream goes on.
+    let mut player = daemon.client_at(48000, 4096);
+    player.start().unwrap();
+    assert!(wait_for(|| log.opens().len() >= 2));
+    assert_eq!(last_open(&log), Some((48000, PERIOD)));
+    assert_eq!(record(&mut recorder, 256).len(), 256);
+    assert!(recorder.hw_position().unwrap() > at);
+    assert!(!recorder.ended());
 }

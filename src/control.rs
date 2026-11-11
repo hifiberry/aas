@@ -81,39 +81,28 @@ pub fn min_buffer_frames(rate: u32, latency_ms: f32) -> u32 {
     min_ring_frames(rate, latency_ms) + refill
 }
 
-/// A view of a ring's header, for the control thread. It maps the header
-/// alone, which is one page. A second mapping of the whole ring would lock
-/// the ring's memory once more for each client. Read-only for a playback
-/// stream; a capture stream's is writable, to mark the stream ended.
+/// A read-only view of a ring's header, for the control thread. It maps
+/// the header alone, which is one page. A second mapping of the whole ring
+/// would lock the ring's memory once more for each client.
 struct HeaderView {
     base: NonNull<Header>,
 }
 
-// SAFETY: the mapping is shared memory that is only accessed through atomics.
+// SAFETY: the mapping is shared memory that is only read, through atomics.
 unsafe impl Send for HeaderView {}
 
 impl HeaderView {
     const LEN: usize = size_of::<Header>();
 
     /// Maps the header of a ring this process made, so its size is known
-    /// to hold one, for reading.
+    /// to hold one.
     fn map(fd: BorrowedFd) -> io::Result<HeaderView> {
-        Self::map_as(fd, libc::PROT_READ)
-    }
-
-    /// Maps the header for reading and writing. Only before the ring is
-    /// sealed, which refuses a new writable mapping.
-    fn map_writable(fd: BorrowedFd) -> io::Result<HeaderView> {
-        Self::map_as(fd, libc::PROT_READ | libc::PROT_WRITE)
-    }
-
-    fn map_as(fd: BorrowedFd, prot: libc::c_int) -> io::Result<HeaderView> {
         // SAFETY: a fresh shared mapping, the result is checked.
         let p = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
                 Self::LEN,
-                prot,
+                libc::PROT_READ,
                 libc::MAP_SHARED,
                 fd.as_raw_fd(),
                 0,
@@ -204,10 +193,9 @@ struct Recorder {
     /// Kept until the ring is sealed, on the first start.
     memfd: Option<OwnedFd>,
     running: bool,
-    /// Writable, to set `ended`.
-    view: HeaderView,
     /// The output's rate has changed: the audio thread has been told to
-    /// remove the tap, and the client has to configure again.
+    /// remove the tap, and the client has to configure again. The ring is
+    /// marked ended once the tap is back, when nothing writes it any more.
     ended: bool,
 }
 
@@ -861,13 +849,12 @@ impl Control {
             self.remove_recorder(old, &mut batch);
         }
         let made = Ring::create(capacity).and_then(|(ring, memfd)| {
-            let view = HeaderView::map_writable(memfd.as_fd())?;
             let wake = eventfd()?;
             let theirs = wake.try_clone()?;
             let memfd_theirs = memfd.try_clone()?;
-            Ok((ring, view, memfd, memfd_theirs, wake, theirs))
+            Ok((ring, memfd, memfd_theirs, wake, theirs))
         });
-        let (ring, view, memfd, memfd_theirs, wake, theirs) = match made {
+        let (ring, memfd, memfd_theirs, wake, theirs) = match made {
             Ok(made) => made,
             Err(e) => {
                 eprintln!("aas: no ring for a recorder: {e}");
@@ -888,7 +875,6 @@ impl Control {
             rate,
             memfd: Some(memfd),
             running: false,
-            view,
             ended: false,
         };
         if let Some(state) = self.conns.get_mut(&conn) {
@@ -961,11 +947,10 @@ impl Control {
 
     /// Ends every capture stream that records at another rate than `rate`.
     /// The capture runs at the output's rate only, so the client has to
-    /// configure again, and is told through the ring.
+    /// configure again. It is told through the ring once the tap is back.
     fn end_recorders(&mut self, rate: u32, batch: &mut Vec<Command>) {
         let recorders = self.conns.values_mut().filter_map(|c| c.recorder.as_mut());
         for recorder in recorders.filter(|r| !r.ended && r.rate != rate) {
-            recorder.view.header().ended.store(1, Ordering::Release);
             recorder.ended = true;
             recorder.running = false;
             batch.push(Command::RemoveTap(recorder.id));
@@ -1288,8 +1273,11 @@ impl Control {
                 | Event::Replaced(_)
                 | Event::OldTable(_)
                 | Event::OldChain(_)
-                | Event::DroppedTap(_)
                 | Event::OldTaps(_) => {}
+                // The audio thread writes it no more, so a client that
+                // reads it empty after this has all of it. A client that
+                // gave the stream up meanwhile is told nothing it minds.
+                Event::DroppedTap(tap) => tap.ring.header().ended.store(1, Ordering::Release),
                 Event::OldCapture(_) => {
                     if let Some(analog) = &mut self.analog {
                         analog.unanswered = analog.unanswered.saturating_sub(1);
@@ -2003,6 +1991,66 @@ mod tests {
             },
             ..Config::default()
         }
+    }
+
+    /// Connects a client on `conn` and configures a capture stream.
+    /// Returns the client's mapping of the ring.
+    fn record(control: &mut Control, conn: ConnId, now: Instant) -> (Ring, u32) {
+        control.connected(conn, "recorder".into());
+        let hello = Request::Hello {
+            version: proto::VERSION,
+        };
+        control.request(conn, Some(hello), now);
+        let capture = Request::Configure {
+            rate: 0,
+            format: ClientFormat::S32,
+            channels: 2,
+            buffer_frames: 4096,
+            capture: true,
+        };
+        let answer = control.request(conn, Some(capture), now);
+        let Some(Reply::Configured { rate }) = answer.reply else {
+            panic!("not configured: {:?}", answer.reply);
+        };
+        (Ring::map(answer.fds[0].as_fd()).unwrap(), rate)
+    }
+
+    fn ask_start(control: &mut Control, conn: ConnId, now: Instant) -> Answer {
+        control.request(conn, Some(Request::Start), now)
+    }
+
+    #[test]
+    fn a_recorder_is_ended_only_once_its_tap_is_back() {
+        let (mut control, mut engine, now) = started(&Config::default(), None);
+        engine.take(true);
+        control.handle_events(now);
+        let (ring, rate) = record(&mut control, 2, now);
+        assert_eq!(rate, 48000);
+        let mut tap = None;
+        while let Ok(command) = engine.commands.pop() {
+            if let Command::AddTap(t) = command {
+                tap = Some(t);
+            }
+        }
+        let tap = tap.expect("no tap added");
+        let ok = Some(Reply::Ok);
+        assert_eq!(ask_start(&mut control, 2, now).reply, ok);
+        // A player at another rate moves the output, and the tap goes.
+        play(&mut control, 1, 44100, now);
+        let seen = engine.take(false);
+        let removed = format!("RemoveTap {}", tap.id);
+        assert!(has(&seen, &removed), "{seen:?}");
+        assert!(has(&seen, "Reconfigure 44100"), "{seen:?}");
+        // The audio thread may still write it, so the client is not told
+        // yet. A start is refused already.
+        assert_eq!(ring.header().ended.load(Ordering::Acquire), 0);
+        let code = libc::ENODEV as u32;
+        let refused = Some(Reply::Error { code });
+        assert_eq!(ask_start(&mut control, 2, now).reply, refused);
+        engine.send(Event::DroppedTap(tap));
+        control.handle_events(now);
+        assert_eq!(ring.header().ended.load(Ordering::Acquire), 1);
+        assert_eq!(ask_start(&mut control, 2, now).reply, refused);
     }
 
     #[test]

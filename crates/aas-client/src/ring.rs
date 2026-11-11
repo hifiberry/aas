@@ -52,7 +52,8 @@ pub struct Header {
     /// after it has changed. Zero asks for a wake-up after every period.
     pub wake_at: AtomicU64,
     /// Set by the daemon when it can no longer serve the stream, such as a
-    /// capture stream after the output rate has changed. Never cleared.
+    /// capture stream after the output rate has changed, once it writes the
+    /// ring no more. Never cleared.
     pub ended: AtomicU32,
 }
 

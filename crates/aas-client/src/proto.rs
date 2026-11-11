@@ -2,6 +2,8 @@
 //! `REQUEST_LEN` bytes and every reply `REPLY_LEN` bytes, little endian.
 //! A message is a u32 tag followed by u32 arguments. A sender sets the
 //! arguments a message does not use to zero. A receiver ignores them.
+//! `Configure` carries the direction of the stream in its channels word,
+//! as `CAPTURE` describes.
 //!
 //! Each request gets one reply, in order. A connection that has sent
 //! `SubscribeVolume` is also sent `Reply::VolumeChanged` when the output
@@ -32,7 +34,9 @@ pub const REPLY_LEN: usize = 8;
 /// Largest buffer a client may ask for. Bounds the ring memory.
 pub const MAX_BUFFER_FRAMES: u32 = 1 << 20;
 /// The bit of `Configure`'s channels word that asks for a capture stream.
-/// The word has room to spare, so the request keeps its size.
+/// The word holds the channels in bits 0 to 7 and the capture flag in bit
+/// 31; every other bit is refused. The word had room to spare, so the
+/// request keeps its size.
 const CAPTURE: u32 = 1 << 31;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
