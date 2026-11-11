@@ -39,9 +39,14 @@ pub fn db_to_gain(db: f32) -> f32 {
 /// One arithmetic format for mixing.
 pub trait Processing {
     type Acc: Copy;
+    /// A gain in the form `accumulate` multiplies by.
+    type Gain: Copy;
     fn zero() -> Self::Acc;
+    /// Converts a gain. `mix_add` does this once per frame, or once per call
+    /// when the gain does not move, not once per sample.
+    fn gain(gain: f32) -> Self::Gain;
     /// Add `sample * gain` to `acc`.
-    fn accumulate(acc: &mut Self::Acc, sample: i32, gain: f32);
+    fn accumulate(acc: &mut Self::Acc, sample: i32, gain: Self::Gain);
     /// Convert to S32, saturating at the limits. A float that is not a
     /// number becomes 0, and an infinite one the limit of its sign.
     fn finish(acc: Self::Acc) -> i32;
@@ -62,13 +67,18 @@ const Q32_ONE: f64 = 4_294_967_296.0;
 
 impl Processing for I32 {
     type Acc = i64;
+    /// Q32 fixed point.
+    type Gain = i64;
 
     fn zero() -> i64 {
         0
     }
 
-    fn accumulate(acc: &mut i64, sample: i32, gain: f32) {
-        let q = (f64::from(gain) * Q32_ONE).round() as i64;
+    fn gain(gain: f32) -> i64 {
+        (f64::from(gain) * Q32_ONE).round() as i64
+    }
+
+    fn accumulate(acc: &mut i64, sample: i32, q: i64) {
         // The product can pass 64 bits at large gains. Add half for rounding,
         // and one less below zero, so that an exact half rounds away from
         // zero as the float formats do.
@@ -85,9 +95,14 @@ impl Processing for I32 {
 
 impl Processing for F32 {
     type Acc = f32;
+    type Gain = f32;
 
     fn zero() -> f32 {
         0.0
+    }
+
+    fn gain(gain: f32) -> f32 {
+        gain
     }
 
     fn accumulate(acc: &mut f32, sample: i32, gain: f32) {
@@ -101,13 +116,18 @@ impl Processing for F32 {
 
 impl Processing for F64 {
     type Acc = f64;
+    type Gain = f64;
 
     fn zero() -> f64 {
         0.0
     }
 
-    fn accumulate(acc: &mut f64, sample: i32, gain: f32) {
-        *acc += f64::from(sample) / SCALE * f64::from(gain);
+    fn gain(gain: f32) -> f64 {
+        f64::from(gain)
+    }
+
+    fn accumulate(acc: &mut f64, sample: i32, gain: f64) {
+        *acc += f64::from(sample) / SCALE * gain;
     }
 
     fn finish(acc: f64) -> i32 {
@@ -141,9 +161,18 @@ pub fn mix_clear<P: Processing>(acc: &mut [[P::Acc; 2]]) {
 
 /// Adds one source. The ramp spans all of `acc`.
 pub fn mix_add<P: Processing>(samples: &[[i32; 2]], ramp: Ramp, acc: &mut [[P::Acc; 2]]) {
+    if ramp.from == ramp.to {
+        // The usual case: the volume is not moving.
+        let g = P::gain(ramp.from);
+        for (a, s) in acc.iter_mut().zip(samples.iter()) {
+            P::accumulate(&mut a[0], s[0], g);
+            P::accumulate(&mut a[1], s[1], g);
+        }
+        return;
+    }
     let n = acc.len();
     for (i, (a, s)) in acc.iter_mut().zip(samples.iter()).enumerate() {
-        let g = ramp.at(i, n);
+        let g = P::gain(ramp.at(i, n));
         P::accumulate(&mut a[0], s[0], g);
         P::accumulate(&mut a[1], s[1], g);
     }

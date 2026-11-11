@@ -45,8 +45,8 @@ const Q32_ONE: f64 = 4_294_967_296.0;
 pub fn mix_i32(inputs: &[&[i32]], gains: &[f32], acc: &mut [i64], out: &mut [i32]) {
     acc.fill(0);
     for (input, gain) in inputs.iter().zip(gains) {
+        let q = (f64::from(*gain) * Q32_ONE).round() as i64;
         for (a, i) in acc.iter_mut().zip(input.iter()) {
-            let q = (f64::from(*gain) * Q32_ONE).round() as i64;
             let p = i128::from(*i) * i128::from(q);
             let p = p + (1i128 << 31) + (p >> 127);
             let v = (p >> 32).clamp(i128::from(i64::MIN / 2), i128::from(i64::MAX / 2));
