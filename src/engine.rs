@@ -494,6 +494,11 @@ impl<P: Processing> Analog<P> {
         {
             capture.close();
         }
+        // One that failed and waits for room in the event queue holds the
+        // device too. Closing it twice does no harm.
+        if let Some(failed) = self.failed.as_mut() {
+            failed.close();
+        }
         self.closed = true;
         self.audible = false;
         self.signal = false;
@@ -1323,8 +1328,18 @@ impl<P: Processing, S: Sink> Engine<P, S> {
 
     /// Closes the capture too: these cards take one rate at a time, so the
     /// capture must be gone before the output opens at another.
+    /// Closes the capture before the card, and every capture still waiting
+    /// to be handed back, since these cards refuse a second open while one
+    /// is held. One already in the event queue is the control thread's,
+    /// which closes it when it takes it: if that is later than the reopen,
+    /// the new capture's first open fails and is tried again a second later.
     fn close(&mut self) {
         self.analog.close();
+        for event in self.backlog.iter_mut() {
+            if let Event::OldCapture(Some(c)) | Event::CaptureFailed(c) = event {
+                c.close();
+            }
+        }
         if self.open {
             self.sink.close();
             self.open = false;
@@ -6069,6 +6084,28 @@ mod tests {
         // It opened and closed while the queue was full. That is no change.
         assert!(rig.events.pop().is_err());
         assert_eq!(rig.counters.analog_open.load(Relaxed), 0);
+    }
+
+    #[test]
+    fn a_failed_capture_still_held_is_closed_before_the_output_reopens() {
+        let mut rig = Rig::<I32>::with_event_slots(BitPerfect::Auto, 1);
+        set_chain(&mut rig, Place::Analog, vec![times(1.0).neutral()]);
+        let (capture, feed) = MemoryCapture::new();
+        rig.send(Command::SetCapture(Some(Box::new(capture))));
+        feed.push(&frames(1, PERIOD));
+        // The queue stays full, so the failed capture is not handed back.
+        rig.cycle();
+        feed.fail();
+        rig.cycle();
+        assert!(!feed.closed());
+        rig.send(Command::Reconfigure {
+            rate: 96000,
+            period: PERIOD as u32,
+        });
+        rig.cycle();
+        rig.cycle();
+        // The card may refuse a second open while it is held.
+        assert!(feed.closed());
     }
 
     #[test]
