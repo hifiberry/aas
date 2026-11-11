@@ -5118,6 +5118,14 @@ mod tests {
         }
         assert!(out[0][0] <= (1 << 20) / 480 + 1, "{:?}", out[0]);
         assert!(out[480..].iter().all(|f| f[0] == 1 << 20));
+        // Once the fade is over the copy path is bit-exact again.
+        let input = ramp(4 * PERIOD);
+        a.ring.write(&input);
+        for _ in 0..4 {
+            rig.cycle();
+        }
+        assert_eq!(rig.last_periods(4), input);
+        assert_eq!(decide(&rig.engine.situation()), Ok(()));
     }
 
     #[test]
