@@ -38,3 +38,9 @@ toml = "1"
 # in release builds, which the audio thread is.
 assert_no_alloc = { version = "1", default-features = false }
 tempfile = "3"
+
+# One codegen unit and link-time optimisation across the crates, so the ring
+# functions of aas-client are inlined into the audio thread's cycle.
+[profile.release]
+lto = "thin"
+codegen-units = 1
