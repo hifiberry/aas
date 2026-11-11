@@ -102,11 +102,15 @@ pub fn build_chain(
             match value {
                 ParamValue::Number(v) => plugin.set_param(index, *v),
                 ParamValue::Text(text) => {
-                    plugin.set_text(index, text).map_err(|e| {
-                        config_error(format!(
-                            "{prefix}{} refused {name} = \"{text}\": {e}",
-                            plugin.name()
-                        ))
+                    plugin.set_text(index, text).map_err(|(kind, e)| {
+                        let what = match kind {
+                            Failure::Unsupported => format!("cannot use at {rate} Hz"),
+                            _ => "refused".to_string(),
+                        };
+                        BuildError::new(
+                            kind,
+                            format!("{prefix}{} {what} {name} = \"{text}\": {e}", plugin.name()),
+                        )
                     })?;
                 }
             }

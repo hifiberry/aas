@@ -154,6 +154,14 @@ pub const CREATE_UNSUPPORTED: u32 = 1;
 /// other value counts as this too.
 pub const CREATE_FAILED: u32 = 2;
 
+/// `set_param_text` took the text.
+pub const TEXT_OK: u32 = 0;
+/// `set_param_text` refuses the text. Any value not listed counts as this.
+pub const TEXT_REFUSED: u32 = 1;
+/// `set_param_text` takes the text but cannot use it at the instance's
+/// rate.
+pub const TEXT_UNSUPPORTED: u32 = 2;
+
 /// Status bit of `process`: the block carried no signal worth sending on.
 pub const STATUS_NO_SIGNAL: u32 = 1;
 
@@ -259,11 +267,22 @@ pub struct Descriptor {
     pub reset: Option<extern "C" fn(*mut c_void)>,
     /// Sets text parameter `index` to the `len` bytes of UTF-8 at `text`,
     /// which are not NUL terminated and are valid only for the call: the
-    /// plugin copies what it needs. Runs on the control thread only.
-    /// Returns 0, or anything else to refuse the value, such as a file
-    /// that is not there; the daemon then does not build the chain, and
-    /// names the plugin, the parameter and the value. Must be given if any
-    /// parameter is [`PARAM_TEXT`], may be `None` otherwise.
+    /// plugin copies what it needs. An empty text has `len` 0 and a
+    /// pointer that is not null but must not be read. Runs on the control
+    /// thread only. Returns:
+    ///
+    /// - [`TEXT_OK`];
+    /// - [`TEXT_REFUSED`] (or any value not listed) to refuse the value,
+    ///   such as a file that is not there: a configuration error, the chain
+    ///   is not built and the daemon names the plugin, the parameter and
+    ///   the value;
+    /// - [`TEXT_UNSUPPORTED`] when the value is fine but cannot be used at
+    ///   the instance's rate, such as a filter file made for another rate:
+    ///   the daemon takes it as [`CREATE_UNSUPPORTED`], and does not use
+    ///   that rate while it runs.
+    ///
+    /// Must be given if any parameter is [`PARAM_TEXT`], may be `None`
+    /// otherwise.
     pub set_param_text:
         Option<extern "C" fn(*mut c_void, index: u32, text: *const u8, len: u32) -> u32>,
 }

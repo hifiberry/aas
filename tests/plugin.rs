@@ -599,6 +599,14 @@ fn a_text_parameter_is_set_while_the_chain_is_built_and_may_be_refused() {
             let m = &e.message;
             assert!(m.contains("plugin 1") && m.contains("fixture"), "{m}");
             assert!(m.contains("file") && m.contains("missing.wav"), "{m}");
+            // A value it cannot use at the rate is a rate it does not
+            // support, as for its `create`.
+            let e = build_with(path, &[("file", text("only-44k.wav"))])
+                .err()
+                .unwrap();
+            assert_eq!(e.kind, Failure::Unsupported, "{e}");
+            assert!(e.message.contains("cannot use at 48000 Hz"), "{e}");
+            assert!(build_with(path, &[("file", text(""))]).is_ok());
             // The value must fit the type, both ways.
             let e = build_with(path, &[("file", ParamValue::Number(1.0))])
                 .err()

@@ -18,15 +18,15 @@
 //! as a later plugin of the same version would. `stateful` counts the
 //! `process` calls since it was created or reset and writes the count into
 //! the samples, and has `reset`. `slow` reports a latency of `u32::MAX`.
-//! `text` has a text parameter, `file`, and refuses the value
-//! `missing.wav`; `textnosetter` has one without `set_param_text`, and
+//! `text` has a text parameter, `file`, refuses the value `missing.wav`
+//! and cannot use `only-44k.wav` at any other rate than 44.1 kHz; `textnosetter` has one without `set_param_text`, and
 //! `textnullname` one without a name.
 //! Anything else, `nodesc` among them, returns no descriptor at all.
 
 use aas_plugin::{
     ABI, CREATE_FAILED, CREATE_OK, CREATE_UNSUPPORTED, DESCRIPTOR_SIZE, Descriptor, FORMAT_F32,
     PARAM_ENUMERATION, PARAM_FLOAT, PARAM_INFO_SIZE, PARAM_INTEGER, PARAM_SWITCH, PARAM_TEXT,
-    ParamInfo, STATUS_NO_SIGNAL, ValueNames,
+    ParamInfo, STATUS_NO_SIGNAL, TEXT_OK, TEXT_REFUSED, TEXT_UNSUPPORTED, ValueNames,
 };
 use std::ffi::c_void;
 
@@ -256,11 +256,21 @@ static TEXT_NULL_NAME: Descriptor = Descriptor {
     ..fixture(ABI, 2)
 };
 
-/// Takes any text but `missing.wav`.
+/// Takes any text but `missing.wav`, and `only-44k.wav` at no rate: the
+/// fixture's instances do not know their rate.
 extern "C" fn set_param_text(_: *mut c_void, _: u32, text: *const u8, len: u32) -> u32 {
-    // SAFETY: the ABI passes `len` bytes at `text`, valid for the call.
-    let text = unsafe { std::slice::from_raw_parts(text, len as usize) };
-    u32::from(text == b"missing.wav")
+    // SAFETY: the ABI passes `len` bytes at `text`, valid for the call; an
+    // empty one is not read.
+    let text = if len == 0 {
+        &[][..]
+    } else {
+        unsafe { std::slice::from_raw_parts(text, len as usize) }
+    };
+    match text {
+        b"missing.wav" => TEXT_REFUSED,
+        b"only-44k.wav" => TEXT_UNSUPPORTED,
+        _ => TEXT_OK,
+    }
 }
 
 static SLOW: Descriptor = Descriptor {

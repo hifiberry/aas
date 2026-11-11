@@ -10,7 +10,7 @@ use super::{Block, BuildError, Failure, Formats, Param, ParamKind, Plugin, Statu
 use aas_plugin::{
     ABI, CREATE_OK, CREATE_UNSUPPORTED, DESCRIPTOR_SIZE, Descriptor, FORMAT_F32, FORMAT_F64,
     FORMAT_I32, PARAM_ENUMERATION, PARAM_FLOAT, PARAM_INFO_SIZE, PARAM_INTEGER, PARAM_SWITCH,
-    PARAM_TEXT, ParamInfo, STATUS_NO_SIGNAL,
+    PARAM_TEXT, ParamInfo, STATUS_NO_SIGNAL, TEXT_OK, TEXT_UNSUPPORTED,
 };
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::os::unix::ffi::OsStrExt;
@@ -480,19 +480,22 @@ impl Plugin for Native {
         (self.fns.neutral)(self.instance) != 0
     }
 
-    fn set_text(&mut self, index: usize, text: &str) -> Result<(), String> {
+    fn set_text(&mut self, index: usize, text: &str) -> Result<(), (Failure, String)> {
+        let config = |why: String| (Failure::Config, why);
         let (Some(p), Some(set)) = (self.params.get(index), self.fns.set_param_text) else {
-            return Err("it takes no text".into());
+            return Err(config("it takes no text".into()));
         };
         if p.kind != ParamKind::Text {
-            return Err(format!("{} is not a text parameter", p.name));
+            return Err(config(format!("{} is not a text parameter", p.name)));
         }
-        let len = u32::try_from(text.len()).map_err(|_| "the text is too long".to_string())?;
+        let len = u32::try_from(text.len()).map_err(|_| config("the text is too long".into()))?;
         // The index fits, as in `set_param`. The text is valid for the
-        // call, as the ABI says.
+        // call, as the ABI says; an empty one has a dangling pointer, which
+        // the ABI says not to read.
         match set(self.instance, index as u32, text.as_ptr(), len) {
-            0 => Ok(()),
-            code => Err(format!("the plugin refused it (status {code})")),
+            TEXT_OK => Ok(()),
+            TEXT_UNSUPPORTED => Err((Failure::Unsupported, "not usable at this rate".into())),
+            code => Err(config(format!("the plugin refused it (status {code})"))),
         }
     }
 

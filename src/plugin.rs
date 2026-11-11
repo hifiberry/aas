@@ -161,9 +161,11 @@ pub trait Plugin: Send {
     /// Processes one block in place. Runs on the audio thread.
     fn process(&mut self, block: Block<'_>) -> Status;
     /// Sets text parameter `index`, on the control thread while the chain
-    /// is built, never later. Fails with why the plugin refuses the value.
-    fn set_text(&mut self, _index: usize, _text: &str) -> Result<(), String> {
-        Err("it takes no text".into())
+    /// is built, never later. Fails with `Failure::Config` and why, for a
+    /// value the plugin refuses, or `Failure::Unsupported` for one it cannot
+    /// use at its rate.
+    fn set_text(&mut self, _index: usize, _text: &str) -> Result<(), (Failure, String)> {
+        Err((Failure::Config, "it takes no text".into()))
     }
     /// Forgets what it kept from earlier blocks, such as a filter's state.
     /// Called when the plugin runs again after blocks that did not pass it.

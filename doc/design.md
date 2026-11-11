@@ -745,7 +745,9 @@ may read a file there *(call)*. It is never set on the audio thread: changing
 one at run time means building a new chain. The plugin can refuse a value; the
 chain is then not built, with an error naming the plugin, the parameter and the
 value. That is a configuration error, not a rate the plugin does not support:
-at startup the daemon does not start. In the config a text parameter takes text
+at startup the daemon does not start. A plugin can also say that a value it
+takes cannot be used at its rate, such as a filter file made for another rate;
+that rate is then not used, as for a rate its `create` does not support. In the config a text parameter takes text
 in quotes and every other one a number, and each value is checked against its
 parameter's type.
 
