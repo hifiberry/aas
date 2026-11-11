@@ -1,0 +1,8 @@
+[package]
+name = "aas-plugin"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "The C ABI of aas plugins, for the daemon and for plugin authors"
+license = "MIT"
+publish = false

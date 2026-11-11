@@ -1,6 +1,21 @@
 [workspace]
-members = [".", "crates/aas-alsa", "crates/aas-client", "tools/measure"]
-default-members = [".", "crates/aas-client", "tools/measure"]
+members = [
+    ".",
+    "crates/aas-alsa",
+    "crates/aas-client",
+    "crates/aas-plugin",
+    "plugins/fixture-bad",
+    "plugins/gain",
+    "tools/measure",
+]
+default-members = [
+    ".",
+    "crates/aas-client",
+    "crates/aas-plugin",
+    "plugins/fixture-bad",
+    "plugins/gain",
+    "tools/measure",
+]
 
 [package]
 name = "aas"
@@ -25,6 +40,7 @@ alsa-output = ["dep:alsa"]
 
 [dependencies]
 aas-client = { version = "0.1.0", path = "crates/aas-client" }
+aas-plugin = { version = "0.1.0", path = "crates/aas-plugin" }
 alsa = { version = "0.12.1", optional = true }
 audioadapter-buffers = "4"
 libc = "0.2"

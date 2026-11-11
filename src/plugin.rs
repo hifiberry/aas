@@ -9,6 +9,7 @@ pub mod balance;
 pub mod builtin;
 pub mod chain;
 pub mod detect;
+pub mod native;
 
 use crate::config::Format;
 
