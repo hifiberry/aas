@@ -817,6 +817,11 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         }
         let work = before_write - start + after_write.elapsed();
         self.record_timing(start, work.as_nanos() as u64);
+        if self.sink.switched() {
+            // The write opened another device. The next cycle has nothing
+            // to measure from, as after any open.
+            self.last_start = None;
+        }
         result
     }
 
@@ -2470,6 +2475,73 @@ mod tests {
         a.ring.header().draining.store(1, Release);
         assert_eq!(rig.engine.cycle(), Err(SinkError::Gone));
         assert!(matches!(rig.events()[..], [Event::Drained(1)]));
+    }
+
+    /// A sink that moves to another device inside one `write`, which takes
+    /// far longer than its buffer lasts, as opening a card does.
+    struct Switching {
+        took: Duration,
+        switch_next: bool,
+        reports: bool,
+        switched: bool,
+    }
+
+    impl Sink for Switching {
+        fn open(&mut self, _rate: u32, _period: u32) -> Result<(), SinkError> {
+            Ok(())
+        }
+
+        fn write(&mut self, _frames: &[[i32; 2]]) -> Result<(), SinkError> {
+            if std::mem::take(&mut self.switch_next) {
+                std::thread::sleep(self.took);
+                self.switched = self.reports;
+            }
+            Ok(())
+        }
+
+        fn close(&mut self) {}
+
+        fn delay_frames(&self) -> u32 {
+            0
+        }
+
+        fn supported_rates(&self) -> Vec<u32> {
+            Vec::new()
+        }
+
+        fn switched(&mut self) -> bool {
+            std::mem::take(&mut self.switched)
+        }
+    }
+
+    /// Wake-up gaps counted over a switch of the device in the third cycle.
+    fn gaps_over_a_switch(reports: bool) -> u64 {
+        // A buffer of 200 ms, so that only the switch is longer.
+        let (rate, period) = (48000, 4800);
+        let sink = Switching {
+            took: Duration::from_millis(300),
+            switch_next: false,
+            reports,
+            switched: false,
+        };
+        let (mut commands, consumer) = RingBuffer::new(16);
+        let (producer, _events) = RingBuffer::new(16);
+        let counters = Arc::new(Counters::default());
+        let mut engine =
+            Engine::<F32, _>::new(sink, consumer, producer, counters.clone(), BitPerfect::Auto);
+        assert!(commands.push(Command::Reconfigure { rate, period }).is_ok());
+        for cycle in 0..5 {
+            engine.sink.switch_next = cycle == 2;
+            engine.cycle().unwrap();
+        }
+        counters.wake_gaps.load(Relaxed)
+    }
+
+    #[test]
+    fn the_time_a_sink_takes_to_switch_devices_is_not_a_wake_up_gap() {
+        assert_eq!(gaps_over_a_switch(true), 0);
+        // The same wait inside a write that switches nothing is one.
+        assert_eq!(gaps_over_a_switch(false), 1);
     }
 
     #[test]

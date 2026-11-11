@@ -34,6 +34,14 @@ pub trait Sink: Send {
     fn delay_frames(&self) -> u32;
     /// Rates the device takes. Empty means any.
     fn supported_rates(&self) -> Vec<u32>;
+    /// True once after a `write` that moved to another device, such as
+    /// from no card to a card that is back. Opening it took that write
+    /// far longer than the buffer lasts, with nothing audible at stake, so
+    /// the engine does not count the time to the next cycle as a late
+    /// wake-up.
+    fn switched(&mut self) -> bool {
+        false
+    }
 }
 
 impl Sink for Box<dyn Sink> {
@@ -59,6 +67,10 @@ impl Sink for Box<dyn Sink> {
 
     fn supported_rates(&self) -> Vec<u32> {
         (**self).supported_rates()
+    }
+
+    fn switched(&mut self) -> bool {
+        (**self).switched()
     }
 }
 
@@ -324,6 +336,8 @@ pub struct FallbackSink {
     format: (u32, u32),
     /// True while `inner` is open and working.
     live: bool,
+    /// A `write` has just gone back to `inner`, until the engine asks.
+    switched: bool,
     /// `inner` was open and working when it was last closed. If it cannot
     /// be opened after that, the card went while the output was closed.
     closed_live: bool,
@@ -346,6 +360,7 @@ impl FallbackSink {
             null: NullSink::default(),
             format: (0, 0),
             live: false,
+            switched: false,
             closed_live: false,
             changes: Arc::default(),
             retry_at: Instant::now(),
@@ -433,6 +448,7 @@ impl Sink for FallbackSink {
     fn write(&mut self, frames: &[[i32; 2]]) -> Result<(), SinkError> {
         if !self.live && Instant::now() >= self.retry_at {
             self.try_inner();
+            self.switched = self.live;
         }
         if self.live {
             match self.inner.write(frames) {
@@ -461,6 +477,10 @@ impl Sink for FallbackSink {
 
     fn supported_rates(&self) -> Vec<u32> {
         self.inner.supported_rates()
+    }
+
+    fn switched(&mut self) -> bool {
+        std::mem::take(&mut self.switched)
     }
 }
 
@@ -623,6 +643,24 @@ mod tests {
         sink.write(&[[3; 2]; 48]).unwrap();
         assert_eq!(log.frames(), [[3; 2]; 48]);
         assert_eq!(log.opens(), [(48000, 48), (48000, 48)]);
+    }
+
+    #[test]
+    fn fallback_says_once_that_a_write_went_back_to_the_inner_sink() {
+        let (mut sink, log) = fallback(Duration::ZERO);
+        sink.open(48000, 48).unwrap();
+        // Opened by the engine, not inside a write.
+        assert!(!sink.switched());
+        log.fail(Some(SinkError::Gone));
+        sink.write(&[[1; 2]; 48]).unwrap();
+        sink.write(&[[1; 2]; 48]).unwrap();
+        assert!(!sink.switched());
+        log.fail(None);
+        sink.write(&[[2; 2]; 48]).unwrap();
+        assert!(sink.switched());
+        assert!(!sink.switched());
+        sink.write(&[[2; 2]; 48]).unwrap();
+        assert!(!sink.switched());
     }
 
     #[test]
