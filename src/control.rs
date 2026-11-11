@@ -1352,6 +1352,8 @@ impl Control {
     pub fn set_supported(&mut self, rates: Vec<u32>, now: Instant) {
         eprintln!("aas: the card takes the rates {rates:?}");
         self.supported = rates;
+        // New rates are a new chance, and a new failure is worth a line.
+        self.stuck = false;
         if !self.update_rates() {
             eprintln!("aas: no rate the card takes works for every plugin chain");
         }
