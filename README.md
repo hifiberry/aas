@@ -41,8 +41,21 @@ cargo build --release -p aas-alsa
 cargo build --release -p measure --features alsa-probes --bins
 ```
 
-On a Pi 3, add `-j2`, or the build can run out of memory. `cargo test
---workspace` also runs the plugin's tests, which need `cc` and the ALSA headers.
+On a Pi 3, add `-j2`, or the build can run out of memory.
+
+The plugin's own tests run where it builds, on the board:
+
+```sh
+cargo test -p aas-alsa
+```
+
+A plain `cargo test` skips them on every machine, because the crate is not a
+default member. `cargo test --workspace` includes them. They need `cc` and the
+ALSA headers: they compare the hand-written declarations in
+`crates/aas-alsa/src/ffi.rs` with the installed headers, and play the daemon on
+a socket for the control. On a machine without `libasound2-dev`,
+`cargo check -p aas-alsa --tests` and `cargo clippy -p aas-alsa --all-targets`
+still compile the crate and its tests, since neither links.
 
 ## Installing
 
