@@ -71,6 +71,8 @@ struct Stream {
     wake: OwnedFd,
     format: ClientFormat,
     channels: u8,
+    /// How long the ring takes to play when it is full.
+    holds: Duration,
 }
 
 /// A connection to the daemon, and the stream it has configured.
@@ -79,6 +81,13 @@ pub struct Client {
     stream: Option<Stream>,
     /// A drain sent by `start_drain` whose reply has not been read.
     drain_pending: bool,
+    /// When the daemon has answered that drain at the latest: after the
+    /// ring has played, the daemon's spare and a request's wait. A daemon
+    /// that is stopped but has not hung up answers nothing, and without
+    /// this a player would wait in its drain for good.
+    drain_deadline: Option<Instant>,
+    /// How long a request waits for its answer.
+    timeout: Duration,
     /// A request failed on the socket, so replies are out of step.
     lost: bool,
 }
@@ -97,7 +106,7 @@ impl Client {
             unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC, 0) };
         check(raw as isize)?;
         let socket = unsafe { OwnedFd::from_raw_fd(raw) };
-        let timeout = libc::timeval {
+        let wait = libc::timeval {
             tv_sec: timeout.as_secs() as libc::time_t,
             tv_usec: timeout.subsec_micros() as libc::suseconds_t,
         };
@@ -108,7 +117,7 @@ impl Client {
                     socket.as_raw_fd(),
                     libc::SOL_SOCKET,
                     option,
-                    (&raw const timeout).cast(),
+                    (&raw const wait).cast(),
                     size_of::<libc::timeval>() as libc::socklen_t,
                 )
             };
@@ -120,6 +129,8 @@ impl Client {
             socket,
             stream: None,
             drain_pending: false,
+            drain_deadline: None,
+            timeout,
             lost: false,
         };
         let hello = Request::Hello {
@@ -278,11 +289,13 @@ impl Client {
             .try_into()
             .map_err(|_| bad("configure came without the ring"))?;
         let ring = Ring::map(memfd.as_fd())?;
+        let holds = Duration::from_secs_f64(ring.capacity() as f64 / f64::from(rate.max(1)));
         self.stream = Some(Stream {
             ring,
             wake,
             format,
             channels,
+            holds,
         });
         Ok(())
     }
@@ -315,9 +328,11 @@ impl Client {
     /// stopped afterwards.
     pub fn drain(&mut self) -> io::Result<()> {
         self.start_drain()?;
-        // The audio may take longer to play than a request may take.
+        // The audio may take longer to play than a request may take, so
+        // this waits again after each timeout, up to the drain's deadline.
         let reply = loop {
             match self.receive_flags(0) {
+                Ok(None) if self.drain_overdue() => break Err(daemon_gone()),
                 Ok(None) => continue,
                 Ok(Some(reply)) => break Ok(reply),
                 Err(e) => break Err(e),
@@ -331,16 +346,24 @@ impl Client {
         }
     }
 
+    /// Whether the drain under way should have been answered by now.
+    fn drain_overdue(&self) -> bool {
+        self.drain_deadline.is_some_and(|at| Instant::now() >= at)
+    }
+
     /// Starts a drain without waiting for it. `poll_drain` tells when it is
     /// done. Does nothing if one is under way already.
     pub fn start_drain(&mut self) -> io::Result<()> {
-        if self.drain_pending {
-            return Ok(());
-        }
+        // First: on a lost connection a drain still counts as under way,
+        // and whatever comes on the socket is not its reply.
         if self.lost {
             return Err(daemon_gone());
         }
+        if self.drain_pending {
+            return Ok(());
+        }
         let stream = self.stream()?;
+        let deadline = Instant::now() + stream.holds + DRAIN_SPARE + self.timeout;
         // After the last frames, which the daemon relies on.
         stream.ring.header().draining.store(1, Ordering::Release);
         if let Err(e) = self.send(&Request::Drain) {
@@ -349,16 +372,22 @@ impl Client {
             return Err(e);
         }
         self.drain_pending = true;
+        self.drain_deadline = Some(deadline);
         Ok(())
     }
 
     /// Whether the drain `start_drain` began has finished. Never waits.
-    /// True also when no drain is under way.
+    /// True also when no drain is under way. A drain the daemon has not
+    /// answered by its deadline loses the connection.
     pub fn poll_drain(&mut self) -> io::Result<bool> {
+        if self.lost {
+            return Err(daemon_gone());
+        }
         if !self.drain_pending {
             return Ok(true);
         }
         let reply = match self.receive_flags(libc::MSG_DONTWAIT) {
+            Ok(None) if self.drain_overdue() => Err(daemon_gone()),
             Ok(None) => return Ok(false),
             other => other,
         };
@@ -372,6 +401,7 @@ impl Client {
 
     fn drain_done(&mut self) {
         self.drain_pending = false;
+        self.drain_deadline = None;
         if let Some(stream) = &self.stream {
             stream.ring.header().draining.store(0, Ordering::Release);
         }
@@ -487,7 +517,6 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::AtomicU32;
     use std::thread::JoinHandle;
-    use std::time::Instant;
 
     const SHORT: Duration = Duration::from_millis(100);
 
@@ -646,6 +675,74 @@ mod tests {
         );
         assert!(start.elapsed() < SHORT);
         assert!(client.check_alive().is_err());
+        drop(client);
+        daemon.join().unwrap();
+    }
+
+    #[test]
+    fn a_lost_connection_does_not_take_a_late_reply_for_a_drain() {
+        let (path, daemon) = fake_daemon(|conn| {
+            greet(&conn);
+            let _stream = configure(&conn);
+            assert_eq!(request(&conn), Some(Request::Drain));
+            assert_eq!(request(&conn), Some(Request::Stop));
+            // Late: the client has given the stop up by now.
+            std::thread::sleep(SHORT * 2);
+            answer(&conn, Reply::Ok, &[]);
+            assert_eq!(request(&conn), None);
+        });
+        let mut client = Client::connect_with(&path, SHORT).unwrap();
+        client.configure(48000, ClientFormat::S16, 2, 1024).unwrap();
+        client.start_drain().unwrap();
+        let err = client.stop().err().and_then(|e| e.raw_os_error());
+        assert_eq!(err, Some(libc::ETIMEDOUT));
+        std::thread::sleep(SHORT * 2);
+        // The reply waiting on the socket is not the drain's.
+        let err = client.poll_drain().err().and_then(|e| e.raw_os_error());
+        assert_eq!(err, Some(libc::ECONNRESET));
+        let err = client.start_drain().err().and_then(|e| e.raw_os_error());
+        assert_eq!(err, Some(libc::ECONNRESET));
+        drop(client);
+        daemon.join().unwrap();
+    }
+
+    #[test]
+    fn a_drain_the_daemon_never_answers_is_given_up() {
+        let (path, daemon) = fake_daemon(|conn| {
+            greet(&conn);
+            let _stream = configure(&conn);
+            while request(&conn).is_some() {}
+        });
+        // 1024 frames at 48 kHz are 21 ms. The daemon answers a drain no
+        // later than that plus its spare.
+        let limit = Duration::from_millis(22) + DRAIN_SPARE + SHORT;
+        let mut client = Client::connect_with(&path, SHORT).unwrap();
+        client.configure(48000, ClientFormat::S16, 2, 1024).unwrap();
+        let start = Instant::now();
+        let err = client.drain().err().and_then(|e| e.raw_os_error());
+        let took = start.elapsed();
+        assert_eq!(err, Some(libc::ECONNRESET));
+        assert!(
+            took >= limit - SHORT && took < limit + SHORT * 3,
+            "took {took:?}"
+        );
+        assert!(client.check_alive().is_err());
+
+        // The same through start_drain and poll_drain, as the plugin waits.
+        drop(client);
+        daemon.join().unwrap();
+        let (path, daemon) = fake_daemon(|conn| {
+            greet(&conn);
+            let _stream = configure(&conn);
+            while request(&conn).is_some() {}
+        });
+        let mut client = Client::connect_with(&path, SHORT).unwrap();
+        client.configure(48000, ClientFormat::S16, 2, 1024).unwrap();
+        client.start_drain().unwrap();
+        assert!(!client.poll_drain().unwrap());
+        std::thread::sleep(limit + SHORT);
+        let err = client.poll_drain().err().and_then(|e| e.raw_os_error());
+        assert_eq!(err, Some(libc::ECONNRESET));
         drop(client);
         daemon.join().unwrap();
     }
