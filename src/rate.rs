@@ -5,6 +5,11 @@ use std::time::Duration;
 /// Identifies a client to the rate rules.
 pub type ClientId = u64;
 
+/// Rates the daemon accepts from a client, as the ALSA plugin offers them,
+/// and as the default rate in the config.
+pub const MIN_RATE: u32 = 8000;
+pub const MAX_RATE: u32 = 384000;
+
 /// How long a lone remaining client waits before the output follows its rate.
 pub const SETTLE: Duration = Duration::from_millis(500);
 

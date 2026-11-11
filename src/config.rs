@@ -1,5 +1,6 @@
 //! The config file: one flat TOML file, all keys optional.
 
+use crate::rate::{MAX_RATE, MIN_RATE};
 use serde::Deserialize;
 use std::fs;
 use std::io::ErrorKind;
@@ -58,16 +59,30 @@ enum IdleKind {
     Off,
 }
 
+/// The settings, after the defaults are filled in. The README lists the
+/// keys of the file.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
+    /// The card to play to, as its ALSA id or index. None finds one.
     pub card: Option<String>,
+    /// The target for the latency of the card's buffer. None takes the
+    /// default of the board.
     pub latency_ms: Option<f32>,
+    /// The rate the output opens at before the first client plays, from
+    /// `MIN_RATE` to `MAX_RATE`.
     pub default_rate: u32,
+    /// The arithmetic used to mix and to apply volume.
     pub format: Format,
+    /// The quality of the resampler for a client at another rate.
     pub resampling: Quality,
+    /// When samples are copied to the card untouched.
     pub bit_perfect: BitPerfect,
+    /// What the output does when nothing plays.
     pub idle: Idle,
+    /// The card's volume control to use. None takes the first of
+    /// `Digital`, `Master` and `PCM` the card has.
     pub volume_control: Option<String>,
+    /// Who applies the volume. None uses the card's control if it has one.
     pub volume_mode: Option<VolumeMode>,
 }
 
@@ -122,6 +137,15 @@ impl Config {
         {
             return Err(format!(
                 "{}: latency_ms must be a positive number",
+                path.display()
+            ));
+        }
+        if raw
+            .default_rate
+            .is_some_and(|rate| !(MIN_RATE..=MAX_RATE).contains(&rate))
+        {
+            return Err(format!(
+                "{}: default_rate must be from {MIN_RATE} to {MAX_RATE}",
                 path.display()
             ));
         }
@@ -187,6 +211,17 @@ mod tests {
     fn a_latency_that_is_not_positive_and_finite_is_an_error() {
         for v in ["nan", "inf", "-inf", "0.0", "-1.0"] {
             assert!(load_str(&format!("latency_ms = {v}\n")).is_err(), "{v}");
+        }
+    }
+
+    #[test]
+    fn a_default_rate_no_client_could_use_is_an_error() {
+        for v in [0, 1, 7999, 384001, 4_000_000_000u32] {
+            assert!(load_str(&format!("default_rate = {v}\n")).is_err(), "{v}");
+        }
+        for v in [8000, 44100, 384000] {
+            let c = load_str(&format!("default_rate = {v}\n")).unwrap();
+            assert_eq!(c.default_rate, v);
         }
     }
 

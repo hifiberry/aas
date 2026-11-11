@@ -9,7 +9,7 @@ use crate::config::{Config, Format, Idle, Quality};
 use crate::dop;
 use crate::engine::{Command, Event, INITIAL_SOURCES, Source};
 use crate::latency::{PERIODS, period_frames};
-use crate::rate::{ClientId, RatePolicy, SETTLE};
+use crate::rate::{ClientId, MAX_RATE, MIN_RATE, RatePolicy, SETTLE};
 use crate::resample::Resampler;
 use crate::state::State;
 use crate::volume::{HardwareVolume, OutputVolume};
@@ -28,9 +28,6 @@ use std::time::{Duration, Instant};
 /// Identifies a connection to the server.
 pub type ConnId = u64;
 
-/// Client rates the daemon accepts, as the ALSA plugin offers them.
-const MIN_RATE: u32 = 8000;
-const MAX_RATE: u32 = 384000;
 /// Smallest period the latency rule gives.
 const MIN_PERIOD: u32 = 32;
 /// Half the longest resampling filter, which rubato adds to its input.
