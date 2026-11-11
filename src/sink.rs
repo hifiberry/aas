@@ -478,6 +478,9 @@ impl FallbackSink {
     fn lost(&mut self) {
         self.inner.close();
         self.live = false;
+        // A retry asked for while the sink still worked is about a loss
+        // before this one.
+        self.retry_now.store(false, Ordering::Release);
         self.gone.store(true, Ordering::Release);
         self.retry_at = Instant::now() + self.retry;
         self.changes.fetch_add(1, Ordering::Release);
@@ -755,6 +758,25 @@ mod tests {
         // A closed output is not looked for.
         sink.close();
         assert!(!search.is_gone());
+    }
+
+    #[test]
+    fn a_retry_asked_for_while_the_sink_worked_is_not_kept_for_the_next_loss() {
+        let (mut sink, log) = fallback(Duration::ZERO);
+        let search = sink.card_search();
+        sink.open(48000, 48).unwrap();
+        // The control thread saw the sink gone a moment ago and asks late.
+        search.retry();
+        sink.write(&[[1; 2]; 48]).unwrap();
+        log.fail(Some(SinkError::Gone));
+        sink.write(&[[1; 2]; 48]).unwrap();
+        assert!(search.is_gone());
+        // Nobody has seen the card since it went, so it is not tried, even
+        // though it would open.
+        log.fail(None);
+        sink.write(&[[2; 2]; 48]).unwrap();
+        assert_eq!(log.opens().len(), 1);
+        assert!(search.is_gone());
     }
 
     #[test]
