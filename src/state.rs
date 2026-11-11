@@ -72,9 +72,27 @@ impl State {
         if written.is_err() {
             let _ = fs::remove_file(temporary);
         }
-        written?;
-        fs::File::open(directory_of(path))?.sync_all()
+        written.map_err(|e| explain("could not write the file", e))?;
+        sync_directory(path)
     }
+}
+
+/// An error that says which step of a save failed.
+fn explain(what: &str, e: io::Error) -> io::Error {
+    io::Error::new(e.kind(), format!("{what}: {e}"))
+}
+
+/// Syncs the directory of a file that has been renamed into place. A
+/// failure here leaves the file saved, and says so.
+fn sync_directory(path: &Path) -> io::Result<()> {
+    fs::File::open(directory_of(path))
+        .and_then(|dir| dir.sync_all())
+        .map_err(|e| {
+            explain(
+                "the file is saved, but its directory could not be synced",
+                e,
+            )
+        })
 }
 
 /// The directory a file is in. A bare file name is in the current one.
@@ -154,7 +172,7 @@ impl Saver {
 
 fn write(state: &State, path: &Path) {
     if let Err(e) = state.save(path) {
-        eprintln!("aas: could not save {}: {e}", path.display());
+        eprintln!("aas: {}: {e}", path.display());
     }
 }
 
@@ -177,6 +195,22 @@ mod tests {
             std::fs::write(&path, text).unwrap();
             assert_eq!(State::load(&path).output_percent, 100, "{text:?}");
         }
+    }
+
+    #[test]
+    fn an_error_says_which_step_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        // The file cannot be written: its directory is missing.
+        let path = dir.path().join("missing/state.toml");
+        let e = State::default().save(&path).unwrap_err().to_string();
+        assert!(e.starts_with("could not write the file: "), "{e}");
+        // Written and in place, but the directory cannot be synced.
+        let e = sync_directory(&path).unwrap_err().to_string();
+        assert!(
+            e.starts_with("the file is saved, but its directory could not be synced: "),
+            "{e}"
+        );
+        assert!(sync_directory(&dir.path().join("state.toml")).is_ok());
     }
 
     #[test]
