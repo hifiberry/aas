@@ -94,8 +94,11 @@ A capture delivers silence for 1 s after each start, `SETTLE_MS` in
 about -28 dBFS that would open the input for about 650 ms. It mutes the analog
 input for 1 s at every start and every rate change. The figure is measured on
 that card only. Missing: whether 1 s stays, and whether it becomes a value per
-card in `src/cards.rs`. First step: measure the offset after a start on the
-DAC+ ADC on the Pi 3 test board, as was done on the CM5 test board.
+card in `src/cards.rs`. The DAC+ ADC on the Pi 3 test board is measured now: it
+never went above -50 dBFS at a start, its loudest 50 ms -83.8 dBFS, so it does
+not need the 1 s; the Pro does, for up to 700 ms (`doc/measurements.md`, Stage
+3a). The design keeps 1 s for every card. First step: the owner confirms that,
+or `SETTLE_MS` moves into the card table with 0 for the DAC+ ADC.
 
 ## Let the capture PCM ask for the daemon's rate without a stream
 
