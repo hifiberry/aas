@@ -463,7 +463,9 @@ preference to reducing resampling quality *(call)*.
 
 Latency added by a plugin counts on top of the budget, and `aas` reports it. The
 reported delay includes it only in cycles where the chains ran, not on the
-bit-perfect copy path or while a DoP stream plays *(call)*.
+bit-perfect copy path or while a DoP stream plays *(call)*. The analog chain's
+latency, in the cycles its output is used, goes into a recorder's delay and
+into the counters' summary in the journal *(call)*.
 
 The analog input adds at most one period to the two the output has, because the
 engine keeps at most two periods of captured audio and reads one per cycle

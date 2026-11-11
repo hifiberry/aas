@@ -448,6 +448,8 @@ struct Analog<P: Processing> {
     raw_level: f32,
     /// The chain reports signal this cycle: a recorder gets its output.
     signal: bool,
+    /// The chain's latency, in the cycles its output is used, else 0.
+    latency: u32,
     gain: f32,
     /// This cycle's period goes into the mix, unless DoP has the output.
     audible: bool,
@@ -470,6 +472,7 @@ impl<P: Processing> Analog<P> {
             plays: Plays::Captured,
             raw_level: 0.0,
             signal: false,
+            latency: 0,
             gain: 1.0,
             audible: false,
             audible_reported: false,
@@ -519,6 +522,7 @@ impl<P: Processing> Analog<P> {
         self.audible = false;
         self.signal = false;
         self.altered = false;
+        self.latency = 0;
         self.plays = Plays::Captured;
         let Some(capture) = self.capture.as_mut() else {
             return;
@@ -554,6 +558,7 @@ impl<P: Processing> Analog<P> {
         if !neutral || status.changed {
             P::from_block(block, processed);
             self.altered = true;
+            self.latency = self.chain.latency_frames();
         }
         self.signal = signal;
         if plugins || neutral {
@@ -758,7 +763,11 @@ impl Taps {
         } else {
             &analog.buf[..period]
         };
+        // As the sink's delay for a player: what the chain holds back.
+        let latency = if analog.signal { analog.latency } else { 0 };
         for tap in table.iter_mut().filter(|t| t.running) {
+            let header = tap.ring.header();
+            header.output_delay_frames.store(latency, Ordering::Relaxed);
             tap.write(block);
             tap.notify();
         }
@@ -1563,6 +1572,9 @@ impl<P: Processing, S: Sink> Engine<P, S> {
     fn report(&mut self) {
         let open = u64::from(self.analog.audible);
         self.counters.analog_open.store(open, Ordering::Relaxed);
+        let latency = u64::from(self.analog.latency);
+        let counted = &self.counters.analog_latency_frames;
+        counted.store(latency, Ordering::Relaxed);
         if !self.backlog.is_empty() {
             return;
         }
@@ -6174,6 +6186,26 @@ mod tests {
         check::<I32>();
         check::<F32>();
         check::<F64>();
+    }
+
+    #[test]
+    fn the_analog_chains_latency_is_reported_to_recorders_and_in_the_counters() {
+        let (mut rig, feed) = with_capture::<F32>(BitPerfect::Auto);
+        set_chain(&mut rig, Place::Analog, vec![times(2.0).latency(8)]);
+        let recorder = add_tap(&mut rig, 5);
+        feed.push(&frames(1000, PERIOD));
+        rig.cycle();
+        let header = recorder.ring.header();
+        assert_eq!(header.output_delay_frames.load(Relaxed), 8);
+        assert_eq!(rig.counters.analog_latency_frames.load(Relaxed), 8);
+        let summary = rig.counters.to_string();
+        assert!(summary.ends_with(", plugin latency 8 frames"), "{summary}");
+        // A chain whose output is not used delays nothing.
+        set_chain(&mut rig, Place::Analog, vec![times(1.0).neutral()]);
+        feed.push(&frames(1000, PERIOD));
+        rig.cycle();
+        assert_eq!(header.output_delay_frames.load(Relaxed), 0);
+        assert_eq!(rig.counters.analog_latency_frames.load(Relaxed), 0);
     }
 
     #[test]

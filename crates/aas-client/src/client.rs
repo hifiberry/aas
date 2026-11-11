@@ -554,7 +554,7 @@ impl Client {
 
     /// Frames between what is written next and the listener: what the ring
     /// holds and what plays after it. For a capture stream, what the ring
-    /// holds to be read.
+    /// holds to be read and what the analog input's plugins hold back.
     pub fn delay_frames(&self) -> u64 {
         let Some(stream) = &self.stream else {
             return 0;

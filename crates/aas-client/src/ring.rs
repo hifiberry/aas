@@ -44,6 +44,8 @@ pub struct Header {
     /// For a capture stream: frames the daemon dropped because the ring
     /// was full.
     pub underruns: AtomicU64,
+    /// Frames that play after the ring: the card's buffer and the plugins.
+    /// For a capture stream: frames the analog input's plugins hold back.
     pub output_delay_frames: AtomicU32,
     pub draining: AtomicU32,
     /// The position the client waits for: the read position for a playback

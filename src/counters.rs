@@ -35,6 +35,9 @@ pub struct Counters {
     /// 1 while the analog input has signal, else 0. During DoP it can have
     /// signal and not be played.
     pub analog_open: AtomicU64,
+    /// The latency of the analog chain, in frames, in the cycles its output
+    /// is used. Recorders see it in their delay too.
+    pub analog_latency_frames: AtomicU64,
 }
 
 /// Now on CLOCK_MONOTONIC, in ns. The same clock as `/proc/uptime` without
@@ -89,6 +92,10 @@ impl std::fmt::Display for Counters {
                 self.analog_padded_frames.load(Relaxed),
                 self.analog_dropped_frames.load(Relaxed),
             )?;
+            let latency = self.analog_latency_frames.load(Relaxed);
+            if latency > 0 {
+                write!(f, ", plugin latency {latency} frames")?;
+            }
         }
         Ok(())
     }
