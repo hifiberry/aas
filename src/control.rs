@@ -1201,10 +1201,12 @@ impl Control {
         };
         let t = now - self.epoch;
         if on {
+            eprintln!("aas: analog input: signal");
             let base = self.policy.base();
             analog.active = Some(base);
             self.policy.client_started(ANALOG, base, t);
         } else {
+            eprintln!("aas: analog input: quiet");
             analog.active = None;
             self.policy.client_stopped(ANALOG, t);
         }
