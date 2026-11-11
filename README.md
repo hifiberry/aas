@@ -101,6 +101,35 @@ is kept in `/var/lib/aas/state.toml`.
 | `volume_control` | a mixer control name | the first of `Digital`, `Master`, `PCM` | The card's control that carries the volume. |
 | `default_rate` | 8000 to 384000 | 48000 | The rate the output opens at before the first client plays. |
 
+Two tables set up the analog input and the audio plugins.
+
+```toml
+[analog]
+enabled = true
+volume_db = 0
+
+[[plugin]]
+place = "analog"          # analog, mix or output
+type = "detect"           # a built-in name, or "library" with a path
+threshold = -50
+hold = 3
+
+[[plugin]]
+place = "output"
+type = "library"
+path = "/usr/lib/aas/libaas_gain.so"
+gain = -3
+```
+
+`[analog]` turns on the card's analog input (`enabled`, default `false`) and sets
+its level (`volume_db`, from -60 to 0, default 0). The input is off unless
+enabled, and it works only on cards with an ADC that `aas` knows.
+
+Each `[[plugin]]` table adds one plugin to the chain at `place`, in the order of
+the file. `type` is a built-in (`detect`, which runs only at `analog` and may
+appear once, or `balance`) or `library` with a `path`. Every other key is a
+parameter and must be a number.
+
 ### After a daemon restart
 
 A player that is playing gets an error from its next write and must reopen the
