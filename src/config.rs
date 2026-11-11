@@ -180,6 +180,12 @@ fn plugin_from_table(n: usize, mut table: toml::Table) -> Result<PluginConfig, S
     let path = take_str("path")?.map(PathBuf::from);
     match (kind.as_str(), &path) {
         ("library", None) => return Err(format!("plugin {n}: type \"library\" needs a path")),
+        ("library", Some(p)) if !p.is_absolute() => {
+            return Err(format!(
+                "plugin {n}: path \"{}\" must be absolute",
+                p.display()
+            ));
+        }
         ("library", Some(_)) => {}
         (k, Some(_)) if BUILT_IN_PLUGINS.contains(&k) => {
             return Err(format!("plugin {n}: path is only for type \"library\""));
@@ -496,6 +502,24 @@ mod tests {
     fn a_library_without_a_path_is_an_error() {
         let e = err("[[plugin]]\nplace = \"mix\"\ntype = \"library\"\n");
         assert!(e.contains("plugin 1") && e.contains("path"), "{e}");
+    }
+
+    #[test]
+    fn a_library_path_that_is_not_absolute_is_an_error() {
+        for path in [
+            "libaas_gain.so",
+            "lib/libaas_gain.so",
+            "./libaas_gain.so",
+            "",
+        ] {
+            let e = err(&format!(
+                "[[plugin]]\nplace = \"mix\"\ntype = \"library\"\npath = \"{path}\"\n"
+            ));
+            assert!(
+                e.contains("plugin 1: path") && e.contains("absolute"),
+                "{e}"
+            );
+        }
     }
 
     #[test]
