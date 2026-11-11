@@ -804,7 +804,9 @@ fn fetch(
 
 /// Fades `out` in after silence: `left` of `fade` frames of the fade are
 /// still to come, and fewer after the call.
+/// A `left` beyond `fade` is taken as `fade`: the fade starts from zero.
 fn unmute(out: &mut [[i32; 2]], left: &mut usize, fade: usize) {
+    *left = (*left).min(fade);
     for frame in out.iter_mut() {
         if *left == 0 {
             break;
@@ -1356,6 +1358,11 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         self.reopen = None;
         self.open = true;
         self.rate = rate;
+        // A fade in still due is counted in frames of the old rate: it
+        // starts again, a whole 10 ms at this one.
+        if self.unmute_left > 0 {
+            self.unmute_left = (rate * FADE_MS / 1000) as usize;
+        }
         self.period = period as usize;
         self.last_start = None;
         self.emit(Event::Reconfigured);
@@ -5083,6 +5090,53 @@ mod tests {
         check::<I32>();
         check::<F32>();
         check::<F64>();
+    }
+
+    #[test]
+    fn a_fade_in_due_at_a_reopen_lasts_10_ms_at_the_new_rate() {
+        // Muted at one rate, the chain fits once the output reopens at the
+        // other: lower, then higher.
+        for (muted_at, opens_at) in [(192000, RATE), (RATE, 192000)] {
+            let mut rig = Rig::<I32>::new(BitPerfect::Auto);
+            let mut a = client(1);
+            rig.add(&mut a);
+            let reopen = |rig: &mut Rig<I32>, rate| {
+                rig.send(Command::Reconfigure {
+                    rate,
+                    period: PERIOD as u32,
+                });
+                rig.cycle();
+                rig.cycle();
+            };
+            if muted_at != RATE {
+                reopen(&mut rig, muted_at);
+            }
+            let chain = chain_of::<I32>(vec![times(2.0)]);
+            rig.send(Command::SetChain(
+                Place::Mix,
+                Box::new((*chain).for_rate(opens_at)),
+            ));
+            a.ring.write(&frames(1 << 20, PERIOD));
+            rig.cycle();
+            assert_eq!(rig.last_periods(1), frames(0, PERIOD));
+            reopen(&mut rig, opens_at);
+            let mut out = Vec::new();
+            for _ in 0..40 {
+                a.ring.write(&frames(1 << 20, PERIOD));
+                rig.cycle();
+                out.extend(rig.last_periods(1));
+            }
+            let full = 1 << 21;
+            let what = format!("{muted_at} to {opens_at}");
+            assert!(out.iter().all(|f| f[0] <= full), "{what}");
+            let first = out.iter().position(|f| f[0] != 0).expect("audio");
+            let reached = out.iter().position(|f| f[0] == full).expect("full level");
+            // The fade runs from the first period at the new rate, which
+            // the empty ring may leave silent.
+            let fade = (opens_at * FADE_MS / 1000) as usize;
+            let took = reached - first;
+            assert!(took < fade && took + PERIOD >= fade - 1, "{what}: {took}");
+        }
     }
 
     #[test]
