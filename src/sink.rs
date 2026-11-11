@@ -373,6 +373,8 @@ pub struct FallbackSink {
     /// while it worked. A card that is back may be a new instance, its
     /// mixer at its own default. A card that is gone may wait to be removed
     /// until every handle on it is closed, the mixer's too.
+    /// The inner sink has been tried at least once.
+    tried: bool,
     changes: Arc<AtomicU64>,
     /// The output is open for the engine and `inner` is not.
     gone: Arc<AtomicBool>,
@@ -395,6 +397,7 @@ impl FallbackSink {
             live: false,
             switched: false,
             closed_live: false,
+            tried: false,
             changes: Arc::default(),
             gone: Arc::default(),
             retry_now: Arc::default(),
@@ -447,11 +450,14 @@ impl FallbackSink {
         // is closed, and must let go of a card that went meanwhile.
         let was_live = self.live;
         let closed_live = std::mem::take(&mut self.closed_live);
+        // The control thread opened the mixer at the start, before any
+        // open: a card gone at the very first open is a change too.
+        let first = !std::mem::replace(&mut self.tried, true);
         self.live = self.inner.open(rate, period).is_ok();
         let changed = if self.live {
             !was_live
         } else {
-            was_live || closed_live
+            was_live || closed_live || first
         };
         if changed {
             self.changes.fetch_add(1, Ordering::Release);
@@ -852,6 +858,23 @@ mod tests {
         sink.close();
         assert!(!watch.changed());
         sink.open(48000, 48).unwrap();
+        assert!(watch.changed());
+    }
+
+    #[test]
+    fn the_card_watch_sees_a_card_gone_at_the_very_first_open() {
+        let (mut sink, log) = fallback(Duration::ZERO);
+        let mut watch = sink.card_watch();
+        log.fail(Some(SinkError::Gone));
+        sink.open(48000, 48).unwrap();
+        // The control thread opened the card's mixer at the start, and
+        // must hear that the card is gone to let go of it.
+        assert!(watch.changed());
+        // A failed retry after that is no change.
+        sink.write(&[[0; 2]; 48]).unwrap();
+        assert!(!watch.changed());
+        log.fail(None);
+        sink.write(&[[0; 2]; 48]).unwrap();
         assert!(watch.changed());
     }
 

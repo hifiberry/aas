@@ -1,0 +1,15 @@
+[package]
+name = "aas-plugin-gain"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Example aas plugin: a gain in dB"
+license = "MIT"
+publish = false
+
+[lib]
+name = "aas_gain"
+crate-type = ["cdylib"]
+
+[dependencies]
+aas-plugin = { version = "0.1.0", path = "../../crates/aas-plugin" }

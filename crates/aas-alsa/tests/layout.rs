@@ -100,6 +100,7 @@ fn rust_layout() -> BTreeMap<String, i64> {
         SND_PCM_IOPLUG_HW_BUFFER_BYTES,
         SND_PCM_IOPLUG_HW_PERIODS,
         SND_PCM_STREAM_PLAYBACK,
+        SND_PCM_STREAM_CAPTURE,
         SND_PCM_NONBLOCK,
         SND_PCM_STATE_SETUP,
         SND_PCM_STATE_PREPARED,

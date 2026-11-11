@@ -87,7 +87,8 @@ Three parts *(call)*:
 2. **An ALSA PCM and control plugin** is installed as the ALSA `default` device.
    Clients load it through libasound, and it passes audio to the daemon. It also
    provides a capture device for the analog input.
-3. **Native plugins** are shared libraries loaded by the daemon.
+3. **Native plugins** are shared libraries loaded by the daemon through a C ABI
+   (see [Plugins](#plugins)).
 
 The handover between the ALSA plugin and the daemon uses shared memory. A socket
 carries setup and teardown only. A socket round trip per period would use too
@@ -182,8 +183,14 @@ When idle, an output does one of two things, chosen in the config:
   that time needs no restart of the output.
 
 "Go off" is the default, with a 60 second delay *(call)*. The output counts as
-idle when no source is active. While input detection is enabled, capture keeps
-running and only the playback side goes off *(call: confirm on the hardware)*.
+idle when no source is active. While the analog input is enabled the output stays
+open and sends silence, and `idle = "off"` does not apply; this is logged once at
+startup. The engine's cycle is paced by the playback card, and input detection
+has to keep measuring. Closing the playback with the capture running was
+measured on both test boards: the clocks keep running, but the ADC is 2.7 dB
+noisier, and another player opening the card at 44.1 kHz silently moves the
+capture clock on the CM5 and clicks on the Pi 3 (`doc/measurements.md`, Stage
+3a, "Idle output with the analog input on").
 
 ## Sample rate rules
 
@@ -205,8 +212,25 @@ Further rules *(call)*:
 - The settle time is 500 ms.
 - If the card does not support a client's rate, the output uses the nearest
   supported rate and the client is resampled. In a tie, the lower rate wins.
+- A rate at which a plugin chain cannot be built counts as a rate the card does
+  not support (see Plugins). A DoP stream needs only the analog chain, so only
+  that one can refuse it a rate.
 - A source that reports no signal (see Analog input) does not count as active.
-- The card keeps its current rate when idle. It does not return to a default.
+- Above threshold, the analog input counts as a client, at the rate the card
+  runs at when it gets signal: it never asks for a rate of its own, and it joins
+  by the rules for any client. If it became active first, it counts as the first
+  client, and a later player at another rate is resampled. Its joining cancels a
+  pending switch away from the rate it joins at. So no PCM rate decision reopens
+  the output while the analog input is audible; only a DoP stream takes the
+  output from it, and a change of the card (its list of rates changing, or the
+  card coming back with another list) may. While DoP owns the output the input
+  is not played and is not a client; it joins when DoP ends, at the rate the
+  card then runs at.
+- A reopen of the output closes the card's capture and opens it again, so the
+  analog input goes quiet for a moment, and is no client until its signal is
+  back.
+- The card keeps its current rate when idle, a rate a DoP stream set included.
+  It does not return to a default.
   The configured default rate applies only from startup until the first client
   sets a rate. So the ADC never forces a rate change: it starts at whatever rate
   the card is at, and no signal is lost to a card restart.
@@ -214,7 +238,8 @@ Further rules *(call)*:
 ## Audio processing
 
 There is one processing path *(call)*. Audio is converted to the processing
-format, resampled if needed, processed, mixed, then written to the card as S32.
+format, resampled if needed, mixed, run through the plugin chains, then written
+to the card as S32. The analog input's chain runs before the mix.
 Audio is never dithered, and float conversion scales by an exact power of two.
 
 ### Processing format
@@ -278,7 +303,9 @@ Pi 4 is still to be measured.
 ### Volume and clipping
 
 Input volumes are calculated on this path. So is the output volume on cards
-without a hardware volume (see Volume).
+without a hardware volume (see Volume). The analog input's volume applies after
+its chain, as it is mixed. It is set with `volume_db`, from -60 to 0 dB, 0 by
+default *(call)*.
 
 Volume changes and input detection opening or closing use short fades, so they do
 not click *(call)*. A fade lasts 10 ms *(call)*. A gain change applies at once
@@ -292,12 +319,13 @@ plugin is in the chain. There is no built-in limiter.
 Bit-perfect means nothing alters the samples. When no volume, plugin or resampling
 applies, samples are copied to the card as S32 without entering the processing
 format. This is the same for all three formats, and `f32` needs it because it
-cannot hold every S32 value *(call)*. There are two ways to get it:
+cannot hold every S32 value *(call)*. Chains whose plugins are all neutral are
+skipped on this path (see Plugins). There are two ways to get it:
 
 - **Automatic:** applies when one source is active, all volumes that `aas`
-  calculates are at 0 dB and no plugin is active. A hardware output volume does
-  not touch the samples, so it does not block bit-perfect *(call)*. Automatic is
-  the default *(call)*.
+  calculates are at 0 dB and every plugin is neutral. A hardware output volume
+  does not touch the samples, so it does not block bit-perfect *(call)*.
+  Automatic is the default *(call)*.
 - **Forced:** a setting. Volumes that `aas` calculates have no effect and plugins
   are bypassed *(call for plugins)*. A hardware output volume keeps working
   *(call)*.
@@ -310,9 +338,21 @@ effect, plugins stay bypassed *(call)*, and bit-perfect resumes once one client
 is left.
 
 Forced bit-perfect does not bypass input detection, because analog input must
-never pass ungated *(call)*. Above threshold the ADC is mixed in like a second
-client, which follows the rule above. This is the one exception to plugins being
-bypassed.
+never pass ungated *(call)*. This is the one exception to plugins being
+bypassed. The analog chain still runs, so that the detector can measure and a
+recorder gets the input after its plugins (see Capture device), but its output
+is not played: the captured frames are played as they are *(call)*. Past a
+chain that alters them, the engine fades them in and out itself, over 10 ms from
+the start of the period in which the detector opens or has closed, so a few
+frames before the detector opened are heard, rising from silence. Below
+the threshold the analog input is not a source, so it does not stop bit-perfect
+in either mode. Above it the ADC is mixed in like a second client, which follows
+the rule above.
+
+In automatic mode, when the analog input is the only source and its chain alters
+nothing, its captured frames are copied to the card as they are, so the copy
+path stays bit-exact *(call)*. While input detection fades in or out, the
+detector's output is mixed instead, so nothing it silences is heard.
 
 A resampled client is never bit-perfect.
 
@@ -327,6 +367,8 @@ A DoP stream must reach the card unaltered, because any volume, plugin or mixing
 turns it into loud noise. While a DoP stream plays:
 
 - volumes that `aas` calculates and all plugins are bypassed;
+- the analog input is still measured and can have signal, but it is not played
+  *(call)*;
 - the output runs at the stream's rate;
 - it has exclusive use of the output. Other clients stay connected, but their
   audio is discarded until the DoP stream stops *(call)*. This is the one exception
@@ -423,7 +465,17 @@ the wait takes effect in that cycle, so the stream does not play one period more
 Resampling adds roughly 1 to 2 ms. A resampled client may exceed 4 ms, in
 preference to reducing resampling quality *(call)*.
 
-Latency added by a plugin counts on top of the budget, and `aas` reports it.
+Latency added by a plugin counts on top of the budget, and `aas` reports it. A
+library plugin's reported latency is taken as at most 10 s at its rate, with a
+line in the log, and latencies add up without overflowing. The
+reported delay includes it only in cycles where the chains ran, not on the
+bit-perfect copy path or while a DoP stream plays *(call)*. The analog chain's
+latency, in the cycles its output is used, goes into a recorder's delay and
+into the counters' summary in the journal *(call)*.
+
+The analog input adds at most one period to the two the output has, because the
+engine keeps at most two periods of captured audio and reads one per cycle
+*(call)*.
 
 The target counts as met when one hour of playback at 44.1 kHz and at 96 kHz runs
 on the test board with no xruns and no wake-up gap longer than the buffer, on an
@@ -442,39 +494,103 @@ run has been made on an idle system yet.
 
 ## Analog input
 
-The card stays open and running while input detection is enabled, because it
-has to keep measuring *(call)*. With detection disabled, capture is not opened.
+The analog input is off unless the config turns it on, with `[analog] enabled =
+true` *(call: the owner should confirm this one)*. It keeps the card's capture
+open all the time, which changes the idle behaviour, so it is not a default.
+While it is on, the card stays open and running, because input detection has to
+keep measuring, and the output never goes off when idle (see Output). While it is
+off, capture is not opened.
+
+Capture opens only on cards in the card table marked as having an ADC *(call)*.
+The table starts with the two cards the test boards carry,
+`snd_rpi_hifiberry_dacplusadc` and `snd_rpi_hifiberry_dacplusadcpro`, and the
+Digi as a card without one. It grows as cards are verified. On any other card,
+`enabled = true` logs one line and opens nothing. Whether the card has an ADC is
+decided at startup if the card is there, and otherwise at each open of the output.
 
 The ADC is a built-in source, mixed in like a client and with its own volume.
 The ADC and DAC share the card's clock, so they run at the same rate and the ADC
-is never resampled *(call: confirm on the hardware)*. It follows the output rate
-and does not set it.
+is never resampled. It follows the output rate and does not set it. On the CM5
+test board, five minutes of tone with the input open gave 0 dropped frames, and
+64 padded frames in the first cycle only *(call: confirm on the Pi 3 test board,
+whose hour runs are recorded in `doc/measurements.md`)*.
+
+Details *(call)*:
+
+- The control thread opens the capture and hands it to the audio thread, because
+  opening a PCM takes milliseconds. Before a reopen of the output the engine
+  closes the capture, because these cards refuse two rates at once, and the
+  control thread opens a new one once the reopen is done.
+- Closing a capture closes the device, because these cards also refuse a second
+  open while the first is held. A capture is opened without waiting: a device
+  that another program holds fails at once, is logged once, and is tried again
+  every second.
+- The engine reads one period of captured audio per cycle and keeps at most two.
+  A shortfall is padded with zeros at the front, and anything over two periods is
+  dropped. Both are counted. Capture overruns are not counted on their own, they
+  show as padded frames.
+- A capture delivers silence for 1 s after each open. The ADC of the DAC+ ADC
+  Pro starts with a transient that stays above -50 dBFS for up to 700 ms, and
+  would open the input by itself. The DAC+ ADC on the Pi 3 test board never
+  went above -50 dBFS at a start, its loudest 50 ms being -83.8 dBFS
+  (`doc/measurements.md`, Stage 3a). So the 1 s is needed for the Pro only, but
+  it applies to every card, so that the cards behave alike *(call: the owner
+  to confirm)*. The cost is that the analog input is muted for 1 s at every
+  start and every rate change. A restart after a capture overrun prepares and
+  starts the stream without closing it; on the Pro that brings no transient
+  (nothing above -98 dBFS in 24 restarts, `doc/measurements.md`), so it is not
+  muted.
+- The engine tells the control thread whether the input has signal, by sending
+  the current state when its event queue has room. If the queue is full while the
+  input opens and closes again, no event is sent for that pair.
 
 ### Input detection plugin
 
-The first plugin, placed on the ADC input. It is a native plugin.
+The first plugin, placed on the analog input. It is built into the daemon as
+`detect`.
 
 - It has a threshold. Below the threshold it sends no audio at all.
-- It can be enabled and disabled. When disabled, the ADC stays off.
-- There is no mode where analog input passes audio regardless of level.
+- It is always in the analog chain. There is no way to run the analog input
+  without it. When the analog input is off, the ADC stays off.
+- There is no mode where analog input passes audio regardless of level. The
+  engine holds to that by itself too: an analog chain without plugins passes
+  nothing.
 
 Further behaviour *(call)*:
 
-- The threshold acts on a short level measurement, not on single samples.
-- A configurable hold time, a few seconds by default, stops quiet passages and
-  fade-outs from cutting in and out.
+- The threshold acts on the level of both channels as RMS over windows of 50 ms,
+  not on single samples. One window above the threshold opens it. The threshold
+  is -50 dBFS by default.
+- A configurable hold time, 3 s by default, stops quiet passages and fade-outs
+  from cutting in and out.
+- Opening and closing fade over 10 ms (see Volume and clipping). The fade in
+  starts at the first frame after the window that opens it, the fade out at the
+  frame where it closes. A block counts as without signal only when nothing of
+  it is heard, so the fade out is played to its end.
+- If the config lists no `detect`, it goes last in the analog chain, so it sees
+  the signal after every other plugin there.
+- "Has signal" is what the analog chain reports.
 - The plugin keeps measuring at the card's current rate while no audio passes.
 - Below threshold, the engine treats the input as not connected: it does not
   count as a client, does not affect the rate rules and does not block
   bit-perfect.
-- Above threshold, it counts as a client. If it became active first, it counts
-  as the first client, and a later player at another rate is resampled.
+- Above threshold, it counts as a client, at the rate the card runs at when it
+  gets signal: it never asks for a rate of its own, and it joins by the rules
+  for any client. If it became active first, it counts as the first client, and
+  a later player at another rate is resampled. Its joining cancels a pending
+  switch away from the rate it joins at. So no PCM rate decision reopens the
+  output while the analog input is audible; only a DoP stream takes the output
+  from it, and a change of the card (its list of rates changing, or the card
+  coming back with another list) may. While DoP owns the output the input is not
+  played and is not a client; it joins when DoP ends, at the rate the card then
+  runs at. (See Sample rate rules.)
 
 ### Input processor plugin
 
 `input-processor` becomes a native plugin on the ADC input. Today it is a LADSPA
 plugin with RIAA equalisation, subsonic filter, gain, declick and notch filter,
-at 44.1, 48, 88.2, 96, 176.4 and 192 kHz. It is part of the first shipped version.
+at 44.1, 48, 88.2, 96, 176.4 and 192 kHz. It is part of the first shipped version,
+and is not built yet.
 
 The order of plugins, including whether it runs before or after input detection,
 is set in the config. The shipped default puts it first, so the threshold acts on
@@ -500,6 +616,33 @@ The capture device delivers the analog input after its plugins. It never deliver
 the output mix, or a network player's audio would be detected as analog activity.
 While input detection is below threshold it delivers silence *(call)*.
 
+### Capture device
+
+Details *(call)*:
+
+- The capture device is `pcm.aas` opened for capture, and the ALSA `default`
+  device covers both directions.
+- A recorder gets the analog input after its plugins and before the input
+  volume, so it hears the same level whatever the volume is. That holds in
+  forced bit-perfect too, where the card plays the input as captured.
+- It runs at the output rate only, as S32 stereo. `plug` in `default` converts in
+  the recorder's process. Capture offers mmap access, which `plug` needs to
+  convert. The plugin learns the daemon's rate when the PCM is opened, by setting
+  up a one-frame stream that it replaces at `hw_params`.
+- When the output rate changes, an open capture stream ends. The recorder gets
+  `ENODEV` and opens the device again at the new rate. A stream is marked ended
+  only once the audio thread has handed it back, and the recorder is woken then.
+  Frames still in its ring at that moment are not delivered. While the analog
+  input has signal only a DoP stream changes the rate, so otherwise only silence
+  is cut.
+- A recorder is not a client. It cannot hold the rate or keep the output open.
+  While the output is closed for idle it gets no frames and no wake-up. With the
+  analog input on, the output never closes.
+- A full ring takes what fits. For a capture stream the ring's `underruns`
+  counter counts the dropped frames, and the recorder sees an overrun (`EPIPE`).
+- The capture flag travels in bit 31 of the channels word of Configure. The
+  protocol and the ring are version 3.
+
 ## Plugins
 
 There is a way to add plugins that process audio, such as routing, mixing and
@@ -508,26 +651,129 @@ filtering. The interface is native to `aas`. LADSPA is not supported, and
 
 Details *(call)*:
 
-- A plugin declares which processing formats it supports. Where it does not
-  support the configured one, `aas` converts around it and shows this in the graph
-  export *(call)*.
-- A plugin runs at one of three places: on one input, on the mix, or just before
-  the output.
-- Plugins form an ordered chain defined in the config. Nothing rewires them on
-  its own.
+- A plugin runs at one of three places: `analog`, on the analog input before it
+  is mixed; `mix`, on the mix; or `output`, just before the output. With one
+  output the mix chain runs first and the output chain after it. The output
+  volume stays in the mix, so both run after it. Until stage 4 only the analog
+  input has a chain of its own, which departs on purpose from a chain on every
+  input: a client's chain needs the per-input settings that come with the API
+  and the state file.
+- Plugins form an ordered chain at each place, defined in the config. Nothing
+  rewires them on its own, and a chain never runs without one of its plugins.
+- A plugin's `create` tells a rate it does not support from a failure. A rate
+  some chain does not support is not a rate the output uses. The rate rules
+  take the nearest rate every chain accepts, as for a rate the card does not
+  take, and clients are resampled to it. It is found when a chain is first
+  built at that rate. If no rate works, the output stays as it is and this is
+  logged; at startup a chain that cannot be built at any rate the card takes
+  stops the daemon. The analog chain has no fallback to its detector alone.
+- A plugin that fails, rather than not support the rate, does not cost the
+  rate. At startup the failure stops the daemon. At run time it is logged with
+  the plugin's name, the output keeps what it has, and the rate is tried again
+  at the next rate decision, that is the next change of clients, of the
+  analog input or of the card, never more often. An output that is closed does
+  not stay closed under a client for this: it opens, for that decision only,
+  at the nearest rate whose chains build, or stays closed with an error in the
+  log if none does.
+- Plugins see stereo blocks in the processing format. Float blocks are scaled so
+  full scale is 1.0 and are not clipped between plugins, and the analog chain's
+  output keeps that headroom until the mix. In `i32` a block is clipped before
+  the first plugin, as every stage clips there.
+- A plugin declares which processing formats it takes. Where it does not take the
+  configured one, the chain converts its blocks to `f64`, else `f32`, else
+  `i32`, and back. The graph export is to show this.
 - Recursive filters keep their state and coefficients in 64-bit float, whatever the
   processing format *(call)*. A 20 Hz high-pass computed entirely in `f32` had an
   error of -90 dBFS at 48 kHz and -73 dBFS at 192 kHz, which is above the DAC's noise
   floor. This matters for the input processor and `speakereq`.
-- A plugin can have different numbers of input and output channels.
-- A plugin can report "no signal" for its input.
+- Plugins take two channels and give two, in place. Other channel counts come
+  with the matrix, and need ABI version 2 (stage 3b), since a plugin that
+  changes the count cannot work in place.
+- A plugin can report "no signal" for its block.
 - Plugins run in-process on the audio thread, so a slow plugin causes dropouts.
-- An active plugin stops automatic bit-perfect, unless it reports itself as
-  neutral. Input detection below threshold and balance at centre are neutral
-  *(call)*.
+- Neutral is a property of a plugin's parameters, not of the audio. A plugin is
+  neutral when, with the parameters it has now, it leaves every block as it is.
+  The engine asks before the cycle, so the bit-perfect path can skip the chains.
+  A plugin that is not neutral stops bit-perfect. Input detection is always
+  neutral, since below the threshold the analog input is not a source at all.
+  Balance at centre is neutral.
+- A chain never depends on the period. A chain with a plugin is built for the
+  longest period the engine can have, 16384 frames, and the engine refuses a
+  shorter one. A plugin is created for blocks of up to that many frames. This
+  costs about 0.5 MiB of scratch memory per chain that holds a plugin, on top of
+  about 0.5 MiB in the engine.
+- Chains are built on the control thread. A rate change builds new instances
+  there. The chains for a new rate are sent just before the reopen and take
+  effect with it, as resamplers do. When the rate does not change the chains
+  stay, so filters keep their state. A DoP stream bypasses the mix and output
+  chains, so they are not built for its rate and keep their state through it;
+  only the analog chain, which keeps measuring, is. If the output stays at the
+  DoP rate afterwards, the others are built for it then, without a reopen.
+- A chain never runs at a rate it was not built for: until the chain for the
+  output's rate arrives, its place plays silence, not a bypass, and fades in
+  over 10 ms when it does. When a DoP stream stops and a chain lags, the output
+  and its chains follow at once rather than after the settle time.
 
-Balance and the limiter are plugins, not engine features. Balance goes on the
-output. The limiter can be added to the chain where wanted.
+Built in are `detect`, the input detection plugin, and `balance`, from -1 (left)
+to 1 (right). That departs on purpose from plugins being libraries: the analog
+input cannot run without a detector, so it must not depend on a file being
+installed, and balance is needed on every system. Balance and the limiter are plugins, not engine features. Balance
+goes on the output. The limiter can be added to the chain where wanted once it
+exists. It is not built yet.
+
+### Plugin libraries
+
+A plugin in a shared library uses a C ABI, version 1 *(call)*. The crate
+`aas-plugin` describes it, and `plugins/gain` is an example. A library exports
+one symbol, `aas_plugin`, a function that returns a descriptor: the ABI version,
+a name, the formats it takes, its channels, its parameters and six functions. A
+library is loaded once and never unloaded.
+
+The descriptor and each parameter entry start with their size as the plugin
+was compiled. Within an ABI version fields are only ever appended: the daemon
+refuses a size smaller than version 1's first one, which is frozen with every
+field's offset, or larger than 4096 bytes or out of step with the struct's
+alignment, and ignores bytes it does not know. A
+plugin may give a `reset` function, which clears what it keeps from earlier
+blocks. The daemon calls it when a chain runs again after periods that did not
+pass it (DoP, the bit-perfect copy path, a mute for a chain at another rate, a
+gap in the capture), so that a filter or a delay does not play an old tail.
+
+A parameter has a name, a unit, a range, a default and a type: float, integer,
+switch, or enumeration with a name for each value *(call)*. Values cross the ABI
+as `f64` whatever the type, and the names are static strings of the library, so
+nothing is allocated across it. The API describes each parameter by its type,
+and a user interface builds its control from that. The daemon passes whole
+numbers to every type but a float.
+
+A text parameter, such as the filter file of a convolver, is set through a
+function of its own, with UTF-8 the plugin copies, on the control thread only,
+while the chain is built and before it reaches the audio thread, so the plugin
+may read a file there *(call)*. It is never set on the audio thread: changing
+one at run time means building a new chain. The plugin can refuse a value; the
+chain is then not built, with an error naming the plugin, the parameter and the
+value. That is a configuration error, not a rate the plugin does not support:
+at startup the daemon does not start. A plugin can also say that a value it
+takes cannot be used at its rate, such as a filter file made for another rate;
+that rate is then not used, as for a rate its `create` does not support. In the config a text parameter takes text
+in quotes and every other one a number, and each value is checked against its
+parameter's type.
+
+Details *(call)*:
+
+- The loader refuses a library without the symbol, another ABI version, a null or
+  misaligned descriptor, a missing function, no format, other than two channels,
+  more than 4096 parameters, a parameter range that is not a range, a default
+  outside its range, or a parameter whose type it does not know or whose range
+  does not fit its type: an integer needs whole numbers, a switch goes from 0 to
+  1, and an enumeration of n named values from 0 to n - 1. Each refusal comes
+  with a message.
+- A plugin that cannot be loaded stops the daemon at startup, like any other
+  config error. Nothing is skipped without a word.
+- At run time the daemon checks that a block is in a format the plugin declared,
+  and never hands it more frames than it was created for.
+- A panic that leaves a plugin's function aborts the daemon. A plugin written in
+  Rust must catch its own panics.
 
 ## Graph export
 
@@ -584,6 +830,14 @@ All of this is *(call)*:
   *(call)*. The control thread does the looking. The audio thread opens the
   card once it is there, and does nothing for it before.
 - After an xrun on the card, the daemon recovers without client involvement.
+- A capture that fails never fails a cycle, and costs only the analog input. The
+  input goes quiet, the control thread is told, and it tries again every second.
+  A suspended or disconnected capture is reported gone.
+- A recorder that stops reading loses only its own audio.
+- If a chain cannot be built at a rate, the daemon logs it. A rate a plugin
+  does not support is not used; a plugin that failed is tried again at the
+  next rate decision (see Plugins). It never runs a chain short of its
+  plugins.
 - The daemon locks each client's ring in memory, so that the audio thread never
   waits for a page. A ring is at most 8 MiB, for the largest buffer a client may
   ask for, and the control thread adds one page for its view of the header.
@@ -609,6 +863,19 @@ default rate, the processing format, the bit-perfect mode and the plugin chain.
 It is flat, and every key is optional. Idle behaviour is `idle = "zeros"` or
 `idle = "off"` with `idle_delay_s`, 60 by default. A delay with `zeros` is an
 error.
+
+Two tables are not flat *(call)*. This departs on purpose from a flat file: the
+analog input's settings belong together, and plugins form an ordered list,
+which flat keys cannot hold. `[analog]` holds `enabled`, `false` by default,
+and `volume_db`. `volume_db` is the level the input starts at. It departs on
+purpose from runtime values being state: until the API exists there is no other
+way to set it, and in stage 4 the runtime input volume becomes state, with this
+as its value on a fresh install. Each `[[plugin]]` table adds one plugin to the chain at its
+`place`, `analog`, `mix` or `output`, in the order of the file. Its `type` is
+`detect`, `balance` or `library`, and a `library` has a `path` to the shared
+library, which is absolute. `detect` runs only at `analog` and appears at most
+once. Every other key is a parameter: a finite number, or text in quotes for a
+text parameter.
 
 Volumes and other values changed at runtime are state, not configuration. They
 are kept in a separate state file owned by the daemon and restored at startup
@@ -666,7 +933,8 @@ needed, to confirm 4 ms and set its defaults.
 Bit-exactness is tested automatically by comparing samples through `snd-aloop`,
 with `bit-check`.
 Real latency is measured on the test board with a cable from the DAC output to the
-ADC input *(call)*.
+ADC input *(call)*. The same cable carries the board tests of the analog input,
+which `dist/test-plugin.sh` runs with `ANALOG=1`.
 
 All players must be tested on real hardware with HiFiBerry OS before the first
 shipped version: `mpd`, `squeezelite`, `librespot`, `shairport-sync`, `raat`,

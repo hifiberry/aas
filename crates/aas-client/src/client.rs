@@ -66,6 +66,11 @@ fn timed_out() -> io::Error {
     io::Error::from_raw_os_error(libc::ETIMEDOUT)
 }
 
+/// A call that does not fit the direction of the stream.
+fn wrong_direction() -> io::Error {
+    io::Error::from_raw_os_error(libc::EBADFD)
+}
+
 struct Stream {
     ring: Ring,
     wake: OwnedFd,
@@ -73,6 +78,8 @@ struct Stream {
     channels: u8,
     /// How long the ring takes to play when it is full.
     holds: Duration,
+    /// A capture stream: the daemon writes the ring and this side reads it.
+    capture: bool,
 }
 
 /// A connection to the daemon, and the stream it has configured.
@@ -273,17 +280,57 @@ impl Client {
         channels: u8,
         buffer_frames: u32,
     ) -> io::Result<()> {
+        self.set_up(rate, format, channels, buffer_frames, false)
+            .map(drop)
+    }
+
+    /// Sets up a capture stream, which records the daemon's analog input:
+    /// S32 stereo at the rate this returns, the rate the daemon's output
+    /// runs at. Replaces any stream set up before. `buffer_frames` is what
+    /// the ring holds at least; the daemon rounds it up as it needs.
+    ///
+    /// The stream carries the analog input after its plugins and before
+    /// the input volume, which belongs to the mix. While the daemon's
+    /// output is closed a running stream gets neither frames nor wake-ups;
+    /// with the analog input enabled the output never closes. A ring that
+    /// is full drops what does not fit, and `underruns` counts the frames
+    /// dropped.
+    ///
+    /// The stream ends when the daemon's rate changes: `ended` turns true
+    /// once nothing more is written, and the wake-up is written then. What
+    /// the ring holds can still be read, and `start` fails with `ENODEV`. A new `configure_capture`
+    /// gets the new rate.
+    pub fn configure_capture(&mut self, buffer_frames: u32) -> io::Result<u32> {
+        self.set_up(0, ClientFormat::S32, 2, buffer_frames, true)
+    }
+
+    /// Sends a configure and maps the ring it is answered with. Returns the
+    /// stream's rate: the one asked for, or for a capture stream the one
+    /// the reply names.
+    fn set_up(
+        &mut self,
+        rate: u32,
+        format: ClientFormat,
+        channels: u8,
+        buffer_frames: u32,
+        capture: bool,
+    ) -> io::Result<u32> {
         self.stream = None;
         let request = Request::Configure {
             rate,
             format,
             channels,
             buffer_frames,
+            capture,
         };
         let (reply, fds) = self.call(&request)?;
         let bad = |m: &str| io::Error::new(io::ErrorKind::InvalidData, m.to_string());
-        if reply != Reply::Configured {
+        let Reply::Configured { rate: told } = reply else {
             return Err(bad("unexpected reply to configure"));
+        };
+        let rate = if capture { told } else { rate };
+        if capture && rate == 0 {
+            return Err(bad("configure named no rate"));
         }
         let [memfd, wake]: [OwnedFd; MAX_FDS] = fds
             .try_into()
@@ -296,8 +343,9 @@ impl Client {
             format,
             channels,
             holds,
+            capture,
         });
-        Ok(())
+        Ok(rate)
     }
 
     /// Gives the stream up on this side: the ring is unmapped and the
@@ -307,7 +355,8 @@ impl Client {
         self.stream = None;
     }
 
-    /// Starts playing what is in the ring and what is written after.
+    /// Starts playing what is in the ring and what is written after. A
+    /// capture stream starts recording.
     pub fn start(&mut self) -> io::Result<()> {
         let stream = self.stream()?;
         stream.ring.header().draining.store(0, Ordering::Release);
@@ -408,9 +457,12 @@ impl Client {
     }
 
     /// Converts and writes as many whole frames as the ring has room for.
-    /// Returns the number of frames written.
+    /// Returns the number of frames written. Fails on a capture stream.
     pub fn write(&mut self, input: &[u8]) -> io::Result<usize> {
         let stream = self.stream()?;
+        if stream.capture {
+            return Err(wrong_direction());
+        }
         let frame_bytes = stream.format.sample_bytes() * usize::from(stream.channels);
         if frame_bytes == 0 {
             return Ok(0);
@@ -429,39 +481,80 @@ impl Client {
         Ok(written)
     }
 
+    /// Reads as many frames of a capture stream as the ring holds, up to
+    /// `out.len()`. Returns the number read. Fails on a playback stream.
+    pub fn read(&mut self, out: &mut [[i32; 2]]) -> io::Result<usize> {
+        let stream = self.stream()?;
+        if !stream.capture {
+            return Err(wrong_direction());
+        }
+        Ok(stream.ring.read(out))
+    }
+
+    /// Whether the daemon has ended the stream. It serves it no more, and
+    /// it has to be configured again. False without a stream.
+    pub fn ended(&self) -> bool {
+        self.stream
+            .as_ref()
+            .is_some_and(|s| s.ring.header().ended.load(Ordering::Acquire) != 0)
+    }
+
     /// Stops the stream and empties its ring, keeping the ring and the
     /// stream. Positions go on counting. Returns once the ring is empty.
+    ///
+    /// A capture stream is emptied from this side, the reader's, once the
+    /// daemon has stopped writing it.
     pub fn reset(&mut self) -> io::Result<()> {
         self.stream()?;
         self.call(&Request::Reset)?;
-        let header = self.stream()?.ring.header();
-        header.draining.store(0, Ordering::Release);
+        let stream = self.stream()?;
+        if stream.capture {
+            stream.ring.consume(usize::MAX);
+        }
+        stream.ring.header().draining.store(0, Ordering::Release);
         Ok(())
     }
 
-    /// Frames the daemon has taken from the ring since it was configured.
-    /// It reads shared memory only, so it does not notice a daemon that
-    /// has gone: `check_alive` and the socket in `poll_fds` do.
+    /// The daemon's position in the ring, the one `wake_at` waits for:
+    /// frames it has taken from a playback ring, or put into a capture
+    /// ring, since the stream was configured. It reads shared memory only,
+    /// so it does not notice a daemon that has gone: `check_alive` and the
+    /// socket in `poll_fds` do.
     pub fn hw_position(&self) -> io::Result<u64> {
-        let header = self.stream()?.ring.header();
-        Ok(header.read_pos.load(Ordering::Acquire))
+        let stream = self.stream()?;
+        let header = stream.ring.header();
+        let position = if stream.capture {
+            &header.write_pos
+        } else {
+            &header.read_pos
+        };
+        Ok(position.load(Ordering::Acquire))
     }
 
-    /// Asks for one wake-up once the daemon has taken `position` frames,
-    /// in place of one after every period. Returns true if it has taken
-    /// them already, in which case no wake-up may come. A position of zero
-    /// brings back the wake-up after every period.
+    /// Asks for one wake-up once the daemon's position, as `hw_position`
+    /// gives it, has reached `position`, in place of one after every
+    /// period. For a playback stream that is frames taken from the ring,
+    /// for a capture stream frames put into it. Returns true if the
+    /// position is reached already, in which case no wake-up may come. A
+    /// position of zero brings back the wake-up after every period.
     pub fn wake_at(&self, position: u64) -> io::Result<bool> {
-        let header = self.stream()?.ring.header();
+        let stream = self.stream()?;
+        let header = stream.ring.header();
         header.wake_at.store(position, Ordering::SeqCst);
         // The daemon stores its position and then loads this one. With a
         // full barrier on both sides, one of the two sees the other.
         fence(Ordering::SeqCst);
-        Ok(header.read_pos.load(Ordering::SeqCst) >= position)
+        let daemon = if stream.capture {
+            &header.write_pos
+        } else {
+            &header.read_pos
+        };
+        Ok(daemon.load(Ordering::SeqCst) >= position)
     }
 
     /// Frames between what is written next and the listener: what the ring
-    /// holds and what plays after it.
+    /// holds and what plays after it. For a capture stream, what the ring
+    /// holds to be read and what the analog input's plugins hold back.
     pub fn delay_frames(&self) -> u64 {
         let Some(stream) = &self.stream else {
             return 0;
@@ -475,6 +568,7 @@ impl Client {
     }
 
     /// Times the daemon found the ring short while the stream was running.
+    /// For a capture stream: frames dropped because the ring was full.
     pub fn underruns(&self) -> u64 {
         self.stream
             .as_ref()
@@ -617,7 +711,7 @@ mod tests {
         // SAFETY: a plain syscall; the descriptor is owned at once.
         let wake = unsafe { OwnedFd::from_raw_fd(libc::eventfd(0, libc::EFD_CLOEXEC)) };
         let fds = [memfd.as_raw_fd(), wake.as_raw_fd()];
-        answer(conn, Reply::Configured, &fds);
+        answer(conn, Reply::Configured { rate: 0 }, &fds);
         (ring, wake)
     }
 

@@ -5,11 +5,16 @@
 //! back is freed here. Commands that belong together go into the queue in
 //! one commit, so the audio thread never sees half a decision.
 
-use crate::config::{Config, Format, Idle, Quality};
+use crate::capture::{Capture, OpenError};
+use crate::config::{Config, Format, Idle, PluginConfig, PluginPlace, Quality};
 use crate::dop;
-use crate::engine::{Command, Event, INITIAL_SOURCES, Source};
+use crate::engine::{Command, Event, INITIAL_SOURCES, INITIAL_TAPS, Source, Tap};
+use crate::format::db_to_gain;
 use crate::latency::{PERIODS, period_frames};
-use crate::rate::{ClientId, MAX_RATE, MIN_RATE, RatePolicy, SETTLE};
+use crate::plugin::build::{Chains, Libraries, build_chain, engine_place};
+use crate::plugin::chain::Chain;
+use crate::plugin::{BuildError, Failure};
+use crate::rate::{ClientId, MAX_RATE, MIN_RATE, RatePolicy, SETTLE, STANDARD_RATES};
 use crate::resample::Resampler;
 use crate::state::{Saver, State};
 use crate::volume::{HardwareVolume, OutputVolume};
@@ -29,6 +34,21 @@ use std::time::{Duration, Instant};
 /// Identifies a connection to the server.
 pub type ConnId = u64;
 
+/// Opens the card's capture at a rate and period. Called on the control
+/// thread, after the output has opened at them.
+///
+/// It must not wait: while it runs, no client request is served. A device
+/// that another process holds must make it fail at once, not block until
+/// the device is free. A failed open is tried again a second later.
+///
+/// An `OpenError::Never`, for a card found to have no analog input aas
+/// knows, ends the analog input: it is not tried again, and the idle rule
+/// of the config applies again.
+pub type OpenCapture = Box<dyn FnMut(u32, u32) -> Result<Box<dyn Capture>, OpenError>>;
+
+/// The name the analog input has in the rate rules while it is a client.
+pub const ANALOG: ClientId = ClientId::MAX;
+
 /// Smallest period the latency rule gives.
 const MIN_PERIOD: u32 = 32;
 /// Half the longest resampling filter, which rubato adds to its input.
@@ -44,6 +64,27 @@ const SEND_WARN: Duration = Duration::from_secs(1);
 /// How long the volume stays unchanged before the state file is written,
 /// so that a volume slider being dragged does not write it many times.
 const SAVE_DELAY: Duration = Duration::from_secs(1);
+/// How often a capture that failed, or would not open, is tried again.
+const CAPTURE_RETRY: Duration = Duration::from_secs(1);
+/// Periods of the output a capture stream's ring holds at least.
+const RECORDER_PERIODS: u32 = 4;
+
+/// Chains built for a rate, not yet sent to the audio thread.
+struct Spare {
+    rate: u32,
+    /// Built for a DoP stream: the analog chain only.
+    dop: bool,
+    chains: Vec<(PluginPlace, Chain)>,
+}
+
+/// Where a place's chain is kept in `Control::built`.
+fn slot(place: PluginPlace) -> usize {
+    match place {
+        PluginPlace::Analog => 0,
+        PluginPlace::Mix => 1,
+        PluginPlace::Output => 2,
+    }
+}
 
 /// Frames a client's ring holds at least, so that one period's input fits
 /// whatever rate the output runs at. One period takes at most what the
@@ -168,12 +209,49 @@ struct Stream {
     drained: bool,
 }
 
+/// A capture stream as the control thread keeps it. It is no client of the
+/// rate rules, never counts as active and has no resampler.
+struct Recorder {
+    id: ClientId,
+    /// The output's rate when it was configured, which it records at.
+    rate: u32,
+    /// Kept until the ring is sealed, on the first start.
+    memfd: Option<OwnedFd>,
+    running: bool,
+    /// The output's rate has changed: the audio thread has been told to
+    /// remove the tap, and the client has to configure again. The ring is
+    /// marked ended once the tap is back, when nothing writes it any more.
+    ended: bool,
+}
+
 struct Conn {
     name: String,
     hello: bool,
+    /// A connection has one stream at a time, this or a recorder.
     stream: Option<Stream>,
+    recorder: Option<Recorder>,
     /// Told of every change to the output volume.
     subscribed: bool,
+}
+
+/// The analog input as the control thread keeps it.
+struct AnalogInput {
+    open: OpenCapture,
+    /// The input has signal.
+    active: bool,
+    /// The input is a client of the rate rules: it has signal and no DoP
+    /// stream owns the output.
+    registered: bool,
+    /// `SetCapture` commands the audio thread has not answered yet. A
+    /// failure reported meanwhile belongs to a capture they replace.
+    unanswered: u32,
+    /// The audio thread has a capture for the output as it is, which has
+    /// not failed.
+    reading: bool,
+    /// When to try again to open the capture.
+    retry_at: Option<Instant>,
+    /// A failure has been logged, and the recovery is not yet.
+    failing: bool,
 }
 
 pub struct Control {
@@ -193,6 +271,9 @@ pub struct Control {
     next_id: ClientId,
     table_capacity: usize,
     table_len: usize,
+    /// The same for the audio thread's table of capture streams.
+    taps_capacity: usize,
+    taps_len: usize,
     /// The rate and period the output was last told to open at. None while
     /// it is closed.
     output: Option<(u32, u32)>,
@@ -220,6 +301,35 @@ pub struct Control {
     save_at: Option<Instant>,
     /// Volume notifications for subscribers, not yet sent.
     notices: Vec<(ConnId, Reply)>,
+    /// The plugins of the config, to build chains from at each rate.
+    plugins: Vec<PluginConfig>,
+    libraries: Libraries,
+    /// Chains built ahead, sent at the first open if it is at their rate.
+    ready: Option<Chains>,
+    /// The rate each place's chain on the audio thread was built for, by
+    /// `slot`. None before one is sent.
+    built: [Option<u32>; 3],
+    /// Chains built for the rate the rules want, sent when the output runs
+    /// at it.
+    spare: Option<Spare>,
+    /// Rates at which a chain could not be built. The output never runs at
+    /// one, and the rules take the nearest other rate.
+    refused: Vec<u32>,
+    /// Of those, the rates the analog chain refused. A DoP stream needs
+    /// only that chain, so it may run at the others.
+    analog_refused: Vec<u32>,
+    /// No rate works for every chain, and that has been logged.
+    stuck: bool,
+    /// A chain failed at this rate, DoP or not, in this rate decision. It
+    /// is tried again at the next one, not before.
+    failed: Option<(u32, bool)>,
+    /// No other rate built either, in this rate decision, while the output
+    /// was closed. Not tried again before the next one.
+    no_fallback: bool,
+    /// The gain of the analog input, from the config.
+    analog_gain: f32,
+    /// None unless the config enables the input and the card has an ADC.
+    analog: Option<AnalogInput>,
 }
 
 impl Control {
@@ -249,6 +359,8 @@ impl Control {
             next_id: 1,
             table_capacity: INITIAL_SOURCES,
             table_len: 0,
+            taps_capacity: INITIAL_TAPS,
+            taps_len: 0,
             output: None,
             reopening: 0,
             switch_at: None,
@@ -260,7 +372,46 @@ impl Control {
             saver: None,
             save_at: None,
             notices: Vec::new(),
+            plugins: config.plugins.clone(),
+            libraries: Libraries::default(),
+            ready: None,
+            built: [None; 3],
+            spare: None,
+            refused: Vec::new(),
+            analog_refused: Vec::new(),
+            stuck: false,
+            failed: None,
+            no_fallback: false,
+            analog_gain: db_to_gain(config.analog.volume_db),
+            analog: None,
         }
+    }
+
+    /// Takes over the libraries loaded at startup, and the chains built
+    /// then, if any. Call before `start`. Without them the chains are built
+    /// at the first open.
+    pub fn set_plugins(&mut self, libraries: Libraries, chains: Option<Chains>) {
+        self.libraries = libraries;
+        self.ready = chains;
+    }
+
+    /// Runs the analog input, which `open` opens. Call before `start`, and
+    /// only when the config enables the input and the card has an ADC.
+    /// The output then stays open when idle, since the card paces the
+    /// capture and the detector has to keep measuring.
+    pub fn set_analog(&mut self, open: OpenCapture) {
+        if let Idle::Off { .. } = self.idle {
+            eprintln!("aas: the analog input keeps the output open, idle = \"off\" does not apply");
+        }
+        self.analog = Some(AnalogInput {
+            open,
+            active: false,
+            registered: false,
+            unanswered: 0,
+            reading: false,
+            retry_at: None,
+            failing: false,
+        });
     }
 
     /// Takes over the output volume, at the level the state file keeps.
@@ -299,9 +450,13 @@ impl Control {
     }
 
     /// Opens the output at the default rate. Until a client plays it sends
-    /// zeros, and the idle rule applies from now.
+    /// zeros, and the idle rule applies from now, unless the analog input
+    /// is on.
     pub fn start(&mut self, now: Instant) {
         let mut batch = vec![Command::SetGain(self.volume.gain())];
+        if self.analog.is_some() {
+            batch.push(Command::SetAnalogGain(self.analog_gain));
+        }
         self.open_output(&mut batch);
         self.idle_since = Some(now);
         self.send(batch);
@@ -326,6 +481,7 @@ impl Control {
             name,
             hello: false,
             stream: None,
+            recorder: None,
             subscribed: false,
         };
         self.conns.insert(conn, state);
@@ -341,6 +497,11 @@ impl Control {
             let mut batch = Vec::new();
             self.remove_stream(stream, now, &mut batch);
             self.decide(now, false, &mut batch);
+            self.send(batch);
+        }
+        if let Some(recorder) = state.recorder {
+            let mut batch = Vec::new();
+            self.remove_recorder(recorder, &mut batch);
             self.send(batch);
         }
     }
@@ -415,16 +576,28 @@ impl Control {
         ) {
             self.cancel_drain(conn);
         }
+        let recording = self.recorder_mut(conn).is_some();
         match request {
             Request::Hello { .. } => Answer::reply(Reply::Hello {
                 version: proto::VERSION,
             }),
             Request::Configure {
+                buffer_frames,
+                capture: true,
+                ..
+            } => self.configure_recorder(conn, buffer_frames, now),
+            Request::Configure {
                 rate,
                 format,
                 channels,
                 buffer_frames,
+                capture: false,
             } => self.configure(conn, rate, format, channels, buffer_frames, now),
+            Request::Start if recording => self.start_recorder(conn),
+            Request::Stop if recording => self.stop_recorder(conn),
+            Request::Reset if recording => self.reset_recorder(conn),
+            // A capture stream never ends by itself.
+            Request::Drain if recording => Answer::error(libc::EINVAL),
             Request::Start => self.start_stream(conn, now),
             Request::Stop => self.stop_stream(conn, now),
             Request::Drain => self.drain(conn, now),
@@ -503,6 +676,9 @@ impl Control {
         if let Some(old) = self.conns.get_mut(&conn).and_then(|c| c.stream.take()) {
             self.remove_stream(old, now, &mut batch);
         }
+        if let Some(old) = self.conns.get_mut(&conn).and_then(|c| c.recorder.take()) {
+            self.remove_recorder(old, &mut batch);
+        }
         let capacity = buffer_frames.max(min_ring_frames(rate, self.latency_ms));
         let made = Ring::create(capacity).and_then(|(ring, memfd)| {
             let view = HeaderView::map(memfd.as_fd())?;
@@ -546,7 +722,7 @@ impl Control {
         self.decide(now, false, &mut batch);
         self.send(batch);
         Answer {
-            reply: Some(Reply::Configured),
+            reply: Some(Reply::Configured { rate: 0 }),
             fds: vec![memfd_theirs, theirs],
             close: false,
         }
@@ -555,6 +731,7 @@ impl Control {
     /// Starts the stream. A stream that cannot be sealed is not trusted, and
     /// the client is dropped.
     fn start_stream(&mut self, conn: ConnId, now: Instant) -> Answer {
+        self.new_rate_decision();
         let urgent = self.running_count() == 0;
         let Some(stream) = self.stream_mut(conn) else {
             return Answer::error(libc::EBADFD);
@@ -613,12 +790,13 @@ impl Control {
         }
     }
 
-    /// The audio thread has emptied a stream's ring: its reset is answered.
+    /// The audio thread has emptied a stream's ring, or stopped a capture
+    /// stream: its reset is answered.
     fn flushed(&mut self, id: ClientId) {
-        let conn = self
-            .conns
-            .iter()
-            .find(|(_, c)| c.stream.as_ref().is_some_and(|s| s.id == id));
+        let conn = self.conns.iter().find(|(_, c)| {
+            c.stream.as_ref().is_some_and(|s| s.id == id)
+                || c.recorder.as_ref().is_some_and(|r| r.id == id)
+        });
         if let Some((&conn, _)) = conn {
             self.outbox.push((conn, Reply::Ok));
         }
@@ -626,6 +804,7 @@ impl Control {
 
     /// Stops a running stream and settles what follows from that.
     fn stop(&mut self, id: ClientId, now: Instant, batch: &mut Vec<Command>) {
+        self.new_rate_decision();
         let Some(stream) = self.stream_by_id(id) else {
             return;
         };
@@ -693,6 +872,7 @@ impl Control {
     }
 
     fn remove_stream(&mut self, stream: Stream, now: Instant, batch: &mut Vec<Command>) {
+        self.new_rate_decision();
         if stream.running {
             self.policy.client_stopped(stream.id, now - self.epoch);
         }
@@ -700,6 +880,139 @@ impl Control {
         self.table_len -= 1;
         self.dop_claims.retain(|&(_, c)| c != stream.id);
         self.update_dop(now, batch);
+    }
+
+    /// Sets up a capture stream: S32 stereo at the rate the output runs at,
+    /// or opens at next if it is closed. The ring holds what is asked for,
+    /// and at least a few periods. Sends the tap to the audio thread, which
+    /// writes it once it is started.
+    fn configure_recorder(&mut self, conn: ConnId, buffer_frames: u32, now: Instant) -> Answer {
+        let rate = match self.output {
+            Some((rate, _)) => rate,
+            None => self.policy.current(),
+        };
+        let least = RECORDER_PERIODS * period_frames(rate, self.latency_ms);
+        let capacity = buffer_frames.max(least);
+        let mut batch = Vec::new();
+        if let Some(old) = self.conns.get_mut(&conn).and_then(|c| c.stream.take()) {
+            self.remove_stream(old, now, &mut batch);
+            self.decide(now, false, &mut batch);
+        }
+        if let Some(old) = self.conns.get_mut(&conn).and_then(|c| c.recorder.take()) {
+            self.remove_recorder(old, &mut batch);
+        }
+        let made = Ring::create(capacity).and_then(|(ring, memfd)| {
+            let wake = eventfd()?;
+            let theirs = wake.try_clone()?;
+            let memfd_theirs = memfd.try_clone()?;
+            Ok((ring, memfd, memfd_theirs, wake, theirs))
+        });
+        let (ring, memfd, memfd_theirs, wake, theirs) = match made {
+            Ok(made) => made,
+            Err(e) => {
+                eprintln!("aas: no ring for a recorder: {e}");
+                self.send(batch);
+                return Answer::error(e.raw_os_error().unwrap_or(libc::ENOMEM));
+            }
+        };
+        let id = self.next_id;
+        self.next_id += 1;
+        if self.taps_len == self.taps_capacity {
+            self.taps_capacity *= 2;
+            batch.push(Command::GrowTaps(Vec::with_capacity(self.taps_capacity)));
+        }
+        batch.push(Command::AddTap(Box::new(Tap::new(id, ring, wake))));
+        self.taps_len += 1;
+        let recorder = Recorder {
+            id,
+            rate,
+            memfd: Some(memfd),
+            running: false,
+            ended: false,
+        };
+        if let Some(state) = self.conns.get_mut(&conn) {
+            state.recorder = Some(recorder);
+        }
+        self.send(batch);
+        Answer {
+            reply: Some(Reply::Configured { rate }),
+            fds: vec![memfd_theirs, theirs],
+            close: false,
+        }
+    }
+
+    /// Starts a capture stream, unless it has ended. As for a player, a
+    /// ring that cannot be sealed is not trusted, and the client is dropped.
+    fn start_recorder(&mut self, conn: ConnId) -> Answer {
+        let Some(recorder) = self.recorder_mut(conn) else {
+            return Answer::error(libc::EBADFD);
+        };
+        if recorder.ended {
+            return Answer::error(libc::ENODEV);
+        }
+        if let Some(memfd) = recorder.memfd.take() {
+            if let Err(e) = ring::seal_writes(memfd.as_fd()) {
+                eprintln!("aas: could not seal a recorder's ring: {e}");
+                return Answer::fatal(e.raw_os_error().unwrap_or(libc::EIO));
+            }
+        }
+        if !std::mem::replace(&mut recorder.running, true) {
+            let id = recorder.id;
+            self.send(vec![Command::SetRunning(id, true)]);
+        }
+        Answer::reply(Reply::Ok)
+    }
+
+    fn stop_recorder(&mut self, conn: ConnId) -> Answer {
+        let Some(recorder) = self.recorder_mut(conn) else {
+            return Answer::error(libc::EBADFD);
+        };
+        if std::mem::take(&mut recorder.running) {
+            let id = recorder.id;
+            self.send(vec![Command::SetRunning(id, false)]);
+        }
+        Answer::reply(Reply::Ok)
+    }
+
+    /// Stops a capture stream. The reply comes once the audio thread has
+    /// stopped writing, so that the client can empty the ring, which is
+    /// the reader's to do.
+    fn reset_recorder(&mut self, conn: ConnId) -> Answer {
+        let Some(recorder) = self.recorder_mut(conn) else {
+            return Answer::error(libc::EBADFD);
+        };
+        recorder.running = false;
+        let id = recorder.id;
+        self.send(vec![Command::Flush(id)]);
+        Answer {
+            reply: None,
+            fds: Vec::new(),
+            close: false,
+        }
+    }
+
+    fn remove_recorder(&mut self, recorder: Recorder, batch: &mut Vec<Command>) {
+        if !recorder.ended {
+            batch.push(Command::RemoveTap(recorder.id));
+            self.taps_len -= 1;
+        }
+    }
+
+    /// Ends every capture stream that records at another rate than `rate`.
+    /// The capture runs at the output's rate only, so the client has to
+    /// configure again. It is told through the ring once the tap is back.
+    fn end_recorders(&mut self, rate: u32, batch: &mut Vec<Command>) {
+        let recorders = self.conns.values_mut().filter_map(|c| c.recorder.as_mut());
+        for recorder in recorders.filter(|r| !r.ended && r.rate != rate) {
+            recorder.ended = true;
+            recorder.running = false;
+            batch.push(Command::RemoveTap(recorder.id));
+            self.taps_len -= 1;
+        }
+    }
+
+    fn recorder_mut(&mut self, conn: ConnId) -> Option<&mut Recorder> {
+        self.conns.get_mut(&conn)?.recorder.as_mut()
     }
 
     fn stream_mut(&mut self, conn: ConnId) -> Option<&mut Stream> {
@@ -723,8 +1036,42 @@ impl Control {
         self.streams().filter(|s| s.running).count()
     }
 
+    /// Whether a DoP stream at `rate` can have the output: the card takes
+    /// the rate, and the analog chain, if any, can be built at it.
     fn is_supported(&self, rate: u32) -> bool {
-        self.supported.is_empty() || self.supported.contains(&rate)
+        let card = self.supported.is_empty() || self.supported.contains(&rate);
+        card && !self.analog_refused.contains(&rate)
+    }
+
+    /// The card's rates, without `refused`. Empty takes any rate, as the
+    /// card's list does, only while nothing has been refused.
+    fn usable(&self, refused: &[u32]) -> Vec<u32> {
+        if refused.is_empty() {
+            return self.supported.clone();
+        }
+        let all = if self.supported.is_empty() {
+            &STANDARD_RATES[..]
+        } else {
+            &self.supported[..]
+        };
+        all.iter()
+            .copied()
+            .filter(|r| !refused.contains(r))
+            .collect()
+    }
+
+    /// Gives the rules the rates the card takes and the chains can be built
+    /// at. Returns false, and leaves the rules as they are, if there is none.
+    fn update_rates(&mut self) -> bool {
+        let pcm = self.usable(&self.refused);
+        if pcm.is_empty() && !self.refused.is_empty() {
+            return false;
+        }
+        // DoP needs only the analog chain, so only its refusals limit DoP.
+        let dop = (self.refused != self.analog_refused).then(|| self.usable(&self.analog_refused));
+        self.policy.set_supported(pcm);
+        self.policy.set_dop_supported(dop);
+        true
     }
 
     /// Makes the rate rules follow the audio thread's DoP owner: the oldest
@@ -749,9 +1096,37 @@ impl Control {
             }
         }
         self.dop_owner = owner;
+        self.new_rate_decision();
+        self.sync_analog_client(now);
         if owner.is_some() {
             self.decide(now, true, batch);
         }
+    }
+
+    /// Makes the analog input a client of the rate rules while it has
+    /// signal and no DoP stream owns the output, and not otherwise. It
+    /// joins at the rate the card runs at, by the rules for any client:
+    /// it never asks for a rate of its own, it holds the running rate as a
+    /// client at it does, and its joining cancels a pending switch away
+    /// from that rate. While DoP owns the output the input is not played,
+    /// so it is not a client; it joins when DoP ends, at the rate the card
+    /// then runs at.
+    fn sync_analog_client(&mut self, now: Instant) {
+        let t = now - self.epoch;
+        let dop = self.dop_owner.is_some();
+        let Some(analog) = &mut self.analog else {
+            return;
+        };
+        let want = analog.active && !dop;
+        if want && !analog.registered {
+            // The rate the card runs at, which the rules may not have
+            // settled on yet, such as just after a DoP stream.
+            let rate = self.output.map_or(self.policy.current(), |(r, _)| r);
+            self.policy.client_started(ANALOG, rate, t);
+        } else if !want && analog.registered {
+            self.policy.client_stopped(ANALOG, t);
+        }
+        analog.registered = want;
     }
 
     /// Takes the output to the rate the rules want, and keeps every running
@@ -765,7 +1140,11 @@ impl Control {
         } else {
             self.idle_since.get_or_insert(now);
         }
-        let want = self.policy.current();
+        let Some(want) = self.usable_rate() else {
+            // The output stays as it is; the clients follow it.
+            self.sync_resamplers(batch);
+            return;
+        };
         let reopen = match self.output {
             None => running,
             Some((rate, _)) if rate == want => {
@@ -784,20 +1163,264 @@ impl Control {
             self.open_output(batch);
         } else {
             self.sync_resamplers(batch);
+            // Chains for the rate the output already runs at, such as when
+            // it stays at the rate a DoP stream set.
+            if self.output.is_some_and(|(rate, _)| rate == want) {
+                self.send_spare(batch);
+            }
+        }
+    }
+
+    /// The rate the rules want, once chains are built for it. A rate at
+    /// which one cannot be built is refused: the rules then take the
+    /// nearest other rate, and the chains are built for that. None if no
+    /// rate works, which is logged once; the output then stays as it is.
+    fn usable_rate(&mut self) -> Option<u32> {
+        loop {
+            let rate = self.policy.current();
+            let dop = self.policy.dop_rate().is_some();
+            let known = if dop {
+                &self.analog_refused
+            } else {
+                &self.refused
+            };
+            if known.contains(&rate) {
+                // Refused already, and nothing else works.
+                return None;
+            }
+            if self.failed == Some((rate, dop)) {
+                // Failed in this rate decision.
+                return self.fallback(rate);
+            }
+            let spare = self.spare.as_ref();
+            if spare.is_some_and(|s| s.rate == rate && s.dop == dop) {
+                return Some(rate);
+            }
+            match self.chains_for(rate, dop) {
+                Ok(chains) => {
+                    self.spare = Some(Spare { rate, dop, chains });
+                    return Some(rate);
+                }
+                Err((_, e)) if e.kind != Failure::Unsupported => {
+                    // Not the rate's fault: it is not refused, and the
+                    // next rate decision tries again.
+                    eprintln!(
+                        "aas: {e}; the output stays as it is until the next change of clients"
+                    );
+                    self.failed = Some((rate, dop));
+                    return self.fallback(rate);
+                }
+                Err((place, e)) => {
+                    eprintln!("aas: {e}; the output does not run at {rate} Hz");
+                    self.refused.push(rate);
+                    if place == PluginPlace::Analog {
+                        self.analog_refused.push(rate);
+                    }
+                    if !self.update_rates() || self.policy.current() == rate {
+                        if !std::mem::replace(&mut self.stuck, true) {
+                            eprintln!("aas: no rate works for every plugin chain");
+                        }
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Builds the chains `rate` needs that are not on the audio thread
+    /// already: for a DoP stream the analog chain only, since DoP bypasses
+    /// the others and they keep their state. Fails with the place whose
+    /// chain could not be built.
+    fn chains_for(
+        &mut self,
+        rate: u32,
+        dop: bool,
+    ) -> Result<Vec<(PluginPlace, Chain)>, (PluginPlace, BuildError)> {
+        let mut ready = self.ready.take().filter(|c| c.rate == rate);
+        let mut chains = Vec::new();
+        for place in self.chain_places() {
+            if (dop && place != PluginPlace::Analog) || self.built[slot(place)] == Some(rate) {
+                continue;
+            }
+            let chain = match &mut ready {
+                Some(ready) => ready.take(place),
+                None => build_chain(&self.plugins, place, rate, self.format, &mut self.libraries)
+                    .map_err(|e| (place, e))?,
+            };
+            chains.push((place, chain));
+        }
+        Ok(chains)
+    }
+
+    /// A change of clients or of the card: a chain that failed is tried
+    /// again, once, at the next rate the rules want.
+    fn new_rate_decision(&mut self) {
+        self.failed = None;
+        self.no_fallback = false;
+    }
+
+    /// The rate to use in this rate decision when the chains for `wanted`
+    /// failed. An open output keeps what it has: None. A closed one must
+    /// not stay closed under a client: it opens at the nearest rate whose
+    /// chains build, without refusing `wanted`, which the next decision
+    /// tries again. None if no rate builds, logged once per decision.
+    fn fallback(&mut self, wanted: u32) -> Option<u32> {
+        if self.output.is_some() || self.no_fallback {
+            return None;
+        }
+        if let Some(spare) = &self.spare
+            && !spare.dop
+            && spare.rate != wanted
+        {
+            return Some(spare.rate);
+        }
+        let mut rates = if self.supported.is_empty() {
+            STANDARD_RATES.to_vec()
+        } else {
+            self.supported.clone()
+        };
+        rates.retain(|r| *r != wanted && !self.refused.contains(r));
+        rates.sort_by_key(|&r| (r.abs_diff(wanted), r));
+        for rate in rates {
+            if let Ok(chains) = self.chains_for(rate, false) {
+                eprintln!("aas: the output opens at {rate} Hz until {wanted} Hz works");
+                self.spare = Some(Spare {
+                    rate,
+                    dop: false,
+                    chains,
+                });
+                return Some(rate);
+            }
+        }
+        eprintln!("aas: error: no rate builds every plugin chain, the output stays closed");
+        self.no_fallback = true;
+        None
+    }
+
+    /// Whether a mix or output chain with plugins on the audio thread is
+    /// built for another rate than the output runs at.
+    fn chains_behind(&self) -> bool {
+        let Some((rate, _)) = self.output else {
+            return false;
+        };
+        self.chain_places()
+            .into_iter()
+            .filter(|&place| place != PluginPlace::Analog)
+            .any(|place| self.built[slot(place)] != Some(rate))
+    }
+
+    /// Sends the spare chains, which take effect from the next command on.
+    fn send_spare(&mut self, batch: &mut Vec<Command>) {
+        let Some(spare) = self.spare.take() else {
+            return;
+        };
+        for (place, chain) in spare.chains {
+            self.built[slot(place)] = Some(spare.rate);
+            batch.push(Command::SetChain(engine_place(place), Box::new(chain)));
         }
     }
 
     /// Opens or reopens the output at the rate the rules want. Resamplers
-    /// for the new rate go first, so that they take effect with it.
+    /// and chains for the new rate go first, so that they take effect with
+    /// it. The audio thread closes the capture first; a new one is opened
+    /// once the output is open.
     fn open_output(&mut self, batch: &mut Vec<Command>) {
-        let rate = self.policy.current();
+        let Some(rate) = self.usable_rate() else {
+            return;
+        };
         let period = period_frames(rate, self.latency_ms);
         eprintln!("aas: output at {rate} Hz, {period} frames per period");
         self.output = Some((rate, period));
         self.reopening += 1;
         self.switch_at = None;
         self.sync_resamplers(batch);
+        self.send_spare(batch);
+        if let Some(analog) = &mut self.analog {
+            analog.reading = false;
+            analog.retry_at = None;
+        }
+        self.end_recorders(rate, batch);
         batch.push(Command::Reconfigure { rate, period });
+    }
+
+    /// The places that get a chain: those the config lists plugins at, and
+    /// the analog input, which always has its detector.
+    fn chain_places(&self) -> Vec<PluginPlace> {
+        let places = [PluginPlace::Analog, PluginPlace::Mix, PluginPlace::Output];
+        places
+            .into_iter()
+            .filter(|&place| match place {
+                PluginPlace::Analog => self.analog.is_some(),
+                _ => self.plugins.iter().any(|p| p.place == place),
+            })
+            .collect()
+    }
+
+    /// Opens the capture for the output and hands it to the audio thread,
+    /// once the output is open and if it has none that works. One that
+    /// will not open is tried again a second later.
+    fn open_capture(&mut self, now: Instant, batch: &mut Vec<Command>) {
+        let (Some((rate, period)), 0) = (self.output, self.reopening) else {
+            return;
+        };
+        let Some(analog) = &mut self.analog else {
+            return;
+        };
+        if analog.reading {
+            return;
+        }
+        match (analog.open)(rate, period) {
+            Ok(capture) => {
+                batch.push(Command::SetCapture(Some(capture)));
+                analog.unanswered += 1;
+                analog.reading = true;
+                analog.retry_at = None;
+                if std::mem::take(&mut analog.failing) {
+                    eprintln!("aas: the analog input works again");
+                }
+            }
+            Err(OpenError::Never(e)) => {
+                eprintln!("aas: the analog input: {e}; it stays off");
+                self.analog = None;
+            }
+            Err(OpenError::Again(e)) => {
+                if !std::mem::replace(&mut analog.failing, true) {
+                    eprintln!("aas: the analog input: {e}, trying again every second");
+                }
+                analog.retry_at = Some(now + CAPTURE_RETRY);
+            }
+        }
+    }
+
+    /// The audio thread reports that the capture failed, and it is closed. A
+    /// report that comes before the answer to a newer capture is about the
+    /// one that capture replaced, so it changes nothing.
+    fn capture_failed(&mut self, now: Instant) {
+        let Some(analog) = &mut self.analog else {
+            return;
+        };
+        if analog.unanswered > 0 || !analog.reading {
+            return;
+        }
+        analog.reading = false;
+        if !std::mem::replace(&mut analog.failing, true) {
+            eprintln!("aas: the analog input failed, trying again every second");
+        }
+        analog.retry_at = Some(now + CAPTURE_RETRY);
+    }
+
+    /// The analog input has signal or not. With signal it is a client of
+    /// the rate rules, see `sync_analog_client`, and the rate is decided
+    /// again as for a player that starts or stops.
+    fn input_signal(&mut self, on: bool, now: Instant, batch: &mut Vec<Command>) {
+        self.new_rate_decision();
+        let Some(analog) = &mut self.analog else {
+            return;
+        };
+        eprintln!("aas: analog input: {}", if on { "signal" } else { "quiet" });
+        analog.active = on;
+        self.sync_analog_client(now);
+        self.decide(now, false, batch);
     }
 
     /// Gives each source at another rate than the output a resampler for
@@ -834,9 +1457,14 @@ impl Control {
     /// The card's rates have changed, such as when a card that was missing
     /// is found. The output moves at once to a rate the card takes.
     pub fn set_supported(&mut self, rates: Vec<u32>, now: Instant) {
+        self.new_rate_decision();
         eprintln!("aas: the card takes the rates {rates:?}");
-        self.supported = rates.clone();
-        self.policy.set_supported(rates);
+        self.supported = rates;
+        // New rates are a new chance, and a new failure is worth a line.
+        self.stuck = false;
+        if !self.update_rates() {
+            eprintln!("aas: no rate the card takes works for every plugin chain");
+        }
         let mut batch = Vec::new();
         self.update_dop(now, &mut batch);
         self.decide(now, true, &mut batch);
@@ -858,8 +1486,38 @@ impl Control {
         for event in events {
             match event {
                 // Freed here, not on the audio thread.
-                Event::Dropped(_) | Event::Replaced(_) | Event::OldTable(_) => {}
-                Event::Reconfigured => self.reopening = self.reopening.saturating_sub(1),
+                Event::Dropped(_)
+                | Event::Replaced(_)
+                | Event::OldTable(_)
+                | Event::OldChain(_)
+                | Event::OldTaps(_) => {}
+                // The audio thread writes it no more, so a client that
+                // reads it empty after this has all of it. A client that
+                // gave the stream up meanwhile is told nothing it minds.
+                // The client is woken: nothing else will wake one that
+                // waits for frames.
+                Event::DroppedTap(tap) => {
+                    tap.ring.header().ended.store(1, Ordering::Release);
+                    let one = 1u64;
+                    // SAFETY: 8 bytes to a non-blocking eventfd. A full
+                    // counter only means the client is woken already.
+                    unsafe { libc::write(tap.wake.as_raw_fd(), (&raw const one).cast(), 8) };
+                }
+                Event::OldCapture(_) => {
+                    if let Some(analog) = &mut self.analog {
+                        analog.unanswered = analog.unanswered.saturating_sub(1);
+                    }
+                }
+                Event::InputSignal(on) => self.input_signal(on, now, &mut batch),
+                Event::CaptureFailed(mut capture) => {
+                    // Off the audio thread, as the engine leaves it.
+                    capture.close();
+                    self.capture_failed(now);
+                }
+                Event::Reconfigured => {
+                    self.reopening = self.reopening.saturating_sub(1);
+                    self.open_capture(now, &mut batch);
+                }
                 Event::DopStarted(id, claim) => {
                     // The events can come in another order than the claims
                     // were made, when the queue was full meanwhile. The
@@ -872,7 +1530,13 @@ impl Control {
                 Event::DopStopped(id) => {
                     self.dop_claims.retain(|&(_, c)| c != id);
                     self.update_dop(now, &mut batch);
-                    self.decide(now, false, &mut batch);
+                    // At once if the mix or output chain on the audio
+                    // thread is built for another rate than the output's:
+                    // the engine keeps them silent until the output and
+                    // its chains follow. Otherwise after the settle time,
+                    // so that a stop and a start leave the rate alone.
+                    let urgent = self.chains_behind();
+                    self.decide(now, urgent, &mut batch);
                 }
                 Event::Drained(id) => self.drained(id, now, &mut batch),
                 Event::Flushed(id) => self.flushed(id),
@@ -914,7 +1578,17 @@ impl Control {
             self.drained(id, now, &mut batch);
         }
         self.decide(now, settled, &mut batch);
-        if let (Idle::Off { delay_s }, Some(since)) = (self.idle, self.idle_since) {
+        let retry = self.analog.as_ref().and_then(|a| a.retry_at);
+        if retry.is_some_and(|at| now >= at) {
+            self.open_capture(now, &mut batch);
+        }
+        // The analog input keeps the output open.
+        let idle = if self.analog.is_some() {
+            Idle::Zeros
+        } else {
+            self.idle
+        };
+        if let (Idle::Off { delay_s }, Some(since)) = (idle, self.idle_since) {
             let delay = Duration::from_secs(u64::from(delay_s));
             if self.output.is_some() && now >= since + delay {
                 eprintln!("aas: output off after {delay_s} s idle");
@@ -986,7 +1660,10 @@ pub(crate) fn eventfd() -> io::Result<OwnedFd> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capture::MemoryCapture;
     use crate::config::{self, Format, Quality};
+    use crate::plugin::chain::Chain;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn a_drain_reported_before_its_request_is_answered_at_once() {
@@ -1009,9 +1686,10 @@ mod tests {
             format: ClientFormat::S32,
             channels: 2,
             buffer_frames: 4096,
+            capture: false,
         };
         let answer = control.request(1, Some(configure), now);
-        assert_eq!(answer.reply, Some(Reply::Configured));
+        assert_eq!(answer.reply, Some(Reply::Configured { rate: 0 }));
         let start = control.request(1, Some(Request::Start), now);
         assert_eq!(start.reply, Some(Reply::Ok));
         // The client set the flag, and the audio thread saw the ring empty
@@ -1060,6 +1738,7 @@ mod tests {
             format: ClientFormat::S16,
             channels: 2,
             buffer_frames,
+            capture: false,
         }
     }
 
@@ -1135,7 +1814,7 @@ mod tests {
             let code = libc::EINVAL as u32;
             assert_eq!(short.reply, Some(Reply::Error { code }), "{rate}");
             let enough = control.request(1, Some(configure(rate, least)), now);
-            assert_eq!(enough.reply, Some(Reply::Configured), "{rate}");
+            assert_eq!(enough.reply, Some(Reply::Configured { rate: 0 }), "{rate}");
         }
     }
 
@@ -1160,7 +1839,7 @@ mod tests {
     fn a_request_during_a_drain_answers_the_drain_first() {
         let (mut control, _commands, now) = hello();
         let answer = control.request(1, Some(configure(48000, 4096)), now);
-        assert_eq!(answer.reply, Some(Reply::Configured));
+        assert_eq!(answer.reply, Some(Reply::Configured { rate: 0 }));
         assert_eq!(
             control.request(1, Some(Request::Start), now).reply,
             Some(Reply::Ok)
@@ -1184,7 +1863,7 @@ mod tests {
     fn a_drain_that_makes_progress_is_not_cut_short() {
         let (mut control, mut commands, now) = hello();
         let answer = control.request(1, Some(configure(48000, 4096)), now);
-        assert_eq!(answer.reply, Some(Reply::Configured));
+        assert_eq!(answer.reply, Some(Reply::Configured { rate: 0 }));
         let source = added(&mut commands);
         source.ring.write(&[[1, 1]; 4096]);
         assert_eq!(
@@ -1218,7 +1897,7 @@ mod tests {
     fn a_drain_is_not_answered_while_the_output_is_still_opening() {
         let (mut control, mut commands, now) = hello();
         let answer = control.request(1, Some(configure(48000, 4096)), now);
-        assert_eq!(answer.reply, Some(Reply::Configured));
+        assert_eq!(answer.reply, Some(Reply::Configured { rate: 0 }));
         let source = added(&mut commands);
         source.ring.write(&[[1, 1]; 4096]);
         let start = control.request(1, Some(Request::Start), now);
@@ -1343,7 +2022,7 @@ mod tests {
             control.request(conn, Some(hello), now);
             let buffer = min_buffer_frames(rate, 12.0);
             let answer = control.request(conn, Some(configure(rate, buffer)), now);
-            assert_eq!(answer.reply, Some(Reply::Configured));
+            assert_eq!(answer.reply, Some(Reply::Configured { rate: 0 }));
             let start = control.request(conn, Some(Request::Start), now);
             assert_eq!(start.reply, Some(Reply::Ok));
         }
@@ -1381,7 +2060,7 @@ mod tests {
         };
         control.request(1, Some(hello), now);
         let answer = control.request(1, Some(configure(48000, 4096)), now);
-        assert_eq!(answer.reply, Some(Reply::Configured));
+        assert_eq!(answer.reply, Some(Reply::Configured { rate: 0 }));
         let source = added(&mut engine_commands);
         source.ring.write(&[[1, 1]; 4096]);
         // The start opens the output, and new rates of the card open it
@@ -1407,6 +2086,1270 @@ mod tests {
         control.handle_events(t);
         control.tick(t + Duration::from_millis(1000));
         assert_eq!(control.take_replies(), vec![(1, Reply::Ok)]);
+    }
+
+    /// Opens `MemoryCapture`s for the control thread and records the rate
+    /// and period of each open. The next `fails` opens fail.
+    #[derive(Clone, Default)]
+    struct Opener {
+        asked: Arc<Mutex<Vec<(u32, u32)>>>,
+        fails: Arc<Mutex<u32>>,
+    }
+
+    impl Opener {
+        fn open(&self) -> OpenCapture {
+            let me = self.clone();
+            Box::new(move |rate, period| {
+                me.asked.lock().unwrap().push((rate, period));
+                let mut fails = me.fails.lock().unwrap();
+                if *fails > 0 {
+                    *fails -= 1;
+                    return Err("no such device".into());
+                }
+                let (capture, _feed) = MemoryCapture::new();
+                Ok(Box::new(capture) as Box<dyn Capture>)
+            })
+        }
+
+        fn asked(&self) -> Vec<(u32, u32)> {
+            self.asked.lock().unwrap().clone()
+        }
+
+        fn fail(&self, times: u32) {
+            *self.fails.lock().unwrap() = times;
+        }
+    }
+
+    /// The audio thread as far as the control thread can tell: it takes the
+    /// commands, answers each as the engine does, and names them.
+    struct FakeEngine {
+        commands: rtrb::Consumer<Command>,
+        events: rtrb::Producer<Event>,
+        capture: Option<Box<dyn Capture>>,
+    }
+
+    impl FakeEngine {
+        /// Takes every queued command and answers it. A reopen answers at
+        /// once only with `opened`.
+        fn take(&mut self, opened: bool) -> Vec<String> {
+            let mut seen = Vec::new();
+            while let Ok(command) = self.commands.pop() {
+                let (name, answer) = match command {
+                    Command::Add(_) => ("Add".into(), None),
+                    Command::Remove(_) => ("Remove".into(), None),
+                    Command::SetRunning(id, on) => (format!("SetRunning {id} {on}"), None),
+                    Command::Flush(id) => (format!("Flush {id}"), Some(Event::Flushed(id))),
+                    Command::SetResampler(id, r) => (
+                        format!("SetResampler {id} {}", r.is_some()),
+                        Some(Event::Replaced(r)),
+                    ),
+                    Command::Reconfigure { rate, period } => (
+                        format!("Reconfigure {rate} {period}"),
+                        opened.then_some(Event::Reconfigured),
+                    ),
+                    Command::CloseOutput => ("CloseOutput".into(), None),
+                    Command::SetGain(_) => ("SetGain".into(), None),
+                    Command::Grow(t) => ("Grow".into(), Some(Event::OldTable(t))),
+                    Command::SetChain(place, chain) => {
+                        let names: Vec<&str> = chain.names().collect();
+                        let name = format!("SetChain {place:?} {}", names.join(","));
+                        (name, Some(Event::OldChain(chain)))
+                    }
+                    Command::SetParam { .. } => ("SetParam".into(), None),
+                    Command::SetCapture(c) => {
+                        let old = std::mem::replace(&mut self.capture, c);
+                        let name = format!("SetCapture {}", self.capture.is_some());
+                        (name, Some(Event::OldCapture(old)))
+                    }
+                    Command::SetAnalogGain(g) => (format!("SetAnalogGain {g}"), None),
+                    Command::AddTap(t) => (format!("AddTap {}", t.id), None),
+                    Command::RemoveTap(id) => (format!("RemoveTap {id}"), None),
+                    Command::GrowTaps(t) => ("GrowTaps".into(), Some(Event::OldTaps(t))),
+                    Command::Shutdown => ("Shutdown".into(), None),
+                };
+                seen.push(name);
+                if let Some(event) = answer {
+                    assert!(self.events.push(event).is_ok());
+                }
+            }
+            seen
+        }
+
+        fn send(&mut self, event: Event) {
+            assert!(self.events.push(event).is_ok());
+        }
+    }
+
+    /// A started control thread with one client said hello on connection
+    /// 1, the analog input on if `opener` is given, and the fake engine.
+    fn started(config: &Config, opener: Option<&Opener>) -> (Control, FakeEngine, Instant) {
+        let (commands, engine_commands) = rtrb::RingBuffer::new(256);
+        let (engine_events, events) = rtrb::RingBuffer::new(256);
+        let audio = std::thread::current();
+        let mut control = Control::new(config, 12.0, Vec::new(), commands, events, audio);
+        if let Some(opener) = opener {
+            control.set_analog(opener.open());
+        }
+        let now = Instant::now();
+        control.start(now);
+        let engine = FakeEngine {
+            commands: engine_commands,
+            events: engine_events,
+            capture: None,
+        };
+        (control, engine, now)
+    }
+
+    /// Connects a client on `conn` and has it play at `rate`.
+    fn play(control: &mut Control, conn: ConnId, rate: u32, now: Instant) {
+        control.connected(conn, "test".into());
+        let hello = Request::Hello {
+            version: proto::VERSION,
+        };
+        control.request(conn, Some(hello), now);
+        let buffer = min_buffer_frames(rate, 12.0);
+        let answer = control.request(conn, Some(configure(rate, buffer)), now);
+        assert_eq!(answer.reply, Some(Reply::Configured { rate: 0 }));
+        let start = control.request(conn, Some(Request::Start), now);
+        assert_eq!(start.reply, Some(Reply::Ok));
+    }
+
+    fn has(seen: &[String], what: &str) -> bool {
+        seen.iter().any(|s| s.starts_with(what))
+    }
+
+    fn analog_config() -> Config {
+        Config {
+            analog: config::Analog {
+                enabled: true,
+                volume_db: -20.0,
+            },
+            ..Config::default()
+        }
+    }
+
+    /// Connects a client on `conn` and configures a capture stream.
+    /// Returns the client's mapping of the ring.
+    fn record(control: &mut Control, conn: ConnId, now: Instant) -> (Ring, u32) {
+        control.connected(conn, "recorder".into());
+        let hello = Request::Hello {
+            version: proto::VERSION,
+        };
+        control.request(conn, Some(hello), now);
+        let capture = Request::Configure {
+            rate: 0,
+            format: ClientFormat::S32,
+            channels: 2,
+            buffer_frames: 4096,
+            capture: true,
+        };
+        let answer = control.request(conn, Some(capture), now);
+        let Some(Reply::Configured { rate }) = answer.reply else {
+            panic!("not configured: {:?}", answer.reply);
+        };
+        (Ring::map(answer.fds[0].as_fd()).unwrap(), rate)
+    }
+
+    fn ask_start(control: &mut Control, conn: ConnId, now: Instant) -> Answer {
+        control.request(conn, Some(Request::Start), now)
+    }
+
+    #[test]
+    fn a_recorder_is_ended_only_once_its_tap_is_back() {
+        let (mut control, mut engine, now) = started(&Config::default(), None);
+        engine.take(true);
+        control.handle_events(now);
+        let (ring, rate) = record(&mut control, 2, now);
+        assert_eq!(rate, 48000);
+        let mut tap = None;
+        while let Ok(command) = engine.commands.pop() {
+            if let Command::AddTap(t) = command {
+                tap = Some(t);
+            }
+        }
+        let tap = tap.expect("no tap added");
+        let ok = Some(Reply::Ok);
+        assert_eq!(ask_start(&mut control, 2, now).reply, ok);
+        // A player at another rate moves the output, and the tap goes.
+        play(&mut control, 1, 44100, now);
+        let seen = engine.take(false);
+        let removed = format!("RemoveTap {}", tap.id);
+        assert!(has(&seen, &removed), "{seen:?}");
+        assert!(has(&seen, "Reconfigure 44100"), "{seen:?}");
+        // The audio thread may still write it, so the client is not told
+        // yet. A start is refused already.
+        assert_eq!(ring.header().ended.load(Ordering::Acquire), 0);
+        let code = libc::ENODEV as u32;
+        let refused = Some(Reply::Error { code });
+        assert_eq!(ask_start(&mut control, 2, now).reply, refused);
+        engine.send(Event::DroppedTap(tap));
+        control.handle_events(now);
+        assert_eq!(ring.header().ended.load(Ordering::Acquire), 1);
+        assert_eq!(ask_start(&mut control, 2, now).reply, refused);
+    }
+
+    /// The count an eventfd holds, which a read takes. Zero if it is not
+    /// readable.
+    fn wake_count(wake: &OwnedFd) -> u64 {
+        let mut count = 0u64;
+        // SAFETY: 8 bytes from a non-blocking eventfd.
+        unsafe { libc::read(wake.as_raw_fd(), (&raw mut count).cast(), 8) };
+        count
+    }
+
+    #[test]
+    fn a_recorder_is_woken_when_its_stream_ends() {
+        let (mut control, mut engine, now) = started(&Config::default(), None);
+        engine.take(true);
+        control.handle_events(now);
+        let (_ring, _) = record(&mut control, 2, now);
+        let mut tap = None;
+        while let Ok(command) = engine.commands.pop() {
+            if let Command::AddTap(t) = command {
+                tap = Some(t);
+            }
+        }
+        let tap = tap.expect("no tap added");
+        // The recorder's copy of the wake-up.
+        let wake = tap.wake.try_clone().unwrap();
+        assert_eq!(ask_start(&mut control, 2, now).reply, Some(Reply::Ok));
+        play(&mut control, 1, 44100, now);
+        engine.take(false);
+        assert_eq!(wake_count(&wake), 0);
+        // A recorder asleep in poll, with nothing more to come, has to
+        // hear that the stream is over.
+        engine.send(Event::DroppedTap(tap));
+        control.handle_events(now);
+        assert_eq!(wake_count(&wake), 1);
+    }
+
+    #[test]
+    fn with_the_analog_input_on_the_output_opens_at_startup() {
+        let opener = Opener::default();
+        let (mut control, mut engine, now) = started(&analog_config(), Some(&opener));
+        let seen = engine.take(true);
+        let gain = crate::format::db_to_gain(-20.0);
+        assert_eq!(
+            seen,
+            [
+                "SetGain".to_string(),
+                format!("SetAnalogGain {gain}"),
+                "SetChain Analog detect".into(),
+                "Reconfigure 48000 256".into(),
+            ]
+        );
+        // The capture opens once the output is open, not before.
+        assert!(opener.asked().is_empty());
+        control.handle_events(now);
+        assert_eq!(opener.asked(), [(48000, 256)]);
+        assert_eq!(engine.take(true), ["SetCapture true"]);
+        control.handle_events(now);
+        assert!(engine.take(true).is_empty());
+    }
+
+    #[test]
+    fn with_the_analog_input_on_the_output_stays_open_when_idle() {
+        let config = Config {
+            idle: Idle::Off { delay_s: 1 },
+            ..analog_config()
+        };
+        let opener = Opener::default();
+        let (mut control, mut engine, now) = started(&config, Some(&opener));
+        engine.take(true);
+        control.handle_events(now);
+        engine.take(true);
+        // A player comes and goes, and the input has signal for a while.
+        play(&mut control, 1, 48000, now);
+        engine.send(Event::InputSignal(true));
+        control.handle_events(now);
+        let stop = control.request(1, Some(Request::Stop), now);
+        assert_eq!(stop.reply, Some(Reply::Ok));
+        engine.send(Event::InputSignal(false));
+        control.handle_events(now);
+        control.tick(now + Duration::from_secs(120));
+        assert!(control.output_is_open());
+        assert!(!has(&engine.take(true), "CloseOutput"));
+        // Without the input the same config closes it.
+        let config = Config {
+            idle: Idle::Off { delay_s: 1 },
+            ..Config::default()
+        };
+        let (mut control, mut engine, now) = started(&config, None);
+        control.tick(now + Duration::from_secs(120));
+        assert!(has(&engine.take(true), "CloseOutput"));
+    }
+
+    #[test]
+    fn the_capture_is_opened_after_each_reconfigure_at_its_rate() {
+        let opener = Opener::default();
+        let (mut control, mut engine, now) = started(&analog_config(), Some(&opener));
+        // The card's rates come before the first open is done: two opens
+        // are under way, and the capture waits for the last.
+        control.set_supported(vec![44100, 96000], now);
+        let seen = engine.take(false);
+        assert!(has(&seen, "Reconfigure 48000"));
+        assert!(has(&seen, "Reconfigure 44100 256"));
+        engine.send(Event::Reconfigured);
+        control.handle_events(now);
+        assert!(opener.asked().is_empty());
+        engine.send(Event::Reconfigured);
+        control.handle_events(now);
+        assert_eq!(opener.asked(), [(44100, 256)]);
+        assert_eq!(engine.take(true), ["SetCapture true"]);
+        control.handle_events(now);
+        // The next rate the card takes moves the output, and the capture
+        // follows it. The old one comes back to be dropped here.
+        control.set_supported(vec![96000], now);
+        let seen = engine.take(true);
+        assert!(has(&seen, "Reconfigure 96000 512"));
+        control.handle_events(now);
+        assert_eq!(opener.asked(), [(44100, 256), (96000, 512)]);
+        assert_eq!(engine.take(true), ["SetCapture true"]);
+    }
+
+    #[test]
+    fn an_active_analog_input_is_the_first_client() {
+        let opener = Opener::default();
+        let (mut control, mut engine, now) = started(&analog_config(), Some(&opener));
+        engine.take(true);
+        control.handle_events(now);
+        engine.take(true);
+        engine.send(Event::InputSignal(true));
+        control.handle_events(now);
+        // A player at 96 kHz arriving while it plays at 48 kHz is resampled.
+        play(&mut control, 1, 96000, now);
+        let seen = engine.take(true);
+        assert!(has(&seen, "SetResampler 1 true"), "{seen:?}");
+        assert!(!has(&seen, "Reconfigure"), "{seen:?}");
+        control.tick(now + Duration::from_secs(5));
+        assert!(!has(&engine.take(true), "Reconfigure"));
+        assert_eq!(opener.asked(), [(48000, 256)]);
+    }
+
+    #[test]
+    fn a_silent_analog_input_does_not_hold_the_rate() {
+        let opener = Opener::default();
+        let (mut control, mut engine, now) = started(&analog_config(), Some(&opener));
+        engine.take(true);
+        control.handle_events(now);
+        engine.take(true);
+        // A player at 96 kHz arriving then sets 96 kHz.
+        play(&mut control, 1, 96000, now);
+        let seen = engine.take(true);
+        assert!(has(&seen, "Reconfigure 96000 512"), "{seen:?}");
+        // The resampler it was given while it was only configured goes.
+        let resampler = seen.iter().rfind(|s| s.starts_with("SetResampler 1"));
+        assert_eq!(resampler.map(String::as_str), Some("SetResampler 1 false"));
+        // And the capture reopens at it.
+        control.handle_events(now);
+        assert_eq!(opener.asked(), [(48000, 256), (96000, 512)]);
+        assert_eq!(engine.take(true), ["SetCapture true"]);
+    }
+
+    #[test]
+    fn the_analog_input_going_quiet_lets_the_remaining_player_take_the_rate() {
+        let opener = Opener::default();
+        let (mut control, mut engine, now) = started(&analog_config(), Some(&opener));
+        engine.take(true);
+        control.handle_events(now);
+        engine.take(true);
+        engine.send(Event::InputSignal(true));
+        control.handle_events(now);
+        play(&mut control, 1, 96000, now);
+        engine.take(true);
+        engine.send(Event::InputSignal(false));
+        control.handle_events(now);
+        // The rate settles first, as for a player that stops.
+        let ms = Duration::from_millis;
+        control.tick(now + ms(400));
+        assert!(!has(&engine.take(true), "Reconfigure"));
+        control.tick(now + ms(600));
+        let seen = engine.take(true);
+        assert!(has(&seen, "Reconfigure 96000 512"), "{seen:?}");
+        // The player needs no resampler at its own rate.
+        assert!(has(&seen, "SetResampler 1 false"), "{seen:?}");
+        control.handle_events(now + ms(600));
+        assert_eq!(opener.asked(), [(48000, 256), (96000, 512)]);
+        // Signal again: the input runs at the output's rate, 96 kHz now.
+        // When the player stops, the input holds that rate.
+        engine.take(true);
+        engine.send(Event::InputSignal(true));
+        control.handle_events(now + ms(700));
+        let stop = control.request(1, Some(Request::Stop), now + ms(700));
+        assert_eq!(stop.reply, Some(Reply::Ok));
+        control.tick(now + ms(5000));
+        assert!(!has(&engine.take(true), "Reconfigure"));
+        assert_eq!(control.policy.current(), 96000);
+    }
+
+    /// The analog input's rate in the rules, while it has signal.
+    /// The analog input's rate in the rules, while it is a client.
+    fn analog_rate(control: &Control) -> Option<u32> {
+        control.policy.client_rate(ANALOG)
+    }
+
+    /// The capture is silent for `SETTLE_MS` after each start and the
+    /// detector needs a window, so on a board the signal is back no sooner
+    /// than this after a reopen.
+    const SIGNAL_BACK: Duration = Duration::from_millis(1050);
+
+    #[test]
+    fn after_dop_a_lone_analog_input_leaves_the_card_at_the_dop_rate() {
+        let ms = Duration::from_millis;
+        // DoP stops before the signal is back, and well after.
+        for held in [ms(300), ms(5000)] {
+            let opener = Opener::default();
+            let (mut control, mut engine, now) = started(&analog_config(), Some(&opener));
+            engine.take(true);
+            control.handle_events(now);
+            engine.take(true);
+            engine.send(Event::InputSignal(true));
+            control.handle_events(now);
+            assert_eq!(analog_rate(&control), Some(48000));
+            // A player at 176.4 kHz is resampled to the input's 48 kHz,
+            // until it plays DoP, which takes the output at its rate.
+            play(&mut control, 1, 176400, now);
+            assert!(!has(&engine.take(true), "Reconfigure"));
+            engine.send(Event::DopStarted(1, 1));
+            control.handle_events(now);
+            let seen = engine.take(false);
+            assert!(has(&seen, "Reconfigure 176400 1024"), "{seen:?}");
+            // While DoP owns the output the input is not a client.
+            assert_eq!(analog_rate(&control), None);
+            // The reopen closes the capture and the new detector has no
+            // hold, so the input goes quiet. The capture opens again at the
+            // rate the output runs at.
+            engine.send(Event::InputSignal(false));
+            engine.send(Event::Reconfigured);
+            control.handle_events(now + ms(10));
+            assert_eq!(opener.asked(), [(48000, 256), (176400, 1024)]);
+            assert_eq!(engine.take(true), ["SetCapture true"]);
+            // DoP ends: the player stops.
+            let stop = control.request(1, Some(Request::Stop), now + held);
+            assert_eq!(stop.reply, Some(Reply::Ok));
+            control.tick(now + held);
+            // The signal is back once the capture's mute is over.
+            let back = now + ms(10) + SIGNAL_BACK;
+            control.tick(back);
+            engine.send(Event::InputSignal(true));
+            control.handle_events(back.max(now + held));
+            assert_eq!(analog_rate(&control), Some(176400), "{held:?}");
+            // Nothing returns the card to 48 kHz: it keeps its rate, as it
+            // does when idle, and the input runs at it.
+            control.tick(now + held + ms(10000));
+            let seen = engine.take(true);
+            assert!(!has(&seen, "Reconfigure"), "{held:?}: {seen:?}");
+            assert_eq!(control.policy.current(), 176400, "{held:?}");
+            assert_eq!(opener.asked().len(), 2, "{held:?}");
+        }
+    }
+
+    /// A 48 kHz player and the analog input with signal; DoP at 176.4 kHz
+    /// takes the output and the input's signal is back after its mute. The
+    /// player leaves during DoP, and DoP ends `gap_ms` later. Returns the
+    /// rate the output is left at.
+    fn player_leaves_during_dop(gap_ms: u64) -> u32 {
+        let (control, _) = player_leaves_during_dop_with(gap_ms);
+        control.output.unwrap().0
+    }
+
+    fn player_leaves_during_dop_with(gap_ms: u64) -> (Control, FakeEngine) {
+        let ms = Duration::from_millis;
+        let opener = Opener::default();
+        let (mut control, mut engine, now) = started(&analog_config(), Some(&opener));
+        engine.take(true);
+        control.handle_events(now);
+        engine.take(true);
+        play(&mut control, 1, 48000, now);
+        engine.send(Event::InputSignal(true));
+        control.handle_events(now + ms(10));
+        engine.take(true);
+        play(&mut control, 2, 176400, now + ms(20));
+        engine.send(Event::DopStarted(2, 1));
+        control.handle_events(now + ms(20));
+        let seen = engine.take(false);
+        assert!(has(&seen, "Reconfigure 176400"), "{seen:?}");
+        engine.send(Event::InputSignal(false));
+        engine.send(Event::Reconfigured);
+        control.handle_events(now + ms(30));
+        engine.take(true);
+        let back = now + ms(30) + SIGNAL_BACK;
+        control.tick(back);
+        engine.send(Event::InputSignal(true));
+        control.handle_events(back);
+        engine.take(true);
+        let t1 = back + ms(1000);
+        let stop = control.request(1, Some(Request::Stop), t1);
+        assert_eq!(stop.reply, Some(Reply::Ok));
+        control.tick(t1);
+        let t2 = t1 + ms(gap_ms);
+        control.tick(t2);
+        let stop = control.request(2, Some(Request::Stop), t2);
+        assert_eq!(stop.reply, Some(Reply::Ok));
+        for k in 0..40 {
+            control.tick(t2 + ms(100 * k));
+            engine.take(true);
+            control.handle_events(t2 + ms(100 * k));
+        }
+        (control, engine)
+    }
+
+    #[test]
+    fn after_dop_the_card_keeps_its_rate_for_the_input_whatever_the_timing() {
+        assert_eq!(player_leaves_during_dop(200), 176400);
+        assert_eq!(player_leaves_during_dop(800), 176400);
+    }
+
+    /// A control thread whose analog input has signal before any player.
+    fn input_first() -> (Control, FakeEngine, Instant) {
+        let opener = Opener::default();
+        let (mut control, mut engine, now) = started(&analog_config(), Some(&opener));
+        engine.take(true);
+        control.handle_events(now);
+        engine.take(true);
+        engine.send(Event::InputSignal(true));
+        control.handle_events(now + Duration::from_millis(10));
+        engine.take(true);
+        (control, engine, now)
+    }
+
+    /// Ticks for `secs` seconds from `from`, and returns what was sent.
+    fn run_for(
+        control: &mut Control,
+        engine: &mut FakeEngine,
+        from: Instant,
+        secs: u64,
+    ) -> Vec<String> {
+        let mut seen = engine.take(true);
+        for k in 0..=10 * secs {
+            let at = from + Duration::from_millis(100 * k);
+            control.tick(at);
+            control.handle_events(at);
+            seen.extend(engine.take(true));
+        }
+        seen
+    }
+
+    #[test]
+    fn s2_two_players_after_the_input_never_reopen_the_output_under_it() {
+        let ms = Duration::from_millis;
+        let (mut control, mut engine, now) = input_first();
+        play(&mut control, 1, 44100, now + ms(20));
+        play(&mut control, 2, 44100, now + ms(30));
+        let stop = control.request(1, Some(Request::Stop), now + ms(2000));
+        assert_eq!(stop.reply, Some(Reply::Ok));
+        let seen = run_for(&mut control, &mut engine, now + ms(2000), 3);
+        assert!(!has(&seen, "Reconfigure"), "{seen:?}");
+        assert!(control.policy.needs_resampling(2));
+    }
+
+    #[test]
+    fn s3_signal_back_within_the_settle_time_cancels_the_switch() {
+        let ms = Duration::from_millis;
+        let (mut control, mut engine, now) = input_first();
+        play(&mut control, 1, 44100, now + ms(20));
+        assert!(!has(&engine.take(true), "Reconfigure"));
+        // A quiet passage closes the detector; signal is back 300 ms later.
+        engine.send(Event::InputSignal(false));
+        control.handle_events(now + ms(5000));
+        engine.send(Event::InputSignal(true));
+        control.handle_events(now + ms(5300));
+        let seen = run_for(&mut control, &mut engine, now + ms(5300), 3);
+        assert!(!has(&seen, "Reconfigure"), "{seen:?}");
+        assert_eq!(analog_rate(&control), Some(48000));
+    }
+
+    #[test]
+    fn s4_a_quiet_input_lets_the_player_take_the_rate_after_the_settle() {
+        let ms = Duration::from_millis;
+        let (mut control, mut engine, now) = input_first();
+        play(&mut control, 1, 44100, now + ms(20));
+        engine.take(true);
+        engine.send(Event::InputSignal(false));
+        control.handle_events(now + ms(5000));
+        control.tick(now + ms(5400));
+        assert!(!has(&engine.take(true), "Reconfigure"));
+        control.tick(now + ms(5500));
+        assert!(has(&engine.take(true), "Reconfigure 44100"));
+        assert!(!control.policy.needs_resampling(1));
+    }
+
+    #[test]
+    fn s5_an_input_after_a_player_holds_the_rate_it_joined_at() {
+        let ms = Duration::from_millis;
+        let opener = Opener::default();
+        let (mut control, mut engine, now) = started(&analog_config(), Some(&opener));
+        engine.take(true);
+        control.handle_events(now);
+        engine.take(true);
+        play(&mut control, 1, 48000, now);
+        engine.send(Event::InputSignal(true));
+        control.handle_events(now + ms(10));
+        play(&mut control, 2, 44100, now + ms(20));
+        let stop = control.request(1, Some(Request::Stop), now + ms(1000));
+        assert_eq!(stop.reply, Some(Reply::Ok));
+        let seen = run_for(&mut control, &mut engine, now + ms(1000), 3);
+        assert!(!has(&seen, "Reconfigure"), "{seen:?}");
+        assert_eq!(analog_rate(&control), Some(48000));
+    }
+
+    #[test]
+    fn s1_after_dop_the_input_joins_at_the_rate_the_card_keeps() {
+        // The output part is `after_dop_the_card_keeps_its_rate_...`.
+        for gap in [200, 800] {
+            let (control, _) = player_leaves_during_dop_with(gap);
+            assert_eq!(analog_rate(&control), Some(176400), "{gap}");
+        }
+    }
+
+    #[test]
+    fn s6_after_dop_as_the_first_client_the_input_joins_at_the_rate_kept() {
+        let ms = Duration::from_millis;
+        let opener = Opener::default();
+        let (mut control, mut engine, now) = started(&analog_config(), Some(&opener));
+        engine.take(true);
+        control.handle_events(now);
+        engine.take(true);
+        play(&mut control, 1, 176400, now);
+        engine.send(Event::DopStarted(1, 1));
+        control.handle_events(now);
+        assert!(has(&engine.take(true), "Reconfigure 176400"));
+        control.handle_events(now);
+        engine.take(true);
+        // The input gets signal while DoP owns the output: not a client yet.
+        engine.send(Event::InputSignal(true));
+        control.handle_events(now + SIGNAL_BACK);
+        assert_eq!(analog_rate(&control), None);
+        let stop = control.request(1, Some(Request::Stop), now + ms(3000));
+        assert_eq!(stop.reply, Some(Reply::Ok));
+        let seen = run_for(&mut control, &mut engine, now + ms(3000), 3);
+        assert!(!has(&seen, "Reconfigure"), "{seen:?}");
+        assert_eq!(analog_rate(&control), Some(176400));
+    }
+
+    /// A 48 kHz player, a DoP stream at 176.4 kHz owning the output, and
+    /// the input with signal. The player stops, and the DoP stream turns to
+    /// PCM `x` ms later and plays on. Returns what was sent after that, the
+    /// output's rate, and whether the stream is resampled.
+    fn dop_turns_to_pcm_after_the_player_left(x: u64) -> (Vec<String>, u32, bool) {
+        let ms = Duration::from_millis;
+        let opener = Opener::default();
+        let (mut control, mut engine, now) = started(&analog_config(), Some(&opener));
+        engine.take(true);
+        control.handle_events(now);
+        engine.take(true);
+        play(&mut control, 1, 48000, now);
+        play(&mut control, 2, 176400, now);
+        engine.take(true);
+        engine.send(Event::DopStarted(2, 1));
+        control.handle_events(now);
+        engine.take(false);
+        engine.send(Event::InputSignal(false));
+        engine.send(Event::Reconfigured);
+        control.handle_events(now + ms(10));
+        engine.take(true);
+        engine.send(Event::InputSignal(true));
+        control.handle_events(now + ms(10) + SIGNAL_BACK);
+        engine.take(true);
+        let t = now + ms(3000);
+        let stop = control.request(1, Some(Request::Stop), t);
+        assert_eq!(stop.reply, Some(Reply::Ok));
+        control.tick(t);
+        engine.take(true);
+        control.tick(t + ms(x));
+        engine.send(Event::DopStopped(2));
+        control.handle_events(t + ms(x));
+        let seen = run_for(&mut control, &mut engine, t + ms(x), 3);
+        let rate = control.output.unwrap().0;
+        (seen, rate, control.policy.needs_resampling(2))
+    }
+
+    #[test]
+    fn the_input_joins_at_the_rate_the_card_runs_at_whatever_the_timing() {
+        for x in [200, 800] {
+            let (seen, rate, resampled) = dop_turns_to_pcm_after_the_player_left(x);
+            assert!(!has(&seen, "Reconfigure"), "{x}: {seen:?}");
+            assert_eq!(rate, 176400, "{x}");
+            assert!(!resampled, "{x}");
+        }
+    }
+
+    #[test]
+    fn a_dop_stream_that_is_the_first_client_leaves_the_analog_input_at_its_rate() {
+        let ms = Duration::from_millis;
+        let opener = Opener::default();
+        let (mut control, mut engine, now) = started(&analog_config(), Some(&opener));
+        engine.take(true);
+        control.handle_events(now);
+        engine.take(true);
+        play(&mut control, 1, 176400, now);
+        engine.send(Event::DopStarted(1, 1));
+        control.handle_events(now);
+        assert!(has(&engine.take(true), "Reconfigure 176400 1024"));
+        control.handle_events(now);
+        engine.take(true);
+        let back = now + SIGNAL_BACK;
+        engine.send(Event::InputSignal(true));
+        control.handle_events(back);
+        assert_eq!(analog_rate(&control), None);
+        let stop = control.request(1, Some(Request::Stop), back + ms(1000));
+        assert_eq!(stop.reply, Some(Reply::Ok));
+        control.tick(back + ms(10000));
+        assert!(!has(&engine.take(true), "Reconfigure"));
+        assert_eq!(control.policy.current(), 176400);
+    }
+
+    #[test]
+    fn an_analog_input_with_signal_during_dop_follows_the_output_back() {
+        let ms = Duration::from_millis;
+        let opener = Opener::default();
+        let (mut control, mut engine, now) = started(&analog_config(), Some(&opener));
+        engine.take(true);
+        control.handle_events(now);
+        engine.take(true);
+        // A player at 48 kHz holds the rate, another at 176.4 kHz plays DoP.
+        play(&mut control, 1, 48000, now);
+        play(&mut control, 2, 176400, now);
+        engine.send(Event::DopStarted(2, 1));
+        control.handle_events(now);
+        assert!(has(&engine.take(true), "Reconfigure 176400 1024"));
+        control.handle_events(now);
+        engine.take(true);
+        // The input gets signal while DoP holds the output: it is not a
+        // client until DoP ends.
+        let back = now + SIGNAL_BACK;
+        engine.send(Event::InputSignal(true));
+        control.handle_events(back);
+        assert_eq!(analog_rate(&control), None);
+        // DoP stops: the input joins at the rate the card runs at, and the
+        // 48 kHz player, the first client, has the output back after the
+        // settle time, as when DoP ends without the input.
+        let stop = control.request(2, Some(Request::Stop), back + ms(100));
+        assert_eq!(stop.reply, Some(Reply::Ok));
+        assert_eq!(analog_rate(&control), Some(176400));
+        control.tick(back + ms(700));
+        assert!(has(&engine.take(true), "Reconfigure 48000 256"));
+        // That reopen mutes the capture: the input goes quiet and leaves,
+        // and joins again at 48 kHz once its signal is back.
+        engine.send(Event::InputSignal(false));
+        engine.send(Event::Reconfigured);
+        control.handle_events(back + ms(710));
+        assert_eq!(analog_rate(&control), None);
+        let again = back + ms(710) + SIGNAL_BACK;
+        engine.send(Event::InputSignal(true));
+        control.handle_events(again);
+        assert_eq!(analog_rate(&control), Some(48000));
+        engine.take(true);
+        // The player leaves. The input holds the rate it plays at.
+        let stop = control.request(1, Some(Request::Stop), again + ms(100));
+        assert_eq!(stop.reply, Some(Reply::Ok));
+        control.tick(again + ms(10000));
+        assert!(!has(&engine.take(true), "Reconfigure"));
+        assert_eq!(control.policy.current(), 48000);
+    }
+
+    #[test]
+    fn a_failed_capture_is_closed_here() {
+        let opener = Opener::default();
+        let (mut control, mut engine, now) = started(&analog_config(), Some(&opener));
+        engine.take(true);
+        control.handle_events(now);
+        engine.take(true);
+        let (capture, feed) = MemoryCapture::new();
+        engine.send(Event::CaptureFailed(Box::new(capture)));
+        control.handle_events(now);
+        assert!(feed.closed());
+    }
+
+    #[test]
+    fn a_late_card_without_an_adc_ends_the_analog_input_and_idle_applies_again() {
+        let config = Config {
+            idle: Idle::Off { delay_s: 1 },
+            ..analog_config()
+        };
+        let (commands, engine_commands) = rtrb::RingBuffer::new(256);
+        let (engine_events, events) = rtrb::RingBuffer::new(256);
+        let audio = std::thread::current();
+        let mut control = Control::new(&config, 12.0, Vec::new(), commands, events, audio);
+        let asked = Arc::new(Mutex::new(0u32));
+        let counted = asked.clone();
+        control.set_analog(Box::new(move |_, _| {
+            *counted.lock().unwrap() += 1;
+            Err(crate::capture::OpenError::Never(
+                "the card has no ADC".into(),
+            ))
+        }));
+        let now = Instant::now();
+        control.start(now);
+        let mut engine = FakeEngine {
+            commands: engine_commands,
+            events: engine_events,
+            capture: None,
+        };
+        engine.take(true);
+        control.handle_events(now);
+        assert_eq!(*asked.lock().unwrap(), 1);
+        // Never tried again, and the output closes when idle once more.
+        control.tick(now + Duration::from_secs(5));
+        assert_eq!(*asked.lock().unwrap(), 1);
+        assert!(has(&engine.take(true), "CloseOutput"));
+    }
+
+    #[test]
+    fn a_failed_capture_is_retried_every_second() {
+        let opener = Opener::default();
+        opener.fail(2);
+        let (mut control, mut engine, now) = started(&analog_config(), Some(&opener));
+        engine.take(true);
+        let ms = Duration::from_millis;
+        // The open after the output opens fails, and so does the next.
+        control.handle_events(now);
+        assert_eq!(opener.asked().len(), 1);
+        assert!(engine.take(true).is_empty());
+        control.tick(now + ms(900));
+        assert_eq!(opener.asked().len(), 1);
+        control.tick(now + ms(1000));
+        assert_eq!(opener.asked().len(), 2);
+        assert!(engine.take(true).is_empty());
+        control.tick(now + ms(1500));
+        assert_eq!(opener.asked().len(), 2);
+        control.tick(now + ms(2000));
+        assert_eq!(opener.asked().len(), 3);
+        assert_eq!(engine.take(true), ["SetCapture true"]);
+        control.handle_events(now + ms(2000));
+        // It fails while it runs. The engine has closed it.
+        engine.send(Event::CaptureFailed(Box::new(MemoryCapture::new().0)));
+        control.handle_events(now + ms(3000));
+        assert_eq!(opener.asked().len(), 3);
+        control.tick(now + ms(3900));
+        assert_eq!(opener.asked().len(), 3);
+        control.tick(now + ms(4000));
+        assert_eq!(opener.asked().len(), 4);
+        // A failure that comes before the answer to the new capture is the
+        // old one's. The new one is kept, and not opened again.
+        engine.send(Event::CaptureFailed(Box::new(MemoryCapture::new().0)));
+        control.handle_events(now + ms(4000));
+        assert_eq!(engine.take(true), ["SetCapture true"]);
+        control.handle_events(now + ms(4000));
+        control.tick(now + ms(10000));
+        assert_eq!(opener.asked().len(), 4);
+        assert!(engine.take(true).is_empty());
+    }
+
+    #[test]
+    fn chains_are_rebuilt_at_the_new_rate() {
+        let mix = config::PluginConfig {
+            place: config::PluginPlace::Mix,
+            kind: "balance".into(),
+            path: None,
+            params: Default::default(),
+        };
+        let config = Config {
+            idle: Idle::Off { delay_s: 1 },
+            plugins: vec![mix],
+            ..Config::default()
+        };
+        let (mut control, mut engine, now) = started(&config, None);
+        // Without the analog input only the places with plugins get one.
+        assert_eq!(
+            engine.take(true),
+            ["SetGain", "SetChain Mix balance", "Reconfigure 48000 256"]
+        );
+        control.handle_events(now);
+        play(&mut control, 1, 96000, now);
+        let seen = engine.take(true);
+        let at = |what: &str| seen.iter().position(|s| s.starts_with(what));
+        let (chain, reopen) = (at("SetChain Mix"), at("Reconfigure 96000"));
+        assert!(chain.is_some() && chain < reopen, "{seen:?}");
+        control.handle_events(now);
+        // An idle close and a reopen at the same rate keep the chains, so
+        // their filters keep their state.
+        let stop = control.request(1, Some(Request::Stop), now);
+        assert_eq!(stop.reply, Some(Reply::Ok));
+        control.tick(now + Duration::from_secs(2));
+        assert!(has(&engine.take(true), "CloseOutput"));
+        let start = control.request(1, Some(Request::Start), now + Duration::from_secs(3));
+        assert_eq!(start.reply, Some(Reply::Ok));
+        let seen = engine.take(true);
+        assert!(has(&seen, "Reconfigure 96000"), "{seen:?}");
+        assert!(!has(&seen, "SetChain"), "{seen:?}");
+        // Without plugins no chain is ever sent.
+        let (mut control, mut engine, now) = started(&Config::default(), None);
+        control.handle_events(now);
+        play(&mut control, 1, 96000, now);
+        assert!(!has(&engine.take(true), "SetChain"));
+    }
+
+    fn entry(place: config::PluginPlace, kind: &str) -> config::PluginConfig {
+        config::PluginConfig {
+            place,
+            kind: kind.into(),
+            path: None,
+            params: Default::default(),
+        }
+    }
+
+    /// What the engine was sent, without the volume.
+    fn sent(engine: &mut FakeEngine) -> Vec<String> {
+        let seen = engine.take(true);
+        seen.into_iter().filter(|s| s != "SetGain").collect()
+    }
+
+    #[test]
+    fn a_plugin_that_fails_at_a_rate_does_not_ban_it_and_is_tried_once_per_decision() {
+        use crate::plugin::builtin::FAILS_TRIED;
+        let tried = || FAILS_TRIED.with(|n| n.get());
+        let config = Config {
+            plugins: vec![entry(config::PluginPlace::Mix, "fails-above-48k")],
+            ..Config::default()
+        };
+        let (mut control, mut engine, now) = started(&config, None);
+        control.set_supported(vec![48000, 96000], now);
+        engine.take(true);
+        control.handle_events(now);
+        let before = tried();
+        play(&mut control, 1, 96000, now);
+        // The output keeps what it has, and the player follows it.
+        let seen = sent(&mut engine);
+        assert!(!has(&seen, "Reconfigure"), "{seen:?}");
+        assert!(has(&seen, "SetResampler 1 true"), "{seen:?}");
+        assert!(!control.refused.contains(&96000));
+        assert_eq!(tried() - before, 1);
+        // Ticks are no rate decision: no new attempt.
+        for k in 1..20 {
+            control.tick(now + Duration::from_millis(100 * k));
+        }
+        assert_eq!(tried() - before, 1);
+        // A change of clients is: one more attempt.
+        play(&mut control, 2, 96000, now + Duration::from_secs(3));
+        assert_eq!(tried() - before, 2);
+        assert!(!has(&sent(&mut engine), "Reconfigure"));
+    }
+
+    #[test]
+    fn a_failing_plugin_never_keeps_the_output_closed_under_a_player() {
+        use crate::plugin::builtin::FAILS_TRIED;
+        let tried = || FAILS_TRIED.with(|n| n.get());
+        let s = Duration::from_secs;
+        let config = Config {
+            plugins: vec![entry(config::PluginPlace::Mix, "fails-above-48k")],
+            idle: Idle::Off { delay_s: 1 },
+            ..Config::default()
+        };
+        let (mut control, mut engine, now) = started(&config, None);
+        control.set_supported(vec![48000, 96000], now);
+        engine.take(true);
+        control.handle_events(now);
+        control.tick(now + s(5));
+        assert!(has(&sent(&mut engine), "CloseOutput"));
+        // A 96 kHz player while the output is closed: the build at 96 kHz
+        // fails, and for this decision the output opens at the nearest
+        // rate that builds, the player resampled to it.
+        play(&mut control, 1, 96000, now + s(6));
+        let seen = sent(&mut engine);
+        assert!(has(&seen, "Reconfigure 48000"), "{seen:?}");
+        assert!(has(&seen, "SetResampler 1 true"), "{seen:?}");
+        // 96 kHz is not refused, and is not tried again on ticks.
+        assert!(!control.refused.contains(&96000));
+        let before = tried();
+        for k in 1..50 {
+            control.tick(now + s(6) + Duration::from_millis(100 * k));
+        }
+        assert_eq!(tried(), before);
+        assert!(!has(&sent(&mut engine), "Reconfigure"));
+        // At the next decision 96 kHz is tried again, and the output stays.
+        play(&mut control, 2, 48000, now + s(12));
+        assert!(tried() > before);
+        assert!(!has(&sent(&mut engine), "Reconfigure"));
+        assert_eq!(control.output.unwrap().0, 48000);
+    }
+
+    #[test]
+    fn a_rate_a_chain_cannot_be_built_at_is_not_used() {
+        let config = Config {
+            plugins: vec![entry(config::PluginPlace::Mix, "only-up-to-48k")],
+            ..Config::default()
+        };
+        let (mut control, mut engine, now) = started(&config, None);
+        control.set_supported(vec![44100, 48000, 96000], now);
+        engine.take(true);
+        control.handle_events(now);
+        // A player at 96 kHz: the nearest rate the chain takes is 48 kHz,
+        // and the player is resampled to it.
+        play(&mut control, 1, 96000, now);
+        let seen = sent(&mut engine);
+        assert!(!has(&seen, "Reconfigure"), "{seen:?}");
+        assert!(has(&seen, "SetResampler 1 true"), "{seen:?}");
+        control.tick(now + Duration::from_secs(5));
+        assert!(!has(&engine.take(true), "Reconfigure"));
+        assert_eq!(control.policy.current(), 48000);
+    }
+
+    #[test]
+    fn with_any_rate_the_card_takes_a_refused_one_moves_to_the_nearest_that_works() {
+        let config = Config {
+            plugins: vec![entry(config::PluginPlace::Output, "only-up-to-48k")],
+            ..Config::default()
+        };
+        let (mut control, mut engine, now) = started(&config, None);
+        engine.take(true);
+        control.handle_events(now);
+        play(&mut control, 1, 96000, now);
+        let seen = sent(&mut engine);
+        // 96, 88.2 and 64 kHz are refused in turn, and nothing is sent for
+        // them: the output stays at 48 kHz, with its chain.
+        assert!(!has(&seen, "Reconfigure"), "{seen:?}");
+        assert!(!has(&seen, "SetChain"), "{seen:?}");
+        assert!(has(&seen, "SetResampler 1 true"), "{seen:?}");
+        assert_eq!(control.policy.current(), 48000);
+    }
+
+    #[test]
+    fn a_chain_is_never_sent_short_of_its_plugins() {
+        // A parameter the plugin does not have fails at every rate.
+        let mut nope = entry(config::PluginPlace::Mix, "balance");
+        nope.params
+            .insert("nope".into(), config::ParamValue::Number(1.0));
+        let config = Config {
+            plugins: vec![nope, entry(config::PluginPlace::Output, "balance")],
+            ..analog_config()
+        };
+        let opener = Opener::default();
+        let (mut control, mut engine, now) = started(&config, Some(&opener));
+        // No rate works, so the output is not opened at all.
+        let seen = sent(&mut engine);
+        assert!(!has(&seen, "SetChain"), "{seen:?}");
+        assert!(!has(&seen, "Reconfigure"), "{seen:?}");
+        play(&mut control, 1, 44100, now);
+        let seen = sent(&mut engine);
+        assert!(
+            !has(&seen, "SetChain") && !has(&seen, "Reconfigure"),
+            "{seen:?}"
+        );
+    }
+
+    #[test]
+    fn the_analog_chain_has_no_fallback_either() {
+        let config = Config {
+            plugins: vec![entry(config::PluginPlace::Analog, "only-up-to-48k")],
+            ..analog_config()
+        };
+        let opener = Opener::default();
+        let (mut control, mut engine, now) = started(&config, Some(&opener));
+        control.set_supported(vec![48000, 96000], now);
+        let seen = sent(&mut engine);
+        assert!(has(&seen, "SetChain Analog balance,detect"), "{seen:?}");
+        control.handle_events(now);
+        engine.take(true);
+        play(&mut control, 1, 96000, now);
+        let seen = sent(&mut engine);
+        assert!(
+            !has(&seen, "Reconfigure") && !has(&seen, "SetChain"),
+            "{seen:?}"
+        );
+    }
+
+    #[test]
+    fn dop_rebuilds_only_the_analog_chain_and_the_others_keep_their_state() {
+        let config = Config {
+            plugins: vec![entry(config::PluginPlace::Mix, "balance")],
+            ..analog_config()
+        };
+        let opener = Opener::default();
+        let (mut control, mut engine, now) = started(&config, Some(&opener));
+        engine.take(true);
+        control.handle_events(now);
+        engine.take(true);
+        play(&mut control, 1, 48000, now);
+        play(&mut control, 2, 176400, now);
+        engine.take(true);
+        engine.send(Event::DopStarted(2, 1));
+        control.handle_events(now);
+        let seen = sent(&mut engine);
+        assert!(has(&seen, "Reconfigure 176400"), "{seen:?}");
+        assert!(has(&seen, "SetChain Analog detect"), "{seen:?}");
+        assert!(!has(&seen, "SetChain Mix"), "{seen:?}");
+        control.handle_events(now);
+        engine.take(true);
+        // DoP stops, and the 48 kHz player has the output back: the mix
+        // chain is the one it had, and the analog chain is built again.
+        let stop = control.request(2, Some(Request::Stop), now);
+        assert_eq!(stop.reply, Some(Reply::Ok));
+        control.tick(now + Duration::from_secs(1));
+        let seen = sent(&mut engine);
+        assert!(has(&seen, "Reconfigure 48000"), "{seen:?}");
+        assert!(has(&seen, "SetChain Analog detect"), "{seen:?}");
+        assert!(!has(&seen, "SetChain Mix"), "{seen:?}");
+    }
+
+    #[test]
+    fn when_dop_stops_the_output_and_its_chains_follow_at_once() {
+        let config = Config {
+            plugins: vec![entry(config::PluginPlace::Mix, "balance")],
+            ..analog_config()
+        };
+        let opener = Opener::default();
+        let (mut control, mut engine, now) = started(&config, Some(&opener));
+        engine.take(true);
+        control.handle_events(now);
+        engine.take(true);
+        play(&mut control, 1, 48000, now);
+        play(&mut control, 2, 176400, now);
+        engine.take(true);
+        engine.send(Event::DopStarted(2, 1));
+        control.handle_events(now);
+        assert!(has(&sent(&mut engine), "Reconfigure 176400"));
+        control.handle_events(now);
+        engine.take(true);
+        // The DoP stream turns to PCM: the 48 kHz player has the output
+        // back at once, not after the settle time.
+        engine.send(Event::DopStopped(2));
+        control.handle_events(now + Duration::from_secs(1));
+        let seen = sent(&mut engine);
+        assert!(has(&seen, "Reconfigure 48000"), "{seen:?}");
+        // And with only the DoP stream's player left, the card keeps the
+        // DoP rate and gets the mix chain for it at once.
+        let config = Config {
+            plugins: vec![entry(config::PluginPlace::Mix, "balance")],
+            ..analog_config()
+        };
+        let (mut control, mut engine, now) = started(&config, Some(&opener));
+        engine.take(true);
+        control.handle_events(now);
+        engine.take(true);
+        play(&mut control, 1, 48000, now);
+        play(&mut control, 2, 176400, now);
+        engine.send(Event::DopStarted(2, 1));
+        control.handle_events(now);
+        control.handle_events(now);
+        let stop = control.request(1, Some(Request::Stop), now);
+        assert_eq!(stop.reply, Some(Reply::Ok));
+        control.tick(now + Duration::from_secs(1));
+        engine.take(true);
+        engine.send(Event::DopStopped(2));
+        control.handle_events(now + Duration::from_secs(2));
+        let seen = sent(&mut engine);
+        assert!(has(&seen, "SetChain Mix balance"), "{seen:?}");
+    }
+
+    #[test]
+    fn dop_at_a_rate_the_analog_chain_refuses_does_not_take_the_output() {
+        let config = Config {
+            plugins: vec![
+                entry(config::PluginPlace::Analog, "only-up-to-48k"),
+                entry(config::PluginPlace::Mix, "balance"),
+            ],
+            ..analog_config()
+        };
+        let opener = Opener::default();
+        let (mut control, mut engine, now) = started(&config, Some(&opener));
+        control.set_supported(vec![48000, 176400], now);
+        engine.take(true);
+        control.handle_events(now);
+        engine.take(true);
+        play(&mut control, 1, 176400, now);
+        engine.send(Event::DopStarted(1, 1));
+        control.handle_events(now);
+        let seen = sent(&mut engine);
+        assert!(!has(&seen, "Reconfigure 176400"), "{seen:?}");
+        assert_eq!(control.policy.current(), 48000);
+    }
+
+    #[test]
+    fn a_rate_only_the_mix_chain_refuses_still_carries_dop() {
+        let config = Config {
+            plugins: vec![entry(config::PluginPlace::Mix, "only-up-to-48k")],
+            ..Config::default()
+        };
+        let (mut control, mut engine, now) = started(&config, None);
+        control.set_supported(vec![48000, 176400], now);
+        engine.take(true);
+        control.handle_events(now);
+        // A PCM player at 176.4 kHz: the mix chain refuses the rate.
+        play(&mut control, 1, 176400, now);
+        engine.take(true);
+        assert_eq!(control.policy.current(), 48000);
+        let stop = control.request(1, Some(Request::Stop), now);
+        assert_eq!(stop.reply, Some(Reply::Ok));
+        engine.take(true);
+        // A DoP stream at that rate bypasses the mix chain, so it has it.
+        play(&mut control, 2, 176400, now);
+        engine.send(Event::DopStarted(2, 1));
+        control.handle_events(now);
+        let seen = sent(&mut engine);
+        assert!(has(&seen, "Reconfigure 176400"), "{seen:?}");
+        assert!(!has(&seen, "SetChain Mix"), "{seen:?}");
+    }
+
+    #[test]
+    fn the_card_kept_at_a_dop_rate_gets_chains_for_it_when_pcm_plays_there() {
+        let ms = Duration::from_millis;
+        let config = Config {
+            plugins: vec![entry(config::PluginPlace::Mix, "balance")],
+            ..analog_config()
+        };
+        let opener = Opener::default();
+        let (mut control, mut engine, now) = started(&config, Some(&opener));
+        engine.take(true);
+        control.handle_events(now);
+        engine.take(true);
+        // The mix chain is built for a player at 48 kHz, then DoP takes
+        // the output to its rate.
+        play(&mut control, 1, 48000, now);
+        play(&mut control, 2, 176400, now);
+        engine.send(Event::DopStarted(2, 1));
+        control.handle_events(now);
+        let seen = sent(&mut engine);
+        assert!(has(&seen, "Reconfigure 176400"), "{seen:?}");
+        assert!(!has(&seen, "SetChain Mix"), "{seen:?}");
+        control.handle_events(now);
+        engine.take(true);
+        // DoP ends with no client left: the card keeps its rate, and the
+        // analog input, back after its mute, plays there through the mix.
+        let stop = control.request(1, Some(Request::Stop), now + ms(50));
+        assert_eq!(stop.reply, Some(Reply::Ok));
+        let stop = control.request(2, Some(Request::Stop), now + ms(100));
+        assert_eq!(stop.reply, Some(Reply::Ok));
+        engine.send(Event::InputSignal(true));
+        control.handle_events(now + SIGNAL_BACK);
+        control.tick(now + SIGNAL_BACK);
+        let seen = sent(&mut engine);
+        assert!(!has(&seen, "Reconfigure"), "{seen:?}");
+        assert!(has(&seen, "SetChain Mix balance"), "{seen:?}");
+    }
+
+    #[test]
+    fn the_chains_built_at_startup_are_sent_at_the_first_open() {
+        let mix = config::PluginConfig {
+            place: config::PluginPlace::Mix,
+            kind: "balance".into(),
+            path: None,
+            params: Default::default(),
+        };
+        let config = Config {
+            plugins: vec![mix],
+            ..Config::default()
+        };
+        let (commands, engine_commands) = rtrb::RingBuffer::new(256);
+        let (engine_events, events) = rtrb::RingBuffer::new(256);
+        let audio = std::thread::current();
+        let mut control = Control::new(&config, 12.0, Vec::new(), commands, events, audio);
+        let mut libraries = Libraries::default();
+        let mut chains =
+            Chains::build(&config.plugins, 48000, Format::F32, &mut libraries).unwrap();
+        // A chain built ahead stands out by what it holds.
+        chains.mix = Chain::empty();
+        control.set_plugins(libraries, Some(chains));
+        control.start(Instant::now());
+        let mut engine = FakeEngine {
+            commands: engine_commands,
+            events: engine_events,
+            capture: None,
+        };
+        assert_eq!(
+            engine.take(true),
+            ["SetGain", "SetChain Mix ", "Reconfigure 48000 256"]
+        );
     }
 
     #[test]

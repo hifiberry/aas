@@ -14,6 +14,8 @@ Raspberry Pi.
 - `crates/aas-client`, the client side of the shared ring and the socket
   protocol.
 - `crates/aas-alsa`, the ALSA PCM and control plugin, one library.
+- `crates/aas-plugin`, the C ABI of audio plugins, and `plugins/gain`, an
+  example plugin.
 - `tools/measure`, probes that measure the hardware. Not part of the daemon.
 - `dist/`, the systemd unit, the ALSA configuration, and the install and board
   test scripts.
@@ -79,6 +81,8 @@ to connect.
 not this one is kept as `/etc/asound.conf.before-aas`. After that:
 
 - ALSA's `default` PCM plays through the daemon. Players need no changes.
+- ALSA's `default` PCM also records the daemon's analog input. See
+  [Recording](#recording).
 - ALSA's `default` control is the daemon's output volume, one element called
   `Master`, 0 to 100. Plain `amixer` shows only `Master`. The card's own
   controls are reached with `amixer -c <card>`.
@@ -94,12 +98,88 @@ is kept in `/var/lib/aas/state.toml`.
 | `card` | an ALSA card id or index | the first card that is not `Loopback`, `Headphones` or HDMI | The card to play to. |
 | `format` | `"f32"`, `"f64"`, `"i32"` | `"f32"` | The arithmetic used to mix and to apply volume. |
 | `resampling` | `"high"`, `"medium"` | `"high"` | Quality of the resampler for a client at another rate than the output. |
-| `bit_perfect` | `"auto"`, `"forced"`, `"off"` | `"auto"` | `auto` copies the samples untouched while one client plays at the output rate with no software volume. `forced` also ignores the software volume. `off` always mixes. |
+| `bit_perfect` | `"auto"`, `"forced"`, `"off"` | `"auto"` | `auto` copies the samples untouched while one client plays at the output rate with no software volume. `forced` also ignores the software volume and bypasses plugins, except input detection. `off` always mixes. |
 | `idle` | `"off"`, `"zeros"` | `"off"` | What the output does when nothing plays: close the card after a delay, or keep it open and send zeros. |
 | `idle_delay_s` | whole seconds | 60 | The delay before `idle = "off"` closes the card. An error with `idle = "zeros"`. |
 | `volume_mode` | `"hardware"`, `"software"` | the card's control if it has one | Who applies the volume: the card's mixer, or the daemon. `hardware` on a card without a control warns and uses software. |
 | `volume_control` | a mixer control name | the first of `Digital`, `Master`, `PCM` | The card's control that carries the volume. |
 | `default_rate` | 8000 to 384000 | 48000 | The rate the output opens at before the first client plays. |
+
+Two tables set up the analog input and the audio plugins.
+
+```toml
+[analog]
+enabled = true
+volume_db = 0
+
+[[plugin]]
+place = "analog"          # analog, mix or output
+type = "detect"           # a built-in name, or "library" with a path
+threshold = -50
+hold = 3
+
+[[plugin]]
+place = "output"
+type = "library"
+path = "/usr/lib/aas/libaas_gain.so"
+gain = -3
+```
+
+`[analog]` turns on the card's analog input (`enabled`, default `false`) and sets
+its level (`volume_db`, from -60 to 0, default 0). `volume_db` is the level the
+input starts at: once the API can change the input volume (stage 4), that
+volume is kept in the state file like the output volume, and the config gives
+only its value on a fresh install. The input is off unless
+enabled, and it works only on cards with an ADC that `aas` knows: today the
+DAC+ ADC and the DAC+ ADC Pro. On any other card it logs one line, opens
+nothing, and the output's idle rule applies as configured. While the input
+runs, on a card with an ADC `aas` knows, the output never closes and
+`idle = "off"` does not apply. A card that is not there at the start is
+looked for every second; if it turns out to have no ADC `aas` knows, the
+input stops there with one line in the log, and `idle = "off"` applies again.
+The input plays only while its level is above a threshold, -50 dBFS
+by default, and stays on for a hold time, 3 s by default, after it falls below.
+For 1 s after the capture starts, and after each change of rate, it is silent.
+
+Each `[[plugin]]` table adds one plugin to the chain at `place`, in the order of
+the file. `analog` runs on the analog input before it is mixed, `mix` on the mix
+and `output` last. Both `mix` and `output` run after the output volume. `type`
+is a built-in (`detect`, which runs only at `analog` and may appear once, or
+`balance`) or `library` with a `path`, which is absolute. Every other key is a
+parameter: a finite number, or text in quotes for a parameter that takes
+text, such as a file a plugin reads. Text is passed to the plugin as written,
+so a path should be absolute. Each value must fit its parameter: text for
+text, a whole number for an integer, 0 or 1 for a switch, and one of the
+values for an enumeration. `detect` takes `threshold` in dBFS and
+`hold` in seconds. Without a `detect` table it runs last at `analog` with its
+defaults. `balance` takes `balance`, from -1 (left) to 1 (right). A plugin that
+cannot be loaded stops the daemon with an error.
+
+### Recording
+
+The `default` device records the analog input, for example:
+
+```sh
+arecord -D default -f S16_LE -c 2 -r 44100 take.wav
+```
+
+It delivers the analog input after its plugins and before the input volume,
+which belongs to the mix. It never delivers the mix itself, so nothing a player
+plays is recorded except through the card's input. With no signal at the input,
+with the input disabled, or on a card without an ADC, it records silence. With
+the input disabled and `idle = "off"`, the output closes `idle_delay_s` after
+the last player stops, and a recording then gets nothing and waits until a
+player opens the output again. While the analog input runs the output stays
+open.
+
+`pcm.aas` records S32 stereo at the rate the daemon's output runs at, and
+nothing else. `plug` in the `default` device converts that to what the recorder
+asks for. When the output changes rate, a recording that is open ends with an
+error, `No such device`, and the recorder has to open the device again. A new
+recording runs at the new rate. With the analog input enabled the rate does not
+change while the input has signal, except for a DoP stream, so otherwise only
+silence is cut. A recorder that falls behind loses only its own frames, and
+sees an overrun.
 
 ### After a daemon restart
 
@@ -125,17 +205,73 @@ sudo rm /usr/lib/aarch64-linux-gnu/alsa-lib/libasound_module_*_aas.so
 
 Then move `/etc/asound.conf.before-aas` back, if there is one.
 
+## Writing a plugin
+
+A plugin is a shared library built against `crates/aas-plugin`, which describes
+the C ABI. `plugins/gain` is a complete example, a gain in dB. The library
+exports one function, `aas_plugin`, that returns its descriptor. In Rust the
+crate type is `cdylib`:
+
+```toml
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+aas-plugin = { path = "../../crates/aas-plugin" }
+```
+
+Build the example and install it where the config above expects it:
+
+```sh
+cargo build --release -p aas-plugin-gain
+sudo install -D -m 0644 target/release/libaas_gain.so /usr/lib/aas/libaas_gain.so
+```
+
+The descriptor and each parameter start with `size`, set to `DESCRIPTOR_SIZE`
+and `PARAM_INFO_SIZE`: fields are only ever appended within ABI version 1, and
+the daemon reads what it knows. Plugins are stereo in and out, in place;
+another channel count is ABI version 2.
+
+`create` stores the instance through its last argument and returns
+`CREATE_OK`, `CREATE_UNSUPPORTED` for a rate (or block size) it does not
+support, which the daemon then never uses, or `CREATE_FAILED`, which stops the
+daemon at startup and is tried again at the next change of clients later.
+`reset`, which may be left out, clears what an instance keeps from earlier
+blocks; the daemon calls it when a chain runs again after a gap, such as after
+a DoP stream.
+
+Each parameter has a type, so that a user interface can build a control for it:
+`PARAM_FLOAT`, `PARAM_INTEGER`, `PARAM_SWITCH` (0 or 1), `PARAM_ENUMERATION`,
+whose values are numbered from 0 and named in `value_names`, or `PARAM_TEXT`.
+Numeric values travel as `f64`, whole numbers for every type but a float. A
+text parameter, such as a file to read, is set through `set_param_text` with
+UTF-8 that is not NUL terminated and is valid only for the call; it returns
+`TEXT_OK`, `TEXT_REFUSED`, which the daemon reports as a config error, or
+`TEXT_UNSUPPORTED` for a value that cannot be used at the instance's rate,
+which the daemon takes as a rate the plugin does not support.
+
+`create`, `destroy`, `set_param_text` and `set_param` while the config's
+values are set run on the daemon's control thread. `process`, `reset`,
+`neutral` and `latency` run on the audio thread, and so will `set_param` once
+the API changes parameters at run time; these must not allocate, lock or
+block. Another instance of the same library may be processing while one is
+created or destroyed. A panic that leaves one of the plugin's
+functions aborts the daemon, so a plugin in Rust must not panic there, or must
+catch the panic with `std::panic::catch_unwind`. The crate's documentation
+(`cargo doc -p aas-plugin --open`) has the rest.
+
 ## Testing
 
 - `cargo test` on any machine. The engine and server tests use a null sink, so
   they need no card.
 - `sh dist/test-plugin.sh` on the board, with the unit running and the plugin
-  installed. It needs `aplay`, `amixer`, `alsactl`, `cc` and `libasound2-dev`,
-  and `mpd`, `mpc` and `python3` for the mixer case. It prints PASS or FAIL for
-  each case. Case names as arguments run only those. On a board whose output is
-  wired to its input, `AAS_TEST_CAPTURE=plughw:<card> sh dist/test-plugin.sh`
-  also records what each sample format plays and checks the tone's level and
-  purity.
+  installed. It needs `aplay`, `arecord`, `amixer`, `alsactl`, `cc` and
+  `libasound2-dev`, and `mpd`, `mpc` and `python3` for the mixer case. It
+  prints PASS or FAIL for each case. Case names as arguments run only those. On
+  a board whose output is wired to its input,
+  `AAS_TEST_CAPTURE=plughw:<card> sh dist/test-plugin.sh` also records what each
+  sample format plays and checks the tone's level and purity, and with
+  `ANALOG=1` the cases of the analog input run too.
 - `cargo test -p aas-alsa` on the board, for the plugin's own tests.
 - `bit-check` proves that what a player sends reaches the card unchanged. Load
   `snd-aloop`, set `card = "Loopback"` and `latency_ms = 48` in the daemon's

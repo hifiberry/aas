@@ -1,7 +1,8 @@
 # Measurements
 
 Stage 1 measured what the hardware can do, before the daemon was written.
-[Stage 2](#stage-2) measured the daemon itself. The probes are in `tools/measure`.
+[Stage 2](#stage-2) measured the daemon itself, and [Stage 3a](#stage-3a) its
+analog input and plugins. The probes are in `tools/measure`.
 The Pi 4 is still to be measured.
 
 ## Boards
@@ -813,3 +814,332 @@ first two rows, of 7 ticks in 15 seconds, is not explained.
 The plugin's `pause_and_resume` test failed 40 of 40 runs on the Pi 3, because the
 stream played one period more after a pause. With the audio loop reading its
 commands after the wait for room, it passed 40 of 40.
+
+## Stage 3a
+
+The analog input and the plugins, measured on the Pi 3 test board and on the CM5
+test board. Each figure names its board.
+
+The daemon ran as root with real-time rights, built with the `alsa-output`
+feature, its defaults on each card, and this config:
+
+```toml
+[analog]
+enabled = true
+volume_db = -20
+```
+
+So the detector ran with its defaults: -50 dBFS, a hold of 3 s, 50 ms windows.
+The DAC output is cabled to the ADC input on both boards, so anything played
+comes back through the analog input and is mixed in again, 20 dB down and
+less the converters' loss. At -20 dB that loop dies away. Players reached
+the daemon through the plugin as ALSA's `default` device.
+
+The hour runs were made on commit 3c2efde. Everything else was built from
+fe1b6f5, with the probes as committed in 55ed179. fe1b6f5 adds fixes to forced
+bit-perfect and to plugin library paths, which change nothing measured here.
+
+### Summary
+
+| Criterion | Pi 3 result | CM5 result | Verdict |
+|---|---|---|---|
+| `detect` and `balance` under 1% of a period on the Pi 3 | p99.9 at most 0.3% at 48 kHz and 0.8% at 192 kHz and 256 frames. 1.0% at 192 kHz and 64 frames | p99.9 at most 0.1% | Pass, except p99.9 at 192 kHz and 64 frames on the Pi 3, which reads 1.0% |
+| Shared clock: an hour with a tone and the input open, padding and dropping stay at their start-up value | 256 frames padded, all at the start, 0 dropped, 0 xruns, 0 wake-up gaps | 64 frames padded, all at the start, 0 dropped, 0 xruns, 0 wake-up gaps | Pass on both |
+| Analog path, at most three periods and the converters | 720 frames, 15.00 ms, against 799 | 222 frames, 4.625 ms, against 242 | Pass on both |
+| One hour at 44.1 kHz, full load | **2 xruns, 2 wake-up gaps, 27.1 and 33.1 ms against an 11.6 ms buffer.** Repeated: **1 xrun**, 0 wake-up gaps, worst gap 11.09 ms, 278 frames dropped | 0 xruns, 0 wake-up gaps, worst gap 1.54 ms against 2.90 ms | **Fail** on the Pi 3, twice. Pass on the CM5 |
+| One hour at 96 kHz, full load | 0 xruns, 0 wake-up gaps, worst gap 10.16 ms against 10.67 ms | 0 xruns, 0 wake-up gaps, worst gap 1.45 ms against 2.67 ms | Pass on both, with little room on the Pi 3 |
+| One hour at 44.1 kHz with a second client at 96 kHz, full load | 0 xruns, 0 wake-up gaps, worst gap 6.82 ms against 11.61 ms | 0 xruns, 0 wake-up gaps, worst gap 1.59 ms against 2.90 ms | Pass on both |
+| Detection: opens within 100 ms, closes 3.0 to 3.1 s after the tone | Opens 4 to 52 ms after, closes 3.012 to 3.055 s after, 20 of 20 | Opens 3 to 51 ms after, closes 3.001 to 3.041 s after, 20 of 20 | Pass on both |
+| `dist/test-plugin.sh`, without and with `ANALOG=1` | 27 of 28 and 31 of 32. The failure is the `mpd` case: `mpd` is not installed | Not run | Pass, except the case that needs `mpd` |
+| ADC start-up above -50 dBFS, covered by the 1 s of silence | Never above -50 dBFS. The loudest 50 ms window after a start was -83.8 dBFS | Above -50 dBFS for up to 700 ms at 44.1 kHz | The 1 s covers both. The DAC+ ADC does not need it |
+
+### Processing cost of the plugins
+
+`dsp-bench --mix-only` times each built-in plugin alone on one block per
+cycle, 100000 cycles each, idle, at real-time priority. The detector sees a
+-20 dBFS tone, so it is open and passes the samples. The balance is set to 0.5,
+so it scales one channel. Share of a period, p99.9 and then max:
+
+| Case | Pi 3 `i32` | Pi 3 `f32` | Pi 3 `f64` | CM5 `i32` | CM5 `f32` | CM5 `f64` |
+|---|---|---|---|---|---|---|
+| `detect`, 48 kHz, 64 frames | 0.3%, 0.9% | 0.3%, 2.8% | 0.2%, 2.5% | 0.0%, 0.3% | 0.0%, 0.1% | 0.0%, 0.2% |
+| `detect`, 48 kHz, 256 frames | 0.2%, 3.2% | 0.2%, 1.1% | 0.2%, 1.6% | 0.0%, 0.1% | 0.0%, 0.1% | 0.0%, 0.0% |
+| `detect`, 192 kHz, 64 frames | 1.0%, 5.2% | 1.0%, 3.4% | 1.0%, 19.3% | 0.1%, 0.5% | 0.1%, 0.5% | 0.1%, 0.5% |
+| `detect`, 192 kHz, 256 frames | 0.8%, 8.9% | 0.8%, 6.1% | 0.7%, 1.1% | 0.1%, 0.2% | 0.1%, 0.2% | 0.1%, 0.3% |
+| `balance`, 48 kHz, 64 frames | 0.2%, 0.8% | 0.0%, 0.7% | 0.0%, 0.8% | 0.0%, 0.1% | 0.0%, 0.1% | 0.0%, 0.1% |
+| `balance`, 48 kHz, 256 frames | 0.2%, 0.2% | 0.0%, 0.2% | 0.0%, 0.2% | 0.0%, 0.0% | 0.0%, 0.0% | 0.0%, 0.0% |
+| `balance`, 192 kHz, 64 frames | 0.8%, 2.8% | 0.1%, 3.1% | 0.1%, 2.3% | 0.0%, 0.5% | 0.0%, 0.4% | 0.0%, 0.8% |
+| `balance`, 192 kHz, 256 frames | 0.6%, 1.4% | 0.2%, 9.5% | 0.2%, 6.0% | 0.0%, 0.3% | 0.0%, 1.5% | 0.0%, 0.2% |
+
+On the mean, the detector takes 4.9 µs for 256 frames on the Pi 3 and 0.7 µs
+on the CM5, about 19 ns a frame on the Pi 3 in any format. The balance takes
+0.7 µs in float and 3.1 µs in `i32` on the Pi 3, where it rounds each product
+in 128 bits. At 192 kHz and 64 frames a period is 0.33 ms, so the detector's
+p99.9 of 3.4 µs reads 1.0%. That period is not a default on the Pi 3, which
+uses 1024 frames at 192 kHz. The worst single cycles, up to 19.3%, are of the
+same size as those of the mixes in the same run, single cycles that the board
+took from the benchmark.
+
+The Pi 3 ran at 1.2 GHz, from 64 to 71 °C, right after the hour runs. The CM5
+ran from 70 to 73 °C and was still coming up from 1.7 GHz to 2.4 GHz, for the
+same reason. The whole run of 96 cases took 75 s on the Pi 3 and 17 s on the
+CM5.
+
+### The shared clock
+
+The ADC and the DAC run from the same clock, so once the capture is running the
+engine should read one period each cycle and never need to pad or drop. A
+1 kHz tone at -20 dBFS peak, made on the board and kept in RAM, was looped into
+`aplay` through `aas` for an hour, on an otherwise idle board. The input opened
+when the tone started and stayed open to the end.
+
+| Board | Padded frames | Dropped frames | Xruns | Wake-up gaps over the buffer | Worst gap / buffer | Worst cycle |
+|---|---|---|---|---|---|---|
+| Pi 3, 48 kHz / 256 | 256 | 0 | 0 | 0 | 5.60 / 10.67 ms | 0.42 ms |
+| CM5, 48 kHz / 64 | 64 | 0 | 0 | 0 | 1.45 / 2.67 ms | 0.03 ms |
+
+The daemon prints its counters only when it stops, so the value after the
+first second was taken from short runs with the same config on the CM5: 15
+to 20 s each gave 64 frames padded and 0 dropped, the same as the hour. Each
+run in this section pads exactly one period each time the capture starts, at
+48 kHz at start-up and again at a rate change. The Pi 3 shows the same: 256
+frames in its hour, and in every short run on the Pi 3 below. So nothing was
+padded or dropped after the first period, in an hour on either board.
+
+### Latency of the analog path
+
+The boards have no second signal source, so the echo was measured.
+`loopback-latency --echo` plays a chirp through `aas` and records the capture
+device, which delivers the analog input. The chirp arrives once from the
+player, through the DAC, the cable and the ADC, and again after the analog
+input has mixed it into the output at -20 dB and it has made the same trip a
+second time. The frames between the two arrivals are the analog path: from a
+frame at the ADC to the same frame at the ADC again, through the engine, the
+output queue, the DAC and the cable. Both arrivals are in one recording on one
+clock, so the figure is exact to the frame. A 1 kHz tone plays for 0.2 s
+first, so that the detector is open when the chirp comes. 20 repeats each, at
+48 kHz.
+
+| Board | Echo after | Expected at most | In periods, without the converters |
+|---|---|---|---|
+| Pi 3, 256 frames | 720 frames, 15.000 ms | 3 × 256 + 31 = 799 frames, 16.65 ms | 2.69 |
+| CM5, 64 frames | 222 frames, 4.625 ms | 3 × 64 + 50 = 242 frames, 5.04 ms | 2.69 |
+
+All 20 repeats on each board gave the same frame count. The converter delays
+are the ones measured in stage 1. The second arrival was 21.9 dB below the
+first on the Pi 3 and 19.7 dB on the CM5. Two periods are the output queue.
+The rest, 0.69 of a period on both boards, is how long a captured frame waits
+for the engine to read it. That it is the same fraction on both suggests the
+phase between capture and playback is set when the two start, but that is not
+proven.
+
+### Hour runs with the analog input
+
+The three runs of stage 2, made the same way, with the analog input on: a fresh
+daemon per run, stopped when its players ended, the stage 1 full load, and the
+same 5 minute stretches of public domain orchestral music at 44.1 kHz 16-bit
+and 96 kHz 24-bit, kept in RAM and looped into `aplay -t raw`. The music played
+through the cable into the ADC, so the input opened a second after each start
+and stayed open, and the music was mixed in a second time at -20 dB. Each
+daemon logs the time of every wake-up gap over the buffer.
+
+On the CM5, 64 frames at 44.1 kHz and 128 at 96 kHz, with the heatsink. It sat
+at 83 to 87 °C and ran between 1.5 and 2.4 GHz.
+
+| Run | Daemon xruns | Wake-up gaps over the buffer | Worst gap / buffer | Worst cycle | Padded, dropped | `aplay` underruns |
+|---|---|---|---|---|---|---|
+| 44.1 kHz | 0 | 0 | 1.54 / 2.90 ms | 0.08 ms | 128, 0 | 0 |
+| 96 kHz | 0 | 0 | 1.45 / 2.67 ms | 0.07 ms | 192, 0 | 0 |
+| 44.1 kHz, then a second client at 96 kHz | 0 | 0 | 1.59 / 2.90 ms | 0.11 ms | 128, 0 | 0 and 0 |
+
+All three pass. Each capture start padded one period: one at 48 kHz when the
+daemon started, and one at the rate the first player set.
+
+On the Pi 3, 256 frames at 44.1 kHz and 512 at 96 kHz, without a heatsink. It
+sat at 86 to 87 °C and 496 to 603 MHz, throttled, as in stage 2.
+
+| Run | Daemon xruns | Wake-up gaps over the buffer | Worst gap / buffer | Worst cycle | Padded, dropped | `aplay` underruns |
+|---|---|---|---|---|---|---|
+| 44.1 kHz | **2** | **2** | **33.13 / 11.61 ms** | 3.92 ms | 1536, 10 | 0 |
+| 96 kHz | 0 | 0 | 10.16 / 10.67 ms | 3.84 ms | 768, 0 | 0 |
+| 44.1 kHz, then a second client at 96 kHz | 0 | 0 | 6.82 / 11.61 ms | 1.45 ms | 512, 0 | 0 and 0 |
+| 44.1 kHz, repeated | **1** | 0 | 11.09 / 11.61 ms | 3.76 ms | 512, 278 | 0 |
+
+**The 44.1 kHz run on the Pi 3 fails.** Ten minutes in, the daemon logged two
+wake-up gaps, of 27.09 ms ending at 535053.843 s and of 33.13 ms ending at
+535053.880 s on `CLOCK_MONOTONIC`, so the audio thread did not run for about
+60 ms. It counted 2 xruns. The capture overran too and restarted in place:
+the 1024 frames padded beyond the two start-ups, and the 10 dropped, came
+from that. `aplay` reported no underrun, since its own buffer is larger. The
+load's write loop logged the end of a 128 MB synchronous write at 535053.49 s,
+about 0.35 s before the gap. Each write ends with the file being deleted, so
+the gap fell while the SD card was finishing that write and the delete. As
+with the CM5's gap in stage 2, that points at the storage's completion work
+and not at the daemon, but one event does not prove it. The kernel log has
+nothing at that time.
+
+This run was the third of the three on the Pi 3, not the first. The first
+attempt at 44.1 kHz did not play: the throttled board took 3.9 s to start the
+daemon under load, and the script started `aplay` after 3 s, so it found no
+socket. The script now waits for the socket.
+
+The 44.1 kHz run was repeated on its own, under the same load, with the daemon
+built from fe1b6f5. It failed again, differently: 1 xrun and no wake-up gap
+over the buffer, but a worst gap of 11.09 ms against an 11.61 ms buffer. A
+wake-up that late leaves less than a millisecond to fill the period, and the
+xrun fits that. The engine also dropped 278 captured frames once, which
+happens only when more than two periods have queued at the ADC, so a cycle
+came late there too. The daemon does not log the time of an xrun, so it
+cannot be matched to the load.
+
+In stage 2 the same run without the analog input passed, with a worst gap of
+7.44 ms and a worst cycle of 0.83 ms. With the input on, both 44.1 kHz runs
+had worst cycles of 3.8 and 3.9 ms. **So the Pi 3 does not hold 44.1 kHz at
+256 frames under full load with the analog input on.** What the input adds is
+a second DMA stream and its interrupts, a capture read and the detector in
+each cycle. The detector costs about 0.1% of a period, so the time more
+likely goes to the interrupts or to the read, but that was not measured. The
+board was throttled to 496 to 603 MHz at 86 to 87 °C, a worst case.
+
+The 96 kHz run passed, but its worst gap, 10.16 ms against a 10.67 ms buffer,
+leaves 0.5 ms. In stage 2 the same run without the analog input had 6.60 ms.
+When in the hour that gap fell is not known: the daemon logs only gaps over the
+buffer.
+
+### Detection
+
+`analog-timing` plays a 1 kHz tone at -20 dBFS peak through `aas` for 2 s, 20
+times, with 1 to 2 s of silence before each and 5 s after. It prints, on
+`CLOCK_MONOTONIC`, when the tone's first and last frame leave the player's
+buffer. The daemon's log lines were stamped with the same clock as they were
+read from its standard error. The time from the player's buffer to the ADC is
+taken from stage 2, through `aas` at 48 kHz: 12.11 ms on the Pi 3 and 4.01 ms
+on the CM5. That figure includes about 40 frames, 0.8 ms, that the method adds,
+so the times below can read up to 1 ms long. The silence before each tone
+differs by a few blocks from tone to tone, so that the tones start at different
+points of the detector's 50 ms windows.
+
+| Board | Opens after the tone reaches the ADC | Closes after the tone ends at the ADC |
+|---|---|---|
+| Pi 3, 256 frames | 4.1 to 52.4 ms, mean 30.5 ms | 3.012 to 3.055 s, mean 3.033 s |
+| CM5, 64 frames | 3.0 to 51.1 ms, mean 20.4 ms | 3.001 to 3.041 s, mean 3.018 s |
+
+Every tone opened the input once and closed it once, and nothing opened it
+between the tones. The spread of the opening is the window: the detector
+decides at the end of each 50 ms window, so a tone that starts early in a window
+opens it up to 50 ms later. Closing is 3 s after the end of the last loud window,
+plus the same wait. The timing has a resolution of about 1 ms.
+
+A first run on the CM5 used the same silence before every tone. All 20 tones
+then started at the same point of a window and opened 15.5 to 16.5 ms after the
+tone reached the ADC, which is why the silence now varies.
+
+### Plugin tests and the ADC start-up on the Pi 3
+
+`dist/test-plugin.sh` ran on the Pi 3 with the daemon installed as its unit and
+the plugin installed, built from fe1b6f5. Without `ANALOG=1` 27 of 28 cases
+passed, and with it 31 of 32. The one failure each time is `mpd_mixer_works`,
+because `mpd` is not installed on the board. The four analog cases passed: the
+input opened 68 ms after the tone started and closed 3.065 s after it ended,
+counted from the player's side; it stayed closed for 10 s of silence; a rate
+change from 44.1 to 96 kHz with the capture open gave 0 xruns and 0 wake-up
+gaps; and the capture device recorded the tone at -19.3 dBFS, all of its power
+at 1 kHz.
+
+The daemon gives zeros for the first second after each capture start, because
+the ADC of the DAC+ ADC Pro starts with a transient that its high-pass filter
+takes up to 700 ms to bring below -50 dBFS. On the DAC+ ADC of the Pi 3 there
+is no such transient. `arecord` straight from the card, with the daemon
+stopped, 5 starts each from a card at rest and 3 each with the playback running,
+at 44.1, 48 and 96 kHz:
+
+| Board | Above -50 dBFS after a start | Loudest 50 ms window |
+|---|---|---|
+| Pi 3, DAC+ ADC | never | -83.8 dBFS |
+| CM5, DAC+ ADC Pro, 44.1 kHz | 700 ms | -26.8 dBFS |
+| CM5, DAC+ ADC Pro, 48 kHz | 650 ms | -27.7 dBFS |
+| CM5, DAC+ ADC Pro, 96 kHz | 300 ms | -28.9 dBFS |
+
+From a card at rest the DAC+ ADC delivers exact zeros for the first 150 ms at
+44.1 and 48 kHz and 50 ms at 96 kHz, then noise at about -84 dBFS that falls to
+-105 dBFS within a second. So the 1 s of zeros covers the Pro, with 300 ms to
+spare at 44.1 kHz, and costs the DAC+ ADC a second of input it would not have
+to lose. The constant was left as it is.
+
+### The ADC after a capture overrun
+
+`aas` recovers a capture overrun by preparing and starting the stream again,
+without closing it. Whether that brings the start transient of the DAC+ ADC
+Pro back, which would call for the 1 s mute again, was measured on the CM5
+test board with the daemon stopped and the input quiet: a small program read
+`hw:sndrpihifiberry` as S32 stereo with a buffer of about 85 ms, stalled for
+300 ms to overrun it, recovered with `snd_pcm_prepare` and `snd_pcm_start`,
+and measured the first 700 ms after each restart: the loudest 50 ms window
+(RMS over both channels) and the peak. Twelve restarts at 44.1 kHz and twelve
+at 48 kHz.
+
+| | First open | Restarts, loudest 50 ms | Restarts, peak |
+|---|---|---|---|
+| 44.1 kHz | -26.8 dBFS | -102.4 to -97.9 dBFS | -92.3 to -90.5 dBFS |
+| 48 kHz | -27.7 dBFS | -102.8 to -98.5 dBFS | -92.7 to -90.0 dBFS |
+
+The transient comes with the open, not with a start: no restart came within
+48 dB of the detector's -50 dBFS. So a restart after an overrun is not muted.
+
+### Idle output with the analog input on
+
+With the analog input on, `aas` keeps the playback open and writes exact zeros
+when nothing plays, because the card's clock and the engine's cycle come from
+the playback. The question was whether closing the playback while the capture
+runs would change anything. Measured on both boards with the daemon stopped,
+with `arecord` and `aplay` on the card's own device, S32 stereo at 48 kHz both
+ways, and the mixer as it was. One run per board: the playback fed zeros (A),
+then closed with the capture still running (B), then one attempt to play at
+44.1 kHz, then zeros again (A), then closed again. The capture rate was taken
+from its hardware position in `/proc/asound` every 0.25 s.
+
+| | Pi 3, DAC+ ADC | CM5, DAC+ ADC Pro |
+|---|---|---|
+| Capture rate in A, in B, after B to A | 48001, 47976, 48006 Hz | 47991, 47998, 48001 Hz |
+| Capture errors, kernel log | none, nothing | none, nothing |
+| Noise at the ADC in A, 10 s, RMS and peak | -102.5, -88.6 dBFS | -103.0, -89.2 dBFS |
+| The same in B | -99.9, -76.4 dBFS | -100.2, -77.0 dBFS |
+| Peak within 100 ms of A to B, B to A, A to B | -95.1, -94.2, -89.0 dBFS | -91.8, -91.1, -91.9 dBFS |
+| Another player at 44.1 kHz in B | Accepted. The capture stayed at 48 kHz. A peak of -53.8 dBFS within 100 ms of its start | Accepted. The capture slowed to about 44 kHz and stayed there, without an error, until a 48 kHz playback opened again |
+
+The clocks keep running in B on both boards: the capture went on at 48 kHz
+with no error across every change. B is about 2.7 dB noisier than A on both
+boards, with peaks 12 dB higher, which shows as single peaks of about -77 dBFS
+in the 10 s. Why is not known. No change from A to B or back made a click
+above -89 dBFS.
+
+The DAC's registers, read from the driver's register map, were the same in A
+and in B on both boards: register 108, the analog mute monitor, 0x00, and the
+clock detection registers 91 to 94 at 0x30, 0x00, 0x40, 0x40. With nothing
+open, 91 was 0x00 and 94 was 0x68 on the CM5 and 0x6a on the Pi 3. Register
+118, the power state, is not in the driver's register map and could not be
+read. The card's "Auto Mute Switch" and "Auto Mute Mono Switch" were on, with
+"Auto Mute Time" at 21 ms, on both boards.
+
+The playback being open does matter in one way. In B the playback device is free,
+and a player that opens it at another rate is accepted. On the CM5, where the Pi
+drives the clock, that moved the capture to the 44.1 kHz clock with no error
+reported anywhere, and it stayed there after the player had gone. On the Pi 3
+the capture kept its rate, with a click at the start. Holding the playback open,
+as `aas` does, prevents both.
+
+What this cannot show without a scope: the DAC's analog output itself, below
+the ADC's own noise of about -103 dBFS, whether the DAC's charge pump or output
+stage changes state in B, and anything faster or quieter than a 50 ms window of
+the capture shows.
+
+### What these figures do not show
+
+- The hour runs were made with music loud enough to keep the input open all
+  hour. An input that opens and closes often during a run was tested only for
+  20 tones, not under load.
+- The shared clock was measured at 48 kHz only. The counters are printed only
+  when the daemon stops, so the first second was taken from separate short runs.
+- The analog path was measured at 48 kHz only.
+- The detection times rest on the stage 2 latency figure for the player's side.
+- Each card was tested on one board only.

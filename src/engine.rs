@@ -4,12 +4,14 @@
 //! code only carries them out. It does not allocate, free or lock. Whatever
 //! it would free goes back to the control thread in an `Event`.
 
-use crate::bitperfect::{Situation, decide, volumes_apply};
+use crate::bitperfect::{Situation, decide, plugins_apply, volumes_apply};
+use crate::capture::Capture;
 use crate::config::BitPerfect;
 use crate::counters::Counters;
 use crate::dop;
-use crate::format::{Processing, Ramp, mix_add, mix_clear, mix_finish};
+use crate::format::{BlockStore, Processing, Ramp, mix_add, mix_add_acc, mix_clear, mix_finish};
 use crate::latency::{MAX_PERIOD, PERIODS};
+use crate::plugin::chain::Chain;
 use crate::rate::ClientId;
 use crate::resample::Resampler;
 use crate::sink::{Sink, SinkError};
@@ -24,6 +26,10 @@ use std::time::Instant;
 /// Sources the table of a new engine has room for. The control thread sends
 /// `Grow` before it adds more.
 pub const INITIAL_SOURCES: usize = 16;
+
+/// Capture streams the tap table of a new engine has room for. The control
+/// thread sends `GrowTaps` before it adds more.
+pub const INITIAL_TAPS: usize = 4;
 
 /// Length of a gain change.
 const FADE_MS: u32 = 10;
@@ -376,11 +382,12 @@ impl Source {
     /// sleeps through the periods before it, and costs no call here.
     fn notify(&mut self, sink_delay: u32, output_rate: u32) {
         let filter = self.resampler.as_ref().map_or(0, |r| r.delay_frames());
-        let delay = u64::from(sink_delay + filter) * u64::from(self.rate) / u64::from(output_rate);
+        let delay = (u64::from(sink_delay) + u64::from(filter)) * u64::from(self.rate)
+            / u64::from(output_rate);
         let header = self.ring.header();
         header
             .output_delay_frames
-            .store(delay as u32, Ordering::Relaxed);
+            .store(delay.min(u64::from(u32::MAX)) as u32, Ordering::Relaxed);
         // The client stores the position it waits for and then loads ours.
         // With a full barrier on both sides, one of the two sees the other.
         fence(Ordering::SeqCst);
@@ -406,6 +413,470 @@ impl Source {
     }
 }
 
+/// The analog input as the audio thread sees it: the capture it reads, the
+/// chain it runs through, and the period read this cycle. It is mixed like
+/// a running source, but only while its chain reports signal.
+struct Analog<P: Processing> {
+    capture: Option<Box<dyn Capture>>,
+    /// The capture has been closed, for a reopen or after a failure. It is
+    /// not read again, and stays until the control thread replaces it.
+    closed: bool,
+    /// A capture whose call failed, to be handed back in
+    /// `Event::CaptureFailed`, which closes it off the audio thread.
+    failed: Option<Box<dyn Capture>>,
+    chain: Chain,
+    /// This cycle's period as captured.
+    buf: Vec<[i32; 2]>,
+    /// This cycle's period after a chain that altered it, in the
+    /// processing format, so that a float format keeps its headroom until
+    /// the mix.
+    processed: Vec<[P::Acc; 2]>,
+    /// `processed` holds the chain's output this cycle. Else the chain left
+    /// `buf` as it was.
+    altered: bool,
+    /// The captured frames faded by the engine, in the processing format.
+    faded: Vec<[P::Acc; 2]>,
+    /// Which frames play this cycle.
+    plays: Plays,
+    /// Where the engine's own fade of the captured frames stands, from 0
+    /// to 1. Only forced bit-perfect past a chain that alters the audio
+    /// uses it: it plays the frames as captured, which the detector's fades
+    /// are not in.
+    raw_level: f32,
+    /// The chain reports signal this cycle: a recorder gets its output.
+    signal: bool,
+    /// A period passed without the chain running, such as with no capture:
+    /// it is reset before it runs again.
+    chain_idle: bool,
+    /// The chain's latency, in the cycles its output is used, else 0.
+    latency: u32,
+    gain: f32,
+    /// This cycle's period goes into the mix, unless DoP has the output.
+    audible: bool,
+    /// What `Event::InputSignal` last said.
+    audible_reported: bool,
+}
+
+impl<P: Processing> Analog<P> {
+    /// No capture, an empty chain, unity gain.
+    fn new(max_frames: usize) -> Analog<P> {
+        Analog {
+            capture: None,
+            closed: false,
+            failed: None,
+            chain: Chain::empty(),
+            buf: vec![[0; 2]; max_frames],
+            processed: vec![[P::zero(); 2]; max_frames],
+            altered: false,
+            faded: vec![[P::zero(); 2]; max_frames],
+            plays: Plays::Captured,
+            raw_level: 0.0,
+            signal: false,
+            chain_idle: false,
+            latency: 0,
+            gain: 1.0,
+            audible: false,
+            audible_reported: false,
+        }
+    }
+
+    /// Puts in another capture, and returns the one it replaces. That may
+    /// be one that failed and was not reported yet: it goes back as the
+    /// one replaced, and is not reported.
+    fn replace(&mut self, capture: Option<Box<dyn Capture>>) -> Option<Box<dyn Capture>> {
+        self.closed = false;
+        self.audible = false;
+        self.signal = false;
+        self.raw_level = 0.0;
+        let old = std::mem::replace(&mut self.capture, capture);
+        old.or_else(|| self.failed.take())
+    }
+
+    /// Stops the capture, once, and silences the input.
+    fn close(&mut self) {
+        if let Some(capture) = self.capture.as_mut()
+            && !self.closed
+        {
+            capture.close();
+        }
+        // One that failed and waits for room in the event queue holds the
+        // device too. Closing it twice does no harm.
+        if let Some(failed) = self.failed.as_mut() {
+            failed.close();
+        }
+        self.closed = true;
+        self.audible = false;
+        self.signal = false;
+        self.raw_level = 0.0;
+    }
+
+    /// Reads one period into `buf` and runs the chain on it, which decides
+    /// whether it is audible. A capture that fails is put aside, to go back
+    /// to the control thread, and the input is silent.
+    /// `store` is the mix's, free until the mix starts. Without `plugins`,
+    /// in forced bit-perfect, the frames that play stay as captured, faded
+    /// in and out as the detector opens and closes; the chain's output
+    /// still goes to the recorders.
+    fn read(
+        &mut self,
+        period: usize,
+        rate: u32,
+        counters: &Counters,
+        store: &mut BlockStore,
+        plugins: bool,
+    ) {
+        // Until the chain runs below, this period passes it by.
+        let idle = std::mem::replace(&mut self.chain_idle, true);
+        self.audible = false;
+        self.signal = false;
+        self.altered = false;
+        self.latency = 0;
+        self.plays = Plays::Captured;
+        let Some(capture) = self.capture.as_mut() else {
+            return;
+        };
+        if self.closed {
+            return;
+        }
+        let buf = &mut self.buf[..period];
+        if fetch(capture.as_mut(), buf, counters).is_err() {
+            // Closing a PCM frees memory and can wait, so the control
+            // thread does it.
+            self.failed = self.capture.take();
+            self.closed = true;
+            return;
+        }
+        if self.chain.is_empty() || !self.chain.fits(rate) {
+            // Nothing measures it, so it has no signal: the analog input
+            // never passes ungated. The control thread always sends a
+            // chain with a detector, built for the rate the engine runs at
+            // once the chain for a new rate has come.
+            return;
+        }
+        // Into the processing format as the mix does it.
+        let processed = &mut self.processed[..period];
+        mix_clear::<P>(processed);
+        mix_add::<P>(buf, Ramp::flat(1.0), processed);
+        let mut block = P::to_block(processed, store);
+        if idle {
+            self.chain.reset();
+        }
+        self.chain_idle = false;
+        let status = self.chain.process(block.reborrow());
+        let signal = !status.no_signal;
+        let neutral = self.chain.neutral();
+        // A neutral chain changed nothing unless the detector faded or
+        // zeroed, so the frames stay as captured and can be copied
+        // bit-perfect.
+        if !neutral || status.changed {
+            P::from_block(block, processed);
+            self.altered = true;
+            self.latency = self.chain.latency_frames();
+        }
+        self.signal = signal;
+        if plugins || neutral {
+            if self.altered {
+                self.plays = Plays::Processed;
+            }
+            self.raw_level = if signal { 1.0 } else { 0.0 };
+            self.audible = signal;
+        } else {
+            self.audible = self.fade_raw(signal, period, rate);
+        }
+    }
+
+    /// Fades the captured frames towards full level with `signal`, else
+    /// towards silence, over 10 ms from the start of the period, into
+    /// `faded`. Returns whether anything of them is heard.
+    fn fade_raw(&mut self, signal: bool, period: usize, rate: u32) -> bool {
+        let target = if signal { 1.0 } else { 0.0 };
+        if self.raw_level == target {
+            return signal;
+        }
+        let fade = (rate * FADE_MS / 1000).max(1) as f32;
+        let left = ((target - self.raw_level).abs() * fade).round() as usize;
+        let frames = left.min(period);
+        let to = if frames == left {
+            target
+        } else {
+            self.raw_level + (target - self.raw_level) * frames as f32 / left as f32
+        };
+        let faded = &mut self.faded[..period];
+        let (fading, steady) = faded.split_at_mut(frames);
+        mix_clear::<P>(fading);
+        mix_clear::<P>(steady);
+        let ramp = Ramp {
+            from: self.raw_level,
+            to,
+        };
+        mix_add::<P>(&self.buf[..frames], ramp, fading);
+        mix_add::<P>(&self.buf[frames..period], Ramp::flat(to), steady);
+        self.raw_level = to;
+        self.plays = Plays::Faded;
+        true
+    }
+
+    /// Adds this cycle's period at `level` to the mix, along the fade.
+    fn mix(&self, fade: Fade, level: f32, acc: &mut [[P::Acc; 2]]) {
+        let period = acc.len();
+        match self.plays {
+            Plays::Captured => fade.add(&self.buf[..period], level, acc, mix_add::<P>),
+            Plays::Processed => fade.add(&self.processed[..period], level, acc, mix_add_acc::<P>),
+            Plays::Faded => fade.add(&self.faded[..period], level, acc, mix_add_acc::<P>),
+        }
+    }
+}
+
+/// Which of its buffers the analog input plays from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Plays {
+    /// `buf`, as captured.
+    Captured,
+    /// `processed`, the chain's output.
+    Processed,
+    /// `faded`, as captured but faded by the engine.
+    Faded,
+}
+
+/// A capture stream as the audio thread sees it: a ring it writes the
+/// analog input into, after the input's chain, for a client to read. The
+/// roles of the ring are those of a source swapped: the engine moves only
+/// `write_pos`, and the client only `read_pos`.
+pub struct Tap {
+    pub id: ClientId,
+    pub ring: Ring,
+    /// An eventfd, non-blocking, written as `notify` decides.
+    pub wake: OwnedFd,
+    pub running: bool,
+    /// The position in the header's `wake_at` that has had its wake-up.
+    woken_at: u64,
+    /// The overruns the client has been woken for.
+    overruns_told: u64,
+}
+
+impl Tap {
+    /// A stopped tap.
+    pub fn new(id: ClientId, ring: Ring, wake: OwnedFd) -> Tap {
+        Tap {
+            id,
+            ring,
+            wake,
+            running: false,
+            woken_at: 0,
+            overruns_told: 0,
+        }
+    }
+
+    /// Writes what fits of `block`. The rest is dropped and counted in the
+    /// header's `underruns`, which for a tap counts frames lost to a full
+    /// ring. The engine never waits for a recorder.
+    fn write(&mut self, block: &[[i32; 2]]) {
+        let n = self.ring.write(block);
+        if n < block.len() {
+            let overruns = &self.ring.header().underruns;
+            overruns.fetch_add((block.len() - n) as u64, Ordering::Relaxed);
+        }
+    }
+
+    /// Wakes the client if it is due: after every period, or once the write
+    /// position reaches the one it waits for, and after each overrun. The
+    /// rule a source follows, with the read position swapped for the write
+    /// position.
+    fn notify(&mut self) {
+        let header = self.ring.header();
+        // The client stores the position it waits for and then loads ours.
+        // With a full barrier on both sides, one of the two sees the other.
+        fence(Ordering::SeqCst);
+        let wake_at = header.wake_at.load(Ordering::SeqCst);
+        let reached = header.write_pos.load(Ordering::Relaxed) >= wake_at;
+        let overruns = header.underruns.load(Ordering::Relaxed);
+        let due = wake_at == 0 || (reached && wake_at != self.woken_at);
+        if !due && overruns == self.overruns_told {
+            return;
+        }
+        self.woken_at = wake_at;
+        self.overruns_told = overruns;
+        let one = 1u64;
+        // SAFETY: a plain write of 8 bytes. The fd is non-blocking, and a full
+        // counter only means the client has plenty of wake-ups waiting.
+        unsafe {
+            libc::write(
+                self.wake.as_raw_fd(),
+                (&raw const one).cast(),
+                size_of::<u64>(),
+            )
+        };
+    }
+}
+
+/// The capture streams, in a table that grows as the source table does:
+/// the control thread sends a bigger empty one, and the old one goes back.
+struct Taps {
+    #[allow(clippy::vec_box)] // Moving a boxed tap moves only a pointer.
+    table: Vec<Box<Tap>>,
+    /// The period converted from the chain's processing format, or zeros.
+    buf: Vec<[i32; 2]>,
+}
+
+impl Taps {
+    fn new(max_frames: usize) -> Taps {
+        Taps {
+            table: Vec::with_capacity(INITIAL_TAPS),
+            buf: vec![[0; 2]; max_frames],
+        }
+    }
+
+    fn find(&mut self, id: ClientId) -> Option<&mut Tap> {
+        let found = self.table.iter_mut().find(|t| t.id == id);
+        found.map(|t| t.as_mut())
+    }
+
+    /// Takes the tap in, or hands it back if the table is full.
+    fn add(&mut self, tap: Box<Tap>) -> Option<Box<Tap>> {
+        if self.table.len() < self.table.capacity() {
+            self.table.push(tap);
+            None
+        } else {
+            Some(tap)
+        }
+    }
+
+    fn remove(&mut self, id: ClientId) -> Option<Box<Tap>> {
+        let index = self.table.iter().position(|t| t.id == id)?;
+        Some(self.table.remove(index))
+    }
+
+    /// Moves the taps into `table` and returns the table they leave, or
+    /// returns `table` itself if it has no room for them.
+    #[allow(clippy::vec_box)] // Moving a boxed tap moves only a pointer.
+    fn grow(&mut self, mut table: Vec<Box<Tap>>) -> Vec<Box<Tap>> {
+        if table.capacity() - table.len() < self.table.len() {
+            return table;
+        }
+        table.append(&mut self.table);
+        std::mem::replace(&mut self.table, table)
+    }
+
+    /// Writes this cycle's analog period to every running tap and wakes
+    /// it as due: the period after the chain while the input has signal,
+    /// in forced bit-perfect too, else zeros, so that a tap keeps real time
+    /// without a signal or a capture. Never the mix.
+    fn deliver<P: Processing>(&mut self, analog: &Analog<P>, period: usize) {
+        let Taps { table, buf } = self;
+        if !table.iter().any(|t| t.running) {
+            return;
+        }
+        let block = if !analog.signal {
+            buf[..period].fill([0; 2]);
+            &buf[..period]
+        } else if analog.altered {
+            // Into 32 bits as the mix's last step does it.
+            mix_finish::<P>(&analog.processed[..period], &mut buf[..period]);
+            &buf[..period]
+        } else {
+            &analog.buf[..period]
+        };
+        // As the sink's delay for a player: what the chain holds back.
+        let latency = if analog.signal { analog.latency } else { 0 };
+        for tap in table.iter_mut().filter(|t| t.running) {
+            let header = tap.ring.header();
+            header.output_delay_frames.store(latency, Ordering::Relaxed);
+            tap.write(block);
+            tap.notify();
+        }
+    }
+}
+
+/// Fills `buf` with the latest period the capture has. More than two periods
+/// queued are cut back to two, and a short read is padded with zeros in
+/// front. Both are counted.
+fn fetch(
+    capture: &mut dyn Capture,
+    buf: &mut [[i32; 2]],
+    counters: &Counters,
+) -> Result<(), SinkError> {
+    let period = buf.len();
+    let queued = capture.available()?;
+    if queued > 2 * period {
+        let excess = queued - 2 * period;
+        capture.skip(excess)?;
+        let dropped = &counters.analog_dropped_frames;
+        dropped.fetch_add(excess as u64, Ordering::Relaxed);
+    }
+    let n = capture.read(buf)?.min(period);
+    if n < period {
+        buf.copy_within(..n, period - n);
+        buf[..period - n].fill([0; 2]);
+        let padded = &counters.analog_padded_frames;
+        padded.fetch_add((period - n) as u64, Ordering::Relaxed);
+    }
+    Ok(())
+}
+
+/// Fades `out` in after silence: `left` of `fade` frames of the fade are
+/// still to come, and fewer after the call.
+/// A `left` beyond `fade` is taken as `fade`: the fade starts from zero.
+fn unmute(out: &mut [[i32; 2]], left: &mut usize, fade: usize) {
+    *left = (*left).min(fade);
+    for frame in out.iter_mut() {
+        if *left == 0 {
+            break;
+        }
+        let gain = (fade - *left) as f64 / fade as f64;
+        *frame = frame.map(|v| (f64::from(v) * gain).round() as i32);
+        *left -= 1;
+    }
+}
+
+/// How the output gain moves over one period.
+#[derive(Clone, Copy)]
+struct Fade {
+    from: f32,
+    to: f32,
+    /// Frames from the start over which the gain goes from `from` to `to`.
+    frames: usize,
+    /// Down to zero over the whole period, before a reopen.
+    out: bool,
+}
+
+impl Fade {
+    /// Adds `samples` at `level` to the mix, along the fade.
+    fn mix<P: Processing>(self, samples: &[[i32; 2]], level: f32, acc: &mut [[P::Acc; 2]]) {
+        self.add(samples, level, acc, mix_add::<P>);
+    }
+
+    /// Adds `samples` with `add`, which takes a ramp over all of its `acc`.
+    fn add<T, A>(self, samples: &[T], level: f32, acc: &mut [A], add: fn(&[T], Ramp, &mut [A])) {
+        if self.out {
+            let ramp = Ramp {
+                from: self.from * level,
+                to: 0.0,
+            };
+            add(samples, ramp, acc);
+            return;
+        }
+        let (fading, steady) = samples.split_at(self.frames);
+        let (acc_fading, acc_steady) = acc.split_at_mut(self.frames);
+        let ramp = Ramp {
+            from: self.from * level,
+            to: self.to * level,
+        };
+        add(fading, ramp, acc_fading);
+        add(steady, Ramp::flat(self.to * level), acc_steady);
+    }
+}
+
+/// Where a chain of plugins runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Place {
+    /// On the analog input, before it is mixed.
+    Analog,
+    /// On the mix of all sources, after the output volume.
+    Mix,
+    /// On what goes to the card, after the mix chain.
+    Output,
+}
+
 /// Decisions from the control thread, carried out in order.
 pub enum Command {
     /// Refused with `Event::Dropped` if the table is full.
@@ -428,6 +899,43 @@ pub enum Command {
     /// An empty table with more capacity. It replaces the current one.
     #[allow(clippy::vec_box)] // Moving a boxed source moves only a pointer.
     Grow(Vec<Box<Source>>),
+    /// Replaces the chain at a place. Answered by `Event::OldChain`. The
+    /// chain is in the engine's processing format and, if it has a plugin,
+    /// built for `MAX_PERIOD` frames, so that no period change can outgrow
+    /// it. A shorter one is refused: it comes back as the `OldChain` and the
+    /// chain in place stays. The control thread sends the chains for a new
+    /// rate just before its `Reconfigure`, so that they take effect with the
+    /// reopen, as resamplers do. In forced bit-perfect the mix and output
+    /// chains are bypassed, and the analog chain runs only for its
+    /// detector: its output is not used.
+    SetChain(Place, Box<Chain>),
+    /// Sets a parameter of one plugin in a chain. One that is not there is
+    /// ignored.
+    SetParam {
+        place: Place,
+        plugin: u8,
+        index: u8,
+        value: f64,
+    },
+    /// Replaces the capture the analog input reads. Answered by
+    /// `Event::OldCapture`, also when there was none, so that every one is
+    /// answered. The engine closes a capture before it reopens the output
+    /// and keeps the closed one until it is replaced here. A capture comes
+    /// back closed or not, so its `Drop` must release the device. A
+    /// `CaptureFailed` that arrives before the `OldCapture` belongs to the
+    /// capture this command replaced.
+    SetCapture(Option<Box<dyn Capture>>),
+    /// The gain of the analog input. Applies at once, as a source's does.
+    SetAnalogGain(f32),
+    /// A capture stream. Refused with `Event::DroppedTap` if the table is
+    /// full. `SetRunning` and `Flush` find it by its id; a flushed tap is
+    /// stopped, and its ring is left for the client to empty.
+    AddTap(Box<Tap>),
+    /// Answered by `Event::DroppedTap`.
+    RemoveTap(ClientId),
+    /// An empty tap table with more capacity. It replaces the current one.
+    #[allow(clippy::vec_box)] // Moving a boxed tap moves only a pointer.
+    GrowTaps(Vec<Box<Tap>>),
     Shutdown,
 }
 
@@ -436,6 +944,8 @@ pub enum Event {
     Dropped(Box<Source>),
     Replaced(Option<Box<Resampler>>),
     OldTable(Vec<Box<Source>>),
+    /// The chain a `SetChain` replaced, to be freed off the audio thread.
+    OldChain(Box<Chain>),
     /// The client plays DoP, with the number of its claim on the output.
     /// The lowest number among the claims is the oldest, whatever order
     /// the events arrive in.
@@ -446,6 +956,26 @@ pub enum Event {
     /// One for every `Reconfigure`: when the sink is open, or when a later
     /// `Reconfigure`, a close or the shutdown has taken its place.
     Reconfigured,
+    /// The capture a `SetCapture` replaced, to be dropped off the audio
+    /// thread.
+    OldCapture(Option<Box<dyn Capture>>),
+    /// The analog input has signal (`true`) or not, as its chain reports.
+    /// While DoP holds the output it has signal but is not played. Sent
+    /// when that changes.
+    /// It starts out not mixed. While the queue is full only the latest
+    /// state is sent, once there is room.
+    InputSignal(bool),
+    /// A capture call failed. The engine reads it no more and hands it
+    /// back, still open, for the control thread to close. Sent once per
+    /// capture. One that arrives before the `OldCapture` answering a
+    /// `SetCapture` belongs to the capture that command replaced.
+    CaptureFailed(Box<dyn Capture>),
+    /// A tap removed, or refused for lack of room.
+    DroppedTap(Box<Tap>),
+    /// The tap table a `GrowTaps` replaced, or the one it brought if that
+    /// had no room for the taps.
+    #[allow(clippy::vec_box)] // Moving a boxed tap moves only a pointer.
+    OldTaps(Vec<Box<Tap>>),
 }
 
 /// Runs the cycles of one output.
@@ -463,6 +993,12 @@ pub struct Engine<P: Processing, S: Sink> {
     out: Vec<[i32; 2]>,
     scratch: Vec<[i32; 2]>,
     acc: Vec<[P::Acc; 2]>,
+    /// Where the mix is handed to the plugins.
+    store: BlockStore,
+    analog: Analog<P>,
+    taps: Taps,
+    mix: Chain,
+    output: Chain,
     rate: u32,
     period: usize,
     open: bool,
@@ -476,6 +1012,14 @@ pub struct Engine<P: Processing, S: Sink> {
     target_gain: f32,
     /// Frames until `gain` reaches `target_gain`.
     fade_left: usize,
+    /// Frames of the fade in left after the mix or output chain was built
+    /// for another rate than the engine runs at, and the output was
+    /// silent for it.
+    unmute_left: usize,
+    /// A period passed without the mix and output chains running: after
+    /// DoP, the copy path, a mute or in forced bit-perfect. They are reset
+    /// before they run again.
+    chains_idle: bool,
     last_start: Option<Instant>,
     /// The last DoP claim handed out.
     claims: u64,
@@ -502,6 +1046,11 @@ impl<P: Processing, S: Sink> Engine<P, S> {
             out: vec![[0; 2]; frames],
             scratch: vec![[0; 2]; frames * MAX_DOWNSAMPLING + dop::MIN_FRAMES],
             acc: vec![[P::zero(); 2]; frames],
+            store: BlockStore::new(frames),
+            analog: Analog::new(frames),
+            taps: Taps::new(frames),
+            mix: Chain::empty(),
+            output: Chain::empty(),
             rate: 0,
             period: 0,
             open: false,
@@ -511,6 +1060,8 @@ impl<P: Processing, S: Sink> Engine<P, S> {
             gain: 1.0,
             target_gain: 1.0,
             fade_left: 0,
+            unmute_left: 0,
+            chains_idle: false,
             last_start: None,
             claims: 0,
         }
@@ -658,6 +1209,46 @@ impl<P: Processing, S: Sink> Engine<P, S> {
             }
             Command::SetGain(gain) => self.set_gain(gain),
             Command::Grow(table) => self.grow(table),
+            Command::SetChain(place, mut chain) => {
+                // A chain that could not take the longest period would fail
+                // after a rate change, so it is sent straight back.
+                if chain.max_frames() >= MAX_PERIOD as usize {
+                    // The old chain goes back in the box the new one came in.
+                    std::mem::swap(self.chain(place), &mut chain);
+                }
+                self.emit(Event::OldChain(chain));
+            }
+            Command::SetParam {
+                place,
+                plugin,
+                index,
+                value,
+            } => self
+                .chain(place)
+                .set_param(plugin.into(), index.into(), value),
+            Command::SetCapture(capture) => {
+                if capture.is_some() {
+                    let enabled = &self.counters.analog_enabled;
+                    enabled.store(true, Ordering::Relaxed);
+                }
+                let old = self.analog.replace(capture);
+                self.emit(Event::OldCapture(old));
+            }
+            Command::SetAnalogGain(gain) => self.analog.gain = gain,
+            Command::AddTap(tap) => {
+                if let Some(refused) = self.taps.add(tap) {
+                    self.emit(Event::DroppedTap(refused));
+                }
+            }
+            Command::RemoveTap(id) => {
+                if let Some(tap) = self.taps.remove(id) {
+                    self.emit(Event::DroppedTap(tap));
+                }
+            }
+            Command::GrowTaps(table) => {
+                let old = self.taps.grow(table);
+                self.emit(Event::OldTaps(old));
+            }
             Command::Shutdown => {
                 self.cancel_reopen();
                 self.close();
@@ -675,6 +1266,14 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         }
     }
 
+    fn chain(&mut self, place: Place) -> &mut Chain {
+        match place {
+            Place::Analog => &mut self.analog.chain,
+            Place::Mix => &mut self.mix,
+            Place::Output => &mut self.output,
+        }
+    }
+
     fn find(&mut self, id: ClientId) -> Option<&mut Source> {
         let found = self.table.iter_mut().find(|s| s.id == id);
         found.map(|s| s.as_mut())
@@ -684,8 +1283,12 @@ impl<P: Processing, S: Sink> Engine<P, S> {
     /// same cycle makes it again. The stream resumes as DoP if it left
     /// frames behind. With nothing left there is nothing to protect, so the
     /// next frames are judged afresh, bar a tail of the run.
+    /// A tap, found when no source has the id, is only started or stopped.
     fn set_running(&mut self, id: ClientId, running: bool) {
         let Some(source) = self.find(id) else {
+            if let Some(tap) = self.taps.find(id) {
+                tap.running = running;
+            }
             return;
         };
         source.running = running;
@@ -741,7 +1344,20 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         self.emit(Event::OldTable(old));
     }
 
+    /// Closes the capture too, and every capture still waiting to be handed
+    /// back: these cards take one rate at a time, so no capture may hold
+    /// the card when the output opens at another. One already in the event
+    /// queue is the control thread's, which closes it when it takes it. If
+    /// that comes after the reopen, the playback open at the new rate can
+    /// fail while that capture holds the card; it is tried again in the
+    /// next cycle.
     fn close(&mut self) {
+        self.analog.close();
+        for event in self.backlog.iter_mut() {
+            if let Event::OldCapture(Some(c)) | Event::CaptureFailed(c) = event {
+                c.close();
+            }
+        }
         if self.open {
             self.sink.close();
             self.open = false;
@@ -758,6 +1374,11 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         self.reopen = None;
         self.open = true;
         self.rate = rate;
+        // A fade in still due is counted in frames of the old rate: it
+        // starts again, a whole 10 ms at this one.
+        if self.unmute_left > 0 {
+            self.unmute_left = (rate * FADE_MS / 1000) as usize;
+        }
         self.period = period as usize;
         self.last_start = None;
         self.emit(Event::Reconfigured);
@@ -772,7 +1393,8 @@ impl<P: Processing, S: Sink> Engine<P, S> {
             return;
         }
         self.target_gain = gain;
-        if self.open && self.audible().next().is_some() {
+        let heard = self.audible().next().is_some() || self.analog.audible;
+        if self.open && heard {
             self.fade_left = (self.rate * FADE_MS / 1000) as usize;
         } else {
             self.finish_fade();
@@ -809,25 +1431,44 @@ impl<P: Processing, S: Sink> Engine<P, S> {
     /// behind no more than the card's buffer. The cycle is timed from
     /// `start`, the end of that wait.
     fn render(&mut self, fade_out: bool, start: Instant) -> Result<(), SinkError> {
+        let store = &mut self.store;
+        let plugins = plugins_apply(self.mode);
+        self.analog
+            .read(self.period, self.rate, &self.counters, store, plugins);
+        self.taps.deliver(&self.analog, self.period);
         self.scan();
         self.order_claims();
         let rate = self.rate;
         let holders = self.table.iter().enumerate();
         let holders = holders.filter(|(_, s)| s.holds_output(rate));
         let owner = holders.min_by_key(|(_, s)| s.dop_claim).map(|(i, _)| i);
-        match owner {
-            Some(owner) => self.play_dop(owner),
+        let chains_ran = match owner {
+            Some(owner) => {
+                self.play_dop(owner);
+                false
+            }
             None => self.play_pcm(fade_out),
-        }
+        };
+        // The mix and output chains missed this period's audio.
+        self.chains_idle |= !chains_ran;
         let before_write = Instant::now();
         let result = self.sink.write(&self.out[..self.period]);
         let after_write = Instant::now();
         if result == Err(SinkError::Xrun) {
             self.counters.xruns.fetch_add(1, Ordering::Relaxed);
         }
-        let sink_delay = self.sink.delay_frames();
+        // What the plugins hold back plays after the ring too, in the
+        // cycles they ran in.
+        let plugins = if chains_ran {
+            self.mix
+                .latency_frames()
+                .saturating_add(self.output.latency_frames())
+        } else {
+            0
+        };
+        let delay = self.sink.delay_frames().saturating_add(plugins);
         for source in self.table.iter_mut().filter(|s| s.running) {
-            source.notify(sink_delay, rate);
+            source.notify(delay, rate);
         }
         let work = before_write - start + after_write.elapsed();
         self.record_timing(start, work.as_nanos() as u64);
@@ -878,7 +1519,8 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         }
     }
 
-    /// DoP has the output to itself and nothing touches its samples.
+    /// DoP has the output to itself and nothing touches its samples. The
+    /// analog input has been read and measured, and is not played.
     fn play_dop(&mut self, owner: usize) {
         self.finish_fade();
         let (rate, period) = (self.rate, self.period);
@@ -892,27 +1534,47 @@ impl<P: Processing, S: Sink> Engine<P, S> {
     }
 
     /// What the bit-perfect rules need to know about this cycle.
+    /// The analog input takes part only while it is audible.
     fn situation(&self) -> Situation {
         let audible = || self.audible();
+        let analog = self.analog.audible;
         Situation {
             mode: self.mode,
-            active: audible().count(),
+            active: audible().count() + usize::from(analog),
             software_volume_at_0db: self.gain == 1.0
                 && self.target_gain == 1.0
-                && audible().all(|s| s.gain == 1.0),
+                && audible().all(|s| s.gain == 1.0)
+                && (!analog || self.analog.gain == 1.0),
             resampled: audible().any(|s| s.resampler.is_some()),
+            plugins_neutral: self.mix.neutral()
+                && self.output.neutral()
+                && (!analog || self.analog.chain.neutral()),
         }
     }
 
-    fn play_pcm(&mut self, fade_out: bool) {
+    /// Mixes the sources and the analog input while it is audible, or copies
+    /// the one that is bit-perfect. A mix then runs the mix chain and the
+    /// output chain, in that order, except in forced bit-perfect, which
+    /// bypasses them. Returns whether a chain with plugins ran.
+    fn play_pcm(&mut self, fade_out: bool) -> bool {
         let (rate, period) = (self.rate, self.period);
         let volumes = volumes_apply(self.mode);
-        let copy = !fade_out && decide(&self.situation()).is_ok();
+        // A detector fading the analog input has changed its frames.
+        let fading = self.analog.audible && self.analog.plays != Plays::Captured;
+        // Nor is a fade in after a mute for a chain at another rate over.
+        let unmuting = self.unmute_left > 0;
+        let copy = !fade_out && !fading && !unmuting && decide(&self.situation()).is_ok();
         let (next_gain, fade_frames) = self.next_fade_step();
         let (from, to) = if volumes {
             (self.gain, next_gain)
         } else {
             (1.0, 1.0)
+        };
+        let fade = Fade {
+            from,
+            to,
+            frames: fade_frames,
+            out: fade_out,
         };
         let out = &mut self.out[..period];
         let scratch = &mut self.scratch[..period];
@@ -934,36 +1596,83 @@ impl<P: Processing, S: Sink> Engine<P, S> {
             } else {
                 source.read_resampled(scratch);
                 let level = if volumes { source.gain } else { 1.0 };
-                if fade_out {
-                    let ramp = Ramp {
-                        from: from * level,
-                        to: 0.0,
-                    };
-                    mix_add::<P>(scratch, ramp, acc);
-                } else {
-                    let (fading, steady) = scratch.split_at(fade_frames);
-                    let (acc_fading, acc_steady) = acc.split_at_mut(fade_frames);
-                    let ramp = Ramp {
-                        from: from * level,
-                        to: to * level,
-                    };
-                    mix_add::<P>(fading, ramp, acc_fading);
-                    mix_add::<P>(steady, Ramp::flat(to * level), acc_steady);
-                }
+                fade.mix::<P>(scratch, level, acc);
             }
         }
+        if self.analog.audible {
+            if copy {
+                // Only with a neutral chain, so `buf` holds the period.
+                out.copy_from_slice(&self.analog.buf[..period]);
+            } else {
+                let level = if volumes { self.analog.gain } else { 1.0 };
+                self.analog.mix(fade, level, acc);
+            }
+        }
+        let has_plugins = !self.mix.is_empty() || !self.output.is_empty();
+        let chains_ran = !copy && plugins_apply(self.mode) && has_plugins;
+        // A chain never runs at a rate it was not built for, such as after
+        // a DoP stream, until the one for this rate comes. Silence, not a
+        // bypass: a crossover or a protection filter must not be skipped.
+        if chains_ran && !(self.mix.fits(rate) && self.output.fits(rate)) {
+            out.fill([0; 2]);
+            self.unmute_left = (rate * FADE_MS / 1000) as usize;
+            self.gain = next_gain;
+            self.fade_left -= fade_frames;
+            return false;
+        }
         if !copy {
+            // Without plugins the mix is not copied for them at all.
+            if chains_ran {
+                // After periods that did not pass them, so that a filter or
+                // a delay does not play an old tail.
+                if std::mem::take(&mut self.chains_idle) {
+                    self.mix.reset();
+                    self.output.reset();
+                }
+                let mut block = P::to_block(acc, &mut self.store);
+                self.mix.process(block.reborrow());
+                self.output.process(block.reborrow());
+                P::from_block(block, acc);
+            }
             mix_finish::<P>(acc, out);
+            if self.unmute_left > 0 {
+                let fade = (rate * FADE_MS / 1000) as usize;
+                unmute(out, &mut self.unmute_left, fade);
+            }
         }
         self.gain = next_gain;
         self.fade_left -= fade_frames;
+        chains_ran
     }
 
-    /// Sends the events that follow from the state of the sources. These need
-    /// no storage: what the queue will not take now is sent on a later cycle.
+    /// Sends the events that follow from the state of the sources and of the
+    /// analog input, and sets the input's counter. The events need no
+    /// storage: what the queue will not take now is sent on a later cycle.
     fn report(&mut self) {
+        let open = u64::from(self.analog.audible);
+        self.counters.analog_open.store(open, Ordering::Relaxed);
+        let latency = u64::from(self.analog.latency);
+        let counted = &self.counters.analog_latency_frames;
+        counted.store(latency, Ordering::Relaxed);
         if !self.backlog.is_empty() {
             return;
+        }
+        if let Some(capture) = self.analog.failed.take() {
+            if let Err(rtrb::PushError::Full(event)) =
+                self.events.push(Event::CaptureFailed(capture))
+            {
+                if let Event::CaptureFailed(capture) = event {
+                    self.analog.failed = Some(capture);
+                }
+                return;
+            }
+        }
+        let audible = self.analog.audible;
+        if audible != self.analog.audible_reported {
+            if self.events.push(Event::InputSignal(audible)).is_err() {
+                return;
+            }
+            self.analog.audible_reported = audible;
         }
         for source in self.table.iter_mut() {
             let dop = source.stream == Stream::Dop && !source.stalled;
@@ -991,8 +1700,12 @@ impl<P: Processing, S: Sink> Engine<P, S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bitperfect::NotBitPerfect;
+    use crate::capture::{Capture, CaptureFeed, MemoryCapture};
     use crate::config::{Format, Quality};
-    use crate::format::{F32, F64, I32, db_to_gain};
+    use crate::format::{BlockStore, F32, F64, I32, db_to_gain};
+    use crate::plugin::detect::Detect;
+    use crate::plugin::{Block, Formats, Param, ParamKind, Plugin, Status as PluginStatus};
     use crate::sink::{MemorySink, SinkLog};
     use aas_client::ring::Ring;
     use assert_no_alloc::assert_no_alloc;
@@ -4191,5 +4904,1983 @@ mod tests {
             rig.cycle();
         }
         assert_eq!(first_difference(&rig.last_periods(21), &rest), None);
+    }
+
+    /// What a test plugin does to each sample, seen at full scale 1.0.
+    #[derive(Clone, Copy)]
+    enum Op {
+        Add,
+        Mul,
+        Nan,
+    }
+
+    /// A plugin for the tests, with one parameter, `value`.
+    struct Probe {
+        op: Op,
+        value: f64,
+        neutral: bool,
+        latency: u32,
+        formats: Formats,
+        params: Vec<Param>,
+        /// Reports `no_signal` for every block.
+        quiet: bool,
+    }
+
+    const ALL_FORMATS: Formats = Formats {
+        i32: true,
+        f32: true,
+        f64: true,
+    };
+
+    impl Probe {
+        fn new(op: Op, value: f64) -> Probe {
+            Probe {
+                op,
+                value,
+                neutral: false,
+                latency: 0,
+                formats: ALL_FORMATS,
+                params: vec![Param {
+                    name: "value".into(),
+                    unit: String::new(),
+                    kind: ParamKind::Float,
+                    min: -100.0,
+                    max: 100.0,
+                    default: value,
+                }],
+                quiet: false,
+            }
+        }
+
+        fn quiet(mut self) -> Probe {
+            self.quiet = true;
+            self
+        }
+
+        fn neutral(mut self) -> Probe {
+            self.neutral = true;
+            self
+        }
+
+        fn latency(mut self, frames: u32) -> Probe {
+            self.latency = frames;
+            self
+        }
+
+        fn only(mut self, formats: Formats) -> Probe {
+            self.formats = formats;
+            self
+        }
+
+        fn apply(&self, s: f64) -> f64 {
+            match self.op {
+                Op::Add => s + self.value,
+                Op::Mul => s * self.value,
+                Op::Nan => f64::NAN,
+            }
+        }
+    }
+
+    impl Plugin for Probe {
+        fn name(&self) -> &str {
+            "probe"
+        }
+
+        fn formats(&self) -> Formats {
+            self.formats
+        }
+
+        fn params(&self) -> &[Param] {
+            &self.params
+        }
+
+        fn set_param(&mut self, index: usize, value: f64) {
+            assert_eq!(index, 0);
+            self.value = value;
+        }
+
+        fn neutral(&self) -> bool {
+            self.neutral
+        }
+
+        fn latency_frames(&self) -> u32 {
+            self.latency
+        }
+
+        fn process(&mut self, block: Block<'_>) -> PluginStatus {
+            const FULL: f64 = 2_147_483_648.0;
+            assert!(self.formats.has(block.format()));
+            match block {
+                Block::I32(d) => {
+                    for s in d.iter_mut().flatten() {
+                        *s = (self.apply(f64::from(*s) / FULL) * FULL).round() as i32;
+                    }
+                }
+                Block::F32(d) => {
+                    for s in d.iter_mut().flatten() {
+                        *s = self.apply(f64::from(*s)) as f32;
+                    }
+                }
+                Block::F64(d) => {
+                    for s in d.iter_mut().flatten() {
+                        *s = self.apply(*s);
+                    }
+                }
+            }
+            PluginStatus {
+                no_signal: self.quiet,
+                changed: false,
+            }
+        }
+    }
+
+    /// Adds `frames` of S32 to every sample.
+    fn plus(frames: i32) -> Probe {
+        Probe::new(Op::Add, f64::from(frames) / 2_147_483_648.0)
+    }
+
+    fn times(factor: f64) -> Probe {
+        Probe::new(Op::Mul, factor)
+    }
+
+    /// The format a rig of `P` processes in.
+    fn format_of<P: Processing>() -> Format {
+        P::to_block(&mut [], &mut BlockStore::new(0)).format()
+    }
+
+    /// A chain in the processing format of `P`, built for the longest period,
+    /// as the engine takes them.
+    fn chain_of<P: Processing>(plugins: Vec<Probe>) -> Box<Chain> {
+        chain_for::<P>(plugins, MAX_PERIOD as usize)
+    }
+
+    fn chain_for<P: Processing>(plugins: Vec<Probe>, max_frames: usize) -> Box<Chain> {
+        let plugins = plugins
+            .into_iter()
+            .map(|p| Box::new(p) as Box<dyn Plugin>)
+            .collect();
+        Box::new(Chain::new(plugins, format_of::<P>(), max_frames))
+    }
+
+    /// Takes only floats, so an engine in another format converts around it.
+    const F64_ONLY: Formats = Formats {
+        i32: false,
+        f32: false,
+        f64: true,
+    };
+
+    fn set_chain<P: Processing>(rig: &mut Rig<P>, place: Place, plugins: Vec<Probe>) {
+        rig.send(Command::SetChain(place, chain_of::<P>(plugins)));
+    }
+
+    /// Delays the audio by one frame: it keeps the last frame of a block
+    /// for the next. Reset, it starts from silence.
+    struct Delay {
+        kept: [f64; 2],
+    }
+
+    impl Plugin for Delay {
+        fn name(&self) -> &str {
+            "delay"
+        }
+
+        fn formats(&self) -> Formats {
+            ALL_FORMATS
+        }
+
+        fn params(&self) -> &[Param] {
+            &[]
+        }
+
+        fn set_param(&mut self, _: usize, _: f64) {}
+
+        fn neutral(&self) -> bool {
+            false
+        }
+
+        fn latency_frames(&self) -> u32 {
+            1
+        }
+
+        fn process(&mut self, block: Block<'_>) -> PluginStatus {
+            if let Block::F64(d) = block {
+                for frame in d.iter_mut() {
+                    std::mem::swap(frame, &mut self.kept);
+                }
+            }
+            PluginStatus::default()
+        }
+
+        fn reset(&mut self) {
+            self.kept = [0.0; 2];
+        }
+    }
+
+    #[test]
+    fn a_chain_that_resumes_after_dop_does_not_play_an_old_tail() {
+        let mut rig = Rig::<F64>::new(BitPerfect::Auto);
+        let plugins: Vec<Box<dyn Plugin>> = vec![Box::new(Delay { kept: [0.0; 2] })];
+        let chain = Chain::new(plugins, Format::F64, MAX_PERIOD as usize);
+        rig.send(Command::SetChain(Place::Mix, Box::new(chain)));
+        let mut a = client(1);
+        rig.add(&mut a);
+        // The delay keeps the last frame of this period.
+        a.ring.write(&frames(1 << 20, PERIOD));
+        rig.cycle();
+        // A DoP stream has the output: the chain does not run.
+        let mut d = client(2);
+        rig.add(&mut d);
+        d.ring.write(&dop_frames(4 * PERIOD));
+        for _ in 0..4 {
+            a.ring.write(&frames(1 << 20, PERIOD));
+            rig.cycle();
+        }
+        rig.send(Command::Remove(2));
+        // PCM again: the first frame is the reset delay's silence, not the
+        // frame it kept from before DoP.
+        a.ring.write(&frames(1 << 21, PERIOD));
+        rig.cycle();
+        let out = rig.last_periods(1);
+        assert_eq!(out[0], [0, 0]);
+        assert_eq!(out[1], [1 << 21, -(1 << 21)]);
+    }
+
+    #[test]
+    fn a_chain_built_for_another_rate_never_runs_and_its_place_is_silent() {
+        fn check<P: Processing>() {
+            let mut rig = Rig::<P>::new(BitPerfect::Auto);
+            let mut a = client(1);
+            rig.add(&mut a);
+            // Built for 96 kHz, while the engine runs at 48 kHz.
+            let chain = chain_of::<P>(vec![times(2.0)]);
+            rig.send(Command::SetChain(
+                Place::Mix,
+                Box::new((*chain).for_rate(96000)),
+            ));
+            for _ in 0..4 {
+                a.ring.write(&frames(1 << 20, PERIOD));
+                rig.cycle();
+            }
+            assert_eq!(rig.last_periods(4), frames(0, 4 * PERIOD));
+            // The chain for the engine's rate arrives: the audio fades back
+            // in over 10 ms, through it.
+            let chain = chain_of::<P>(vec![times(2.0)]);
+            rig.send(Command::SetChain(
+                Place::Mix,
+                Box::new((*chain).for_rate(RATE)),
+            ));
+            let mut out = Vec::new();
+            for _ in 0..12 {
+                a.ring.write(&frames(1 << 20, PERIOD));
+                rig.cycle();
+                out.extend(rig.last_periods(1));
+            }
+            let full = 1 << 21;
+            assert!(out[0][0] <= full / 480 + 1, "{:?}", out[0]);
+            let step = out.windows(2).map(|w| (w[1][0] - w[0][0]).abs()).max();
+            assert!(step.unwrap() <= full / 480 + 2, "{:?}", format_of::<P>());
+            assert!(
+                out[480..].iter().all(|f| f[0] == full),
+                "{:?}",
+                format_of::<P>()
+            );
+        }
+        check::<I32>();
+        check::<F32>();
+        check::<F64>();
+    }
+
+    #[test]
+    fn a_fade_in_due_at_a_reopen_lasts_10_ms_at_the_new_rate() {
+        // Muted at one rate, the chain fits once the output reopens at the
+        // other: lower, then higher.
+        for (muted_at, opens_at) in [(192000, RATE), (RATE, 192000)] {
+            let mut rig = Rig::<I32>::new(BitPerfect::Auto);
+            let mut a = client(1);
+            rig.add(&mut a);
+            let reopen = |rig: &mut Rig<I32>, rate| {
+                rig.send(Command::Reconfigure {
+                    rate,
+                    period: PERIOD as u32,
+                });
+                rig.cycle();
+                rig.cycle();
+            };
+            if muted_at != RATE {
+                reopen(&mut rig, muted_at);
+            }
+            let chain = chain_of::<I32>(vec![times(2.0)]);
+            rig.send(Command::SetChain(
+                Place::Mix,
+                Box::new((*chain).for_rate(opens_at)),
+            ));
+            a.ring.write(&frames(1 << 20, PERIOD));
+            rig.cycle();
+            assert_eq!(rig.last_periods(1), frames(0, PERIOD));
+            reopen(&mut rig, opens_at);
+            let mut out = Vec::new();
+            for _ in 0..40 {
+                a.ring.write(&frames(1 << 20, PERIOD));
+                rig.cycle();
+                out.extend(rig.last_periods(1));
+            }
+            let full = 1 << 21;
+            let what = format!("{muted_at} to {opens_at}");
+            assert!(out.iter().all(|f| f[0] <= full), "{what}");
+            let first = out.iter().position(|f| f[0] != 0).expect("audio");
+            let reached = out.iter().position(|f| f[0] == full).expect("full level");
+            // The fade runs from the first period at the new rate, which
+            // the empty ring may leave silent.
+            let fade = (opens_at * FADE_MS / 1000) as usize;
+            let took = reached - first;
+            assert!(took < fade && took + PERIOD >= fade - 1, "{what}: {took}");
+        }
+    }
+
+    #[test]
+    fn after_a_mute_the_copy_path_fades_in_too_and_no_dip_comes_later() {
+        let mut rig = Rig::<I32>::new(BitPerfect::Auto);
+        let (mut a, mut b) = (client(1), client(2));
+        rig.add(&mut a);
+        rig.add(&mut b);
+        // A neutral mix chain built for 96 kHz: two clients are mixed, so
+        // the chain would run, and the output is silent.
+        let chain = chain_of::<I32>(vec![times(1.0).neutral()]);
+        rig.send(Command::SetChain(
+            Place::Mix,
+            Box::new((*chain).for_rate(96000)),
+        ));
+        a.ring.write(&frames(1 << 20, PERIOD));
+        b.ring.write(&frames(0, PERIOD));
+        rig.cycle();
+        assert_eq!(rig.last_periods(1), frames(0, PERIOD));
+        // One client is left, and the chain fits: the copy path would
+        // start at full level at once.
+        rig.send(Command::Remove(2));
+        let chain = chain_of::<I32>(vec![times(1.0).neutral()]);
+        rig.send(Command::SetChain(
+            Place::Mix,
+            Box::new((*chain).for_rate(RATE)),
+        ));
+        let mut out = Vec::new();
+        for _ in 0..20 {
+            a.ring.write(&frames(1 << 20, PERIOD));
+            rig.cycle();
+            out.extend(rig.last_periods(1));
+        }
+        assert!(out[0][0] <= (1 << 20) / 480 + 1, "{:?}", out[0]);
+        assert!(out[480..].iter().all(|f| f[0] == 1 << 20));
+        // Once the fade is over the copy path is bit-exact again.
+        let input = ramp(4 * PERIOD);
+        a.ring.write(&input);
+        for _ in 0..4 {
+            rig.cycle();
+        }
+        assert_eq!(rig.last_periods(4), input);
+        assert_eq!(decide(&rig.engine.situation()), Ok(()));
+    }
+
+    #[test]
+    fn an_analog_chain_built_for_another_rate_gives_no_signal() {
+        let (mut rig, feed) = with_capture::<F32>(BitPerfect::Auto);
+        let chain = chain_of::<F32>(vec![times(1.0).neutral()]);
+        rig.send(Command::SetChain(
+            Place::Analog,
+            Box::new((*chain).for_rate(96000)),
+        ));
+        for _ in 0..3 {
+            feed.push(&frames(1 << 20, PERIOD));
+            rig.cycle();
+        }
+        assert_eq!(rig.last_periods(3), frames(0, 3 * PERIOD));
+        assert!(signals(&rig.events()).is_empty());
+    }
+
+    #[test]
+    fn a_plugin_on_the_mix_changes_what_reaches_the_sink() {
+        fn check<P: Processing>() {
+            let mut rig = Rig::<P>::new(BitPerfect::Auto);
+            let mut a = client(1);
+            rig.add(&mut a);
+            set_chain(&mut rig, Place::Mix, vec![times(2.0)]);
+            a.ring.write(&frames(1000, PERIOD));
+            rig.cycle();
+            assert_eq!(
+                rig.last_periods(1),
+                frames(2000, PERIOD),
+                "{:?}",
+                format_of::<P>()
+            );
+        }
+        check::<I32>();
+        check::<F32>();
+        check::<F64>();
+    }
+
+    #[test]
+    fn the_mix_chain_runs_before_the_output_chain() {
+        let mut rig = Rig::<F64>::new(BitPerfect::Auto);
+        let mut a = client(1);
+        rig.add(&mut a);
+        set_chain(&mut rig, Place::Output, vec![times(2.0)]);
+        set_chain(&mut rig, Place::Mix, vec![plus(1 << 20)]);
+        a.ring.write(&frames(1 << 20, PERIOD));
+        rig.cycle();
+        // (x + c) * 2, not x * 2 + c.
+        assert_eq!(rig.last_periods(1), vec![[1 << 22, 0]; PERIOD]);
+    }
+
+    #[test]
+    fn a_plugin_that_is_not_neutral_stops_bit_perfect() {
+        for place in [Place::Mix, Place::Output] {
+            let mut rig = Rig::<F32>::new(BitPerfect::Auto);
+            let mut a = client(1);
+            rig.add(&mut a);
+            set_chain(&mut rig, place, vec![times(1.0)]);
+            a.ring.write(&frames(ODD, 2 * PERIOD));
+            rig.cycle();
+            assert_eq!(decide(&rig.engine.situation()), Err(NotBitPerfect::Plugin));
+            // An f32 mix cannot hold all 32 bits.
+            assert_ne!(rig.last_periods(1), frames(ODD, PERIOD));
+        }
+    }
+
+    fn bit_exact_beside_neutral_plugins<P: Processing>() {
+        let mut rig = Rig::<P>::new(BitPerfect::Auto);
+        let mut a = client(1);
+        rig.add(&mut a);
+        set_chain(&mut rig, Place::Mix, vec![times(1.0).neutral()]);
+        set_chain(
+            &mut rig,
+            Place::Output,
+            vec![times(1.0).neutral().latency(4)],
+        );
+        let input: Vec<[i32; 2]> = (0..PERIOD as i32 * 3)
+            .map(|i| [ODD + i, i32::MIN + i])
+            .collect();
+        a.ring.write(&input);
+        for _ in 0..3 {
+            rig.cycle();
+        }
+        assert_eq!(decide(&rig.engine.situation()), Ok(()));
+        assert_eq!(rig.log.frames()[PERIOD..], input, "{:?}", format_of::<P>());
+    }
+
+    #[test]
+    fn a_neutral_plugin_leaves_one_source_bit_exact() {
+        bit_exact_beside_neutral_plugins::<I32>();
+        bit_exact_beside_neutral_plugins::<F32>();
+        bit_exact_beside_neutral_plugins::<F64>();
+    }
+
+    #[test]
+    fn forced_bit_perfect_bypasses_plugins() {
+        fn check<P: Processing>() {
+            let mut rig = Rig::<P>::new(BitPerfect::Forced);
+            let mut a = client(1);
+            a.source.as_mut().unwrap().gain = 0.25;
+            rig.add(&mut a);
+            set_chain(&mut rig, Place::Mix, vec![times(2.0)]);
+            set_chain(&mut rig, Place::Output, vec![times(2.0)]);
+            rig.send(Command::SetGain(0.1));
+            // One source is copied untouched, whatever the plugins.
+            let input = ramp(2 * PERIOD);
+            a.ring.write(&input);
+            rig.cycle();
+            rig.cycle();
+            assert_eq!(rig.last_periods(2), input, "{:?}", format_of::<P>());
+            assert_eq!(decide(&rig.engine.situation()), Ok(()));
+            // A second is mixed in at unity, and the plugins stay out.
+            let mut b = client(2);
+            rig.add(&mut b);
+            a.ring.write(&frames(1000, PERIOD));
+            b.ring.write(&frames(234, PERIOD));
+            rig.cycle();
+            assert_eq!(rig.last_periods(1), frames(1234, PERIOD));
+        }
+        check::<I32>();
+        check::<F32>();
+        check::<F64>();
+    }
+
+    #[test]
+    fn plugin_latency_is_not_in_the_delay_in_forced_bit_perfect() {
+        let mut rig = Rig::<F32>::new(BitPerfect::Forced);
+        let (mut a, mut b) = (client(1), client(2));
+        rig.add(&mut a);
+        rig.add(&mut b);
+        set_chain(&mut rig, Place::Mix, vec![plus(0).latency(10)]);
+        set_chain(&mut rig, Place::Output, vec![plus(0).latency(4)]);
+        rig.log.set_delay(128);
+        a.ring.write(&frames(1000, PERIOD));
+        b.ring.write(&frames(1000, PERIOD));
+        rig.cycle();
+        // Mixed, and still without the plugins' delay.
+        let delay = |c: &Client| c.ring.header().output_delay_frames.load(Relaxed);
+        assert_eq!(delay(&a), 128);
+        assert_eq!(delay(&b), 128);
+    }
+
+    #[test]
+    fn dop_passes_by_every_chain() {
+        fn check<P: Processing>() {
+            let mut rig = Rig::<P>::new(BitPerfect::Auto);
+            let mut a = client(1);
+            rig.add(&mut a);
+            set_chain(&mut rig, Place::Mix, vec![plus(1000), times(0.5)]);
+            set_chain(
+                &mut rig,
+                Place::Output,
+                vec![times(2.0), Probe::new(Op::Nan, 0.0)],
+            );
+            a.ring.write(&dop_frames(2 * PERIOD));
+            rig.cycle();
+            rig.cycle();
+            assert_eq!(rig.last_periods(2), dop_frames(2 * PERIOD));
+        }
+        check::<I32>();
+        check::<F32>();
+        check::<F64>();
+    }
+
+    #[test]
+    fn a_replaced_chain_comes_back() {
+        let mut rig = Rig::<F32>::new(BitPerfect::Auto);
+        set_chain(&mut rig, Place::Mix, vec![plus(0).latency(1)]);
+        set_chain(&mut rig, Place::Mix, vec![plus(0).latency(2)]);
+        set_chain(&mut rig, Place::Output, vec![plus(0).latency(3)]);
+        set_chain(&mut rig, Place::Analog, vec![plus(0).latency(4)]);
+        rig.cycle();
+        let latencies = old_chains;
+        // The engine starts with empty chains.
+        assert_eq!(
+            latencies(rig.events()),
+            [Some(0), Some(1), Some(0), Some(0)]
+        );
+        // Each place keeps its own.
+        set_chain(&mut rig, Place::Analog, vec![]);
+        set_chain(&mut rig, Place::Output, vec![]);
+        set_chain(&mut rig, Place::Mix, vec![]);
+        rig.cycle();
+        assert_eq!(latencies(rig.events()), [Some(4), Some(3), Some(2)]);
+    }
+
+    #[test]
+    fn a_parameter_set_takes_effect_on_the_next_cycle() {
+        let mut rig = Rig::<I32>::new(BitPerfect::Auto);
+        let mut a = client(1);
+        rig.add(&mut a);
+        set_chain(&mut rig, Place::Mix, vec![plus(0), times(2.0)]);
+        set_chain(&mut rig, Place::Output, vec![plus(0)]);
+        a.ring.write(&frames(1000, 3 * PERIOD));
+        rig.cycle();
+        assert_eq!(rig.last_periods(1), frames(2000, PERIOD));
+        assert_eq!(rig.events().len(), 2);
+        let set = |place, plugin, value| Command::SetParam {
+            place,
+            plugin,
+            index: 0,
+            value,
+        };
+        rig.send(set(Place::Mix, 1, 3.0));
+        rig.cycle();
+        assert_eq!(rig.last_periods(1), frames(3000, PERIOD));
+        rig.send(set(Place::Output, 0, 7.0 / 2_147_483_648.0));
+        rig.cycle();
+        assert_eq!(rig.last_periods(1), vec![[3007, -2993]; PERIOD]);
+        assert!(rig.events().is_empty());
+    }
+
+    #[test]
+    fn a_parameter_for_a_plugin_that_is_not_there_is_ignored() {
+        let mut rig = Rig::<F64>::new(BitPerfect::Auto);
+        let mut a = client(1);
+        rig.add(&mut a);
+        set_chain(&mut rig, Place::Mix, vec![times(2.0)]);
+        rig.cycle();
+        rig.events();
+        a.ring.write(&frames(1000, PERIOD));
+        // The probe panics on any index but 0.
+        for (place, plugin, index) in [
+            (Place::Mix, 0, 1),
+            (Place::Mix, 1, 0),
+            (Place::Output, 0, 0),
+            (Place::Analog, 3, 3),
+        ] {
+            rig.send(Command::SetParam {
+                place,
+                plugin,
+                index,
+                value: 5.0,
+            });
+        }
+        rig.cycle();
+        assert_eq!(rig.last_periods(1), frames(2000, PERIOD));
+        assert!(rig.events().is_empty());
+    }
+
+    /// The latencies of the `OldChain` events, `None` for any other event.
+    fn old_chains(events: Vec<Event>) -> Vec<Option<u32>> {
+        let old = events.into_iter().map(|e| match e {
+            Event::OldChain(c) => Some(c.latency_frames()),
+            _ => None,
+        });
+        old.collect()
+    }
+
+    #[test]
+    fn a_chain_built_for_less_than_the_longest_period_is_refused() {
+        let mut rig = Rig::<I32>::new(BitPerfect::Auto);
+        let mut a = client(1);
+        rig.add(&mut a);
+        set_chain(&mut rig, Place::Mix, vec![times(2.0).latency(1)]);
+        rig.cycle();
+        rig.events();
+        let short = MAX_PERIOD as usize - 1;
+        let refused = chain_for::<I32>(vec![times(3.0).latency(7)], short);
+        rig.send(Command::SetChain(Place::Mix, refused));
+        a.ring.write(&frames(1000, PERIOD));
+        rig.cycle();
+        // The refused chain comes back, and the one in place keeps playing.
+        assert_eq!(old_chains(rig.events()), [Some(7)]);
+        assert_eq!(rig.last_periods(1), frames(2000, PERIOD));
+        // A chain without plugins takes any period.
+        rig.send(Command::SetChain(Place::Mix, Box::new(Chain::empty())));
+        rig.cycle();
+        assert_eq!(old_chains(rig.events()), [Some(1)]);
+    }
+
+    #[test]
+    fn a_reconfigure_to_a_longer_period_keeps_the_chains_working() {
+        fn check<P: Processing>() {
+            const LONGER: usize = 2 * PERIOD;
+            let mut rig = Rig::<P>::new(BitPerfect::Auto);
+            let mut a = client(1);
+            rig.add(&mut a);
+            set_chain(&mut rig, Place::Mix, vec![times(2.0).only(F64_ONLY)]);
+            set_chain(&mut rig, Place::Output, vec![plus(0)]);
+            a.ring.write(&frames(1000, PERIOD));
+            rig.cycle();
+            rig.send(Command::Reconfigure {
+                rate: RATE,
+                period: LONGER as u32,
+            });
+            a.ring.write(&frames(1000, 10 * LONGER));
+            for _ in 0..4 {
+                rig.cycle();
+            }
+            assert_eq!(rig.log.opens().last(), Some(&(RATE, LONGER as u32)));
+            let log = rig.log.frames();
+            let last = &log[log.len() - LONGER..];
+            assert_eq!(last, frames(2000, LONGER), "{:?}", format_of::<P>());
+        }
+        check::<I32>();
+        check::<F32>();
+        check::<F64>();
+    }
+
+    #[test]
+    fn a_chain_sent_just_before_a_reconfigure_takes_effect_with_the_reopen() {
+        const LONGER: usize = 2 * PERIOD;
+        let mut rig = Rig::<I32>::new(BitPerfect::Auto);
+        let mut a = client(1);
+        rig.add(&mut a);
+        set_chain(&mut rig, Place::Output, vec![times(2.0).latency(2)]);
+        a.ring.write(&frames(1000, 20 * PERIOD));
+        rig.cycle();
+        rig.events();
+        rig.send(Command::SetChain(
+            Place::Output,
+            chain_of::<I32>(vec![times(3.0).latency(3)]),
+        ));
+        rig.send(Command::Reconfigure {
+            rate: RATE,
+            period: LONGER as u32,
+        });
+        // The fade before the reopen still runs the old chain. It starts at
+        // full level.
+        rig.cycle();
+        assert_eq!(rig.last_periods(1)[0], [2000, -2000]);
+        assert!(old_chains(rig.events()).is_empty());
+        rig.cycle();
+        let log = rig.log.frames();
+        assert_eq!(log[log.len() - LONGER..], frames(3000, LONGER));
+        let events = old_chains(rig.events());
+        assert!(events.contains(&Some(2)), "{events:?}");
+    }
+
+    #[test]
+    fn the_delay_leaves_out_plugins_that_did_not_run() {
+        let delay = |c: &Client| c.ring.header().output_delay_frames.load(Relaxed);
+        // A bit-perfect copy runs no chain.
+        let mut rig = Rig::<F32>::new(BitPerfect::Auto);
+        let mut a = client(1);
+        rig.add(&mut a);
+        set_chain(
+            &mut rig,
+            Place::Output,
+            vec![times(1.0).neutral().latency(20)],
+        );
+        rig.log.set_delay(128);
+        a.ring.write(&frames(ODD, PERIOD));
+        rig.cycle();
+        assert_eq!(rig.last_periods(1), frames(ODD, PERIOD));
+        assert_eq!(delay(&a), 128);
+        // Nor does DoP.
+        let mut rig = Rig::<F32>::new(BitPerfect::Auto);
+        let mut a = client(1);
+        rig.add(&mut a);
+        set_chain(&mut rig, Place::Mix, vec![times(2.0).latency(20)]);
+        rig.log.set_delay(128);
+        a.ring.write(&dop_frames(PERIOD));
+        rig.cycle();
+        assert_eq!(rig.last_periods(1), dop_frames(PERIOD));
+        assert_eq!(delay(&a), 128);
+    }
+
+    #[test]
+    fn a_huge_plugin_latency_does_not_overflow_the_delay() {
+        let mut rig = Rig::<F32>::new(BitPerfect::Auto);
+        let mut a = client(1);
+        rig.add(&mut a);
+        let mut b = client_at(2, 24000);
+        let r = Resampler::new(24000, RATE, PERIOD as u32, Quality::High, Format::F32);
+        let filter = u64::from(r.delay_frames());
+        b.source.as_mut().unwrap().resampler = Some(Box::new(r));
+        rig.add(&mut b);
+        set_chain(&mut rig, Place::Mix, vec![plus(0).latency(u32::MAX)]);
+        set_chain(&mut rig, Place::Output, vec![plus(0).latency(u32::MAX)]);
+        rig.log.set_delay(128);
+        a.ring.write(&frames(1, PERIOD));
+        rig.cycle();
+        let delay = |c: &Client| c.ring.header().output_delay_frames.load(Relaxed);
+        assert_eq!(delay(&a), u32::MAX);
+        assert_eq!(u64::from(delay(&b)), (u64::from(u32::MAX) + filter) / 2);
+    }
+
+    #[test]
+    fn plugin_latency_is_added_to_the_published_delay() {
+        let mut rig = Rig::<F32>::new(BitPerfect::Auto);
+        let mut a = client(1);
+        let mut b = client_at(2, 24000);
+        let r = Resampler::new(24000, RATE, PERIOD as u32, Quality::High, Format::F32);
+        let filter = r.delay_frames();
+        b.source.as_mut().unwrap().resampler = Some(Box::new(r));
+        rig.add(&mut a);
+        rig.add(&mut b);
+        set_chain(
+            &mut rig,
+            Place::Mix,
+            vec![plus(0).latency(10), plus(0).latency(2)],
+        );
+        set_chain(&mut rig, Place::Output, vec![plus(0).latency(4)]);
+        // Not run in the output's path, so not part of its delay.
+        set_chain(&mut rig, Place::Analog, vec![plus(0).latency(1000)]);
+        rig.log.set_delay(128);
+        rig.cycle();
+        let delay = |c: &Client| c.ring.header().output_delay_frames.load(Relaxed);
+        assert_eq!(delay(&a), 128 + 16);
+        assert_eq!(delay(&b), (128 + 16 + filter) / 2);
+    }
+
+    #[test]
+    fn a_nan_from_a_plugin_reaches_the_card_as_zero() {
+        fn check<P: Processing>() {
+            let mut rig = Rig::<P>::new(BitPerfect::Auto);
+            let mut a = client(1);
+            rig.add(&mut a);
+            // The output chain gets the NaN, whatever comes after it.
+            set_chain(&mut rig, Place::Mix, vec![Probe::new(Op::Nan, 0.0)]);
+            set_chain(&mut rig, Place::Output, vec![times(2.0)]);
+            a.ring.write(&frames(ODD, PERIOD));
+            rig.cycle();
+            assert_eq!(
+                rig.last_periods(1),
+                frames(0, PERIOD),
+                "{:?}",
+                format_of::<P>()
+            );
+        }
+        check::<F32>();
+        check::<F64>();
+    }
+
+    fn no_allocation_with_chains<P: Processing>(other: Formats) {
+        let mut rig = Rig::<P>::new(BitPerfect::Auto);
+        let (mut a, mut b) = (client(1), client_at(2, 44100));
+        let r = Resampler::new(44100, RATE, PERIOD as u32, Quality::High, format_of::<P>());
+        b.source.as_mut().unwrap().resampler = Some(Box::new(r));
+        rig.add(&mut a);
+        rig.add(&mut b);
+        set_chain(&mut rig, Place::Mix, vec![plus(0), times(0.5).only(other)]);
+        set_chain(&mut rig, Place::Output, vec![times(2.0).only(other)]);
+        rig.cycle();
+        rig.events();
+        let input = frames(1 << 24, PERIOD);
+        // Everything the audio thread will be handed is made out here.
+        rig.send(Command::SetGain(db_to_gain(-6.0)));
+        rig.send(Command::SetParam {
+            place: Place::Mix,
+            plugin: 1,
+            index: 0,
+            value: 0.25,
+        });
+        rig.send(Command::SetChain(
+            Place::Output,
+            chain_of::<P>(vec![times(3.0).only(other).latency(8)]),
+        ));
+        rig.send(Command::SetChain(
+            Place::Analog,
+            chain_of::<P>(vec![plus(0).only(other)]),
+        ));
+        let engine = &mut rig.engine;
+        assert_no_alloc(|| {
+            for _ in 0..200 {
+                a.ring.write(&input);
+                b.ring.write(&input);
+                engine.cycle().unwrap();
+            }
+        });
+        // Two sources at -6 dB, a quarter, then three times. The resampled
+        // source is near its level, not exactly at it.
+        let want = f64::from(1 << 24) * f64::from(db_to_gain(-6.0)) * 2.0 * 0.25 * 3.0;
+        let last = rig.log.frames().last().copied().unwrap();
+        let error = (f64::from(last[0]) - want).abs() / want;
+        assert!(
+            error < 1e-3,
+            "{last:?}, want {want} in {:?}",
+            format_of::<P>()
+        );
+        // The returned chains are freed here, off the audio thread.
+        assert_eq!(rig.events().len(), 2);
+    }
+
+    #[test]
+    fn cycles_with_chains_do_not_allocate() {
+        let only = |i32, f32, f64| Formats { i32, f32, f64 };
+        no_allocation_with_chains::<I32>(only(false, false, true));
+        no_allocation_with_chains::<F32>(only(true, false, false));
+        no_allocation_with_chains::<F64>(only(false, true, false));
+    }
+
+    // The analog input.
+
+    /// A rig with a capture handed over, not yet cycled, and an analog
+    /// chain that always has signal and alters nothing.
+    fn with_capture<P: Processing>(mode: BitPerfect) -> (Rig<P>, CaptureFeed) {
+        let mut rig = Rig::<P>::new(mode);
+        let (capture, feed) = MemoryCapture::new();
+        rig.send(Command::SetCapture(Some(Box::new(capture))));
+        set_chain(&mut rig, Place::Analog, vec![times(1.0).neutral()]);
+        (rig, feed)
+    }
+
+    #[test]
+    fn without_a_chain_the_analog_input_is_silent() {
+        let mut rig = Rig::<I32>::new(BitPerfect::Auto);
+        let (capture, feed) = MemoryCapture::new();
+        rig.send(Command::SetCapture(Some(Box::new(capture))));
+        let recorder = add_tap(&mut rig, 5);
+        for _ in 0..3 {
+            feed.push(&frames(1 << 28, PERIOD));
+            rig.cycle();
+        }
+        // Nothing measures it, so nothing of it passes.
+        assert_eq!(rig.last_periods(3), frames(0, 3 * PERIOD));
+        assert_eq!(recorder.take(), frames(0, 3 * PERIOD));
+        assert!(signals(&rig.events()).is_empty());
+        assert_eq!(feed.queued(), 0);
+    }
+
+    /// Frames that differ from each other, with the low bits set.
+    fn ramp(n: usize) -> Vec<[i32; 2]> {
+        (0..n as i32).map(|i| [ODD + i, i32::MIN + 7 * i]).collect()
+    }
+
+    fn signals(events: &[Event]) -> Vec<bool> {
+        let signal = |e: &Event| match e {
+            Event::InputSignal(on) => Some(*on),
+            _ => None,
+        };
+        events.iter().filter_map(signal).collect()
+    }
+
+    fn failures(events: &[Event]) -> usize {
+        count(events, |e| matches!(e, Event::CaptureFailed(_)))
+    }
+
+    fn detect_chain<P: Processing>(hold_s: f64) -> Box<Chain> {
+        let mut detect = Detect::new(RATE);
+        detect.set_param(1, hold_s);
+        let plugins: Vec<Box<dyn Plugin>> = vec![Box::new(detect)];
+        Box::new(Chain::new(plugins, format_of::<P>(), MAX_PERIOD as usize))
+    }
+
+    #[test]
+    fn a_captured_period_reaches_the_sink() {
+        fn check<P: Processing>() {
+            // Through the mix, at values every format holds exactly.
+            let (mut rig, feed) = with_capture::<P>(BitPerfect::Off);
+            let input: Vec<[i32; 2]> = (0..PERIOD as i32).map(|i| [i << 20, -i << 12]).collect();
+            feed.push(&input);
+            rig.cycle();
+            assert_eq!(rig.last_periods(1), input, "{:?}", format_of::<P>());
+            assert_eq!(feed.queued(), 0);
+        }
+        check::<I32>();
+        check::<F32>();
+        check::<F64>();
+    }
+
+    #[test]
+    fn the_analog_gain_applies() {
+        let (mut rig, feed) = with_capture::<I32>(BitPerfect::Auto);
+        rig.send(Command::SetAnalogGain(0.5));
+        feed.push(&frames(1000, PERIOD));
+        rig.cycle();
+        assert_eq!(rig.last_periods(1), frames(500, PERIOD));
+        assert_eq!(decide(&rig.engine.situation()), Err(NotBitPerfect::Volume));
+    }
+
+    #[test]
+    fn the_analog_input_is_mixed_with_a_client() {
+        let (mut rig, feed) = with_capture::<I32>(BitPerfect::Auto);
+        let mut a = client(1);
+        rig.add(&mut a);
+        a.ring.write(&frames(1000, PERIOD));
+        feed.push(&frames(234, PERIOD));
+        rig.cycle();
+        assert_eq!(rig.last_periods(1), frames(1234, PERIOD));
+    }
+
+    #[test]
+    fn below_the_threshold_nothing_of_it_reaches_the_sink() {
+        let (mut rig, feed) = with_capture::<I32>(BitPerfect::Off);
+        // Reports no signal and leaves the samples, so only the engine
+        // keeps them out.
+        set_chain(&mut rig, Place::Analog, vec![times(1.0).quiet()]);
+        for _ in 0..3 {
+            feed.push(&frames(1000, PERIOD));
+            rig.cycle();
+            assert_eq!(rig.counters.analog_open.load(Relaxed), 0);
+        }
+        assert_eq!(rig.last_periods(3), frames(0, 3 * PERIOD));
+        assert_eq!(feed.queued(), 0);
+        assert!(signals(&rig.events()).is_empty());
+    }
+
+    #[test]
+    fn below_the_threshold_one_client_stays_bit_exact() {
+        let (mut rig, feed) = with_capture::<F32>(BitPerfect::Auto);
+        set_chain(&mut rig, Place::Analog, vec![times(2.0).quiet()]);
+        let mut a = client(1);
+        rig.add(&mut a);
+        let input = ramp(3 * PERIOD);
+        a.ring.write(&input);
+        for _ in 0..3 {
+            feed.push(&frames(ODD, PERIOD));
+            rig.cycle();
+        }
+        assert_eq!(decide(&rig.engine.situation()), Ok(()));
+        assert_eq!(rig.last_periods(3), input);
+    }
+
+    #[test]
+    fn above_the_threshold_a_client_is_no_longer_bit_perfect() {
+        let (mut rig, feed) = with_capture::<F32>(BitPerfect::Auto);
+        let mut a = client(1);
+        rig.add(&mut a);
+        a.ring.write(&frames(ODD, PERIOD));
+        feed.push(&frames(0, PERIOD));
+        rig.cycle();
+        assert_eq!(
+            decide(&rig.engine.situation()),
+            Err(NotBitPerfect::SeveralSources)
+        );
+        assert_eq!(rig.counters.analog_open.load(Relaxed), 1);
+    }
+
+    #[test]
+    fn the_analog_input_alone_is_copied_bit_exact() {
+        fn check<P: Processing>() {
+            let (mut rig, feed) = with_capture::<P>(BitPerfect::Auto);
+            set_chain(&mut rig, Place::Analog, vec![times(1.0).neutral()]);
+            let input = ramp(3 * PERIOD);
+            for period in input.chunks(PERIOD) {
+                feed.push(period);
+                rig.cycle();
+            }
+            assert_eq!(decide(&rig.engine.situation()), Ok(()));
+            assert_eq!(rig.last_periods(3), input, "{:?}", format_of::<P>());
+        }
+        check::<I32>();
+        check::<F32>();
+        check::<F64>();
+    }
+
+    #[test]
+    fn a_plugin_on_the_analog_input_changes_it_and_stops_bit_perfect() {
+        let (mut rig, feed) = with_capture::<I32>(BitPerfect::Auto);
+        set_chain(&mut rig, Place::Analog, vec![times(2.0)]);
+        feed.push(&frames(1000, PERIOD));
+        rig.cycle();
+        assert_eq!(rig.last_periods(1), frames(2000, PERIOD));
+        assert_eq!(decide(&rig.engine.situation()), Err(NotBitPerfect::Plugin));
+    }
+
+    #[test]
+    fn a_chain_that_raises_the_level_has_headroom_before_the_analog_gain() {
+        fn check<P: Processing>(want: Vec<[i32; 2]>) {
+            let (mut rig, feed) = with_capture::<P>(BitPerfect::Auto);
+            set_chain(&mut rig, Place::Analog, vec![times(4.0)]);
+            rig.send(Command::SetAnalogGain(0.25));
+            feed.push(&frames(0x7000_0000, PERIOD));
+            rig.cycle();
+            assert_eq!(rig.last_periods(1), want, "{:?}", format_of::<P>());
+        }
+        check::<F32>(frames(0x7000_0000, PERIOD));
+        check::<F64>(frames(0x7000_0000, PERIOD));
+        // An i32 block is clipped before each plugin, as the design says.
+        check::<I32>(frames(1 << 29, PERIOD));
+    }
+
+    #[test]
+    fn forced_bit_perfect_plays_the_analog_input_as_captured_and_still_gates_it() {
+        fn check<P: Processing>() {
+            let (mut rig, feed) = with_capture::<P>(BitPerfect::Forced);
+            let mut detect = Detect::new(RATE);
+            detect.set_param(1, 0.0);
+            let plugins: Vec<Box<dyn Plugin>> = vec![Box::new(times(4.0)), Box::new(detect)];
+            let chain = Chain::new(plugins, format_of::<P>(), MAX_PERIOD as usize);
+            rig.send(Command::SetChain(Place::Analog, Box::new(chain)));
+            let recorder = add_tap(&mut rig, 5);
+            // A loud ramp, with the low bits set, for two windows of 50 ms.
+            let loud: Vec<[i32; 2]> = (0..75 * PERIOD as i32)
+                .map(|i| [(1 << 28) + 7 * i + 1, -(1 << 28) - i])
+                .collect();
+            for period in loud.chunks(PERIOD) {
+                feed.push(period);
+                rig.cycle();
+            }
+            // Open from the end of the first window on, and as captured.
+            let open = loud.len() - 30 * PERIOD;
+            assert_eq!(rig.last_periods(30), loud[open..], "{:?}", format_of::<P>());
+            // A recorder gets the input after its plugins all the same,
+            // as near as `f32` holds it.
+            let tapped = recorder.take();
+            let tapped = &tapped[tapped.len() - 30 * PERIOD..];
+            for (t, l) in tapped.iter().zip(&loud[open..]) {
+                let error = (i64::from(t[0]) - 4 * i64::from(l[0])).abs();
+                assert!(error <= 256, "{t:?} {l:?} {:?}", format_of::<P>());
+            }
+            // Below the threshold nothing of it plays, even times four,
+            // once it has faded out.
+            for _ in 0..100 {
+                feed.push(&frames(1000, PERIOD));
+                rig.cycle();
+            }
+            assert_eq!(rig.last_periods(30), frames(0, 30 * PERIOD));
+            assert_eq!(signals(&rig.events()), [true, false]);
+        }
+        check::<I32>();
+        check::<F32>();
+        check::<F64>();
+    }
+
+    #[test]
+    fn opening_and_closing_send_one_event_each() {
+        let (mut rig, feed) = with_capture::<F32>(BitPerfect::Auto);
+        rig.send(Command::SetChain(Place::Analog, detect_chain::<F32>(0.0)));
+        let mut events = Vec::new();
+        // A 50 ms window is 37.5 periods. Two windows of signal at -18 dBFS,
+        // then two far below the threshold.
+        for round in 0..150 {
+            let value = if round < 75 { 1 << 28 } else { 1000 };
+            feed.push(&frames(value, PERIOD));
+            rig.cycle();
+            events.extend(rig.events());
+            let open = rig.counters.analog_open.load(Relaxed);
+            assert_eq!(open, u64::from(signals(&events) == [true]), "{round}");
+        }
+        assert_eq!(signals(&events), [true, false]);
+        // Nothing of the quiet input after the close reaches the sink.
+        assert_eq!(rig.last_periods(30), frames(0, 30 * PERIOD));
+    }
+
+    /// The largest change from one frame to the next, on the left channel.
+    fn largest_step(frames: &[[i32; 2]]) -> i64 {
+        let step = |w: &[[i32; 2]]| (i64::from(w[1][0]) - i64::from(w[0][0])).abs();
+        frames.windows(2).map(step).max().unwrap_or(0)
+    }
+
+    /// Plays a loud input through `analog`, a chain with a detector at
+    /// -30 dBFS and no hold, until it opens, then an input just below the
+    /// threshold until it has closed. Each period of the input is played
+    /// in the cycle it is captured in. With `client`, a client playing
+    /// zeros is mixed in. Returns what reached the sink, and where the
+    /// input turned quiet.
+    fn open_and_close<P: Processing>(
+        mode: BitPerfect,
+        analog: Vec<Box<dyn Plugin>>,
+        client: bool,
+    ) -> (Vec<[i32; 2]>, usize) {
+        open_and_close_at::<P>(RATE, mode, analog, client)
+    }
+
+    /// `open_and_close` with the output at `rate`.
+    fn open_and_close_at<P: Processing>(
+        rate: u32,
+        mode: BitPerfect,
+        analog: Vec<Box<dyn Plugin>>,
+        client: bool,
+    ) -> (Vec<[i32; 2]>, usize) {
+        let mut rig = Rig::<P>::new(mode);
+        if rate != RATE {
+            rig.send(Command::Reconfigure {
+                rate,
+                period: PERIOD as u32,
+            });
+            rig.cycle();
+            rig.cycle();
+        }
+        // After the reopen, which closes a capture, as the control thread
+        // does it.
+        let (capture, feed) = MemoryCapture::new();
+        rig.send(Command::SetCapture(Some(Box::new(capture))));
+        let chain = Chain::new(analog, format_of::<P>(), MAX_PERIOD as usize);
+        rig.send(Command::SetChain(Place::Analog, Box::new(chain)));
+        let mut a = client.then(|| client_at(1, rate));
+        if let Some(a) = a.as_mut() {
+            rig.add(a);
+        }
+        // 200 ms of each at 48 kHz, as long at any rate.
+        let half = (150 * rate as usize).div_ceil(RATE as usize);
+        let mut out = Vec::new();
+        for round in 0..2 * half {
+            let value = if round < half { LOUD } else { QUIET };
+            feed.push(&frames(value, PERIOD));
+            if let Some(a) = &a {
+                a.ring.write(&frames(0, PERIOD));
+            }
+            rig.cycle();
+            out.extend(rig.last_periods(1));
+        }
+        (out, half * PERIOD)
+    }
+
+    /// -6 dBFS, and just below -30 dBFS.
+    const LOUD: i32 = 1 << 30;
+    const QUIET: i32 = 1 << 26;
+
+    fn gate(with: Option<Probe>) -> Vec<Box<dyn Plugin>> {
+        gate_at(RATE, with)
+    }
+
+    fn gate_at(rate: u32, with: Option<Probe>) -> Vec<Box<dyn Plugin>> {
+        let mut detect = Detect::new(rate);
+        detect.set_param(0, -30.0);
+        detect.set_param(1, 0.0);
+        let mut plugins: Vec<Box<dyn Plugin>> = Vec::new();
+        if let Some(p) = with {
+            plugins.push(Box::new(p));
+        }
+        plugins.push(Box::new(detect));
+        plugins
+    }
+
+    /// No step is larger than a 10 ms ramp to the level allows, the first
+    /// frame heard is near zero, and once closed the output is exact zeros.
+    fn check_fades(out: &[[i32; 2]], quiet_at: usize, what: &str) {
+        check_fades_at(RATE, out, quiet_at, what)
+    }
+
+    fn check_fades_at(rate: u32, out: &[[i32; 2]], quiet_at: usize, what: &str) {
+        // One step of a 10 ms ramp to `level`, give or take the rounding
+        // of a gain in `f32`.
+        let ramp = |level: i32| f64::from(level) / f64::from(rate * FADE_MS / 1000) * 1.001 + 2.0;
+        let first = out.iter().position(|f| f[0] != 0).expect(what);
+        assert!(f64::from(out[first][0]) <= ramp(LOUD), "{what}");
+        let opening = largest_step(&out[..quiet_at]);
+        assert!(opening as f64 <= ramp(LOUD), "{what}: {opening}");
+        // The input itself steps down at `quiet_at`.
+        let closing = largest_step(&out[quiet_at..]);
+        assert!(closing as f64 <= ramp(QUIET), "{what}: {closing}");
+        assert!(out[out.len() - 10 * PERIOD..].iter().all(|f| *f == [0, 0]));
+        // It did open, to the full level.
+        assert!(out[..quiet_at].iter().any(|f| f[0] == LOUD), "{what}");
+    }
+
+    #[test]
+    fn input_detection_fades_over_10_ms_at_44_1_and_192_khz() {
+        for rate in [44100, 192000] {
+            let auto = BitPerfect::Auto;
+            let (out, at) = open_and_close_at::<F32>(rate, auto, gate_at(rate, None), false);
+            check_fades_at(rate, &out, at, &format!("copy at {rate}"));
+            let (out, at) = open_and_close_at::<F32>(rate, auto, gate_at(rate, None), true);
+            check_fades_at(rate, &out, at, &format!("mix at {rate}"));
+            let forced = BitPerfect::Forced;
+            let gate = gate_at(rate, Some(times(1.0)));
+            let (out, at) = open_and_close_at::<F32>(rate, forced, gate, false);
+            check_fades_at(rate, &out, at, &format!("forced at {rate}"));
+        }
+    }
+
+    #[test]
+    fn the_copy_path_is_bit_exact_again_once_the_fade_is_over() {
+        fn check<P: Processing>() {
+            let (mut rig, feed) = with_capture::<P>(BitPerfect::Auto);
+            let chain = Chain::new(gate(None), format_of::<P>(), MAX_PERIOD as usize);
+            rig.send(Command::SetChain(Place::Analog, Box::new(chain)));
+            // Loud, with the low bits set, through the open and its fade.
+            let loud: Vec<[i32; 2]> = (0..75 * PERIOD as i32)
+                .map(|i| [(1 << 28) + 7 * i + 1, -(1 << 28) - i])
+                .collect();
+            for period in loud.chunks(PERIOD) {
+                feed.push(period);
+                rig.cycle();
+            }
+            let n = loud.len();
+            assert_eq!(decide(&rig.engine.situation()), Ok(()));
+            let f = format_of::<P>();
+            assert_eq!(rig.last_periods(20), loud[n - 20 * PERIOD..], "{f:?}");
+        }
+        check::<I32>();
+        check::<F32>();
+        check::<F64>();
+    }
+
+    #[test]
+    fn input_detection_fades_in_and_out_on_every_path() {
+        fn check<P: Processing>() {
+            let f = format_of::<P>();
+            // Alone, so copied when nothing fades.
+            let (out, at) = open_and_close::<P>(BitPerfect::Auto, gate(None), false);
+            check_fades(&out, at, &format!("copy {f:?}"));
+            // Mixed with a client.
+            let (out, at) = open_and_close::<P>(BitPerfect::Auto, gate(None), true);
+            check_fades(&out, at, &format!("mix {f:?}"));
+            // Past a plugin that alters it.
+            let (out, at) = open_and_close::<P>(BitPerfect::Off, gate(Some(times(1.0))), false);
+            check_fades(&out, at, &format!("plugin {f:?}"));
+            // Forced bit-perfect, which plays it as captured past that
+            // plugin, and with the detector alone.
+            let forced = BitPerfect::Forced;
+            let (out, at) = open_and_close::<P>(forced, gate(Some(times(1.0))), false);
+            check_fades(&out, at, &format!("forced {f:?}"));
+            let (out, at) = open_and_close::<P>(forced, gate(None), false);
+            check_fades(&out, at, &format!("forced alone {f:?}"));
+        }
+        check::<I32>();
+        check::<F32>();
+        check::<F64>();
+    }
+
+    #[test]
+    fn a_short_capture_is_padded_at_the_front_and_counted() {
+        let (mut rig, feed) = with_capture::<I32>(BitPerfect::Auto);
+        feed.push(&frames(ODD, PERIOD - 10));
+        rig.cycle();
+        let mut want = frames(0, 10);
+        want.extend(frames(ODD, PERIOD - 10));
+        assert_eq!(rig.last_periods(1), want);
+        assert_eq!(rig.counters.analog_padded_frames.load(Relaxed), 10);
+        assert_eq!(rig.counters.analog_dropped_frames.load(Relaxed), 0);
+    }
+
+    #[test]
+    fn a_capture_more_than_two_periods_ahead_is_cut_back_and_counted() {
+        let (mut rig, feed) = with_capture::<I32>(BitPerfect::Auto);
+        for value in 1..=5 {
+            feed.push(&frames(value, PERIOD));
+        }
+        rig.cycle();
+        // Three periods are dropped, the fourth plays, the fifth waits.
+        assert_eq!(rig.last_periods(1), frames(4, PERIOD));
+        assert_eq!(feed.queued(), PERIOD);
+        let dropped = rig.counters.analog_dropped_frames.load(Relaxed);
+        assert_eq!(dropped, 3 * PERIOD as u64);
+        assert_eq!(rig.counters.analog_padded_frames.load(Relaxed), 0);
+        // Two periods ahead is not too many.
+        feed.push(&frames(6, PERIOD));
+        rig.cycle();
+        assert_eq!(rig.last_periods(1), frames(5, PERIOD));
+        assert_eq!(rig.counters.analog_dropped_frames.load(Relaxed), dropped);
+    }
+
+    #[test]
+    fn a_capture_that_fails_costs_only_the_analog_input() {
+        let (mut rig, feed) = with_capture::<F32>(BitPerfect::Auto);
+        let mut a = client(1);
+        rig.add(&mut a);
+        a.ring.write(&frames(1 << 20, PERIOD));
+        feed.push(&frames(1 << 20, 2 * PERIOD));
+        rig.cycle();
+        assert_eq!(rig.last_periods(1), frames(1 << 21, PERIOD));
+        feed.fail();
+        let input = ramp(4 * PERIOD);
+        a.ring.write(&input);
+        let mut events = rig.events();
+        for _ in 0..4 {
+            rig.cycle();
+            events.extend(rig.events());
+        }
+        // The client plays on alone, untouched.
+        assert_eq!(rig.last_periods(4), input);
+        assert_eq!(decide(&rig.engine.situation()), Ok(()));
+        assert_eq!(failures(&events), 1);
+        assert_eq!(signals(&events), [true, false]);
+        assert_eq!(rig.counters.analog_open.load(Relaxed), 0);
+        // The audio thread does not close it: it hands it back, and the
+        // control thread closes it.
+        assert!(!feed.closed());
+        let back = events.into_iter().find_map(|e| match e {
+            Event::CaptureFailed(c) => Some(c),
+            _ => None,
+        });
+        back.unwrap().close();
+        assert!(feed.closed());
+    }
+
+    /// A sink that notes at each open whether the capture was closed by then.
+    struct WatchesCapture {
+        feed: CaptureFeed,
+        closed_at_open: Arc<std::sync::Mutex<Vec<bool>>>,
+    }
+
+    impl Sink for WatchesCapture {
+        fn open(&mut self, _rate: u32, _period: u32) -> Result<(), SinkError> {
+            self.closed_at_open.lock().unwrap().push(self.feed.closed());
+            Ok(())
+        }
+
+        fn write(&mut self, _frames: &[[i32; 2]]) -> Result<(), SinkError> {
+            Ok(())
+        }
+
+        fn close(&mut self) {}
+
+        fn delay_frames(&self) -> u32 {
+            0
+        }
+
+        fn supported_rates(&self) -> Vec<u32> {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn the_capture_is_closed_before_the_output_reopens() {
+        let (capture, feed) = MemoryCapture::new();
+        let closed_at_open = Arc::default();
+        let sink = WatchesCapture {
+            feed: feed.clone(),
+            closed_at_open: Arc::clone(&closed_at_open),
+        };
+        let (mut commands, consumer) = RingBuffer::new(16);
+        let (producer, mut events) = RingBuffer::new(16);
+        let counters = Arc::new(Counters::default());
+        let mut engine =
+            Engine::<F32, _>::new(sink, consumer, producer, counters, BitPerfect::Auto);
+        let mut send = |c| assert!(commands.push(c).is_ok());
+        send(Command::Reconfigure {
+            rate: RATE,
+            period: PERIOD as u32,
+        });
+        engine.cycle().unwrap();
+        // As the control thread does, after the output is open.
+        send(Command::SetChain(
+            Place::Analog,
+            chain_of::<F32>(vec![times(1.0).neutral()]),
+        ));
+        send(Command::SetCapture(Some(Box::new(capture))));
+        feed.push(&frames(1000, PERIOD));
+        engine.cycle().unwrap();
+        send(Command::Reconfigure {
+            rate: 96000,
+            period: PERIOD as u32,
+        });
+        // The fade, which still reads the capture.
+        engine.cycle().unwrap();
+        assert!(!feed.closed());
+        engine.cycle().unwrap();
+        assert_eq!(*closed_at_open.lock().unwrap(), [false, true]);
+        // A closed capture is not read, and costs no failure.
+        feed.push(&frames(1000, 3 * PERIOD));
+        for _ in 0..3 {
+            engine.cycle().unwrap();
+        }
+        assert_eq!(feed.queued(), 3 * PERIOD);
+        let events: Vec<Event> = std::iter::from_fn(|| events.pop().ok()).collect();
+        assert_eq!(signals(&events), [true, false]);
+        assert_eq!(failures(&events), 0);
+    }
+
+    #[test]
+    fn a_dop_stream_silences_the_analog_input() {
+        let (mut rig, feed) = with_capture::<I32>(BitPerfect::Auto);
+        rig.send(Command::SetChain(Place::Analog, detect_chain::<I32>(3.0)));
+        let mut a = client(1);
+        rig.add(&mut a);
+        let dop = dop_frames(40 * PERIOD);
+        a.ring.write(&dop);
+        for _ in 0..40 {
+            feed.push(&frames(1 << 28, PERIOD));
+            rig.cycle();
+        }
+        assert_eq!(rig.last_periods(40), dop);
+        // The detector kept measuring all along.
+        assert_eq!(feed.queued(), 0);
+        assert_eq!(signals(&rig.events()), [true]);
+    }
+
+    #[test]
+    fn the_fade_out_before_a_reopen_fades_the_analog_input_too() {
+        let (mut rig, feed) = with_capture::<F64>(BitPerfect::Auto);
+        feed.push(&frames(1 << 24, 2 * PERIOD));
+        rig.cycle();
+        rig.send(Command::Reconfigure {
+            rate: 96000,
+            period: 128,
+        });
+        rig.cycle();
+        let got = rig.last_periods(1);
+        assert_eq!(got[0][0], 1 << 24);
+        for (i, f) in got.iter().enumerate() {
+            let want = (1.0 - i as f64 / PERIOD as f64) * (1 << 24) as f64;
+            assert!((f64::from(f[0]) - want).abs() < 2.0, "frame {i}");
+        }
+        assert_eq!(rig.log.opens().len(), 1);
+    }
+
+    #[test]
+    fn a_full_event_queue_delays_the_input_signal_without_losing_it() {
+        let mut rig = Rig::<I32>::with_event_slots(BitPerfect::Auto, 1);
+        set_chain(&mut rig, Place::Analog, vec![times(1.0).neutral()]);
+        rig.cycle();
+        assert!(matches!(rig.events.pop(), Ok(Event::OldChain(_))));
+        let (capture, feed) = MemoryCapture::new();
+        rig.send(Command::SetCapture(Some(Box::new(capture))));
+        feed.push(&frames(1, PERIOD));
+        rig.cycle();
+        assert!(matches!(rig.events.pop(), Ok(Event::OldCapture(None))));
+        assert!(rig.events.pop().is_err());
+        assert_eq!(rig.counters.analog_open.load(Relaxed), 1);
+        feed.fail();
+        rig.cycle();
+        assert!(matches!(rig.events.pop(), Ok(Event::CaptureFailed(_))));
+        rig.cycle();
+        // It opened and closed while the queue was full. That is no change.
+        assert!(rig.events.pop().is_err());
+        assert_eq!(rig.counters.analog_open.load(Relaxed), 0);
+    }
+
+    #[test]
+    fn a_failed_capture_still_held_is_closed_before_the_output_reopens() {
+        let mut rig = Rig::<I32>::with_event_slots(BitPerfect::Auto, 1);
+        set_chain(&mut rig, Place::Analog, vec![times(1.0).neutral()]);
+        let (capture, feed) = MemoryCapture::new();
+        rig.send(Command::SetCapture(Some(Box::new(capture))));
+        feed.push(&frames(1, PERIOD));
+        // The queue stays full, so the failed capture is not handed back.
+        rig.cycle();
+        feed.fail();
+        rig.cycle();
+        assert!(!feed.closed());
+        rig.send(Command::Reconfigure {
+            rate: 96000,
+            period: PERIOD as u32,
+        });
+        rig.cycle();
+        rig.cycle();
+        // The card may refuse a second open while it is held.
+        assert!(feed.closed());
+    }
+
+    #[test]
+    fn a_replaced_capture_comes_back() {
+        let mut rig = Rig::<I32>::new(BitPerfect::Auto);
+        let (first, first_feed) = MemoryCapture::new();
+        let (second, second_feed) = MemoryCapture::new();
+        rig.send(Command::SetCapture(Some(Box::new(first))));
+        rig.send(Command::SetCapture(Some(Box::new(second))));
+        rig.send(Command::SetCapture(None));
+        rig.cycle();
+        let back: Vec<bool> = rig
+            .events()
+            .into_iter()
+            .filter_map(|e| match e {
+                Event::OldCapture(c) => Some(c.is_some()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(back, [false, true, true]);
+        // Neither is read any more, nor closed by the engine.
+        first_feed.push(&frames(1, PERIOD));
+        second_feed.push(&frames(1, PERIOD));
+        rig.cycle();
+        assert_eq!(first_feed.queued() + second_feed.queued(), 2 * PERIOD);
+        assert!(!first_feed.closed() && !second_feed.closed());
+    }
+
+    #[test]
+    fn the_summary_names_the_analog_input_once_a_capture_was_set() {
+        let (mut rig, feed) = with_capture::<I32>(BitPerfect::Auto);
+        let before = rig.counters.to_string();
+        assert!(!before.contains("analog"), "{before}");
+        feed.push(&frames(1, PERIOD - 3));
+        rig.cycle();
+        let after = rig.counters.to_string();
+        assert!(before.ends_with(" cycles"), "{before}");
+        assert!(
+            after.ends_with("; analog input open, 3 frames padded, 0 frames dropped"),
+            "{after}"
+        );
+    }
+
+    fn no_allocation_with_a_capture<P: Processing>(other: Formats) {
+        let (mut rig, feed) = with_capture::<P>(BitPerfect::Auto);
+        let mut a = client(1);
+        rig.add(&mut a);
+        // A plugin to convert around, and a real detector that opens and
+        // closes during the checked cycles.
+        let mut detect = Detect::new(RATE);
+        detect.set_param(1, 0.0);
+        let plugins: Vec<Box<dyn Plugin>> =
+            vec![Box::new(times(1.0).only(other)), Box::new(detect)];
+        let chain = Chain::new(plugins, format_of::<P>(), MAX_PERIOD as usize);
+        rig.send(Command::SetChain(Place::Analog, Box::new(chain)));
+        rig.cycle();
+        rig.events();
+        let (spare, spare_feed) = MemoryCapture::new();
+        let input = frames(1 << 24, PERIOD);
+        let loud = frames(1 << 28, PERIOD);
+        let quiet = frames(1000, PERIOD);
+        // Everything the audio thread will be handed is made out here.
+        rig.send(Command::SetAnalogGain(0.5));
+        let mut spare = Some(Box::new(spare) as Box<dyn Capture>);
+        let engine = &mut rig.engine;
+        let commands = &mut rig.commands;
+        assert_no_alloc(|| {
+            for round in 0..300 {
+                a.ring.write(&input);
+                // Above the threshold for a window and more, then below it
+                // for two.
+                let level = if round < 60 { &loud } else { &quiet };
+                // Short, then on time, then too much.
+                let n = [PERIOD / 2, PERIOD, 4 * PERIOD][round % 3];
+                feed.push(&level[..n.min(PERIOD)]);
+                if n > PERIOD {
+                    feed.push(level);
+                    feed.push(level);
+                    feed.push(level);
+                }
+                if round == 140 {
+                    feed.fail();
+                }
+                if round == 160 {
+                    let _ = commands.push(Command::SetCapture(spare.take()));
+                }
+                if round == 240 {
+                    let _ = commands.push(Command::Reconfigure {
+                        rate: RATE,
+                        period: PERIOD as u32,
+                    });
+                }
+                spare_feed.push(&loud);
+                engine.cycle().unwrap();
+            }
+        });
+        let counters = &rig.counters;
+        assert!(counters.analog_padded_frames.load(Relaxed) > 0);
+        assert!(counters.analog_dropped_frames.load(Relaxed) > 0);
+        assert!(spare_feed.closed(), "{:?}", format_of::<P>());
+        // The returned items are freed here, off the audio thread.
+        let events = rig.events();
+        // Opened and closed by the detector, opened again by the spare,
+        // closed for the reopen.
+        assert_eq!(signals(&events), [true, false, true, false]);
+        assert_eq!(failures(&events), 1);
+        assert_eq!(count(&events, |e| matches!(e, Event::OldCapture(_))), 1);
+    }
+
+    #[test]
+    fn cycles_with_a_capture_do_not_allocate() {
+        let only = |i32, f32, f64| Formats { i32, f32, f64 };
+        no_allocation_with_a_capture::<I32>(only(false, false, true));
+        no_allocation_with_a_capture::<F32>(only(true, false, false));
+        no_allocation_with_a_capture::<F64>(only(false, true, false));
+    }
+
+    // Capture streams.
+
+    /// A recorder's side of a tap: its own mapping of the ring, and the
+    /// wake-up.
+    struct Recorder {
+        id: ClientId,
+        ring: Ring,
+        wake: OwnedFd,
+    }
+
+    impl Recorder {
+        /// Everything the ring holds.
+        fn take(&self) -> Vec<[i32; 2]> {
+            let mut out = vec![[0; 2]; self.ring.capacity()];
+            let n = self.ring.read(&mut out);
+            out.truncate(n);
+            out
+        }
+
+        fn overruns(&self) -> u64 {
+            self.ring.header().underruns.load(Relaxed)
+        }
+
+        /// How often the wake-up was written since it was last read.
+        fn wake_ups(&self) -> u64 {
+            let mut count = 0u64;
+            // SAFETY: 8 bytes from a non-blocking eventfd.
+            unsafe { libc::read(self.wake.as_raw_fd(), (&raw mut count).cast(), 8) };
+            count
+        }
+    }
+
+    /// A stopped tap with a ring of `capacity` frames, and its recorder.
+    fn tap_of(id: ClientId, capacity: u32) -> (Recorder, Box<Tap>) {
+        let (ring, fd) = Ring::create(capacity).unwrap();
+        let peer = Ring::map(fd.as_fd()).unwrap();
+        let wake = eventfd();
+        let theirs = wake.try_clone().unwrap();
+        let recorder = Recorder {
+            id,
+            ring: peer,
+            wake,
+        };
+        (recorder, Box::new(Tap::new(id, ring, theirs)))
+    }
+
+    /// A running tap with room for many periods.
+    fn add_tap<P: Processing>(rig: &mut Rig<P>, id: ClientId) -> Recorder {
+        let (recorder, tap) = tap_of(id, 1 << 16);
+        rig.send(Command::AddTap(tap));
+        rig.send(Command::SetRunning(id, true));
+        recorder
+    }
+
+    #[test]
+    fn a_tap_gets_the_analog_input_after_its_chain() {
+        fn check<P: Processing>() {
+            let (mut rig, feed) = with_capture::<P>(BitPerfect::Auto);
+            set_chain(&mut rig, Place::Analog, vec![times(2.0)]);
+            let recorder = add_tap(&mut rig, 5);
+            feed.push(&frames(1000, PERIOD));
+            rig.cycle();
+            assert_eq!(
+                recorder.take(),
+                frames(2000, PERIOD),
+                "{:?}",
+                format_of::<P>()
+            );
+            // Clipped to 32 bits as the mix's last step does it.
+            set_chain(&mut rig, Place::Analog, vec![times(4.0)]);
+            feed.push(&frames(0x4000_0000, PERIOD));
+            rig.cycle();
+            assert_eq!(recorder.take(), vec![[i32::MAX, i32::MIN]; PERIOD]);
+            // A neutral chain hands over the frames as captured.
+            set_chain(&mut rig, Place::Analog, vec![times(1.0).neutral()]);
+            let input = ramp(3 * PERIOD);
+            for period in input.chunks(PERIOD) {
+                feed.push(period);
+                rig.cycle();
+            }
+            assert_eq!(recorder.take(), input, "{:?}", format_of::<P>());
+            // The analog gain is the mix's, and does not apply.
+            rig.send(Command::SetAnalogGain(0.5));
+            feed.push(&input[..PERIOD]);
+            rig.cycle();
+            assert_eq!(recorder.take(), input[..PERIOD]);
+        }
+        check::<I32>();
+        check::<F32>();
+        check::<F64>();
+    }
+
+    #[test]
+    fn the_analog_chains_latency_is_reported_to_recorders_and_in_the_counters() {
+        let (mut rig, feed) = with_capture::<F32>(BitPerfect::Auto);
+        set_chain(&mut rig, Place::Analog, vec![times(2.0).latency(8)]);
+        let recorder = add_tap(&mut rig, 5);
+        feed.push(&frames(1000, PERIOD));
+        rig.cycle();
+        let header = recorder.ring.header();
+        assert_eq!(header.output_delay_frames.load(Relaxed), 8);
+        assert_eq!(rig.counters.analog_latency_frames.load(Relaxed), 8);
+        let summary = rig.counters.to_string();
+        assert!(summary.ends_with(", plugin latency 8 frames"), "{summary}");
+        // A chain whose output is not used delays nothing.
+        set_chain(&mut rig, Place::Analog, vec![times(1.0).neutral()]);
+        feed.push(&frames(1000, PERIOD));
+        rig.cycle();
+        assert_eq!(header.output_delay_frames.load(Relaxed), 0);
+        assert_eq!(rig.counters.analog_latency_frames.load(Relaxed), 0);
+    }
+
+    #[test]
+    fn a_tap_gets_silence_while_there_is_no_signal() {
+        // No capture at all: a period of zeros every cycle, in real time.
+        let mut rig = Rig::<I32>::new(BitPerfect::Auto);
+        let recorder = add_tap(&mut rig, 5);
+        for _ in 0..3 {
+            rig.cycle();
+        }
+        assert_eq!(recorder.take(), frames(0, 3 * PERIOD));
+        // Below the threshold.
+        let (mut rig, feed) = with_capture::<I32>(BitPerfect::Auto);
+        set_chain(&mut rig, Place::Analog, vec![times(1.0).quiet()]);
+        let recorder = add_tap(&mut rig, 5);
+        for _ in 0..3 {
+            feed.push(&frames(1000, PERIOD));
+            rig.cycle();
+        }
+        assert_eq!(recorder.take(), frames(0, 3 * PERIOD));
+        // A capture that has failed.
+        let (mut rig, feed) = with_capture::<I32>(BitPerfect::Auto);
+        let recorder = add_tap(&mut rig, 5);
+        feed.push(&frames(1000, PERIOD));
+        rig.cycle();
+        feed.fail();
+        rig.cycle();
+        rig.cycle();
+        let mut want = frames(1000, PERIOD);
+        want.extend(frames(0, 2 * PERIOD));
+        assert_eq!(recorder.take(), want);
+    }
+
+    #[test]
+    fn a_tap_never_gets_the_mix() {
+        let mut rig = Rig::<I32>::new(BitPerfect::Auto);
+        let recorder = add_tap(&mut rig, 5);
+        let mut a = client(1);
+        rig.add(&mut a);
+        a.ring.write(&frames(ODD, 3 * PERIOD));
+        for _ in 0..3 {
+            rig.cycle();
+        }
+        assert_eq!(rig.last_periods(3), frames(ODD, 3 * PERIOD));
+        assert_eq!(recorder.take(), frames(0, 3 * PERIOD));
+        // With an input, the tap gets the input alone, the card both.
+        let (mut rig, feed) = with_capture::<I32>(BitPerfect::Auto);
+        let recorder = add_tap(&mut rig, 5);
+        let mut a = client(1);
+        rig.add(&mut a);
+        a.ring.write(&frames(1000, PERIOD));
+        feed.push(&frames(234, PERIOD));
+        rig.cycle();
+        assert_eq!(rig.last_periods(1), frames(1234, PERIOD));
+        assert_eq!(recorder.take(), frames(234, PERIOD));
+        // While DoP holds the output, the input is still measured and taken.
+        let mut d = client(2);
+        rig.add(&mut d);
+        let dop = dop_frames(4 * PERIOD);
+        d.ring.write(&dop);
+        for _ in 0..4 {
+            feed.push(&frames(234, PERIOD));
+            rig.cycle();
+        }
+        assert_eq!(rig.last_periods(4), dop);
+        assert_eq!(recorder.take(), frames(234, 4 * PERIOD));
+    }
+
+    #[test]
+    fn a_recorder_that_stops_reading_loses_only_its_own_audio() {
+        let (mut rig, feed) = with_capture::<I32>(BitPerfect::Auto);
+        let capacity = 2 * PERIOD + 10;
+        let (stalled, tap) = tap_of(5, capacity as u32);
+        rig.send(Command::AddTap(tap));
+        rig.send(Command::SetRunning(5, true));
+        let reading = add_tap(&mut rig, 6);
+        let mut a = client(1);
+        rig.add(&mut a);
+        let input = ramp(10 * PERIOD);
+        a.ring.write(&frames(1000, 10 * PERIOD));
+        let mut got = Vec::new();
+        for period in input.chunks(PERIOD) {
+            feed.push(period);
+            rig.cycle();
+            got.extend(reading.take());
+        }
+        // The full ring kept the oldest frames, and counts the rest.
+        assert_eq!(stalled.take(), input[..capacity]);
+        assert_eq!(stalled.overruns(), (10 * PERIOD - capacity) as u64);
+        // The other recorder and the card lost nothing.
+        assert_eq!(got, input);
+        assert_eq!(reading.overruns(), 0);
+        assert_eq!(underruns(&a), 0);
+        assert_eq!(a.ring.available(), 0);
+        assert_eq!(rig.log.frames().len(), PERIOD + 10 * PERIOD);
+    }
+
+    #[test]
+    fn a_stopped_tap_is_not_written() {
+        let (mut rig, feed) = with_capture::<I32>(BitPerfect::Auto);
+        let (recorder, tap) = tap_of(5, 1 << 16);
+        rig.send(Command::AddTap(tap));
+        feed.push(&frames(1, PERIOD));
+        rig.cycle();
+        assert!(recorder.take().is_empty());
+        assert_eq!(recorder.wake_ups(), 0);
+        rig.send(Command::SetRunning(5, true));
+        feed.push(&frames(2, PERIOD));
+        rig.cycle();
+        assert_eq!(recorder.take(), frames(2, PERIOD));
+        rig.send(Command::SetRunning(5, false));
+        feed.push(&frames(3, PERIOD));
+        rig.cycle();
+        assert!(recorder.take().is_empty());
+        // A flush stops it, and is answered. The ring is the reader's to
+        // empty, so the engine leaves it alone.
+        rig.send(Command::SetRunning(5, true));
+        feed.push(&frames(4, PERIOD));
+        rig.cycle();
+        rig.events();
+        rig.send(Command::Flush(5));
+        feed.push(&frames(5, PERIOD));
+        rig.cycle();
+        let events = rig.events();
+        assert!(matches!(events[..], [Event::Flushed(5)]));
+        assert_eq!(recorder.take(), frames(4, PERIOD));
+        assert_eq!(
+            recorder.ring.header().read_pos.load(Relaxed),
+            2 * PERIOD as u64
+        );
+    }
+
+    #[test]
+    fn a_tap_waiting_for_a_position_is_woken_once_when_it_is_reached() {
+        let mut rig = Rig::<I32>::new(BitPerfect::Auto);
+        let recorder = add_tap(&mut rig, 5);
+        // Zero asks for a wake-up after every period.
+        rig.cycle();
+        rig.cycle();
+        assert_eq!(recorder.wake_ups(), 2);
+        let header = recorder.ring.header();
+        header.wake_at.store(5 * PERIOD as u64, Ordering::SeqCst);
+        for _ in 0..2 {
+            rig.cycle();
+            assert_eq!(recorder.wake_ups(), 0);
+        }
+        rig.cycle();
+        assert_eq!(recorder.wake_ups(), 1);
+        rig.cycle();
+        assert_eq!(recorder.wake_ups(), 0);
+        // A full ring wakes it as an underrun wakes a player.
+        let (stalled, tap) = tap_of(6, PERIOD as u32);
+        rig.send(Command::AddTap(tap));
+        rig.send(Command::SetRunning(6, true));
+        stalled
+            .ring
+            .header()
+            .wake_at
+            .store(1 << 40, Ordering::SeqCst);
+        rig.cycle();
+        assert_eq!(stalled.wake_ups(), 0);
+        rig.cycle();
+        assert_eq!(stalled.wake_ups(), 1);
+        assert_eq!(stalled.overruns(), PERIOD as u64);
+    }
+
+    #[test]
+    fn a_removed_or_refused_tap_comes_back() {
+        let mut rig = Rig::<I32>::new(BitPerfect::Auto);
+        let recorders: Vec<Recorder> = (0..INITIAL_TAPS as u64 + 1)
+            .map(|id| {
+                let (recorder, tap) = tap_of(id, 1024);
+                rig.send(Command::AddTap(tap));
+                recorder
+            })
+            .collect();
+        rig.send(Command::RemoveTap(2));
+        rig.send(Command::RemoveTap(99));
+        rig.cycle();
+        let back: Vec<ClientId> = rig
+            .events()
+            .iter()
+            .filter_map(|e| match e {
+                Event::DroppedTap(t) => Some(t.id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(back, [INITIAL_TAPS as u64, 2]);
+        // A bigger table keeps every tap, and the old one comes back.
+        rig.send(Command::GrowTaps(Vec::with_capacity(2 * INITIAL_TAPS)));
+        for id in [0, 1, 3] {
+            rig.send(Command::SetRunning(id, true));
+        }
+        rig.cycle();
+        let events = rig.events();
+        assert!(matches!(&events[..], [Event::OldTaps(t)] if t.is_empty()));
+        for r in &recorders {
+            let want = if [0, 1, 3].contains(&r.id) { PERIOD } else { 0 };
+            assert_eq!(r.take().len(), want, "tap {}", r.id);
+        }
+    }
+
+    fn taps_without_allocation<P: Processing>() {
+        let (mut rig, feed) = with_capture::<P>(BitPerfect::Auto);
+        // Converted from the processing format.
+        set_chain(&mut rig, Place::Analog, vec![times(2.0)]);
+        let mut a = client(1);
+        rig.add(&mut a);
+        let reading = add_tap(&mut rig, 5);
+        let (full, tap) = tap_of(6, PERIOD as u32);
+        rig.send(Command::AddTap(tap));
+        rig.send(Command::SetRunning(6, true));
+        rig.cycle();
+        rig.events();
+        let (late, tap) = tap_of(7, 1 << 12);
+        let mut late_tap = Some(tap);
+        let mut grown = Some(Vec::with_capacity(4 * INITIAL_TAPS));
+        let input = frames(1 << 20, PERIOD);
+        let mut out = vec![[0; 2]; 4 * PERIOD];
+        let engine = &mut rig.engine;
+        let commands = &mut rig.commands;
+        assert_no_alloc(|| {
+            for round in 0..200 {
+                a.ring.write(&input);
+                feed.push(&input);
+                match round {
+                    20 => {
+                        let _ = commands.push(Command::GrowTaps(grown.take().unwrap()));
+                        let _ = commands.push(Command::AddTap(late_tap.take().unwrap()));
+                        let _ = commands.push(Command::SetRunning(7, true));
+                    }
+                    60 => {
+                        let _ = commands.push(Command::Flush(5));
+                    }
+                    80 => {
+                        let _ = commands.push(Command::SetRunning(5, true));
+                    }
+                    100 => {
+                        let _ = commands.push(Command::RemoveTap(6));
+                    }
+                    150 => feed.fail(),
+                    _ => {}
+                }
+                engine.cycle().unwrap();
+                reading.ring.read(&mut out);
+                late.ring.read(&mut out);
+            }
+        });
+        assert!(full.overruns() > 0);
+        assert_eq!(reading.overruns(), 0);
+        // The returned items are freed here, off the audio thread.
+        let events = rig.events();
+        assert_eq!(count(&events, |e| matches!(e, Event::OldTaps(_))), 1);
+        assert_eq!(count(&events, |e| matches!(e, Event::DroppedTap(_))), 1);
+    }
+
+    #[test]
+    fn taps_do_not_allocate() {
+        taps_without_allocation::<I32>();
+        taps_without_allocation::<F32>();
+        taps_without_allocation::<F64>();
     }
 }

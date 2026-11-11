@@ -111,6 +111,46 @@ fn hardware_volume(config: &Config) -> Option<OpenVolume> {
     None
 }
 
+/// The analog input, if the config enables it. A card that is there at
+/// the start is decided on now, by its driver, in `analog_capture`. A card
+/// that is not there yet is looked for at each open, so a driver that
+/// probes after the start is picked up; until then, and for a card with no
+/// ADC aas knows, the open fails and the control thread tries again.
+#[cfg(feature = "alsa-output")]
+fn analog_input(config: &Config) -> Option<aas::control::OpenCapture> {
+    use aas::capture::{Capture, OpenError};
+    use aas::sink_alsa::{AlsaCapture, AnalogCard, analog_card, capture_card, cards_text};
+    match analog_card(&cards_text(), config) {
+        AnalogCard::Off => None,
+        AnalogCard::Present { card, driver } => {
+            let open: aas::control::OpenCapture = Box::new(move |rate, period| {
+                AlsaCapture::open(&card, rate, period)
+                    .map(|c| Box::new(c) as Box<dyn Capture>)
+                    .map_err(OpenError::Again)
+            });
+            server::analog_capture(config, &driver, open)
+        }
+        AnalogCard::Absent => {
+            eprintln!("aas: analog input on, its card is not there yet");
+            let wanted = config.card.clone();
+            Some(Box::new(move |rate, period| {
+                let card = capture_card(&cards_text(), wanted.as_deref())?;
+                AlsaCapture::open(&card, rate, period)
+                    .map(|c| Box::new(c) as Box<dyn Capture>)
+                    .map_err(OpenError::Again)
+            }))
+        }
+    }
+}
+
+#[cfg(not(feature = "alsa-output"))]
+fn analog_input(config: &Config) -> Option<aas::control::OpenCapture> {
+    if config.analog.enabled {
+        eprintln!("aas: warning: built without ALSA, the analog input stays off");
+    }
+    None
+}
+
 /// Looks for the card on the control thread while it is gone, so that the
 /// audio thread tries to open it only once it is there. A build without
 /// ALSA never asks: its output is never gone.
@@ -143,8 +183,11 @@ fn main() -> ExitCode {
     let sink = output(&config);
     let hardware = hardware_volume(&config);
     let probe = Some(card_probe(&config));
+    let capture = analog_input(&config);
     let (socket, state) = (&args.socket, &args.state);
-    match server::run_probing(config, sink, socket, state, hardware, probe, shutdown) {
+    match server::run_probing(
+        config, sink, socket, state, hardware, probe, capture, shutdown,
+    ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("aas: {e}");

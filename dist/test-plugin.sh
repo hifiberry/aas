@@ -1,7 +1,7 @@
 #!/bin/sh
 # Board tests for the aas ALSA plugin. Runs on the test board, as a member
 # of group audio that may sudo, with the daemon running as aas.service and
-# the plugin installed by dist/install-plugin.sh. Needs aplay, amixer,
+# the plugin installed by dist/install-plugin.sh. Needs aplay, arecord, amixer,
 # alsactl, cc and libasound2-dev, and for the mixer case mpd, mpc and
 # python3. Each case prints PASS or FAIL and its name. The exit status is
 # the number of cases that failed.
@@ -12,15 +12,27 @@
 # the capture device, for example plughw:sndrpihifiberry. The format case
 # then plays a tone and checks what the input hears. Without it, the case
 # plays silence and checks only that each format plays.
+#
+# With ANALOG=1 the cases of the analog input run too, on a board whose
+# card has one and whose output is wired to it. They restart the daemon
+# with the input enabled at -20 dB, so that the loop through the cable
+# stays quiet, and put the config back after. Without ANALOG=1 they are
+# not run and not counted.
 set -u
 # alsactl is in sbin.
 PATH=$PATH:/usr/sbin
 
 rate=48000
 work=$(mktemp -d)
+conf=/etc/aas/aas.toml
+# What analog_on did to the config, for analog_off to undo: "kept" with
+# the old file in $work, "added" where there was none.
+analog_conf=""
+analog_dir=""
 # Full volume again at the end, however the run ends, for whatever plays
-# next.
-trap 'kill $(jobs -p) 2>/dev/null; amixer -q -D default sset Master 100% 2>/dev/null; rm -rf "$work"' EXIT
+# next, and the config the daemon had.
+trap 'kill $(jobs -p) 2>/dev/null; analog_off; amixer -q -D default sset Master 100% 2>/dev/null; rm -rf "$work"' EXIT
+trap 'exit 130' INT TERM HUP
 failed=0
 
 pass() { echo "PASS $1${2:+: $2}"; }
@@ -52,8 +64,92 @@ wait_daemon() {
 	return 1
 }
 
+# Restarts the daemon with the analog input enabled at -20 dB, on top of
+# the config it has. A config with an [analog] table of its own is left
+# alone and the case fails.
+analog_on() {
+	if [ -e $conf ]; then
+		grep -q '^[[:space:]]*\[analog\]' $conf && return 1
+		cp $conf "$work/aas.toml.before"
+		analog_conf=kept
+	else
+		[ -d /etc/aas ] || analog_dir=made
+		: >"$work/aas.toml.before"
+		analog_conf=added
+	fi
+	{
+		cat "$work/aas.toml.before"
+		printf '\n[analog]\nenabled = true\nvolume_db = -20\n'
+	} >"$work/analog.toml"
+	sudo install -D -m 0644 "$work/analog.toml" $conf || return 1
+	# Each case starts the daemon twice. More than five starts in ten
+	# seconds would reach systemd's limit.
+	sudo systemctl reset-failed aas
+	sudo systemctl restart aas
+	wait_daemon || return 1
+	# The capture reads zeros for its first second, while the ADC settles.
+	sleep 1.5
+}
+
+# Puts the config back as analog_on found it and restarts the daemon. Does
+# nothing if analog_on changed nothing.
+analog_off() {
+	case $analog_conf in
+	kept) sudo install -m 0644 "$work/aas.toml.before" $conf ;;
+	added)
+		sudo rm -f $conf
+		[ "$analog_dir" = made ] && sudo rmdir /etc/aas
+		;;
+	*) return 0 ;;
+	esac
+	analog_conf=""
+	analog_dir=""
+	sudo systemctl reset-failed aas
+	sudo systemctl restart aas
+	wait_daemon
+}
+
+# The log of the daemon that ran as process $1, from its start to its
+# "stopped" line, one line each as "<seconds.micro> <message>". By its pid,
+# so that a restart's lines from the daemon before cannot be taken for
+# its own.
+daemon_log() {
+	journalctl -q _SYSTEMD_UNIT=aas.service _PID="$1" -o short-unix --no-pager 2>/dev/null |
+		sed 's/^\([0-9.]*\) [^:]*: /\1 /'
+}
+
+# Waits up to $3 ms for the first line with $2 in the log of the daemon
+# that ran as process $1, and prints its time in ms since the epoch.
+# Returns 1 if none came.
+log_wait() {
+	waited=0
+	while :; do
+		at=$(daemon_log "$1" | grep -F -- "$2" | head -n1 | cut -d' ' -f1)
+		if [ -n "$at" ]; then
+			echo "$at" | awk '{ printf "%d\n", $1 * 1000 }'
+			return 0
+		fi
+		[ "$waited" -ge "$3" ] && return 1
+		sleep 0.05
+		waited=$((waited + 50))
+	done
+}
+
+# Whether the daemon holds a capture stream of a card open and running.
+capture_running() {
+	daemon=$(main_pid)
+	for status in /proc/asound/card*/pcm*c/sub*/status; do
+		[ -r "$status" ] || continue
+		if grep -q "owner_pid *: $daemon\$" "$status" && grep -q 'state: RUNNING' "$status"; then
+			return 0
+		fi
+	done
+	return 1
+}
+
 # A helper for what aplay cannot show: pause, delay, underrun, polling
-# with descriptors fetched once, and a non-blocking drain.
+# with descriptors fetched once, and a non-blocking drain. The cases whose
+# name starts with "capture" open the PCM for capture.
 cat >"$work/pcmtest.c" <<'EOF'
 #include <alsa/asoundlib.h>
 #include <fcntl.h>
@@ -65,6 +161,7 @@ cat >"$work/pcmtest.c" <<'EOF'
 #include <unistd.h>
 
 static snd_pcm_t *pcm;
+static snd_pcm_stream_t direction = SND_PCM_STREAM_PLAYBACK;
 static unsigned int rate = 48000;
 static snd_pcm_uframes_t period = 1024, buffer = 4096;
 static long written;
@@ -101,7 +198,7 @@ static int params(int *can_pause)
 
 static int setup(const char *device, int mode, int *can_pause)
 {
-	int err = snd_pcm_open(&pcm, device, SND_PCM_STREAM_PLAYBACK, mode);
+	int err = snd_pcm_open(&pcm, device, direction, mode);
 
 	if (err < 0) {
 		printf("open: %s\n", snd_strerror(err));
@@ -477,12 +574,151 @@ static int hw_free_test(void)
 	return !(before == 1 && after == 0 && again == 1 && took > 0.45 && took < 0.8);
 }
 
+/* Reads `frames`, blocking. Returns 0, or the error, which it prints
+ * unless it is -EPIPE. */
+static int get(long frames)
+{
+	while (frames > 0) {
+		long n = frames < (long)period ? frames : (long)period;
+		snd_pcm_sframes_t r = snd_pcm_readi(pcm, silence, n);
+		if (r < 0) {
+			if (r != -EPIPE)
+				printf("read: %s\n", snd_strerror(r));
+			return r;
+		}
+		frames -= r;
+	}
+	return 0;
+}
+
+/* A recorder that falls behind by more than its buffer gets -EPIPE, as
+ * from a card, and reads on in real time after prepare. */
+static int capture_overrun_test(void)
+{
+	double t0, took;
+	int err;
+
+	if (get(rate / 4))
+		return 1;
+	usleep(300000);
+	err = get(rate / 4);
+	if (err != -EPIPE) {
+		printf("a read 300 ms late with a buffer of %lu frames gave %d, not -EPIPE\n",
+		       buffer, err);
+		return 1;
+	}
+	if ((err = snd_pcm_prepare(pcm)) < 0) {
+		printf("prepare: %s\n", snd_strerror(err));
+		return 1;
+	}
+	t0 = now();
+	if (get(rate / 2))
+		return 1;
+	took = now() - t0;
+	snd_pcm_drop(pcm);
+	printf("-EPIPE after falling 300 ms behind, then 500 ms read in %.0f ms after prepare\n",
+	       took * 1000);
+	return !(took > 0.4 && took < 0.7);
+}
+
+/* Reads `frames` by polling the descriptors in `pfd`. Fails on a poll
+ * that times out, an error, or too many wake-ups. */
+static int read_polled(struct pollfd *pfd, int n, long frames, int *polls)
+{
+	long done = 0;
+
+	*polls = 0;
+	while (done < frames) {
+		unsigned short revents = 0;
+		if (++*polls > 2000) {
+			printf("over 2000 wake-ups for %ld frames\n", frames);
+			return 1;
+		}
+		if (poll(pfd, n, 1000) <= 0) {
+			printf("no wake-up within 1 s\n");
+			return 1;
+		}
+		if (snd_pcm_poll_descriptors_revents(pcm, pfd, n, &revents) < 0 ||
+		    (revents & POLLERR)) {
+			printf("poll error after %ld frames\n", done);
+			return 1;
+		}
+		if (!(revents & POLLIN))
+			continue;
+		snd_pcm_sframes_t avail = snd_pcm_avail_update(pcm);
+		if (avail < 0) {
+			printf("avail: %s\n", snd_strerror(avail));
+			return 1;
+		}
+		long want = avail < frames - done ? avail : frames - done;
+		want = want > 16384 ? 16384 : want;
+		snd_pcm_sframes_t r = snd_pcm_readi(pcm, silence, want);
+		if (r < 0 && r != -EAGAIN) {
+			printf("read: %s\n", snd_strerror(r));
+			return 1;
+		}
+		done += r > 0 ? r : 0;
+	}
+	return 0;
+}
+
+/* A non-blocking recorder polls the descriptors it fetched once, with
+ * POLLIN when a period is there to read. A drop and a prepare keep them,
+ * and a second polled read goes on in real time. */
+static int capture_poll_test(void)
+{
+	struct pollfd cached[8], fresh[8];
+	int n = snd_pcm_poll_descriptors_count(pcm), polls1, polls2, i, err;
+	double t0, first, second;
+
+	if (n <= 0 || n > 8 || snd_pcm_poll_descriptors(pcm, cached, n) != n) {
+		printf("no poll descriptors\n");
+		return 1;
+	}
+	if ((err = snd_pcm_start(pcm)) < 0) {
+		printf("start: %s\n", snd_strerror(err));
+		return 1;
+	}
+	t0 = now();
+	if (read_polled(cached, n, rate / 2, &polls1))
+		return 1;
+	first = now() - t0;
+	if (snd_pcm_drop(pcm) < 0 || snd_pcm_prepare(pcm) < 0) {
+		printf("drop and prepare failed\n");
+		return 1;
+	}
+	snd_pcm_poll_descriptors(pcm, fresh, n);
+	for (i = 0; i < n; i++) {
+		if (fresh[i].fd != cached[i].fd) {
+			printf("descriptor %d moved from %d to %d\n", i, cached[i].fd, fresh[i].fd);
+			return 1;
+		}
+	}
+	if ((err = snd_pcm_start(pcm)) < 0) {
+		printf("start after prepare: %s\n", snd_strerror(err));
+		return 1;
+	}
+	t0 = now();
+	if (read_polled(cached, n, rate / 2, &polls2))
+		return 1;
+	second = now() - t0;
+	snd_pcm_drop(pcm);
+	printf("500 ms read polling in %.0f ms with %d wake-ups, and after a drop and a "
+	       "prepare in %.0f ms with %d on the same descriptors\n",
+	       first * 1000, polls1, second * 1000, polls2);
+	return !(first > 0.4 && first < 0.7 && second > 0.4 && second < 0.7);
+}
+
 int main(int argc, char **argv)
 {
 	int can_pause = 0, mode = 0, spare = -1;
 
 	if (argc != 3)
 		return 2;
+	if (!strncmp(argv[1], "capture", 7))
+		direction = SND_PCM_STREAM_CAPTURE;
+	if (!strcmp(argv[1], "capturepoll"))
+		mode = SND_PCM_NONBLOCK;
 	if (!strcmp(argv[1], "dropdrain")) {
 		period = 4096;
 		buffer = rate;
@@ -496,6 +732,10 @@ int main(int argc, char **argv)
 		return 2;
 	if (!strcmp(argv[1], "stable"))
 		return stable_test(spare);
+	if (!strcmp(argv[1], "capturexrun"))
+		return capture_overrun_test();
+	if (!strcmp(argv[1], "capturepoll"))
+		return capture_poll_test();
 	if (!strcmp(argv[1], "nonblock"))
 		return nonblock_drain_test();
 	if (!strcmp(argv[1], "dropdrain"))
@@ -570,10 +810,12 @@ fi
 
 # A helper for the tone the format case plays and hears. `gen` writes one
 # second of a 1 kHz sine at -20 dBFS, at 48 kHz, in the format and channel
-# count given. `hear` reads a recording, S32_LE stereo at 48 kHz, and
-# prints for each channel the tone's level in dBFS, the share of the
-# signal's power that is the tone, and for how many tenths of a second the
-# tone was there.
+# count given. `hear` reads a recording, S32_LE stereo at 48 kHz or at the
+# rate given, and prints for each channel the tone's level in dBFS, the
+# share of the signal's power that is the tone, and for how many tenths of
+# a second the tone was there. `freq` reads the same and prints for each
+# channel the frequency of its strongest component between 500 and 2000 Hz,
+# to 0.01 Hz. `widen` turns S16_LE into S32_LE, exactly.
 cat >"$work/tone.c" <<'EOF'
 #include <math.h>
 #include <stdint.h>
@@ -583,8 +825,11 @@ cat >"$work/tone.c" <<'EOF'
 
 #define RATE 48000
 #define FREQ 1000.0
-#define BLOCK (RATE / 10)
+#define MAX_BLOCK (RATE / 10)
 #define MAX_BLOCKS 64
+
+/* The rate of a recording `hear` and `freq` read, at most RATE. */
+static int rate = RATE;
 
 static int by_value(const void *a, const void *b)
 {
@@ -628,16 +873,17 @@ static int gen(const char *format, int channels)
 
 static int hear(void)
 {
-	static int32_t block[BLOCK][2];
+	static int32_t block[MAX_BLOCK][2];
 	static double tone[2][MAX_BLOCKS], share[2][MAX_BLOCKS];
 	int blocks = 0;
+	const int BLOCK = rate / 10;
 
-	while (blocks < MAX_BLOCKS && fread(block, sizeof block, 1, stdin) == 1) {
+	while (blocks < MAX_BLOCKS && fread(block, sizeof block[0], BLOCK, stdin) == (size_t)BLOCK) {
 		for (int c = 0; c < 2; c++) {
 			double re = 0, im = 0, sum = 0, squares = 0;
 			for (int i = 0; i < BLOCK; i++) {
 				double x = block[i][c] / 2147483648.0;
-				double w = 2 * M_PI * FREQ * i / RATE;
+				double w = 2 * M_PI * FREQ * i / rate;
 				re += x * cos(w);
 				im += x * sin(w);
 				sum += x;
@@ -674,12 +920,73 @@ static int hear(void)
 	return 0;
 }
 
+/* The power at `f` Hz of channel `c` of `n` frames, by Goertzel. */
+static double power_at(int32_t (*x)[2], long n, int c, double f)
+{
+	double k = 2 * cos(2 * M_PI * f / rate), s1 = 0, s2 = 0;
+
+	for (long i = 0; i < n; i++) {
+		double s = x[i][c] / 2147483648.0 + k * s1 - s2;
+		s2 = s1;
+		s1 = s;
+	}
+	return s1 * s1 + s2 * s2 - k * s1 * s2;
+}
+
+static int freq(void)
+{
+	static int32_t x[RATE * 4][2];
+	long n = fread(x, sizeof x[0], RATE * 4, stdin);
+
+	for (int c = 0; c < 2; c++) {
+		double best = 500, most = -1;
+		for (double f = 500; f <= 2000; f += 1) {
+			double p = power_at(x, n, c, f);
+			if (p > most) {
+				most = p;
+				best = f;
+			}
+		}
+		double coarse = best;
+		for (double f = coarse - 1; f <= coarse + 1; f += 0.01) {
+			double p = power_at(x, n, c, f);
+			if (p > most) {
+				most = p;
+				best = f;
+			}
+		}
+		printf("%.2f ", best);
+	}
+	printf("\n");
+	return 0;
+}
+
+static int widen(void)
+{
+	int16_t v;
+
+	while (fread(&v, 2, 1, stdin) == 1) {
+		int32_t w = (int32_t)((uint32_t)(uint16_t)v << 16);
+		fwrite(&w, 4, 1, stdout);
+	}
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
+	if (argc == 3 && (!strcmp(argv[1], "freq") || !strcmp(argv[1], "hear"))) {
+		rate = atoi(argv[2]);
+		if (rate < 1000 || rate > RATE)
+			return 2;
+	}
+	if ((argc == 2 || argc == 3) && !strcmp(argv[1], "freq"))
+		return freq();
 	if (argc == 4 && !strcmp(argv[1], "gen"))
 		return gen(argv[2], atoi(argv[3]));
-	if (argc == 2 && !strcmp(argv[1], "hear"))
+	if ((argc == 2 || argc == 3) && !strcmp(argv[1], "hear"))
 		return hear();
+	if (argc == 2 && !strcmp(argv[1], "widen"))
+		return widen();
 	return 2;
 }
 EOF
@@ -897,6 +1204,185 @@ case_player_killed_keeps_daemon_up() {
 	else
 		fail $name "status $status, $took ms, daemon pid $daemon now $(main_pid): $(cat "$work/err")"
 	fi
+}
+
+# Plays silence at 48 kHz through the plugin in the background, so that the
+# daemon's output is open at that rate while a case records. With the
+# analog input disabled the daemon writes a recorder only while its output
+# is open. The holder plays silence, which a recorder never hears anyway.
+hold_output() {
+	aplay -q -D aas -t raw -f S16_LE -c 2 -r $rate /dev/zero 2>/dev/null &
+	holder=$!
+	sleep 0.3
+}
+release_output() {
+	kill $holder 2>/dev/null
+	wait $holder 2>/dev/null
+}
+
+# Whether file $1 is $2 bytes long and every byte of it is zero.
+all_zero() { [ "$(stat -c %s "$1")" = "$2" ] && cmp -s -n "$2" "$1" /dev/zero; }
+
+# Records one second from the default device in each format and rate a
+# recorder is likely to ask for. plug converts from what the daemon gives.
+case_arecord_records_each_format() {
+	name=arecord_records_each_format
+	bad=""
+	hold_output
+	for r in 44100 48000; do
+		for spec in "S16_LE 2" "S24_LE 4" "S32_LE 4"; do
+			set -- $spec
+			if ! timeout 5 arecord -q -D default -t raw -f $1 -c 2 -r $r -s $r \
+				"$work/rec.raw" 2>"$work/err"; then
+				bad="$bad $1/$r($(head -n1 "$work/err"))"
+				continue
+			fi
+			size=$(stat -c %s "$work/rec.raw")
+			[ "$size" = $((r * 2 * $2)) ] || bad="$bad $1/$r($size bytes)"
+		done
+	done
+	release_output
+	if [ -z "$bad" ]; then
+		pass $name "S16_LE, S24_LE and S32_LE at 44.1 and 48 kHz, 1 s each of the length asked for"
+	else
+		fail $name "failed:$bad"
+	fi
+}
+
+# With the analog input disabled, the default install, the device records
+# silence: every sample is 0.
+case_capture_is_silent_without_signal() {
+	name=capture_is_silent_without_signal
+	hold_output
+	timeout 5 arecord -q -D default -t raw -f S32_LE -c 2 -r $rate -s $rate \
+		"$work/rec.raw" 2>"$work/err"
+	status=$?
+	release_output
+	if [ $status -ne 0 ]; then
+		fail $name "arecord exited $status: $(head -n1 "$work/err")"
+	elif all_zero "$work/rec.raw" $((rate * 8)); then
+		pass $name "1 s recorded, every sample 0"
+	else
+		fail $name "$(stat -c %s "$work/rec.raw") bytes, not all 0"
+	fi
+}
+
+# The device never delivers the mix: a tone played through the daemon
+# while the analog input is disabled gives an all-zero recording.
+case_capture_never_hears_a_player() {
+	name=capture_never_hears_a_player
+	"$work/tone" gen S16_LE 2 >"$work/tone.raw"
+	volume=$(master)
+	amixer -q -D default sset Master 100%
+	hold_output
+	timeout 5 arecord -q -D default -t raw -f S32_LE -c 2 -r $rate -s $((rate * 16 / 10)) \
+		"$work/rec.raw" 2>"$work/caperr" &
+	recorder=$!
+	sleep 0.3
+	aplay -q -D aas -t raw -f S16_LE -c 2 -r $rate "$work/tone.raw" 2>"$work/err"
+	played=$?
+	wait $recorder
+	status=$?
+	release_output
+	amixer -q -D default sset Master "$volume%"
+	if [ $played -ne 0 ]; then
+		fail $name "aplay exited $played: $(head -n1 "$work/err")"
+	elif [ $status -ne 0 ]; then
+		fail $name "arecord exited $status: $(head -n1 "$work/caperr")"
+	elif all_zero "$work/rec.raw" $((rate * 16 / 10 * 8)); then
+		pass $name "1 s of tone played during 1.6 s recorded, every sample 0"
+	else
+		fail $name "the recording is not all 0: $("$work/tone" hear <"$work/rec.raw")"
+	fi
+}
+
+# The output's rate changes while a recording runs: the recording ends
+# with an error within a second, and a new one records at the new rate.
+case_capture_ends_on_a_rate_change() {
+	name=capture_ends_on_a_rate_change
+	# The output at 48 kHz, with no player left to hold a rate.
+	aplay -q -D aas -t raw -f S16_LE -c 2 -r $rate -d 1 /dev/zero 2>"$work/err"
+	arecord -q -D default -t raw -f S32_LE -c 2 -r $rate "$work/rec.raw" 2>"$work/caperr" &
+	recorder=$!
+	sleep 0.5
+	if ! kill -0 $recorder 2>/dev/null; then
+		wait $recorder
+		fail $name "arecord stopped before the rate change: $(head -n1 "$work/caperr")"
+		return
+	fi
+	aplay -q -D aas -t raw -f S16_LE -c 2 -r 44100 -d 2 /dev/zero 2>"$work/err" &
+	player=$!
+	start=$(now_ms)
+	if ! wait_gone $recorder 3000; then
+		kill -9 $recorder $player 2>/dev/null
+		wait $recorder $player 2>/dev/null
+		fail $name "arecord still runs 3 s after a player moved the output to 44.1 kHz"
+		return
+	fi
+	took=$(($(now_ms) - start))
+	wait $recorder
+	status=$?
+	why=$(tr '\n' ' ' <"$work/caperr")
+	timeout 5 arecord -q -D default -t raw -f S32_LE -c 2 -r $rate -s $rate \
+		"$work/rec2.raw" 2>"$work/caperr"
+	again=$?
+	size=$(stat -c %s "$work/rec2.raw" 2>/dev/null)
+	wait $player
+	if [ $status -ne 0 ] && [ $took -le 1000 ] && [ $again -eq 0 ] &&
+		[ "$size" = $((rate * 8)) ]; then
+		pass $name "arecord exited $status after $took ms: $why; a new one recorded 1 s"
+	else
+		fail $name "arecord exited $status after $took ms: $why; a new one exited $again with $size bytes: $(head -n1 "$work/caperr")"
+	fi
+}
+
+# A recorder killed mid-stream costs the daemon nothing: another recorder
+# records on, and the daemon keeps its pid.
+case_recorder_killed_keeps_daemon_up() {
+	name=recorder_killed_keeps_daemon_up
+	daemon=$(main_pid)
+	hold_output
+	start=$(now_ms)
+	timeout 5 arecord -q -D default -t raw -f S16_LE -c 2 -r $rate -s $((rate * 2)) \
+		"$work/rec.raw" 2>"$work/err" &
+	keeper=$!
+	arecord -q -D default -t raw -f S16_LE -c 2 -r $rate /dev/null 2>/dev/null &
+	victim=$!
+	sleep 0.5
+	kill -9 $victim 2>/dev/null
+	wait $victim 2>/dev/null
+	wait $keeper
+	status=$?
+	took=$(($(now_ms) - start))
+	release_output
+	size=$(stat -c %s "$work/rec.raw" 2>/dev/null)
+	if [ $status -eq 0 ] && [ "$size" = $((rate * 8)) ] && [ $took -ge 1900 ] &&
+		[ $took -le 2600 ] && [ "$(main_pid)" = "$daemon" ] && systemctl -q is-active aas; then
+		pass $name "the other arecord recorded 2 s in $took ms, daemon pid $daemon unchanged"
+	else
+		fail $name "status $status, $size bytes, $took ms, daemon pid $daemon now $(main_pid): $(cat "$work/err")"
+	fi
+}
+
+# A recorder that falls behind gets -EPIPE and goes on after prepare.
+case_capture_overrun_returns_epipe() {
+	name=capture_overrun_returns_epipe
+	hold_output
+	out=$(timeout 10 "$work/pcmtest" capturexrun default)
+	status=$?
+	release_output
+	if [ $status -eq 0 ]; then pass $name "$out"; else fail $name "$out"; fi
+}
+
+# A non-blocking recorder polls, and keeps its descriptors through a
+# drop and a prepare.
+case_capture_polls_and_survives_a_reset() {
+	name=capture_polls_and_survives_a_reset
+	hold_output
+	out=$(timeout 10 "$work/pcmtest" capturepoll default)
+	status=$?
+	release_output
+	if [ $status -eq 0 ]; then pass $name "$out"; else fail $name "$out"; fi
 }
 
 # The daemon's volume in percent, read through the control.
@@ -1151,6 +1637,182 @@ case_monitor_sleeps_when_the_daemon_is_gone() {
 	fi
 }
 
+# The analog input opens when a -20 dBFS tone reaches it through the
+# cable, within 200 ms of the start, and closes when the hold of 3 s has
+# passed after the tone, within a second more. The tone lasts 2 s from
+# the start: aplay exits later than it ends, after its drain. The first
+# open of the daemon is taken, so one before the tone fails the case.
+case_analog_input_opens_on_signal() {
+	name=analog_input_opens_on_signal
+	if ! analog_on; then
+		fail $name "the daemon did not start with the analog input"
+		analog_off
+		return
+	fi
+	daemon=$(main_pid)
+	volume=$(master)
+	amixer -q -D default sset Master 100%
+	if ! capture_running; then
+		fail $name "the daemon holds no running capture: $(daemon_log $daemon | grep analog | tr '\n' ' ')"
+		amixer -q -D default sset Master "$volume%"
+		analog_off
+		return
+	fi
+	"$work/tone" gen S16_LE 2 >"$work/tone.raw"
+	cat "$work/tone.raw" "$work/tone.raw" >"$work/tone2.raw"
+	start=$(now_ms)
+	aplay -q -D default -t raw -f S16_LE -c 2 -r $rate "$work/tone2.raw" 2>"$work/err"
+	status=$?
+	end=$(now_ms)
+	opened=$(log_wait $daemon "analog input: signal" 1000)
+	closed=$(log_wait $daemon "analog input: quiet" 6000)
+	amixer -q -D default sset Master "$volume%"
+	analog_off
+	took=$((end - start))
+	end=$((start + 2000))
+	if [ $status -ne 0 ]; then
+		fail $name "aplay exited $status: $(head -n1 "$work/err")"
+	elif [ -z "$opened" ]; then
+		fail $name "no open in the log during 2 s of tone"
+	elif [ -z "$closed" ]; then
+		fail $name "opened after $((opened - start)) ms, not closed 6 s after the tone"
+	elif [ $opened -ge $start ] && [ $((opened - start)) -le 200 ] &&
+		[ $((closed - end)) -ge 3000 ] &&
+		[ $((closed - end)) -le 4000 ]; then
+		pass $name "opened $((opened - start)) ms after the tone started, closed $((closed - end)) ms after it ended; aplay took $took ms"
+	else
+		fail $name "opened $((opened - start)) ms after the tone started, closed $((closed - end)) ms after it ended; aplay took $took ms"
+	fi
+}
+
+# With nothing playing, the input stays closed from the start of the
+# daemon and for 10 s more, with the capture running all the while. The
+# start counts: the ADC's offset settling as the capture starts must not
+# open it.
+case_analog_input_stays_closed_on_silence() {
+	name=analog_input_stays_closed_on_silence
+	if ! analog_on; then
+		fail $name "the daemon did not start with the analog input"
+		analog_off
+		return
+	fi
+	daemon=$(main_pid)
+	sleep 10
+	running=no
+	capture_running && running=yes
+	opens=$(daemon_log $daemon | grep -c -F "analog input: signal")
+	log=$(daemon_log $daemon | grep analog | tr '\n' ' ')
+	analog_off
+	if [ $running = yes ] && [ "$opens" -eq 0 ]; then
+		pass $name "capture running, no open in 10 s"
+	else
+		fail $name "capture running: $running, opens: $opens: $log"
+	fi
+}
+
+# The output changes rate from 44.1 to 96 kHz while the capture is open.
+# Both players finish, the capture runs at the new rate, and the daemon
+# counts no xrun and no wake-up gap.
+case_rate_change_with_capture_open() {
+	name=rate_change_with_capture_open
+	if ! analog_on; then
+		fail $name "the daemon did not start with the analog input"
+		analog_off
+		return
+	fi
+	daemon=$(main_pid)
+	aplay -q -D default -t raw -f S16_LE -c 2 -r 44100 -d 1 /dev/zero 2>"$work/err"
+	first=$?
+	aplay -q -D default -t raw -f S16_LE -c 2 -r 96000 -d 1 /dev/zero 2>>"$work/err"
+	second=$?
+	sleep 0.5
+	running=no
+	capture_running && running=yes
+	analog_off
+	log_wait $daemon "aas: stopped:" 2000 >/dev/null
+	log=$(daemon_log $daemon)
+	counters=$(echo "$log" | grep -F "aas: stopped:" | head -n1 | cut -d' ' -f2-)
+	rates=$(echo "$log" | grep -o "output at [0-9]* Hz" | tr '\n' ' ')
+	failures=$(echo "$log" | grep -F "analog input" | grep -c -e fail -e "trying again")
+	if [ $first -ne 0 ] || [ $second -ne 0 ]; then
+		fail $name "aplay exited $first and $second: $(head -n2 "$work/err" | tr '\n' ' ')"
+	elif [ $running = yes ] && [ "$failures" -eq 0 ] &&
+		echo "$rates" | grep -q "output at 96000 Hz" &&
+		echo "$counters" | grep -q ": 0 xruns, 0 wake gaps,"; then
+		pass $name "$rates; pid $daemon $counters"
+	else
+		fail $name "capture running: $running, capture failures: $failures; $rates; pid $daemon $counters"
+	fi
+}
+
+# A 1 kHz tone played through the daemon reaches the analog input through
+# the cable and is in what the device records: at 1 kHz within 2 Hz on
+# both channels, nine tenths of the power in the tone. Recorded three
+# times: from the default device with read access, from the plugin itself
+# with mmap access, the way plug reads it for any conversion, and from the
+# default device as S16_LE at 44.1 kHz, which plug converts.
+case_capture_hears_the_analog_input() {
+	name=capture_hears_the_analog_input
+	if ! analog_on; then
+		fail $name "the daemon did not start with the analog input"
+		analog_off
+		return
+	fi
+	volume=$(master)
+	amixer -q -D default sset Master 100%
+	"$work/tone" gen S16_LE 2 >"$work/tone.raw"
+	bad=""
+	report=""
+	for how in "-D default -f S32_LE -r $rate" "-M -D aas -f S32_LE -r $rate" \
+		"-D default -f S16_LE -r 44100"; do
+		at=${how##* }
+		timeout 5 arecord -q $how -t raw -c 2 -s $((at * 16 / 10)) \
+			"$work/rec.raw" 2>"$work/caperr" &
+		recorder=$!
+		sleep 0.3
+		aplay -q -D default -t raw -f S16_LE -c 2 -r $rate "$work/tone.raw" 2>"$work/err"
+		played=$?
+		wait $recorder
+		status=$?
+		if [ $played -ne 0 ]; then
+			bad="$bad $how(aplay exited $played: $(head -n1 "$work/err"))"
+			continue
+		fi
+		if [ $status -ne 0 ]; then
+			bad="$bad $how(arecord exited $status: $(head -n1 "$work/caperr"))"
+			continue
+		fi
+		case $how in
+		*S16_LE*)
+			"$work/tone" widen <"$work/rec.raw" >"$work/rec32.raw"
+			mv "$work/rec32.raw" "$work/rec.raw"
+			;;
+		esac
+		heard=$("$work/tone" hear $at <"$work/rec.raw")
+		heard=${heard% }
+		freqs=$("$work/tone" freq $at <"$work/rec.raw")
+		freqs=${freqs% }
+		line="$how: $freqs Hz, level, share and tenths per channel $heard"
+		if echo "$freqs $heard" | awk '{
+			for (c = 0; c < 2; c++)
+				if ($(1 + c) < 998 || $(1 + c) > 1002 || $(4 + 3 * c) < 0.9)
+					exit 1
+		}'; then
+			report="$report $line;"
+		else
+			bad="$bad $line;"
+		fi
+	done
+	amixer -q -D default sset Master "$volume%"
+	analog_off
+	if [ -z "$bad" ]; then
+		report="${report# }"
+		pass $name "${report%;}"
+	else
+		fail $name "failed:$bad"
+	fi
+}
+
 cases="aplay_plays_each_format drain_returns pause_and_resume delay_is_plausible
 underrun_returns_epipe poll_descriptors_survive_a_reset nonblocking_drain
 drop_during_a_blocking_drain hw_free_gives_the_stream_up
@@ -1159,9 +1821,19 @@ client_reconnects_after_restart player_killed_keeps_daemon_up
 amixer_reads_and_sets_master second_client_sees_the_change mpd_mixer_works
 volume_survives_a_restart control_reconnects_after_restart
 amixer_fails_without_the_daemon watcher_hears_the_daemon_go
-monitor_sleeps_when_the_daemon_is_gone"
+monitor_sleeps_when_the_daemon_is_gone arecord_records_each_format
+capture_is_silent_without_signal capture_never_hears_a_player
+capture_ends_on_a_rate_change recorder_killed_keeps_daemon_up
+capture_overrun_returns_epipe capture_polls_and_survives_a_reset"
+analog_cases="analog_input_opens_on_signal analog_input_stays_closed_on_silence
+rate_change_with_capture_open capture_hears_the_analog_input"
+[ "${ANALOG:-}" = 1 ] && cases="$cases $analog_cases"
 [ $# -gt 0 ] && cases="$*"
 for name in $cases; do
+	if [ "${ANALOG:-}" != 1 ] && echo "$analog_cases" | grep -qw -- "$name"; then
+		echo "SKIP $name: needs ANALOG=1"
+		continue
+	fi
 	if ! command -v "case_$name" >/dev/null; then
 		fail "$name" "no such case"
 		continue

@@ -2,6 +2,8 @@
 //!
 //! The format is chosen once at startup. `mix` never allocates.
 
+use crate::plugin::Block;
+
 /// A per-block gain that moves linearly from `from` to `to`.
 ///
 /// Frame `i` of an `n` frame block uses `from + (to - from) * i / n`, so the
@@ -47,9 +49,37 @@ pub trait Processing {
     fn gain(gain: f32) -> Self::Gain;
     /// Add `sample * gain` to `acc`.
     fn accumulate(acc: &mut Self::Acc, sample: i32, gain: Self::Gain);
+    /// Add `value * gain` to `acc`, where `value` is a sample already in
+    /// the accumulator's form, such as the result of a plugin chain.
+    fn accumulate_acc(acc: &mut Self::Acc, value: Self::Acc, gain: Self::Gain);
     /// Convert to S32, saturating at the limits. A float that is not a
     /// number becomes 0, and an infinite one the limit of its sign.
     fn finish(acc: Self::Acc) -> i32;
+    /// Copies `acc` into a block in `scratch` for the plugins. Float blocks
+    /// have full scale at 1.0 and are not clipped. An `i32` block is clipped
+    /// to S32. `scratch` must hold `acc.len()` frames.
+    fn to_block<'s>(acc: &mut [[Self::Acc; 2]], scratch: &'s mut BlockStore) -> Block<'s>;
+    /// Copies a block that `to_block` gave back into `acc`.
+    fn from_block(block: Block<'_>, acc: &mut [[Self::Acc; 2]]);
+}
+
+/// The buffers a block lives in between the mix and the plugins, one per
+/// sample type. Sized once, outside the audio thread.
+pub struct BlockStore {
+    pub(crate) i32: Vec<[i32; 2]>,
+    pub(crate) f32: Vec<[f32; 2]>,
+    pub(crate) f64: Vec<[f64; 2]>,
+}
+
+impl BlockStore {
+    /// Room for blocks of up to `max_frames` frames. Allocates nothing for 0.
+    pub fn new(max_frames: usize) -> Self {
+        BlockStore {
+            i32: vec![[0; 2]; max_frames],
+            f32: vec![[0.0; 2]; max_frames],
+            f64: vec![[0.0; 2]; max_frames],
+        }
+    }
 }
 
 /// Integer processing. The accumulator is wide, so a sum that passes full
@@ -88,8 +118,33 @@ impl Processing for I32 {
         *acc = acc.saturating_add(v as i64);
     }
 
+    /// As `accumulate`, on a wider value.
+    fn accumulate_acc(acc: &mut i64, value: i64, q: i64) {
+        let p = i128::from(value) * i128::from(q);
+        let p = p + (1i128 << 31) + (p >> 127);
+        let v = (p >> 32).clamp(i128::from(i64::MIN / 2), i128::from(i64::MAX / 2));
+        *acc = acc.saturating_add(v as i64);
+    }
+
     fn finish(acc: i64) -> i32 {
         acc.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+    }
+
+    fn to_block<'s>(acc: &mut [[i64; 2]], scratch: &'s mut BlockStore) -> Block<'s> {
+        let block = &mut scratch.i32[..acc.len()];
+        for (b, a) in block.iter_mut().zip(acc.iter()) {
+            *b = [Self::finish(a[0]), Self::finish(a[1])];
+        }
+        Block::I32(block)
+    }
+
+    fn from_block(block: Block<'_>, acc: &mut [[i64; 2]]) {
+        let Block::I32(block) = block else {
+            unreachable!("an i32 accumulator takes an i32 block")
+        };
+        for (a, b) in acc.iter_mut().zip(block.iter()) {
+            *a = [i64::from(b[0]), i64::from(b[1])];
+        }
     }
 }
 
@@ -109,8 +164,26 @@ impl Processing for F32 {
         *acc += sample as f32 / SCALE as f32 * gain;
     }
 
+    fn accumulate_acc(acc: &mut f32, value: f32, gain: f32) {
+        *acc += value * gain;
+    }
+
     fn finish(acc: f32) -> i32 {
         (acc * SCALE as f32).round() as i32
+    }
+
+    /// The accumulator already has full scale at 1.0, so this is a copy.
+    fn to_block<'s>(acc: &mut [[f32; 2]], scratch: &'s mut BlockStore) -> Block<'s> {
+        let block = &mut scratch.f32[..acc.len()];
+        block.copy_from_slice(acc);
+        Block::F32(block)
+    }
+
+    fn from_block(block: Block<'_>, acc: &mut [[f32; 2]]) {
+        let Block::F32(block) = block else {
+            unreachable!("an f32 accumulator takes an f32 block")
+        };
+        acc.copy_from_slice(&block[..acc.len()]);
     }
 }
 
@@ -130,8 +203,26 @@ impl Processing for F64 {
         *acc += f64::from(sample) / SCALE * gain;
     }
 
+    fn accumulate_acc(acc: &mut f64, value: f64, gain: f64) {
+        *acc += value * gain;
+    }
+
     fn finish(acc: f64) -> i32 {
         (acc * SCALE).round() as i32
+    }
+
+    /// The accumulator already has full scale at 1.0, so this is a copy.
+    fn to_block<'s>(acc: &mut [[f64; 2]], scratch: &'s mut BlockStore) -> Block<'s> {
+        let block = &mut scratch.f64[..acc.len()];
+        block.copy_from_slice(acc);
+        Block::F64(block)
+    }
+
+    fn from_block(block: Block<'_>, acc: &mut [[f64; 2]]) {
+        let Block::F64(block) = block else {
+            unreachable!("an f64 accumulator takes an f64 block")
+        };
+        acc.copy_from_slice(&block[..acc.len()]);
     }
 }
 
@@ -175,6 +266,27 @@ pub fn mix_add<P: Processing>(samples: &[[i32; 2]], ramp: Ramp, acc: &mut [[P::A
         let g = P::gain(ramp.at(i, n));
         P::accumulate(&mut a[0], s[0], g);
         P::accumulate(&mut a[1], s[1], g);
+    }
+}
+
+/// Adds a source that is already in the accumulator's form, such as the
+/// output of a plugin chain, without going through S32 and so without
+/// clipping it. The ramp spans all of `acc`.
+pub fn mix_add_acc<P: Processing>(values: &[[P::Acc; 2]], ramp: Ramp, acc: &mut [[P::Acc; 2]]) {
+    if ramp.from == ramp.to {
+        // The usual case, as in `mix_add`: one gain for the whole call.
+        let g = P::gain(ramp.from);
+        for (a, v) in acc.iter_mut().zip(values.iter()) {
+            P::accumulate_acc(&mut a[0], v[0], g);
+            P::accumulate_acc(&mut a[1], v[1], g);
+        }
+        return;
+    }
+    let n = acc.len();
+    for (i, (a, v)) in acc.iter_mut().zip(values.iter()).enumerate() {
+        let g = P::gain(ramp.at(i, n));
+        P::accumulate_acc(&mut a[0], v[0], g);
+        P::accumulate_acc(&mut a[1], v[1], g);
     }
 }
 
@@ -377,9 +489,100 @@ mod tests {
         }
     }
 
+    /// Mixes `input` at unity, passes it through a block and back, and
+    /// finishes it. `look` sees the block on the way.
+    fn block_round_trip<P: Processing>(input: &[i32], look: impl Fn(&Block<'_>)) -> Vec<i32> {
+        let frames: Vec<[i32; 2]> = input.iter().map(|&v| [v, v]).collect();
+        let mut acc = vec![[P::zero(); 2]; frames.len()];
+        let mut store = BlockStore::new(frames.len());
+        let mut out = vec![[0; 2]; frames.len()];
+        mix_clear::<P>(&mut acc);
+        mix_add::<P>(&frames, Ramp::flat(1.0), &mut acc);
+        let block = P::to_block(&mut acc, &mut store);
+        look(&block);
+        P::from_block(block, &mut acc);
+        mix_finish::<P>(&acc, &mut out);
+        out.iter().map(|f| f[0]).collect()
+    }
+
+    #[test]
+    fn every_s24_value_survives_the_block_round_trip_in_f32() {
+        // Every S24 value, left aligned in an S32 sample.
+        let v: Vec<i32> = (-(1 << 23)..(1 << 23)).map(|k| k << 8).collect();
+        let got = block_round_trip::<F32>(&v, |block| {
+            let Block::F32(b) = block else {
+                panic!("not an f32 block")
+            };
+            for (f, &s) in b.iter().zip(v.iter()) {
+                assert_eq!(f[0], s as f32 / 2_147_483_648.0);
+            }
+        });
+        assert_eq!(got, v);
+    }
+
+    #[test]
+    fn every_s32_edge_survives_the_block_round_trip_in_f64_and_i32() {
+        let mut v = EDGES.to_vec();
+        v.extend([0x1234_5679, -0x1234_5679, 0x7FFF_FF01]);
+        let got = block_round_trip::<F64>(&v, |block| {
+            let Block::F64(b) = block else {
+                panic!("not an f64 block")
+            };
+            for (f, &s) in b.iter().zip(v.iter()) {
+                assert_eq!(f[0], f64::from(s) / 2_147_483_648.0);
+            }
+        });
+        assert_eq!(got, v);
+        let got = block_round_trip::<I32>(&v, |block| {
+            let Block::I32(b) = block else {
+                panic!("not an i32 block")
+            };
+            assert_eq!(b.iter().map(|f| f[0]).collect::<Vec<_>>(), v);
+        });
+        assert_eq!(got, v);
+    }
+
     #[test]
     fn db_to_gain_known_values() {
         assert_eq!(db_to_gain(0.0), 1.0);
         assert!((db_to_gain(-20.0) - 0.1).abs() < 1e-6);
+    }
+
+    /// `mix_add_acc` on what `mix_add` made of S32 frames at unity gives
+    /// what `mix_add` gives with the same ramp.
+    fn adding_an_accumulator_matches_adding_its_frames<P: Processing>() {
+        let frames: Vec<[i32; 2]> = EDGES.iter().map(|&v| [v, v ^ 0x55]).collect();
+        let mut block = vec![[P::zero(); 2]; frames.len()];
+        mix_add::<P>(&frames, Ramp::flat(1.0), &mut block);
+        for ramp in [Ramp::flat(0.5), Ramp { from: 1.0, to: 0.0 }] {
+            let mut want = vec![[P::zero(); 2]; frames.len()];
+            let mut got = vec![[P::zero(); 2]; frames.len()];
+            mix_add::<P>(&frames, ramp, &mut want);
+            mix_add_acc::<P>(&block, ramp, &mut got);
+            let (mut w, mut g) = (vec![[0; 2]; frames.len()], vec![[0; 2]; frames.len()]);
+            mix_finish::<P>(&want, &mut w);
+            mix_finish::<P>(&got, &mut g);
+            assert_eq!(g, w, "{ramp:?}");
+        }
+    }
+
+    #[test]
+    fn adding_an_accumulator_is_adding_its_frames() {
+        adding_an_accumulator_matches_adding_its_frames::<I32>();
+        adding_an_accumulator_matches_adding_its_frames::<F32>();
+        adding_an_accumulator_matches_adding_its_frames::<F64>();
+    }
+
+    #[test]
+    fn a_float_accumulator_over_full_scale_is_added_unclipped() {
+        let mut out = [[0; 2]];
+        let mut acc = [[0.0f32; 2]];
+        mix_add_acc::<F32>(&[[2.0, -3.0]], Ramp::flat(0.25), &mut acc);
+        mix_finish::<F32>(&acc, &mut out);
+        assert_eq!(out, [[1 << 30, -(3 << 29)]]);
+        let mut acc = [[0.0f64; 2]];
+        mix_add_acc::<F64>(&[[2.0, -3.0]], Ramp::flat(0.25), &mut acc);
+        mix_finish::<F64>(&acc, &mut out);
+        assert_eq!(out, [[1 << 30, -(3 << 29)]]);
     }
 }

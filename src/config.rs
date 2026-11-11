@@ -2,9 +2,10 @@
 
 use crate::rate::{MAX_RATE, MIN_RATE};
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::ErrorKind;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Default config path.
 pub const DEFAULT_PATH: &str = "/etc/aas/aas.toml";
@@ -59,6 +60,57 @@ enum IdleKind {
     Off,
 }
 
+/// The card's analog input.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Analog {
+    /// Whether the input is used. It needs a card with an ADC.
+    pub enabled: bool,
+    /// The level of the input in dB, from -60 to 0.
+    pub volume_db: f32,
+}
+
+impl Default for Analog {
+    fn default() -> Analog {
+        Analog {
+            enabled: false,
+            volume_db: 0.0,
+        }
+    }
+}
+
+/// Where in the signal path a plugin runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PluginPlace {
+    /// On the analog input, before it is mixed.
+    Analog,
+    /// On the mix of all sources.
+    Mix,
+    /// On the final output, after the volume.
+    Output,
+}
+
+/// One `[[plugin]]` table.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PluginConfig {
+    pub place: PluginPlace,
+    /// The `type` key: a built-in name, or `library`.
+    pub kind: String,
+    /// The shared library of a `library` plugin.
+    pub path: Option<PathBuf>,
+    /// Every other key of the table. The chain builder checks the names,
+    /// and each value against the type of its parameter.
+    pub params: BTreeMap<String, ParamValue>,
+}
+
+/// The value of a plugin parameter in the config.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ParamValue {
+    /// For every parameter but a text one. Finite.
+    Number(f64),
+    /// For a text parameter, passed to the plugin as written.
+    Text(String),
+}
+
 /// The settings, after the defaults are filled in. The README lists the
 /// keys of the file.
 #[derive(Debug, Clone, PartialEq)]
@@ -84,6 +136,17 @@ pub struct Config {
     pub volume_control: Option<String>,
     /// Who applies the volume. None uses the card's control if it has one.
     pub volume_mode: Option<VolumeMode>,
+    /// The card's analog input.
+    pub analog: Analog,
+    /// The plugins, in the order of the file.
+    pub plugins: Vec<PluginConfig>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawAnalog {
+    enabled: Option<bool>,
+    volume_db: Option<f32>,
 }
 
 #[derive(Deserialize)]
@@ -99,6 +162,78 @@ struct Raw {
     idle_delay_s: Option<u32>,
     volume_control: Option<String>,
     volume_mode: Option<VolumeMode>,
+    analog: Option<RawAnalog>,
+    plugin: Option<Vec<toml::Table>>,
+}
+
+const BUILT_IN_PLUGINS: [&str; 2] = ["detect", "balance"];
+
+/// Checks one `[[plugin]]` table. `n` is its position in the file, from 1.
+fn plugin_from_table(n: usize, mut table: toml::Table) -> Result<PluginConfig, String> {
+    let mut take_str = |key: &str| match table.remove(key) {
+        None => Ok(None),
+        Some(toml::Value::String(s)) => Ok(Some(s)),
+        Some(_) => Err(format!("plugin {n}: {key} must be a string")),
+    };
+    let place = match take_str("place")?.as_deref() {
+        Some("analog") => PluginPlace::Analog,
+        Some("mix") => PluginPlace::Mix,
+        Some("output") => PluginPlace::Output,
+        Some(other) => {
+            return Err(format!(
+                "plugin {n}: place \"{other}\" must be \"analog\", \"mix\" or \"output\""
+            ));
+        }
+        None => return Err(format!("plugin {n}: place is missing")),
+    };
+    let kind = take_str("type")?.ok_or(format!("plugin {n}: type is missing"))?;
+    let path = take_str("path")?.map(PathBuf::from);
+    match (kind.as_str(), &path) {
+        ("library", None) => return Err(format!("plugin {n}: type \"library\" needs a path")),
+        ("library", Some(p)) if !p.is_absolute() => {
+            return Err(format!(
+                "plugin {n}: path \"{}\" must be absolute",
+                p.display()
+            ));
+        }
+        ("library", Some(_)) => {}
+        (k, Some(_)) if BUILT_IN_PLUGINS.contains(&k) => {
+            return Err(format!("plugin {n}: path is only for type \"library\""));
+        }
+        (k, _) if BUILT_IN_PLUGINS.contains(&k) => {}
+        (other, _) => {
+            return Err(format!(
+                "plugin {n}: type \"{other}\" must be \"detect\", \"balance\" or \"library\""
+            ));
+        }
+    }
+    if kind == "detect" && place != PluginPlace::Analog {
+        return Err(format!(
+            "plugin {n}: detect only runs with place = \"analog\""
+        ));
+    }
+    let mut params = BTreeMap::new();
+    for (key, value) in table {
+        let number = match value {
+            toml::Value::Float(f) => f,
+            toml::Value::Integer(i) => i as f64,
+            toml::Value::String(text) => {
+                params.insert(key, ParamValue::Text(text));
+                continue;
+            }
+            _ => return Err(format!("plugin {n}: {key} must be a number or text")),
+        };
+        if !number.is_finite() {
+            return Err(format!("plugin {n}: {key} must be a finite number"));
+        }
+        params.insert(key, ParamValue::Number(number));
+    }
+    Ok(PluginConfig {
+        place,
+        kind,
+        path,
+        params,
+    })
 }
 
 const DEFAULT_IDLE_DELAY_S: u32 = 60;
@@ -117,6 +252,8 @@ impl Default for Config {
             },
             volume_control: None,
             volume_mode: None,
+            analog: Analog::default(),
+            plugins: Vec::new(),
         }
     }
 }
@@ -162,6 +299,31 @@ impl Config {
                 delay_s: delay.unwrap_or(DEFAULT_IDLE_DELAY_S),
             },
         };
+        let mut analog = d.analog;
+        if let Some(a) = raw.analog {
+            analog.enabled = a.enabled.unwrap_or(analog.enabled);
+            analog.volume_db = a.volume_db.unwrap_or(analog.volume_db);
+        }
+        if !(-60.0..=0.0).contains(&analog.volume_db) {
+            return Err(format!(
+                "{}: analog volume_db must be from -60 to 0",
+                path.display()
+            ));
+        }
+        let mut plugins = Vec::new();
+        for (i, table) in raw.plugin.unwrap_or_default().into_iter().enumerate() {
+            let plugin =
+                plugin_from_table(i + 1, table).map_err(|e| format!("{}: {e}", path.display()))?;
+            if plugin.kind == "detect" && plugins.iter().any(|p: &PluginConfig| p.kind == "detect")
+            {
+                return Err(format!(
+                    "{}: plugin {}: only one detect plugin is allowed",
+                    path.display(),
+                    i + 1
+                ));
+            }
+            plugins.push(plugin);
+        }
         Ok(Config {
             card: raw.card,
             latency_ms: raw.latency_ms,
@@ -172,6 +334,8 @@ impl Config {
             idle,
             volume_control: raw.volume_control,
             volume_mode: raw.volume_mode,
+            analog,
+            plugins,
         })
     }
 }
@@ -267,5 +431,177 @@ mod tests {
     #[test]
     fn idle_zeros_parses() {
         assert_eq!(load_str("idle = \"zeros\"\n").unwrap().idle, Idle::Zeros);
+    }
+
+    fn err(text: &str) -> String {
+        load_str(text).unwrap_err()
+    }
+
+    #[test]
+    fn the_analog_input_is_off_by_default() {
+        for c in [Config::default(), load_str("").unwrap()] {
+            assert_eq!(
+                c.analog,
+                Analog {
+                    enabled: false,
+                    volume_db: 0.0
+                }
+            );
+            assert!(c.plugins.is_empty());
+        }
+        let c = load_str("[analog]\nenabled = true\nvolume_db = -6.5\n").unwrap();
+        assert_eq!(
+            c.analog,
+            Analog {
+                enabled: true,
+                volume_db: -6.5
+            }
+        );
+    }
+
+    #[test]
+    fn plugins_keep_the_order_of_the_file() {
+        let c = load_str(
+            "[[plugin]]\nplace = \"output\"\ntype = \"balance\"\n\
+             [[plugin]]\nplace = \"analog\"\ntype = \"detect\"\n\
+             [[plugin]]\nplace = \"mix\"\ntype = \"balance\"\n",
+        )
+        .unwrap();
+        let places: Vec<_> = c.plugins.iter().map(|p| p.place).collect();
+        assert_eq!(
+            places,
+            [PluginPlace::Output, PluginPlace::Analog, PluginPlace::Mix]
+        );
+    }
+
+    #[test]
+    fn a_plugin_table_carries_its_parameters() {
+        let c = load_str(
+            "[analog]\nenabled = true\nvolume_db = 0\n\
+             [[plugin]]\nplace = \"analog\"\ntype = \"detect\"\nthreshold = -50\nhold = 3.5\n\
+             [[plugin]]\nplace = \"output\"\ntype = \"library\"\n\
+             path = \"/usr/lib/aas/libaas_gain.so\"\ngain = -3\n",
+        )
+        .unwrap();
+        let detect = &c.plugins[0];
+        assert_eq!(detect.kind, "detect");
+        assert_eq!(detect.path, None);
+        assert_eq!(detect.params["threshold"], ParamValue::Number(-50.0));
+        assert_eq!(detect.params["hold"], ParamValue::Number(3.5));
+        assert_eq!(detect.params.len(), 2);
+        let lib = &c.plugins[1];
+        assert_eq!(lib.place, PluginPlace::Output);
+        assert_eq!(lib.kind, "library");
+        assert_eq!(
+            lib.path.as_deref(),
+            Some(Path::new("/usr/lib/aas/libaas_gain.so"))
+        );
+        assert_eq!(lib.params.len(), 1);
+        assert_eq!(lib.params["gain"], ParamValue::Number(-3.0));
+    }
+
+    #[test]
+    fn an_unknown_place_is_an_error() {
+        let e = err("[[plugin]]\nplace = \"input\"\ntype = \"balance\"\n");
+        assert!(e.contains("plugin 1") && e.contains("place"), "{e}");
+        let e = err("[[plugin]]\ntype = \"balance\"\n");
+        assert!(e.contains("plugin 1") && e.contains("place"), "{e}");
+        let e = err("[[plugin]]\nplace = \"mix\"\ntype = \"reverb\"\n");
+        assert!(e.contains("plugin 1") && e.contains("reverb"), "{e}");
+        let e = err("[[plugin]]\nplace = \"mix\"\n");
+        assert!(e.contains("plugin 1") && e.contains("type"), "{e}");
+    }
+
+    #[test]
+    fn a_library_without_a_path_is_an_error() {
+        let e = err("[[plugin]]\nplace = \"mix\"\ntype = \"library\"\n");
+        assert!(e.contains("plugin 1") && e.contains("path"), "{e}");
+    }
+
+    #[test]
+    fn a_library_path_that_is_not_absolute_is_an_error() {
+        for path in [
+            "libaas_gain.so",
+            "lib/libaas_gain.so",
+            "./libaas_gain.so",
+            "",
+        ] {
+            let e = err(&format!(
+                "[[plugin]]\nplace = \"mix\"\ntype = \"library\"\npath = \"{path}\"\n"
+            ));
+            assert!(
+                e.contains("plugin 1: path") && e.contains("absolute"),
+                "{e}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_path_on_a_built_in_is_an_error() {
+        let e = err("[[plugin]]\nplace = \"mix\"\ntype = \"balance\"\npath = \"/x.so\"\n");
+        assert!(e.contains("plugin 1") && e.contains("path"), "{e}");
+    }
+
+    #[test]
+    fn detect_outside_the_analog_chain_is_an_error() {
+        for place in ["mix", "output"] {
+            let e = err(&format!(
+                "[[plugin]]\nplace = \"{place}\"\ntype = \"detect\"\n"
+            ));
+            assert!(e.contains("plugin 1") && e.contains("detect"), "{e}");
+        }
+    }
+
+    #[test]
+    fn two_detect_entries_are_an_error() {
+        let e = err("[[plugin]]\nplace = \"analog\"\ntype = \"detect\"\n\
+             [[plugin]]\nplace = \"analog\"\ntype = \"detect\"\n");
+        assert!(e.contains("plugin 2") && e.contains("detect"), "{e}");
+    }
+
+    #[test]
+    fn a_volume_outside_the_range_is_an_error() {
+        for v in ["-60.5", "0.5", "nan", "inf"] {
+            let e = err(&format!("[analog]\nvolume_db = {v}\n"));
+            assert!(e.contains("volume_db"), "{v}: {e}");
+        }
+        for v in ["-60", "0", "-12.5"] {
+            assert!(
+                load_str(&format!("[analog]\nvolume_db = {v}\n")).is_ok(),
+                "{v}"
+            );
+        }
+        assert!(load_str("[analog]\nvolum_db = 0\n").is_err());
+    }
+
+    #[test]
+    fn a_parameter_that_is_not_a_number_or_text_is_an_error() {
+        for v in ["true", "{ a = 1 }", "[1, 2]"] {
+            let e = err(&format!(
+                "[[plugin]]\nplace = \"mix\"\ntype = \"balance\"\ngain = {v}\n"
+            ));
+            assert!(e.contains("plugin 1") && e.contains("gain"), "{v}: {e}");
+        }
+    }
+
+    #[test]
+    fn a_parameter_in_quotes_is_text_as_written() {
+        let c = load_str(
+            "[[plugin]]\nplace = \"mix\"\ntype = \"library\"\n\
+             path = \"/usr/lib/aas/libconv.so\"\nfilter = \"/etc/aas/room 1.wav\"\n",
+        )
+        .unwrap();
+        let text = ParamValue::Text("/etc/aas/room 1.wav".into());
+        assert_eq!(c.plugins[0].params["filter"], text);
+    }
+
+    #[test]
+    fn a_parameter_that_is_not_finite_is_an_error() {
+        for v in ["nan", "inf", "-inf", "+nan"] {
+            let e = err(&format!(
+                "[[plugin]]\nplace = \"mix\"\ntype = \"balance\"\ngain = {v}\n"
+            ));
+            assert!(e.contains("plugin 1") && e.contains("gain"), "{v}: {e}");
+        }
     }
 }

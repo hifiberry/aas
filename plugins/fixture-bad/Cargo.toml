@@ -1,0 +1,15 @@
+[package]
+name = "aas-plugin-fixture-bad"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Test fixture: plugins the aas loader refuses"
+license = "MIT"
+publish = false
+
+[lib]
+name = "aas_fixture_bad"
+crate-type = ["cdylib"]
+
+[dependencies]
+aas-plugin = { version = "0.1.0", path = "../../crates/aas-plugin" }

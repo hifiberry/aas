@@ -1,5 +1,7 @@
 //! Single producer, single consumer ring of stereo `i32` frames in shared
-//! memory. The writer is the client, the reader is the daemon.
+//! memory. For a playback stream the writer is the client and the reader
+//! the daemon. A capture stream swaps them: the daemon writes, the client
+//! reads.
 //!
 //! The mapped memory is written by another process, so nothing in it is
 //! trusted. The capacity is read once at map time and kept in the `Ring`.
@@ -19,7 +21,7 @@ use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 pub const MAGIC: u32 = 0x4141_5352;
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 
 /// Bytes before the frame data. Keeps the data 64 byte aligned.
 const DATA_OFFSET: usize = 64;
@@ -38,13 +40,23 @@ pub struct Header {
     pub write_pos: AtomicU64,
     /// Frames consumed since creation. Never wraps back.
     pub read_pos: AtomicU64,
+    /// Times the daemon found the ring short while the stream was running.
+    /// For a capture stream: frames the daemon dropped because the ring
+    /// was full.
     pub underruns: AtomicU64,
+    /// Frames that play after the ring: the card's buffer and the plugins.
+    /// For a capture stream: frames the analog input's plugins hold back.
     pub output_delay_frames: AtomicU32,
     pub draining: AtomicU32,
-    /// The read position the client waits for. The daemon writes the
-    /// wake-up once `read_pos` has reached it, and once more only after it
-    /// has changed. Zero asks for a wake-up after every period.
+    /// The position the client waits for: the read position for a playback
+    /// stream, the write position for a capture stream. The daemon writes
+    /// the wake-up once that position has reached it, and once more only
+    /// after it has changed. Zero asks for a wake-up after every period.
     pub wake_at: AtomicU64,
+    /// Set by the daemon when it can no longer serve the stream, such as a
+    /// capture stream after the output rate has changed, once it writes the
+    /// ring no more. Never cleared.
+    pub ended: AtomicU32,
 }
 
 const _: () = assert!(std::mem::size_of::<Header>() <= DATA_OFFSET);
@@ -60,7 +72,8 @@ const _: () = {
     assert!(offset_of!(Header, output_delay_frames) == 40);
     assert!(offset_of!(Header, draining) == 44);
     assert!(offset_of!(Header, wake_at) == 48);
-    assert!(std::mem::size_of::<Header>() == 56);
+    assert!(offset_of!(Header, ended) == 56);
+    assert!(std::mem::size_of::<Header>() == 64);
 };
 
 pub struct Ring {
@@ -535,6 +548,12 @@ mod tests {
         .unwrap();
     }
 
+    /// The size of a page of memory.
+    fn page_size() -> usize {
+        // SAFETY: a plain query.
+        unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }
+    }
+
     /// A shared mapping of a fresh memfd, not populated and not locked.
     fn bare_mapping(len: usize) -> (*mut libc::c_void, OwnedFd) {
         let fd = memfd(len);
@@ -555,33 +574,34 @@ mod tests {
 
     /// How many pages of the mapping are in memory.
     fn resident(p: *mut libc::c_void, len: usize) -> usize {
-        let mut pages = vec![0u8; len.div_ceil(4096)];
+        let mut pages = vec![0u8; len.div_ceil(page_size())];
         assert_eq!(unsafe { libc::mincore(p, len, pages.as_mut_ptr()) }, 0);
         pages.iter().filter(|&&page| page & 1 == 1).count()
     }
 
     #[test]
     fn a_kernel_without_populate_write_still_gets_every_page_mapped() {
+        // In the kernel's own pages, which are 16 KiB on some boards.
         const PAGES: usize = 64;
-        const LEN: usize = PAGES * 4096;
+        let len = PAGES * page_size();
         // An advice the kernel takes and ignores populates nothing. This
         // is what the fallback is there to prevent.
-        let (p, _fd) = bare_mapping(LEN);
-        unsafe { Ring::populate(p, LEN, libc::MADV_NORMAL) };
-        assert_eq!(resident(p, LEN), 0);
-        unsafe { libc::munmap(p, LEN) };
+        let (p, _fd) = bare_mapping(len);
+        unsafe { Ring::populate(p, len, libc::MADV_NORMAL) };
+        assert_eq!(resident(p, len), 0);
+        unsafe { libc::munmap(p, len) };
 
         // An advice no kernel knows fails as MADV_POPULATE_WRITE does
         // before Linux 5.14, and the fallback reads every page in.
-        let (p, _fd) = bare_mapping(LEN);
-        unsafe { Ring::populate(p, LEN, -1) };
-        assert_eq!(resident(p, LEN), PAGES);
-        unsafe { libc::munmap(p, LEN) };
+        let (p, _fd) = bare_mapping(len);
+        unsafe { Ring::populate(p, len, -1) };
+        assert_eq!(resident(p, len), PAGES);
+        unsafe { libc::munmap(p, len) };
 
-        let (p, _fd) = bare_mapping(LEN);
-        unsafe { Ring::populate(p, LEN, libc::MADV_POPULATE_WRITE) };
-        assert_eq!(resident(p, LEN), PAGES);
-        unsafe { libc::munmap(p, LEN) };
+        let (p, _fd) = bare_mapping(len);
+        unsafe { Ring::populate(p, len, libc::MADV_POPULATE_WRITE) };
+        assert_eq!(resident(p, len), PAGES);
+        unsafe { libc::munmap(p, len) };
     }
 
     #[test]

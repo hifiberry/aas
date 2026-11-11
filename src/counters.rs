@@ -1,6 +1,6 @@
 //! Counters the audio thread keeps for monitoring. All updates are lock free.
 
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 
 /// Totals since the start of the daemon.
 #[derive(Debug, Default)]
@@ -23,6 +23,21 @@ pub struct Counters {
     /// CLOCK_MONOTONIC, so that it can be matched to other events.
     pub last_gap_ns: AtomicU64,
     pub last_gap_at_ns: AtomicU64,
+    /// A capture has been handed to the engine at some point. Only then
+    /// does the summary name the analog input.
+    pub analog_enabled: AtomicBool,
+    /// Zeros put in front of a captured period that came short. A capture
+    /// overrun is counted nowhere else: the capture restarts in place and
+    /// the frames it lost show up here.
+    pub analog_padded_frames: AtomicU64,
+    /// Captured frames dropped because more than two periods were queued.
+    pub analog_dropped_frames: AtomicU64,
+    /// 1 while the analog input has signal, else 0. During DoP it can have
+    /// signal and not be played.
+    pub analog_open: AtomicU64,
+    /// The latency of the analog chain, in frames, in the cycles its output
+    /// is used. Recorders see it in their delay too.
+    pub analog_latency_frames: AtomicU64,
 }
 
 /// Now on CLOCK_MONOTONIC, in ns. The same clock as `/proc/uptime` without
@@ -64,7 +79,25 @@ impl std::fmt::Display for Counters {
             ms(&self.worst_gap_ns),
             ms(&self.worst_cycle_ns),
             self.cycles.load(Relaxed),
-        )
+        )?;
+        if self.analog_enabled.load(Relaxed) {
+            let state = if self.analog_open.load(Relaxed) == 1 {
+                "open"
+            } else {
+                "quiet"
+            };
+            write!(
+                f,
+                "; analog input {state}, {} frames padded, {} frames dropped",
+                self.analog_padded_frames.load(Relaxed),
+                self.analog_dropped_frames.load(Relaxed),
+            )?;
+            let latency = self.analog_latency_frames.load(Relaxed);
+            if latency > 0 {
+                write!(f, ", plugin latency {latency} frames")?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -102,6 +135,20 @@ mod tests {
             c.to_string(),
             "3 xruns, 1 wake gaps, worst gap 2.000 ms, worst cycle 0.500 ms, 1 cycles"
         );
+    }
+
+    #[test]
+    fn the_summary_names_the_analog_input_once_it_is_enabled() {
+        let c = Counters::default();
+        c.analog_padded_frames.fetch_add(5, Relaxed);
+        assert!(c.to_string().ends_with(" 0 cycles"));
+        c.analog_enabled.store(true, Relaxed);
+        let quiet = "; analog input quiet, 5 frames padded, 0 frames dropped";
+        assert!(c.to_string().ends_with(quiet), "{c}");
+        c.analog_open.store(1, Relaxed);
+        c.analog_dropped_frames.fetch_add(7, Relaxed);
+        let open = "; analog input open, 5 frames padded, 7 frames dropped";
+        assert!(c.to_string().ends_with(open), "{c}");
     }
 
     #[test]

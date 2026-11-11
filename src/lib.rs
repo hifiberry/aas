@@ -2,6 +2,8 @@
 
 pub mod bitperfect;
 pub mod board;
+pub mod capture;
+pub mod cards;
 pub mod config;
 pub mod control;
 pub mod counters;
@@ -9,6 +11,7 @@ pub mod dop;
 pub mod engine;
 pub mod format;
 pub mod latency;
+pub mod plugin;
 pub mod rate;
 pub mod resample;
 pub mod rt;
