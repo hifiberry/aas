@@ -67,9 +67,24 @@ impl Formats {
 pub struct Param {
     pub name: String,
     pub unit: String,
+    pub kind: ParamKind,
     pub min: f64,
     pub max: f64,
     pub default: f64,
+}
+
+/// Which values a parameter takes, so that a control can be built for it.
+/// Values are `f64` whatever the type.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ParamKind {
+    /// Any value in the range.
+    Float,
+    /// Whole numbers in the range.
+    Integer,
+    /// 0 is off, 1 is on.
+    Switch,
+    /// One of the named values, numbered from 0.
+    Enumeration(Vec<String>),
 }
 
 /// What a plugin reports about the block it processed.

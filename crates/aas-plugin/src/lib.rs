@@ -7,7 +7,9 @@
 //! library and never change.
 //!
 //! A plugin processes stereo audio in place, in one of the formats it
-//! names. Float samples are scaled so that full scale is 1.0 and are not
+//! names. Stereo in place is fixed in version 1: `channels_in` and
+//! `channels_out` must both be 2. A plugin that changes the channel count
+//! needs a separate output buffer, which is ABI version 2. Float samples are scaled so that full scale is 1.0 and are not
 //! clipped. `create` and `destroy` run on the control thread. `process`,
 //! `set_param`, `neutral` and `latency` run on the audio thread and must
 //! not allocate, lock or block. An instance can move between threads but
@@ -29,16 +31,35 @@
 //! A plugin written in Rust exports its descriptor as a `static`:
 //!
 //! ```
-//! use aas_plugin::{ABI, Descriptor, FORMAT_F32, ParamInfo};
+//! use aas_plugin::{
+//!     ABI, Descriptor, FORMAT_F32, PARAM_ENUMERATION, PARAM_FLOAT, ParamInfo, ValueNames,
+//! };
 //! use std::ffi::c_void;
 //!
-//! static PARAMS: [ParamInfo; 1] = [ParamInfo {
-//!     name: c"level".as_ptr(),
-//!     unit: c"dB".as_ptr(),
-//!     min: -20.0,
-//!     max: 0.0,
-//!     default: 0.0,
-//! }];
+//! static CURVES: ValueNames<2> = ValueNames([c"flat".as_ptr(), c"riaa".as_ptr()]);
+//!
+//! static PARAMS: [ParamInfo; 2] = [
+//!     ParamInfo {
+//!         name: c"level".as_ptr(),
+//!         unit: c"dB".as_ptr(),
+//!         kind: PARAM_FLOAT,
+//!         min: -20.0,
+//!         max: 0.0,
+//!         default: 0.0,
+//!         value_count: 0,
+//!         value_names: std::ptr::null(),
+//!     },
+//!     ParamInfo {
+//!         name: c"curve".as_ptr(),
+//!         unit: std::ptr::null(),
+//!         kind: PARAM_ENUMERATION,
+//!         min: 0.0,
+//!         max: 1.0,
+//!         default: 0.0,
+//!         value_count: 2,
+//!         value_names: CURVES.as_ptr(),
+//!     },
+//! ];
 //!
 //! static DESCRIPTOR: Descriptor = Descriptor {
 //!     abi: ABI,
@@ -85,7 +106,21 @@ pub const FORMAT_F64: u32 = 4;
 /// Status bit of `process`: the block carried no signal worth sending on.
 pub const STATUS_NO_SIGNAL: u32 = 1;
 
-/// One parameter of a plugin.
+/// A parameter that takes any value in its range.
+pub const PARAM_FLOAT: u32 = 0;
+/// A parameter that takes whole numbers only. Its range and default are
+/// whole numbers.
+pub const PARAM_INTEGER: u32 = 1;
+/// A switch: 0 is off, 1 is on. Its range is 0 to 1, its default 0 or 1.
+pub const PARAM_SWITCH: u32 = 2;
+/// One of a list of named values, numbered from 0. Its range is 0 to the
+/// number of values less one, its default one of them, and `value_names`
+/// names each value.
+pub const PARAM_ENUMERATION: u32 = 3;
+
+/// One parameter of a plugin. Values always travel as `f64`; the type says
+/// which of them the parameter takes, so that a user interface can build
+/// the right control for it.
 #[repr(C)]
 #[derive(Debug)]
 pub struct ParamInfo {
@@ -93,12 +128,21 @@ pub struct ParamInfo {
     pub name: *const c_char,
     /// A NUL terminated UTF-8 unit, such as `dB`. Null means none.
     pub unit: *const c_char,
+    /// One of the `PARAM_` types.
+    pub kind: u32,
     /// The smallest value, inclusive. Not NaN.
     pub min: f64,
     /// The largest value, inclusive. Not NaN, and not below `min`.
     pub max: f64,
     /// The value an instance starts with. It lies in `min` to `max`.
     pub default: f64,
+    /// For [`PARAM_ENUMERATION`], the number of values, at least 1 and at
+    /// most 4096. 0 for every other type.
+    pub value_count: u32,
+    /// For [`PARAM_ENUMERATION`], `value_count` pointers to the NUL
+    /// terminated UTF-8 name of each value, from value 0 on. Null for every
+    /// other type. Like the descriptor, they live as long as the library.
+    pub value_names: *const *const c_char,
 }
 
 /// What a plugin is and the functions that run it. Every function must be
@@ -127,7 +171,8 @@ pub struct Descriptor {
     /// Frees an instance `create` returned.
     pub destroy: Option<extern "C" fn(*mut c_void)>,
     /// Sets parameter `index` to `value`. The daemon passes only indices
-    /// below `param_count` and values inside the parameter's range.
+    /// below `param_count` and values inside the parameter's range, whole
+    /// numbers for every type but [`PARAM_FLOAT`].
     pub set_param: Option<extern "C" fn(*mut c_void, index: u32, value: f64)>,
     /// Not 0 if, with the parameters it has now, the instance leaves every
     /// block as it is.
@@ -141,6 +186,23 @@ pub struct Descriptor {
     pub process:
         Option<extern "C" fn(*mut c_void, format: u32, samples: *mut c_void, frames: u32) -> u32>,
 }
+
+/// The names of an enumeration's values, as a `static` can hold them: a
+/// plain array of pointers cannot be one, since pointers are not `Sync`.
+#[repr(transparent)]
+#[derive(Debug)]
+pub struct ValueNames<const N: usize>(pub [*const c_char; N]);
+
+impl<const N: usize> ValueNames<N> {
+    /// The pointer for [`ParamInfo::value_names`].
+    pub const fn as_ptr(&self) -> *const *const c_char {
+        self.0.as_ptr()
+    }
+}
+
+// SAFETY: as for `ParamInfo`: the names are constant for the life of the
+// library.
+unsafe impl<const N: usize> Sync for ValueNames<N> {}
 
 // SAFETY: the pointers in a parameter are only read, and the data they
 // point to is constant for the life of the library (see the crate docs).

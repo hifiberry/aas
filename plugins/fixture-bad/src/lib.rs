@@ -7,9 +7,15 @@
 //! whose default lies outside its range, and `chunks` is a working `f32`
 //! plugin that writes the frame count of each `process` call into the
 //! samples it is given and reports no signal when that count is odd.
+//! `typed` has one parameter of each type. `badkind` has a parameter of
+//! type 9, `badint` an integer with a fraction, `badswitch` a switch from
+//! 0 to 2, and `badenum` an enumeration without names.
 //! Anything else, `nodesc` among them, returns no descriptor at all.
 
-use aas_plugin::{ABI, Descriptor, FORMAT_F32, ParamInfo, STATUS_NO_SIGNAL};
+use aas_plugin::{
+    ABI, Descriptor, FORMAT_F32, PARAM_ENUMERATION, PARAM_FLOAT, PARAM_INTEGER, PARAM_SWITCH,
+    ParamInfo, STATUS_NO_SIGNAL, ValueNames,
+};
 use std::ffi::c_void;
 
 /// A fixture descriptor: stereo, `f32`, no parameters.
@@ -43,18 +49,75 @@ static NO_FN: Descriptor = Descriptor {
 };
 static CHUNKS: Descriptor = fixture(ABI, 2);
 
-static BAD_DEFAULT: [ParamInfo; 1] = [ParamInfo {
-    name: c"level".as_ptr(),
-    unit: std::ptr::null(),
-    min: 0.0,
-    max: 10.0,
-    default: 30.0,
-}];
+/// A parameter of type `kind`, with no unit and no value names, and its
+/// range and default.
+const fn param(name: &'static std::ffi::CStr, kind: u32, range: (f64, f64, f64)) -> ParamInfo {
+    ParamInfo {
+        name: name.as_ptr(),
+        unit: std::ptr::null(),
+        kind,
+        min: range.0,
+        max: range.1,
+        default: range.2,
+        value_count: 0,
+        value_names: std::ptr::null(),
+    }
+}
+
+static BAD_DEFAULT: [ParamInfo; 1] = [param(c"level", PARAM_FLOAT, (0.0, 10.0, 30.0))];
 static DEFAULT: Descriptor = Descriptor {
     param_count: 1,
     params: BAD_DEFAULT.as_ptr(),
     ..fixture(ABI, 2)
 };
+
+static CURVES: ValueNames<3> = ValueNames([c"riaa".as_ptr(), c"flat".as_ptr(), c"nab".as_ptr()]);
+static TYPED_PARAMS: [ParamInfo; 4] = [
+    param(c"level", PARAM_FLOAT, (0.0, 10.0, 0.5)),
+    param(c"taps", PARAM_INTEGER, (1.0, 16.0, 4.0)),
+    param(c"bypass", PARAM_SWITCH, (0.0, 1.0, 0.0)),
+    ParamInfo {
+        value_count: 3,
+        value_names: CURVES.as_ptr(),
+        ..param(c"curve", PARAM_ENUMERATION, (0.0, 2.0, 1.0))
+    },
+];
+static TYPED: Descriptor = Descriptor {
+    param_count: 4,
+    params: TYPED_PARAMS.as_ptr(),
+    ..fixture(ABI, 2)
+};
+
+/// A descriptor with one parameter.
+macro_rules! one_param {
+    ($params:ident, $desc:ident, $info:expr) => {
+        static $params: [ParamInfo; 1] = [$info];
+        static $desc: Descriptor = Descriptor {
+            param_count: 1,
+            params: $params.as_ptr(),
+            ..fixture(ABI, 2)
+        };
+    };
+}
+one_param!(KIND_PARAMS, BAD_KIND, param(c"level", 9, (0.0, 1.0, 0.0)));
+one_param!(
+    INT_PARAMS,
+    BAD_INT,
+    param(c"taps", PARAM_INTEGER, (1.0, 16.0, 4.5))
+);
+one_param!(
+    SWITCH_PARAMS,
+    BAD_SWITCH,
+    param(c"bypass", PARAM_SWITCH, (0.0, 2.0, 0.0))
+);
+one_param!(
+    ENUM_PARAMS,
+    BAD_ENUM,
+    ParamInfo {
+        value_count: 3,
+        ..param(c"curve", PARAM_ENUMERATION, (0.0, 2.0, 0.0))
+    }
+);
 
 /// The entry point. Returns the case `AAS_FIXTURE` names.
 #[unsafe(no_mangle)]
@@ -65,6 +128,11 @@ pub extern "C" fn aas_plugin() -> *const Descriptor {
         Ok("null") => &NULL_CREATE,
         Ok("nofn") => &NO_FN,
         Ok("default") => &DEFAULT,
+        Ok("typed") => &TYPED,
+        Ok("badkind") => &BAD_KIND,
+        Ok("badint") => &BAD_INT,
+        Ok("badswitch") => &BAD_SWITCH,
+        Ok("badenum") => &BAD_ENUM,
         Ok("chunks") => &CHUNKS,
         _ => std::ptr::null(),
     }

@@ -2,7 +2,7 @@
 //! fixture that breaks the ABI in the ways the loader refuses.
 
 use aas::plugin::native::Library;
-use aas::plugin::{Block, Formats, Plugin, Status};
+use aas::plugin::{Block, Formats, ParamKind, Plugin, Status};
 use assert_no_alloc::assert_no_alloc;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -174,6 +174,7 @@ fn its_parameters_are_described() {
         (q.name.as_str(), q.unit.as_str(), q.min, q.max, q.default),
         ("gain", "dB", -60.0, 20.0, 0.0)
     );
+    assert_eq!(q.kind, ParamKind::Float);
 }
 
 #[test]
@@ -338,5 +339,66 @@ fn a_parameter_whose_default_is_outside_its_range_is_refused() {
             assert!(msg.contains(path), "{msg}");
             assert!(msg.contains("default"), "{msg}");
         },
+    );
+}
+
+#[test]
+fn typed_parameters_are_described() {
+    with_fixture("typed_parameters_are_described", "typed", |path| {
+        let p = Library::open(path).unwrap().create(48000, 1024).unwrap();
+        let kinds: Vec<(&str, &ParamKind)> = p
+            .params()
+            .iter()
+            .map(|q| (q.name.as_str(), &q.kind))
+            .collect();
+        let names = ["riaa", "flat", "nab"].map(String::from).to_vec();
+        assert_eq!(
+            kinds,
+            [
+                ("level", &ParamKind::Float),
+                ("taps", &ParamKind::Integer),
+                ("bypass", &ParamKind::Switch),
+                ("curve", &ParamKind::Enumeration(names)),
+            ]
+        );
+    });
+}
+
+#[test]
+fn a_parameter_of_an_unknown_type_is_refused() {
+    refused_fixture(
+        "a_parameter_of_an_unknown_type_is_refused",
+        "badkind",
+        |msg, path| {
+            assert!(msg.contains(path), "{msg}");
+            assert!(msg.contains("type 9"), "{msg}");
+        },
+    );
+}
+
+#[test]
+fn an_integer_parameter_with_a_fraction_is_refused() {
+    refused_fixture(
+        "an_integer_parameter_with_a_fraction_is_refused",
+        "badint",
+        |msg, _| assert!(msg.contains("taps") && msg.contains("whole"), "{msg}"),
+    );
+}
+
+#[test]
+fn a_switch_that_is_not_0_to_1_is_refused() {
+    refused_fixture(
+        "a_switch_that_is_not_0_to_1_is_refused",
+        "badswitch",
+        |msg, _| assert!(msg.contains("bypass") && msg.contains("0 to 1"), "{msg}"),
+    );
+}
+
+#[test]
+fn an_enumeration_without_a_name_for_each_value_is_refused() {
+    refused_fixture(
+        "an_enumeration_without_a_name_for_each_value_is_refused",
+        "badenum",
+        |msg, _| assert!(msg.contains("curve") && msg.contains("names"), "{msg}"),
     );
 }

@@ -652,8 +652,9 @@ Details *(call)*:
   processing format *(call)*. A 20 Hz high-pass computed entirely in `f32` had an
   error of -90 dBFS at 48 kHz and -73 dBFS at 192 kHz, which is above the DAC's noise
   floor. This matters for the input processor and `speakereq`.
-- Plugins take two channels and give two. Other channel counts come with the
-  matrix.
+- Plugins take two channels and give two, in place. Other channel counts come
+  with the matrix, and need ABI version 2 (stage 3b), since a plugin that
+  changes the count cannot work in place.
 - A plugin can report "no signal" for its block.
 - Plugins run in-process on the audio thread, so a slow plugin causes dropouts.
 - Neutral is a property of a plugin's parameters, not of the audio. A plugin is
@@ -688,12 +689,22 @@ one symbol, `aas_plugin`, a function that returns a descriptor: the ABI version,
 a name, the formats it takes, its channels, its parameters and six functions. A
 library is loaded once and never unloaded.
 
+A parameter has a name, a unit, a range, a default and a type: float, integer,
+switch, or enumeration with a name for each value *(call)*. Values cross the ABI
+as `f64` whatever the type, and the names are static strings of the library, so
+nothing is allocated across it. The API describes each parameter by its type,
+and a user interface builds its control from that. The daemon passes whole
+numbers to every type but a float.
+
 Details *(call)*:
 
 - The loader refuses a library without the symbol, another ABI version, a null or
   misaligned descriptor, a missing function, no format, other than two channels,
-  more than 4096 parameters, a parameter range that is not a range, or a default
-  outside its range. Each refusal comes with a message.
+  more than 4096 parameters, a parameter range that is not a range, a default
+  outside its range, or a parameter whose type it does not know or whose range
+  does not fit its type: an integer needs whole numbers, a switch goes from 0 to
+  1, and an enumeration of n named values from 0 to n - 1. Each refusal comes
+  with a message.
 - A plugin that cannot be loaded stops the daemon at startup, like any other
   config error. Nothing is skipped without a word.
 - At run time the daemon checks that a block is in a format the plugin declared,

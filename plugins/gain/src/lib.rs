@@ -3,7 +3,7 @@
 //! It takes `f32` and `f64` blocks, has no latency and reports no status.
 //! At 0 dB it is neutral and leaves the audio alone.
 
-use aas_plugin::{ABI, Descriptor, FORMAT_F32, FORMAT_F64, ParamInfo};
+use aas_plugin::{ABI, Descriptor, FORMAT_F32, FORMAT_F64, PARAM_FLOAT, ParamInfo};
 use std::ffi::c_void;
 
 const MIN_DB: f64 = -60.0;
@@ -12,9 +12,12 @@ const MAX_DB: f64 = 20.0;
 static PARAMS: [ParamInfo; 1] = [ParamInfo {
     name: c"gain".as_ptr(),
     unit: c"dB".as_ptr(),
+    kind: PARAM_FLOAT,
     min: MIN_DB,
     max: MAX_DB,
     default: 0.0,
+    value_count: 0,
+    value_names: std::ptr::null(),
 }];
 
 static DESCRIPTOR: Descriptor = Descriptor {

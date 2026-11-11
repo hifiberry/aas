@@ -215,6 +215,12 @@ cargo build --release -p aas-plugin-gain
 sudo install -D -m 0644 target/release/libaas_gain.so /usr/lib/aas/libaas_gain.so
 ```
 
+Each parameter has a type, so that a user interface can build a control for it:
+`PARAM_FLOAT`, `PARAM_INTEGER`, `PARAM_SWITCH` (0 or 1) or `PARAM_ENUMERATION`,
+whose values are numbered from 0 and named in `value_names`. Values always
+travel as `f64`, whole numbers for every type but a float. Plugins are stereo in
+and out, in place; another channel count is ABI version 2.
+
 `process`, `set_param`, `neutral` and `latency` run on the audio thread and
 must not allocate, lock or block. A panic that leaves one of the plugin's
 functions aborts the daemon, so a plugin in Rust must not panic there, or must

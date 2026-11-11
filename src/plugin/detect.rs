@@ -14,7 +14,7 @@
 //! threshold and leaves no trace in the next. An infinite sample is above
 //! any threshold.
 
-use super::{Block, Formats, Param, Plugin, Status};
+use super::{Block, Formats, Param, ParamKind, Plugin, Status};
 
 /// Full scale of an `i32` sample.
 const I32_FULL: f64 = 2_147_483_648.0;
@@ -51,6 +51,7 @@ impl Detect {
             Param {
                 name: "threshold".into(),
                 unit: "dBFS".into(),
+                kind: ParamKind::Float,
                 min: -90.0,
                 max: 0.0,
                 default: -50.0,
@@ -58,6 +59,7 @@ impl Detect {
             Param {
                 name: "hold".into(),
                 unit: "s".into(),
+                kind: ParamKind::Float,
                 min: 0.0,
                 max: 60.0,
                 default: 3.0,

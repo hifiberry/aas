@@ -1605,7 +1605,7 @@ mod tests {
     use crate::config::{Format, Quality};
     use crate::format::{BlockStore, F32, F64, I32, db_to_gain};
     use crate::plugin::detect::Detect;
-    use crate::plugin::{Block, Formats, Param, Plugin, Status as PluginStatus};
+    use crate::plugin::{Block, Formats, Param, ParamKind, Plugin, Status as PluginStatus};
     use crate::sink::{MemorySink, SinkLog};
     use aas_client::ring::Ring;
     use assert_no_alloc::assert_no_alloc;
@@ -4843,6 +4843,7 @@ mod tests {
                 params: vec![Param {
                     name: "value".into(),
                     unit: String::new(),
+                    kind: ParamKind::Float,
                     min: -100.0,
                     max: 100.0,
                     default: value,

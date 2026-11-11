@@ -221,7 +221,7 @@ fn through<S: Sample, T: Sample>(
 mod tests {
     use super::*;
     use crate::format::{F32, F64, I32, Processing};
-    use crate::plugin::Param;
+    use crate::plugin::{Param, ParamKind};
     use assert_no_alloc::assert_no_alloc;
     use std::sync::{Arc, Mutex};
 
@@ -256,6 +256,7 @@ mod tests {
                 params: vec![Param {
                     name: "value".into(),
                     unit: String::new(),
+                    kind: ParamKind::Float,
                     min: -100.0,
                     max: 100.0,
                     default: value,

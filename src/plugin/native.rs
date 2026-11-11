@@ -6,9 +6,10 @@
 //! what it reports into Rust values when it is built, so the calls on the
 //! audio thread allocate nothing.
 
-use super::{Block, Formats, Param, Plugin, Status};
+use super::{Block, Formats, Param, ParamKind, Plugin, Status};
 use aas_plugin::{
-    ABI, Descriptor, FORMAT_F32, FORMAT_F64, FORMAT_I32, ParamInfo, STATUS_NO_SIGNAL,
+    ABI, Descriptor, FORMAT_F32, FORMAT_F64, FORMAT_I32, PARAM_ENUMERATION, PARAM_FLOAT,
+    PARAM_INTEGER, PARAM_SWITCH, ParamInfo, STATUS_NO_SIGNAL,
 };
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::os::unix::ffi::OsStrExt;
@@ -201,6 +202,89 @@ unsafe fn text(p: *const c_char) -> Result<String, String> {
 
 /// Copies and checks one parameter. A unit may be null.
 fn param(info: &ParamInfo) -> Result<Param, String> {
+    let param = range(info)?;
+    let name = &param.name;
+    let whole = |v: f64| v.fract() == 0.0;
+    let kind = match info.kind {
+        PARAM_FLOAT => ParamKind::Float,
+        PARAM_INTEGER => ParamKind::Integer,
+        PARAM_SWITCH => ParamKind::Switch,
+        PARAM_ENUMERATION => ParamKind::Enumeration(value_names(info, name)?),
+        other => {
+            return Err(format!(
+                "{name}: it has type {other}, which is not one of the ABI's"
+            ));
+        }
+    };
+    if info.kind != PARAM_ENUMERATION && (info.value_count != 0 || !info.value_names.is_null()) {
+        return Err(format!("{name}: only an enumeration has value names"));
+    }
+    match &kind {
+        ParamKind::Float => {}
+        ParamKind::Integer => {
+            if ![info.min, info.max, info.default].into_iter().all(whole) {
+                return Err(format!(
+                    "{name}: an integer needs a whole range and default, not {} to {} and {}",
+                    info.min, info.max, info.default
+                ));
+            }
+        }
+        ParamKind::Switch => {
+            if info.min != 0.0 || info.max != 1.0 || !whole(info.default) {
+                return Err(format!(
+                    "{name}: a switch goes from 0 to 1 and starts at one of them, not {} to {} \
+                     and {}",
+                    info.min, info.max, info.default
+                ));
+            }
+        }
+        ParamKind::Enumeration(names) => {
+            let last = names.len() as f64 - 1.0;
+            if info.min != 0.0 || info.max != last || !whole(info.default) {
+                return Err(format!(
+                    "{name}: an enumeration of {} values goes from 0 to {last} and starts at \
+                     one of them, not {} to {} and {}",
+                    names.len(),
+                    info.min,
+                    info.max,
+                    info.default
+                ));
+            }
+        }
+    }
+    Ok(Param { kind, ..param })
+}
+
+/// The most values an enumeration may have.
+const MAX_VALUES: u32 = 4096;
+
+/// Copies the names of an enumeration's values.
+fn value_names(info: &ParamInfo, name: &str) -> Result<Vec<String>, String> {
+    let count = info.value_count;
+    if count == 0 || count > MAX_VALUES {
+        return Err(format!(
+            "{name}: an enumeration has 1 to {MAX_VALUES} values, not {count}"
+        ));
+    }
+    if info.value_names.is_null() || !info.value_names.is_aligned() {
+        return Err(format!(
+            "{name}: an enumeration needs an aligned list of value names"
+        ));
+    }
+    // SAFETY: not null and aligned, and the ABI promises `value_count`
+    // names there for as long as the library is loaded.
+    let names = unsafe { std::slice::from_raw_parts(info.value_names, count as usize) };
+    names
+        .iter()
+        .enumerate()
+        // SAFETY: the ABI promises each is a C string that lives as long
+        // as the library; `text` refuses a null one.
+        .map(|(i, &p)| unsafe { text(p) }.map_err(|e| format!("{name}: the name of value {i} {e}")))
+        .collect()
+}
+
+/// Copies one parameter and checks its range, whatever its type.
+fn range(info: &ParamInfo) -> Result<Param, String> {
     // SAFETY: the ABI promises the name and unit are null or C strings
     // that live as long as the library.
     let name = unsafe { text(info.name) }.map_err(|e| format!("its name {e}"))?;
@@ -227,6 +311,7 @@ fn param(info: &ParamInfo) -> Result<Param, String> {
     Ok(Param {
         name,
         unit,
+        kind: ParamKind::Float,
         min: info.min,
         max: info.max,
         default: info.default,
@@ -280,13 +365,19 @@ impl Plugin for Native {
     }
 
     /// An index beyond the parameters never reaches the library, and a
-    /// value is clamped to the parameter's range. NaN is ignored.
+    /// value is clamped to the parameter's range, and rounded to a whole
+    /// number unless the parameter is a float. NaN is ignored.
     fn set_param(&mut self, index: usize, value: f64) {
         if let Some(p) = self.params.get(index)
             && !value.is_nan()
         {
+            let mut value = value.clamp(p.min, p.max);
+            if p.kind != ParamKind::Float {
+                // A whole range keeps a rounded value inside it.
+                value = value.round();
+            }
             // The index fits: there are at most `param_count` parameters.
-            (self.fns.set_param)(self.instance, index as u32, value.clamp(p.min, p.max));
+            (self.fns.set_param)(self.instance, index as u32, value);
         }
     }
 

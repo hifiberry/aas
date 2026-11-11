@@ -1,6 +1,6 @@
 //! Balance: turns one channel down to favour the other.
 
-use super::{Block, Formats, Param, Plugin, Status};
+use super::{Block, Formats, Param, ParamKind, Plugin, Status};
 
 /// Towards one side the other channel's gain falls linearly to 0. The near
 /// side stays at 1, so the centre leaves the audio untouched.
@@ -15,6 +15,7 @@ impl Balance {
             params: [Param {
                 name: "balance".into(),
                 unit: String::new(),
+                kind: ParamKind::Float,
                 min: -1.0,
                 max: 1.0,
                 default: 0.0,
