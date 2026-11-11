@@ -331,7 +331,9 @@ impl Control {
             return match request {
                 Request::Hello { version } if version == proto::VERSION => {
                     state.hello = true;
-                    Answer::reply(Reply::Ok)
+                    Answer::reply(Reply::Hello {
+                        version: proto::VERSION,
+                    })
                 }
                 Request::Hello { version } => {
                     eprintln!("aas: {} speaks protocol {version}", state.name);
@@ -351,7 +353,9 @@ impl Control {
             self.cancel_drain(conn);
         }
         match request {
-            Request::Hello { .. } => Answer::reply(Reply::Ok),
+            Request::Hello { .. } => Answer::reply(Reply::Hello {
+                version: proto::VERSION,
+            }),
             Request::Configure {
                 rate,
                 format,
@@ -909,7 +913,10 @@ mod tests {
         let hello = Request::Hello {
             version: proto::VERSION,
         };
-        assert_eq!(control.request(1, Some(hello), now).reply, Some(Reply::Ok));
+        let said = Reply::Hello {
+            version: proto::VERSION,
+        };
+        assert_eq!(control.request(1, Some(hello), now).reply, Some(said));
         let configure = Request::Configure {
             rate: 48000,
             format: ClientFormat::S32,
@@ -950,7 +957,10 @@ mod tests {
         let hello = Request::Hello {
             version: proto::VERSION,
         };
-        assert_eq!(control.request(1, Some(hello), now).reply, Some(Reply::Ok));
+        let said = Reply::Hello {
+            version: proto::VERSION,
+        };
+        assert_eq!(control.request(1, Some(hello), now).reply, Some(said));
         (control, engine_commands, now)
     }
 

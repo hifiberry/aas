@@ -779,7 +779,10 @@ fn volume_client(daemon: &Daemon) -> OwnedFd {
             version: proto::VERSION,
         },
     );
-    assert_eq!(receive_raw(&fd, PATIENCE), Some(Reply::Ok));
+    let said = Reply::Hello {
+        version: proto::VERSION,
+    };
+    assert_eq!(receive_raw(&fd, PATIENCE), Some(said));
     fd
 }
 
