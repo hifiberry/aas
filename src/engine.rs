@@ -4,7 +4,7 @@
 //! code only carries them out. It does not allocate, free or lock. Whatever
 //! it would free goes back to the control thread in an `Event`.
 
-use crate::bitperfect::{Situation, decide, volumes_apply};
+use crate::bitperfect::{Situation, decide, plugins_apply, volumes_apply};
 use crate::capture::Capture;
 use crate::config::BitPerfect;
 use crate::counters::Counters;
@@ -480,8 +480,10 @@ impl<P: Processing> Analog<P> {
 
     /// Reads one period into `buf` and runs the chain on it, which decides
     /// whether it is audible. A capture that fails is closed and is silent.
-    /// `store` is the mix's, free until the mix starts.
-    fn read(&mut self, period: usize, counters: &Counters, store: &mut BlockStore) {
+    /// `store` is the mix's, free until the mix starts. Without `plugins`,
+    /// in forced bit-perfect, the chain runs for its detector only and the
+    /// frames stay as captured.
+    fn read(&mut self, period: usize, counters: &Counters, store: &mut BlockStore, plugins: bool) {
         self.audible = false;
         self.is_processed = false;
         let Some(capture) = self.capture.as_mut() else {
@@ -510,7 +512,7 @@ impl<P: Processing> Analog<P> {
         let status = self.chain.process(block.reborrow());
         // A neutral chain changed nothing, so the frames stay as captured
         // and can be copied bit-perfect.
-        if !self.chain.neutral() {
+        if plugins && !self.chain.neutral() {
             P::from_block(block, processed);
             self.is_processed = true;
         }
@@ -776,7 +778,9 @@ pub enum Command {
     /// it. A shorter one is refused: it comes back as the `OldChain` and the
     /// chain in place stays. The control thread sends the chains for a new
     /// rate just before its `Reconfigure`, so that they take effect with the
-    /// reopen, as resamplers do.
+    /// reopen, as resamplers do. In forced bit-perfect the mix and output
+    /// chains are bypassed, and the analog chain runs only for its
+    /// detector: its output is not used.
     SetChain(Place, Box<Chain>),
     /// Sets a parameter of one plugin in a chain. One that is not there is
     /// ignored.
@@ -1276,7 +1280,9 @@ impl<P: Processing, S: Sink> Engine<P, S> {
     /// `start`, the end of that wait.
     fn render(&mut self, fade_out: bool, start: Instant) -> Result<(), SinkError> {
         let store = &mut self.store;
-        self.analog.read(self.period, &self.counters, store);
+        let plugins = plugins_apply(self.mode);
+        self.analog
+            .read(self.period, &self.counters, store, plugins);
         self.taps.deliver(&self.analog, self.period);
         self.scan();
         self.order_claims();
@@ -1391,9 +1397,9 @@ impl<P: Processing, S: Sink> Engine<P, S> {
     }
 
     /// Mixes the sources and the analog input while it is audible, or copies
-    /// the one that is bit-perfect. A mix then
-    /// runs the mix chain and the output chain, in that order. Returns
-    /// whether a chain with plugins ran.
+    /// the one that is bit-perfect. A mix then runs the mix chain and the
+    /// output chain, in that order, except in forced bit-perfect, which
+    /// bypasses them. Returns whether a chain with plugins ran.
     fn play_pcm(&mut self, fade_out: bool) -> bool {
         let (rate, period) = (self.rate, self.period);
         let volumes = volumes_apply(self.mode);
@@ -1442,7 +1448,8 @@ impl<P: Processing, S: Sink> Engine<P, S> {
                 self.analog.mix(fade, level, acc);
             }
         }
-        let chains_ran = !copy && (!self.mix.is_empty() || !self.output.is_empty());
+        let has_plugins = !self.mix.is_empty() || !self.output.is_empty();
+        let chains_ran = !copy && plugins_apply(self.mode) && has_plugins;
         if !copy {
             // Without plugins the mix is not copied for them at all.
             if chains_ran {
@@ -4955,18 +4962,51 @@ mod tests {
     }
 
     #[test]
-    fn forced_bit_perfect_still_runs_plugins() {
-        let mut rig = Rig::<I32>::new(BitPerfect::Forced);
-        let mut a = client(1);
-        a.source.as_mut().unwrap().gain = 0.25;
+    fn forced_bit_perfect_bypasses_plugins() {
+        fn check<P: Processing>() {
+            let mut rig = Rig::<P>::new(BitPerfect::Forced);
+            let mut a = client(1);
+            a.source.as_mut().unwrap().gain = 0.25;
+            rig.add(&mut a);
+            set_chain(&mut rig, Place::Mix, vec![times(2.0)]);
+            set_chain(&mut rig, Place::Output, vec![times(2.0)]);
+            rig.send(Command::SetGain(0.1));
+            // One source is copied untouched, whatever the plugins.
+            let input = ramp(2 * PERIOD);
+            a.ring.write(&input);
+            rig.cycle();
+            rig.cycle();
+            assert_eq!(rig.last_periods(2), input, "{:?}", format_of::<P>());
+            assert_eq!(decide(&rig.engine.situation()), Ok(()));
+            // A second is mixed in at unity, and the plugins stay out.
+            let mut b = client(2);
+            rig.add(&mut b);
+            a.ring.write(&frames(1000, PERIOD));
+            b.ring.write(&frames(234, PERIOD));
+            rig.cycle();
+            assert_eq!(rig.last_periods(1), frames(1234, PERIOD));
+        }
+        check::<I32>();
+        check::<F32>();
+        check::<F64>();
+    }
+
+    #[test]
+    fn plugin_latency_is_not_in_the_delay_in_forced_bit_perfect() {
+        let mut rig = Rig::<F32>::new(BitPerfect::Forced);
+        let (mut a, mut b) = (client(1), client(2));
         rig.add(&mut a);
-        set_chain(&mut rig, Place::Output, vec![times(2.0)]);
-        rig.send(Command::SetGain(0.1));
-        a.ring.write(&frames(1000, 2 * PERIOD));
+        rig.add(&mut b);
+        set_chain(&mut rig, Place::Mix, vec![plus(0).latency(10)]);
+        set_chain(&mut rig, Place::Output, vec![plus(0).latency(4)]);
+        rig.log.set_delay(128);
+        a.ring.write(&frames(1000, PERIOD));
+        b.ring.write(&frames(1000, PERIOD));
         rig.cycle();
-        rig.cycle();
-        // The volumes still do not apply, the plugin does.
-        assert_eq!(rig.last_periods(2), frames(2000, 2 * PERIOD));
+        // Mixed, and still without the plugins' delay.
+        let delay = |c: &Client| c.ring.header().output_delay_frames.load(Relaxed);
+        assert_eq!(delay(&a), 128);
+        assert_eq!(delay(&b), 128);
     }
 
     #[test]
@@ -5451,6 +5491,42 @@ mod tests {
         check::<F64>(frames(0x7000_0000, PERIOD));
         // An i32 block is clipped before each plugin, as the design says.
         check::<I32>(frames(1 << 29, PERIOD));
+    }
+
+    #[test]
+    fn forced_bit_perfect_plays_the_analog_input_as_captured_and_still_gates_it() {
+        fn check<P: Processing>() {
+            let (mut rig, feed) = with_capture::<P>(BitPerfect::Forced);
+            let mut detect = Detect::new(RATE);
+            detect.set_param(1, 0.0);
+            let plugins: Vec<Box<dyn Plugin>> = vec![Box::new(times(4.0)), Box::new(detect)];
+            let chain = Chain::new(plugins, format_of::<P>(), MAX_PERIOD as usize);
+            rig.send(Command::SetChain(Place::Analog, Box::new(chain)));
+            let recorder = add_tap(&mut rig, 5);
+            // A loud ramp, with the low bits set, for two windows of 50 ms.
+            let loud: Vec<[i32; 2]> = (0..75 * PERIOD as i32)
+                .map(|i| [(1 << 28) + 7 * i + 1, -(1 << 28) - i])
+                .collect();
+            for period in loud.chunks(PERIOD) {
+                feed.push(period);
+                rig.cycle();
+            }
+            // Open from the end of the first window on, and as captured.
+            let open = loud.len() - 30 * PERIOD;
+            assert_eq!(rig.last_periods(30), loud[open..], "{:?}", format_of::<P>());
+            let tapped = recorder.take();
+            assert_eq!(tapped[tapped.len() - 30 * PERIOD..], loud[open..]);
+            // Below the threshold nothing of it plays, even times four.
+            for _ in 0..80 {
+                feed.push(&frames(1000, PERIOD));
+                rig.cycle();
+            }
+            assert_eq!(rig.last_periods(30), frames(0, 30 * PERIOD));
+            assert_eq!(signals(&rig.events()), [true, false]);
+        }
+        check::<I32>();
+        check::<F32>();
+        check::<F64>();
     }
 
     #[test]

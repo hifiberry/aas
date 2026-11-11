@@ -13,7 +13,8 @@ pub enum NotBitPerfect {
     Volume,
     /// A client is being resampled.
     Resampled,
-    /// A plugin that alters the audio is in a chain.
+    /// A plugin that alters the audio is in a chain. Automatic mode only;
+    /// forced mode bypasses plugins.
     Plugin,
     /// Nothing is playing.
     NoSource,
@@ -29,17 +30,18 @@ pub struct Situation {
     pub software_volume_at_0db: bool,
     pub resampled: bool,
     /// Every plugin in the chains the output passes through leaves the
-    /// audio as it is.
+    /// audio as it is. Only automatic mode asks: forced mode bypasses them.
     pub plugins_neutral: bool,
 }
 
 /// Returns `Ok(())` when samples can be copied to the card untouched.
 ///
 /// `Off` is never bit-perfect, whatever plays. Otherwise it takes exactly
-/// one source that is not resampled, and plugins that leave the audio as it
-/// is. Forced mode does not change that: a client at another rate than the
-/// output is still resampled, and a plugin still runs, so neither is
-/// bit-perfect. Forced mode only sets aside the volumes that aas calculates.
+/// one source that is not resampled. Automatic mode also takes plugins that
+/// leave the audio as it is and volumes at 0 dB. Forced mode sets aside the
+/// volumes that aas calculates and bypasses the plugins, so neither counts
+/// there. A client at another rate than the output is still resampled, so
+/// it is not bit-perfect in either mode.
 pub fn decide(s: &Situation) -> Result<(), NotBitPerfect> {
     if s.mode == BitPerfect::Off {
         return Err(NotBitPerfect::Disabled);
@@ -52,7 +54,7 @@ pub fn decide(s: &Situation) -> Result<(), NotBitPerfect> {
     if s.resampled {
         return Err(NotBitPerfect::Resampled);
     }
-    if !s.plugins_neutral {
+    if plugins_apply(s.mode) && !s.plugins_neutral {
         return Err(NotBitPerfect::Plugin);
     }
     if s.mode == BitPerfect::Auto && !s.software_volume_at_0db {
@@ -63,6 +65,13 @@ pub fn decide(s: &Situation) -> Result<(), NotBitPerfect> {
 
 /// Whether volumes that aas calculates take effect in this mode.
 pub fn volumes_apply(mode: BitPerfect) -> bool {
+    mode != BitPerfect::Forced
+}
+
+/// Whether plugins act on the audio in this mode. In forced mode they are
+/// bypassed. The analog chain still runs there, for its detector only: its
+/// output is not used.
+pub fn plugins_apply(mode: BitPerfect) -> bool {
     mode != BitPerfect::Forced
 }
 
@@ -182,20 +191,46 @@ mod tests {
     }
 
     #[test]
-    fn a_plugin_that_is_not_neutral_stops_bit_perfect() {
-        for mode in [BitPerfect::Auto, BitPerfect::Forced] {
-            let busy =
-                |active, sw, resampled| decide(&with_plugins(mode, active, sw, resampled, false));
-            assert_eq!(busy(1, true, false), Err(NotBitPerfect::Plugin));
-            // After the resampler, before the volume.
-            assert_eq!(busy(1, true, true), Err(NotBitPerfect::Resampled));
-            assert_eq!(busy(1, false, false), Err(NotBitPerfect::Plugin));
-            assert_eq!(busy(2, true, false), Err(NotBitPerfect::SeveralSources));
-            assert_eq!(busy(0, true, false), Err(NotBitPerfect::NoSource));
-        }
+    fn a_plugin_that_is_not_neutral_stops_automatic_bit_perfect() {
+        let busy = |active, sw, resampled| {
+            decide(&with_plugins(
+                BitPerfect::Auto,
+                active,
+                sw,
+                resampled,
+                false,
+            ))
+        };
+        assert_eq!(busy(1, true, false), Err(NotBitPerfect::Plugin));
+        // After the resampler, before the volume.
+        assert_eq!(busy(1, true, true), Err(NotBitPerfect::Resampled));
+        assert_eq!(busy(1, false, false), Err(NotBitPerfect::Plugin));
+        assert_eq!(busy(2, true, false), Err(NotBitPerfect::SeveralSources));
+        assert_eq!(busy(0, true, false), Err(NotBitPerfect::NoSource));
+        assert!(plugins_apply(BitPerfect::Auto));
+        assert!(plugins_apply(BitPerfect::Off));
         assert_eq!(
             decide(&with_plugins(BitPerfect::Off, 1, true, false, false)),
             Err(NotBitPerfect::Disabled)
         );
+    }
+
+    #[test]
+    fn forced_bit_perfect_bypasses_plugins() {
+        let busy = |active, sw, resampled| {
+            decide(&with_plugins(
+                BitPerfect::Forced,
+                active,
+                sw,
+                resampled,
+                false,
+            ))
+        };
+        assert_eq!(busy(1, true, false), Ok(()));
+        assert_eq!(busy(1, false, false), Ok(()));
+        assert_eq!(busy(1, true, true), Err(NotBitPerfect::Resampled));
+        assert_eq!(busy(2, true, false), Err(NotBitPerfect::SeveralSources));
+        assert_eq!(busy(0, true, false), Err(NotBitPerfect::NoSource));
+        assert!(!plugins_apply(BitPerfect::Forced));
     }
 }
