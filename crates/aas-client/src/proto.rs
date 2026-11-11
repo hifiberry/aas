@@ -1,6 +1,7 @@
 //! Control protocol between client and daemon. Every request is
 //! `REQUEST_LEN` bytes and every reply `REPLY_LEN` bytes, little endian.
-//! A message is a u32 tag followed by u32 arguments, unused ones zero.
+//! A message is a u32 tag followed by u32 arguments. A sender sets the
+//! arguments a message does not use to zero. A receiver ignores them.
 //!
 //! Each request gets one reply, in order. A connection that has sent
 //! `SubscribeVolume` is also sent `Reply::VolumeChanged` when the output
@@ -15,10 +16,17 @@
 //! notifications never fill its socket.
 
 use crate::convert::ClientFormat;
+use std::ffi::OsString;
 use std::path::PathBuf;
 
-/// The protocol version a client sends in `Hello`.
+/// The protocol version a client sends in `Hello`, and the daemon in its
+/// reply.
 pub const VERSION: u32 = 2;
+// The ring's layout is part of the protocol, and the two versions move
+// together. A ring that changes without the protocol would get past
+// `Hello` and fail at `Configure`, where a player takes it for a bad
+// parameter.
+const _: () = assert!(VERSION == crate::ring::VERSION);
 pub const REQUEST_LEN: usize = 20;
 pub const REPLY_LEN: usize = 8;
 /// Largest buffer a client may ask for. Bounds the ring memory.
@@ -26,6 +34,8 @@ pub const MAX_BUFFER_FRAMES: u32 = 1 << 20;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Request {
+    /// Answered by `Hello`, or an error for a version the daemon does not
+    /// speak.
     Hello {
         version: u32,
     },
@@ -65,6 +75,10 @@ pub enum Reply {
     /// Not a reply: the output volume changed. Sent only to subscribers.
     VolumeChanged {
         percent: u8,
+    },
+    /// The reply to `Hello`: the protocol version the daemon speaks.
+    Hello {
+        version: u32,
     },
 }
 
@@ -160,6 +174,7 @@ pub fn encode_reply(r: &Reply) -> [u8; REPLY_LEN] {
         Reply::Volume { percent } => (3, percent as u32),
         Reply::Error { code } => (4, code),
         Reply::VolumeChanged { percent } => (5, percent as u32),
+        Reply::Hello { version } => (6, version),
     };
     let mut out = [0u8; REPLY_LEN];
     out[..4].copy_from_slice(&tag.to_le_bytes());
@@ -183,13 +198,22 @@ pub fn decode_reply(b: &[u8]) -> Option<Reply> {
         5 => Reply::VolumeChanged {
             percent: u8::try_from(word(b, 1)).ok()?,
         },
+        6 => Reply::Hello {
+            version: word(b, 1),
+        },
         _ => return None,
     })
 }
 
 /// `AAS_SOCKET` if set, else `/run/aas/aas.sock`.
 pub fn default_socket_path() -> PathBuf {
-    match std::env::var_os("AAS_SOCKET") {
+    socket_path(std::env::var_os("AAS_SOCKET"))
+}
+
+/// The socket for a value of `AAS_SOCKET`: the value, or the default if
+/// it is unset or empty.
+fn socket_path(value: Option<OsString>) -> PathBuf {
+    match value {
         Some(p) if !p.is_empty() => PathBuf::from(p),
         _ => PathBuf::from("/run/aas/aas.sock"),
     }
@@ -226,6 +250,7 @@ mod tests {
             Reply::Volume { percent: 100 },
             Reply::Error { code: 22 },
             Reply::VolumeChanged { percent: 40 },
+            Reply::Hello { version: 7 },
         ];
         for r in replies {
             assert_eq!(decode_reply(&encode_reply(&r)), Some(r));
@@ -277,11 +302,23 @@ mod tests {
 
     #[test]
     fn socket_path_default_and_override() {
-        // Both cases in one test so the environment is not raced.
-        unsafe { std::env::remove_var("AAS_SOCKET") };
-        assert_eq!(default_socket_path(), PathBuf::from("/run/aas/aas.sock"));
-        unsafe { std::env::set_var("AAS_SOCKET", "/tmp/x.sock") };
-        assert_eq!(default_socket_path(), PathBuf::from("/tmp/x.sock"));
-        unsafe { std::env::remove_var("AAS_SOCKET") };
+        // The value is passed in, so the test leaves the environment alone.
+        let default = PathBuf::from("/run/aas/aas.sock");
+        assert_eq!(socket_path(None), default);
+        assert_eq!(socket_path(Some(OsString::new())), default);
+        assert_eq!(
+            socket_path(Some(OsString::from("/tmp/x.sock"))),
+            PathBuf::from("/tmp/x.sock")
+        );
+    }
+
+    #[test]
+    fn decode_ignores_the_arguments_a_message_does_not_use() {
+        assert_eq!(decode_request(&pack(3, [1, 2, 3, 4])), Some(Request::Start));
+        assert_eq!(
+            decode_request(&pack(7, [55, 9, 9, 9])),
+            Some(Request::SetVolume { percent: 55 })
+        );
+        assert_eq!(decode_reply(&[1, 0, 0, 0, 9, 0, 0, 0]), Some(Reply::Ok));
     }
 }

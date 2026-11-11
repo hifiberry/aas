@@ -3,7 +3,7 @@
 use alsa::Direction;
 use clap::Parser;
 use measure::hw::{self, CHANNELS};
-use measure::stats::{Stats, report_header};
+use measure::stats::{Stats, report_header, verdict};
 use measure::xrun::{Action, Counter};
 use measure::{rt, stop};
 use std::process::ExitCode;
@@ -28,20 +28,9 @@ struct Args {
     no_rt: bool,
 }
 
-fn setup_rt(no_rt: bool) -> Result<(), String> {
-    let result = rt::lock_memory().and_then(|()| rt::set_fifo(FIFO_PRIORITY));
-    match result {
-        Err(e) if no_rt => {
-            eprintln!("continuing without real-time rights: {e}");
-            Ok(())
-        }
-        other => other,
-    }
-}
-
 fn run(args: &Args) -> Result<(), String> {
     stop::install();
-    setup_rt(args.no_rt)?;
+    let rt = rt::acquire(FIFO_PRIORITY, args.no_rt)?;
     let pcm = hw::open(
         &args.device,
         Direction::Playback,
@@ -73,15 +62,23 @@ fn run(args: &Args) -> Result<(), String> {
     }
     let actual = started.elapsed();
     let s = wakeups.summary();
-    println!("{}", report_header(planned, actual));
+    println!("{}", report_header(planned, actual, s.count));
     println!(
         "device {} rate {} period {} periods {} rt {}",
-        args.device, args.rate, args.period, args.periods, !args.no_rt
+        args.device, args.rate, args.period, args.periods, rt
     );
+    let buffer_ns =
+        args.period as u64 * u64::from(args.periods) * 1_000_000_000 / u64::from(args.rate);
+    println!("buffer {:.3} ms", buffer_ns as f64 / 1e6);
     println!("xruns {}", xruns.count());
     println!(
         "wake-up interval ns: count {} min {} mean {} p99 {} p99.9 {} max {}",
         s.count, s.min, s.mean, s.p99, s.p999, s.max
+    );
+    let complete = actual >= planned && s.count > 0;
+    println!(
+        "verdict {}",
+        verdict(complete, xruns.count(), s.max, buffer_ns)
     );
     Ok(())
 }

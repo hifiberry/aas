@@ -29,6 +29,11 @@ pub struct Situation {
 }
 
 /// Returns `Ok(())` when samples can be copied to the card untouched.
+///
+/// `Off` is never bit-perfect, whatever plays. Otherwise it takes exactly
+/// one source that is not resampled. Forced mode does not change that: a
+/// client at another rate than the output is still resampled, and is not
+/// bit-perfect. Forced mode only sets aside the volumes that aas calculates.
 pub fn decide(s: &Situation) -> Result<(), NotBitPerfect> {
     if s.mode == BitPerfect::Off {
         return Err(NotBitPerfect::Disabled);
@@ -71,9 +76,21 @@ mod tests {
     }
 
     #[test]
-    fn hardware_volume_does_not_block_bit_perfect() {
-        // Hardware volume leaves the software gain at 0 dB.
-        assert_eq!(decide(&sit(BitPerfect::Auto, 1, true, false)), Ok(()));
+    fn only_the_software_volume_decides_in_automatic_mode() {
+        // The card's own volume is not part of the situation. A volume the
+        // card carries leaves the software gain at 0 dB, and only that gain
+        // is asked about.
+        for resampled in [false, true] {
+            for active in 0..3 {
+                let at_0db = decide(&sit(BitPerfect::Auto, active, true, resampled));
+                let lowered = decide(&sit(BitPerfect::Auto, active, false, resampled));
+                let single = active == 1 && !resampled;
+                assert_eq!(at_0db.is_ok(), single);
+                assert_ne!(lowered, Ok(()));
+                // The volume is the last reason given, after the others.
+                assert_eq!(lowered == Err(NotBitPerfect::Volume), single);
+            }
+        }
         assert!(volumes_apply(BitPerfect::Auto));
     }
 
@@ -110,6 +127,18 @@ mod tests {
             Err(NotBitPerfect::Disabled)
         );
         assert!(volumes_apply(BitPerfect::Off));
+    }
+
+    #[test]
+    fn off_gives_its_own_reason_with_no_source_or_several() {
+        for active in [0, 2, 5] {
+            for resampled in [false, true] {
+                assert_eq!(
+                    decide(&sit(BitPerfect::Off, active, false, resampled)),
+                    Err(NotBitPerfect::Disabled)
+                );
+            }
+        }
     }
 
     #[test]

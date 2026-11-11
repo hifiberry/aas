@@ -51,17 +51,6 @@ struct Args {
     mix_only: bool,
 }
 
-fn setup_rt(no_rt: bool) -> Result<(), String> {
-    let result = rt::lock_memory().and_then(|()| rt::set_fifo(FIFO_PRIORITY));
-    match result {
-        Err(e) if no_rt => {
-            eprintln!("continuing without real-time rights: {e}");
-            Ok(())
-        }
-        other => other,
-    }
-}
-
 fn mix_case<T: Float>(
     to: fn(i32) -> T,
     from: fn(T) -> i32,
@@ -249,7 +238,7 @@ fn run_cases(cycles: usize, mix_only: bool) -> usize {
 
 fn run(args: &Args) -> Result<(), String> {
     stop::install();
-    setup_rt(args.no_rt)?;
+    let rt = rt::acquire(FIFO_PRIORITY, args.no_rt)?;
     let started = Instant::now();
     println!(
         "{:<34} {:>5} {:>9} {:>9} {:>9} {:>8} {:>8}",
@@ -262,11 +251,7 @@ fn run(args: &Args) -> Result<(), String> {
         MIX_CASES + RESAMPLE_CASES
     };
     println!("{}", report_cases(done, planned));
-    println!(
-        "took {:.1} s, rt {}",
-        started.elapsed().as_secs_f64(),
-        !args.no_rt
-    );
+    println!("took {:.1} s, rt {}", started.elapsed().as_secs_f64(), rt);
     Ok(())
 }
 

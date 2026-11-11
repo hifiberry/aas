@@ -5,6 +5,11 @@ use std::time::Duration;
 /// Identifies a client to the rate rules.
 pub type ClientId = u64;
 
+/// Rates the daemon accepts from a client, as the ALSA plugin offers them,
+/// and as the default rate in the config.
+pub const MIN_RATE: u32 = 8000;
+pub const MAX_RATE: u32 = 384000;
+
 /// How long a lone remaining client waits before the output follows its rate.
 pub const SETTLE: Duration = Duration::from_millis(500);
 
@@ -232,6 +237,47 @@ mod tests {
         p.client_started(1, 88200, T0);
         assert_eq!(p.current(), 96000);
         assert!(p.needs_resampling(1));
+    }
+
+    #[test]
+    fn a_rate_halfway_between_two_supported_ones_uses_the_lower() {
+        // 46050 is 1950 from both 44100 and 48000.
+        let mut p = policy();
+        p.client_started(1, 46050, T0);
+        assert_eq!(p.current(), 44100);
+        assert_eq!(p.nearest(46050), 44100);
+        assert_eq!(p.nearest(46051), 48000);
+        // With no rates known, every rate is taken as it is.
+        assert_eq!(RatePolicy::new(48000, Vec::new()).nearest(46050), 46050);
+    }
+
+    #[test]
+    fn new_supported_rates_move_the_output_to_the_nearest_at_once() {
+        let mut p = RatePolicy::new(48000, Vec::new());
+        p.client_started(1, 88200, T0);
+        assert_eq!(p.current(), 88200);
+        p.set_supported(RATES.to_vec());
+        assert_eq!(p.current(), 96000);
+        assert!(p.needs_resampling(1));
+        // A rate that is still supported stays.
+        p.set_supported(vec![48000, 96000]);
+        assert_eq!(p.current(), 96000);
+    }
+
+    #[test]
+    fn new_supported_rates_drop_a_switch_that_is_no_longer_needed() {
+        let mut p = RatePolicy::new(48000, vec![44100, 96000]);
+        p.client_started(1, 44100, T0);
+        p.client_started(2, 96000, T0);
+        p.client_stopped(1, T0);
+        // The card now takes 96000 only, so the output is there already.
+        p.set_supported(vec![96000]);
+        assert_eq!(p.current(), 96000);
+        assert!(p.switch_at.is_none());
+        // And a DoP rate the card no longer takes does not hold the output.
+        p.dop_started(2);
+        p.set_supported(vec![44100]);
+        assert_eq!(p.current(), 44100);
     }
 
     #[test]

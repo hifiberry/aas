@@ -9,18 +9,19 @@ use crate::config::{Config, Format, Idle, Quality};
 use crate::dop;
 use crate::engine::{Command, Event, INITIAL_SOURCES, Source};
 use crate::latency::{PERIODS, period_frames};
-use crate::rate::{ClientId, RatePolicy, SETTLE};
+use crate::rate::{ClientId, MAX_RATE, MIN_RATE, RatePolicy, SETTLE};
 use crate::resample::Resampler;
-use crate::state::State;
+use crate::state::{Saver, State};
 use crate::volume::{HardwareVolume, OutputVolume};
 use aas_client::convert::ClientFormat;
 use aas_client::proto::{self, Reply, Request};
-use aas_client::ring::{self, Ring};
+use aas_client::ring::{self, Header, Ring};
 use rtrb::{Consumer, Producer};
 use std::collections::BTreeMap;
 use std::io;
-use std::os::fd::{AsFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::path::PathBuf;
+use std::ptr::NonNull;
 use std::sync::atomic::Ordering;
 use std::thread::Thread;
 use std::time::{Duration, Instant};
@@ -28,9 +29,6 @@ use std::time::{Duration, Instant};
 /// Identifies a connection to the server.
 pub type ConnId = u64;
 
-/// Client rates the daemon accepts, as the ALSA plugin offers them.
-const MIN_RATE: u32 = 8000;
-const MAX_RATE: u32 = 384000;
 /// Smallest period the latency rule gives.
 const MIN_PERIOD: u32 = 32;
 /// Half the longest resampling filter, which rubato adds to its input.
@@ -40,6 +38,9 @@ const RATIO_HEADROOM: f64 = 1.1;
 /// How long a drain may wait beyond what its ring holds, should the audio
 /// thread never report it drained.
 const DRAIN_SPARE: Duration = Duration::from_millis(500);
+/// How long the control thread waits for room in the command queue before
+/// it says so in the log. It goes on waiting.
+const SEND_WARN: Duration = Duration::from_secs(1);
 /// How long the volume stays unchanged before the state file is written,
 /// so that a volume slider being dragged does not write it many times.
 const SAVE_DELAY: Duration = Duration::from_secs(1);
@@ -62,6 +63,56 @@ pub fn min_buffer_frames(rate: u32, latency_ms: f32) -> u32 {
     let shortest = f64::from(MIN_PERIOD) / f64::from(MIN_RATE);
     let refill = (f64::from(rate) * per_period.max(shortest)).ceil() as u32;
     min_ring_frames(rate, latency_ms) + refill
+}
+
+/// A read-only view of a ring's header, for the control thread. It maps
+/// the header alone, which is one page. A second mapping of the whole ring
+/// would lock the ring's memory once more for each client.
+struct HeaderView {
+    base: NonNull<Header>,
+}
+
+// SAFETY: the mapping is shared memory that is only read, through atomics.
+unsafe impl Send for HeaderView {}
+
+impl HeaderView {
+    const LEN: usize = size_of::<Header>();
+
+    /// Maps the header of a ring this process made, so its size is known
+    /// to hold one.
+    fn map(fd: BorrowedFd) -> io::Result<HeaderView> {
+        // SAFETY: a fresh shared mapping, the result is checked.
+        let p = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                Self::LEN,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                fd.as_raw_fd(),
+                0,
+            )
+        };
+        if p == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        let base = NonNull::new(p.cast()).ok_or_else(|| io::Error::other("mmap gave null"))?;
+        Ok(HeaderView { base })
+    }
+
+    fn header(&self) -> &Header {
+        // SAFETY: the mapping holds a header, page aligned, until drop.
+        unsafe { self.base.as_ref() }
+    }
+}
+
+// The view never takes more than the first page of a ring.
+const _: () = assert!(HeaderView::LEN <= 4096);
+
+impl Drop for HeaderView {
+    fn drop(&mut self) {
+        // SAFETY: unmaps exactly what `map` mapped.
+        unsafe { libc::munmap(self.base.as_ptr().cast(), Self::LEN) };
+    }
 }
 
 /// What the server does with a request.
@@ -106,7 +157,7 @@ struct Stream {
     /// The output rate and period of the resampler the source has.
     resampler: Option<(u32, u32)>,
     /// The control thread's own view of the ring, to see a drain progress.
-    view: Ring,
+    view: HeaderView,
     /// A drain waits for its reply. If the audio thread has taken nothing
     /// from the ring by then, it is answered anyway.
     drain: Option<Instant>,
@@ -145,19 +196,26 @@ pub struct Control {
     /// The rate and period the output was last told to open at. None while
     /// it is closed.
     output: Option<(u32, u32)>,
+    /// How many times the audio thread has been told to open the output
+    /// and has not yet answered. Nothing plays while one is under way. A
+    /// count, since an answer to an earlier open says nothing of a later
+    /// one. The audio thread answers every one, also one it dropped.
+    reopening: u32,
     /// A rate change that waits, so that a stop and a start close together
     /// do not change the rate twice.
     switch_at: Option<Instant>,
     /// Since when no client has been running.
     idle_since: Option<Instant>,
-    /// Clients the audio thread has seen play DoP, in the order seen.
-    dop_claims: Vec<ClientId>,
+    /// Clients the audio thread has seen play DoP, each with the number
+    /// the audio thread gave its claim, oldest claim first.
+    dop_claims: Vec<(u64, ClientId)>,
     dop_owner: Option<ClientId>,
     /// Replies that were not ready when their request came.
     outbox: Vec<(ConnId, Reply)>,
     volume: OutputVolume,
-    /// Where the volume is kept across restarts. None keeps it nowhere.
-    state: Option<PathBuf>,
+    /// Writes the volume to the state file, to keep it across restarts.
+    /// None keeps it nowhere.
+    saver: Option<Saver>,
     /// When the state file is due to be written.
     save_at: Option<Instant>,
     /// Volume notifications for subscribers, not yet sent.
@@ -192,13 +250,14 @@ impl Control {
             table_capacity: INITIAL_SOURCES,
             table_len: 0,
             output: None,
+            reopening: 0,
             switch_at: None,
             idle_since: None,
             dop_claims: Vec::new(),
             dop_owner: None,
             outbox: Vec::new(),
             volume: OutputVolume::new(None, config.bit_perfect),
-            state: None,
+            saver: None,
             save_at: None,
             notices: Vec::new(),
         }
@@ -209,7 +268,7 @@ impl Control {
     pub fn restore_volume(&mut self, mut volume: OutputVolume, state: PathBuf) {
         volume.set(State::load(&state).output_percent);
         self.volume = volume;
-        self.state = Some(state);
+        self.saver = Some(Saver::new(state));
         eprintln!(
             "aas: output volume {}%, in {}",
             self.volume.percent(),
@@ -249,11 +308,15 @@ impl Control {
     }
 
     /// Stops the audio thread. It returns once it has seen this.
-    /// Writes the state file if a change is still waiting for it.
+    /// Writes the state file if a change is still waiting for it, and
+    /// returns only once the file is on disk.
     pub fn shutdown(&mut self) {
         self.send(vec![Command::Shutdown]);
         if self.save_at.is_some() {
             self.save();
+        }
+        if let Some(saver) = &mut self.saver {
+            saver.finish();
         }
     }
 
@@ -331,7 +394,9 @@ impl Control {
             return match request {
                 Request::Hello { version } if version == proto::VERSION => {
                     state.hello = true;
-                    Answer::reply(Reply::Ok)
+                    Answer::reply(Reply::Hello {
+                        version: proto::VERSION,
+                    })
                 }
                 Request::Hello { version } => {
                     eprintln!("aas: {} speaks protocol {version}", state.name);
@@ -351,7 +416,9 @@ impl Control {
             self.cancel_drain(conn);
         }
         match request {
-            Request::Hello { .. } => Answer::reply(Reply::Ok),
+            Request::Hello { .. } => Answer::reply(Reply::Hello {
+                version: proto::VERSION,
+            }),
             Request::Configure {
                 rate,
                 format,
@@ -384,34 +451,34 @@ impl Control {
 
     /// Sets the output volume and tells every subscriber. The state file is
     /// written once the volume has been left alone for a while.
+    ///
+    /// The card's mixer is written even when the percent is the same, so
+    /// that asking again puts back a level another tool has changed. A
+    /// change made outside aas is not read back.
     fn set_volume(&mut self, percent: u8, now: Instant) {
-        if percent == self.volume.percent() {
+        let changed = percent != self.volume.percent();
+        self.volume.set(percent);
+        if !changed {
             return;
         }
-        self.volume.set(percent);
         self.send(vec![Command::SetGain(self.volume.gain())]);
         let subscribers = self.conns.iter().filter(|(_, c)| c.subscribed);
         let notice = Reply::VolumeChanged { percent };
         self.notices
             .extend(subscribers.map(|(&conn, _)| (conn, notice)));
-        if self.state.is_some() {
+        if self.saver.is_some() {
             self.save_at = Some(now + SAVE_DELAY);
         }
     }
 
-    /// Writes the state file. Its fsync runs on the control thread and can
-    /// hold up requests on a slow SD card, never the audio thread; the
-    /// save delay keeps it rare.
+    /// Has the state file written. The write and its sync to disk run on
+    /// the saver's thread, so a slow SD card holds up no request.
     fn save(&mut self) {
         self.save_at = None;
-        let Some(path) = &self.state else {
-            return;
-        };
-        let state = State {
-            output_percent: self.volume.percent(),
-        };
-        if let Err(e) = state.save(path) {
-            eprintln!("aas: could not save {}: {e}", path.display());
+        if let Some(saver) = &self.saver {
+            saver.save(State {
+                output_percent: self.volume.percent(),
+            });
         }
     }
 
@@ -438,7 +505,7 @@ impl Control {
         }
         let capacity = buffer_frames.max(min_ring_frames(rate, self.latency_ms));
         let made = Ring::create(capacity).and_then(|(ring, memfd)| {
-            let view = Ring::map(memfd.as_fd())?;
+            let view = HeaderView::map(memfd.as_fd())?;
             let wake = eventfd()?;
             let theirs = wake.try_clone()?;
             let memfd_theirs = memfd.try_clone()?;
@@ -567,7 +634,7 @@ impl Control {
         }
         self.policy.client_stopped(id, now - self.epoch);
         batch.push(Command::SetRunning(id, false));
-        self.dop_claims.retain(|&c| c != id);
+        self.dop_claims.retain(|&(_, c)| c != id);
         self.update_dop(now, batch);
         self.decide(now, false, batch);
     }
@@ -631,7 +698,7 @@ impl Control {
         }
         batch.push(Command::Remove(stream.id));
         self.table_len -= 1;
-        self.dop_claims.retain(|&c| c != stream.id);
+        self.dop_claims.retain(|&(_, c)| c != stream.id);
         self.update_dop(now, batch);
     }
 
@@ -665,7 +732,8 @@ impl Control {
     /// ranks the streams holding the output the same way. A new owner needs its rate at
     /// once, since its audio is discarded until then.
     fn update_dop(&mut self, now: Instant, batch: &mut Vec<Command>) {
-        let owner = self.dop_claims.iter().copied().find(|&id| {
+        let claimed = self.dop_claims.iter().map(|&(_, id)| id);
+        let owner = claimed.into_iter().find(|&id| {
             let stream = self.streams().find(|s| s.id == id);
             stream.is_some_and(|s| s.running && self.is_supported(s.rate))
         });
@@ -726,6 +794,7 @@ impl Control {
         let period = period_frames(rate, self.latency_ms);
         eprintln!("aas: output at {rate} Hz, {period} frames per period");
         self.output = Some((rate, period));
+        self.reopening += 1;
         self.switch_at = None;
         self.sync_resamplers(batch);
         batch.push(Command::Reconfigure { rate, period });
@@ -790,15 +859,18 @@ impl Control {
             match event {
                 // Freed here, not on the audio thread.
                 Event::Dropped(_) | Event::Replaced(_) | Event::OldTable(_) => {}
-                Event::Reconfigured => {}
-                Event::DopStarted(id) => {
-                    if !self.dop_claims.contains(&id) {
-                        self.dop_claims.push(id);
-                    }
+                Event::Reconfigured => self.reopening = self.reopening.saturating_sub(1),
+                Event::DopStarted(id, claim) => {
+                    // The events can come in another order than the claims
+                    // were made, when the queue was full meanwhile. The
+                    // number says which is older, as the audio thread has it.
+                    self.dop_claims.retain(|&(_, c)| c != id);
+                    let at = self.dop_claims.partition_point(|&(c, _)| c < claim);
+                    self.dop_claims.insert(at, (claim, id));
                     self.update_dop(now, &mut batch);
                 }
                 Event::DopStopped(id) => {
-                    self.dop_claims.retain(|&c| c != id);
+                    self.dop_claims.retain(|&(_, c)| c != id);
                     self.update_dop(now, &mut batch);
                     self.decide(now, false, &mut batch);
                 }
@@ -810,22 +882,26 @@ impl Control {
     }
 
     /// Applies what is due by the clock: a settled rate change, the end of
-    /// a drain the audio thread never reported, and the idle timer.
+    /// a drain the audio thread never reported, and the idle timer. Such a
+    /// drain is not ended while the output is being opened.
     pub fn tick(&mut self, now: Instant) {
         let mut batch = Vec::new();
         let before = self.policy.current();
         self.policy.tick(now - self.epoch);
         let settled = self.policy.current() != before;
         let mut overdue = Vec::new();
+        let reopening = self.reopening > 0;
         for stream in self.streams_mut() {
             if !stream.drain.is_some_and(|at| now >= at) {
                 continue;
             }
             // A drain that still makes progress is slow, not stuck: the
             // audio thread can fall behind real time when its cycles run
-            // long. It gets more time for as long as it takes frames.
+            // long. It gets more time for as long as it takes frames. So
+            // does one that waits for the card to open: its audio has not
+            // been played, and the time runs from when the card is open.
             let read = stream.view.header().read_pos.load(Ordering::Acquire);
-            if read != stream.drain_seen {
+            if read != stream.drain_seen || reopening {
                 stream.drain_seen = read;
                 stream.drain = Some(now + DRAIN_SPARE);
             } else {
@@ -856,8 +932,15 @@ impl Control {
     /// Queues the commands in one commit and wakes the audio thread. Waits
     /// for room if needed, taking events out of the other queue meanwhile,
     /// because the audio thread stops taking commands while that is full.
+    ///
+    /// The wait has no limit: a command left out would leave the two
+    /// threads with different ideas of the clients. The audio thread reads
+    /// commands every cycle, so room comes within a period. A wait of a
+    /// second means it is stuck, and is logged once.
     fn send(&mut self, batch: Vec<Command>) {
         let capacity = self.commands.buffer().capacity();
+        let mut waiting_since: Option<Instant> = None;
+        let mut warned = false;
         let mut batch = batch.into_iter().peekable();
         while batch.peek().is_some() {
             // Nobody is left to take them.
@@ -874,6 +957,14 @@ impl Control {
                         self.stash.push(event);
                     }
                     self.audio.unpark();
+                    let since = *waiting_since.get_or_insert_with(Instant::now);
+                    if !warned && since.elapsed() >= SEND_WARN {
+                        warned = true;
+                        eprintln!(
+                            "aas: the audio thread has taken no command for {} s, still waiting",
+                            SEND_WARN.as_secs()
+                        );
+                    }
                     std::thread::sleep(Duration::from_millis(1));
                 }
             }
@@ -895,7 +986,7 @@ pub(crate) fn eventfd() -> io::Result<OwnedFd> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Format, Quality};
+    use crate::config::{self, Format, Quality};
 
     #[test]
     fn a_drain_reported_before_its_request_is_answered_at_once() {
@@ -909,7 +1000,10 @@ mod tests {
         let hello = Request::Hello {
             version: proto::VERSION,
         };
-        assert_eq!(control.request(1, Some(hello), now).reply, Some(Reply::Ok));
+        let said = Reply::Hello {
+            version: proto::VERSION,
+        };
+        assert_eq!(control.request(1, Some(hello), now).reply, Some(said));
         let configure = Request::Configure {
             rate: 48000,
             format: ClientFormat::S32,
@@ -938,10 +1032,13 @@ mod tests {
     }
 
     /// A control thread with one connection that has said hello, and the
-    /// audio thread's end of the command queue.
+    /// audio thread's end of the command queue. One `Reconfigured` waits in
+    /// the event queue, for a test to take with `handle_events` once it has
+    /// made the output open.
     fn hello() -> (Control, rtrb::Consumer<Command>, Instant) {
         let (commands, engine_commands) = rtrb::RingBuffer::new(64);
-        let (_engine_events, events) = rtrb::RingBuffer::new(64);
+        let (mut engine_events, events) = rtrb::RingBuffer::new(64);
+        assert!(engine_events.push(Event::Reconfigured).is_ok());
         let config = Config::default();
         let audio = std::thread::current();
         let mut control = Control::new(&config, 12.0, Vec::new(), commands, events, audio);
@@ -950,7 +1047,10 @@ mod tests {
         let hello = Request::Hello {
             version: proto::VERSION,
         };
-        assert_eq!(control.request(1, Some(hello), now).reply, Some(Reply::Ok));
+        let said = Reply::Hello {
+            version: proto::VERSION,
+        };
+        assert_eq!(control.request(1, Some(hello), now).reply, Some(said));
         (control, engine_commands, now)
     }
 
@@ -971,6 +1071,59 @@ mod tests {
             }
         }
         panic!("no source added");
+    }
+
+    /// A card's mixer that records what it is set to.
+    struct FakeMixer(std::sync::Arc<std::sync::Mutex<Vec<f32>>>);
+
+    impl HardwareVolume for FakeMixer {
+        fn set_db(&mut self, db: f32) {
+            self.0.lock().unwrap().push(db);
+        }
+
+        fn range_db(&self) -> (f32, f32) {
+            (-103.5, 0.0)
+        }
+
+        fn can_mute(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn the_same_volume_again_is_written_to_the_card_but_not_announced() {
+        let (mut control, mut commands, now) = hello();
+        let set = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        control.card_changed(Some(Box::new(FakeMixer(set.clone()))));
+        let volume = |percent| Some(Request::SetVolume { percent });
+        assert_eq!(
+            control
+                .request(1, Some(Request::SubscribeVolume), now)
+                .reply,
+            Some(Reply::Volume { percent: 100 })
+        );
+        assert_eq!(control.request(1, volume(50), now).reply, Some(Reply::Ok));
+        assert_eq!(*set.lock().unwrap(), [0.0, -30.0]);
+        assert_eq!(control.take_notices().len(), 1);
+        while commands.pop().is_ok() {}
+        // Someone moved the card's mixer with another tool meanwhile. The
+        // same percent again puts it back.
+        assert_eq!(control.request(1, volume(50), now).reply, Some(Reply::Ok));
+        assert_eq!(*set.lock().unwrap(), [0.0, -30.0, -30.0]);
+        // Nothing changed for the subscribers, the engine or the state file.
+        assert!(control.take_notices().is_empty());
+        assert!(commands.pop().is_err());
+        assert!(control.save_at.is_none());
+    }
+
+    #[test]
+    fn the_header_view_follows_the_ring() {
+        let (ring, memfd) = Ring::create(1 << 20).unwrap();
+        let view = HeaderView::map(memfd.as_fd()).unwrap();
+        ring.write(&[[1, 1]; 300]);
+        ring.consume(200);
+        assert_eq!(view.header().read_pos.load(Ordering::Acquire), 200);
+        assert_eq!(view.header().write_pos.load(Ordering::Acquire), 300);
     }
 
     #[test]
@@ -1044,6 +1197,8 @@ mod tests {
                 .reply
                 .is_none()
         );
+        // The output has opened.
+        control.handle_events(now);
         // The audio thread runs slower than real time but keeps taking
         // frames, well past the deadline set for the ring.
         let mut t = now;
@@ -1060,9 +1215,207 @@ mod tests {
     }
 
     #[test]
+    fn a_drain_is_not_answered_while_the_output_is_still_opening() {
+        let (mut control, mut commands, now) = hello();
+        let answer = control.request(1, Some(configure(48000, 4096)), now);
+        assert_eq!(answer.reply, Some(Reply::Configured));
+        let source = added(&mut commands);
+        source.ring.write(&[[1, 1]; 4096]);
+        let start = control.request(1, Some(Request::Start), now);
+        assert_eq!(start.reply, Some(Reply::Ok));
+        let drain = control.request(1, Some(Request::Drain), now);
+        assert!(drain.reply.is_none());
+        // The card takes long to open, so nothing is played, far past the
+        // time the ring lasts. The audio was not played, so no reply.
+        let mut t = now;
+        for _ in 0..20 {
+            t += Duration::from_millis(400);
+            control.tick(t);
+            assert!(control.take_replies().is_empty(), "answered unplayed");
+        }
+        // Once it is open, the last resort applies again from then.
+        control.handle_events(t);
+        control.tick(t + Duration::from_millis(400));
+        assert!(control.take_replies().is_empty());
+        control.tick(t + Duration::from_millis(1000));
+        assert_eq!(control.take_replies(), vec![(1, Reply::Ok)]);
+    }
+
+    /// Waits for the helper thread to have written this volume.
+    fn saved(path: &std::path::Path, percent: u8) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if path.exists() && State::load(path).output_percent == percent {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        false
+    }
+
+    #[test]
+    fn the_volume_is_saved_once_it_has_been_left_alone_for_a_second() {
+        let (mut control, _commands, now) = hello();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        let volume = OutputVolume::new(None, config::BitPerfect::Auto);
+        control.restore_volume(volume, path.clone());
+        let set = |percent| Some(Request::SetVolume { percent });
+        control.request(1, set(40), now);
+        // A slider still moving: each change starts the second again.
+        control.request(1, set(30), now + Duration::from_millis(500));
+        control.tick(now + Duration::from_millis(1499));
+        assert!(control.save_at.is_some());
+        assert!(!path.exists());
+        control.tick(now + Duration::from_millis(1500));
+        assert!(control.save_at.is_none());
+        assert!(saved(&path, 30));
+        // Nothing more is written until the next change.
+        std::fs::remove_file(&path).unwrap();
+        control.tick(now + Duration::from_secs(60));
+        control.shutdown();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_volume_still_waiting_is_on_disk_when_shutdown_returns() {
+        let (mut control, _commands, now) = hello();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        let volume = OutputVolume::new(None, config::BitPerfect::Auto);
+        control.restore_volume(volume, path.clone());
+        control.request(1, Some(Request::SetVolume { percent: 20 }), now);
+        control.shutdown();
+        assert_eq!(State::load(&path).output_percent, 20);
+        // Only the state file is left, no temporary one.
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn a_batch_larger_than_the_queue_arrives_whole_and_in_order() {
+        let (commands, mut engine_commands) = rtrb::RingBuffer::new(4);
+        let (_engine_events, events) = rtrb::RingBuffer::new(4);
+        let audio = std::thread::current();
+        let mut control = Control::new(
+            &Config::default(),
+            12.0,
+            Vec::new(),
+            commands,
+            events,
+            audio,
+        );
+        // The audio thread takes one command now and then.
+        let reader = std::thread::spawn(move || {
+            let mut gains = Vec::new();
+            while gains.len() < 11 {
+                match engine_commands.pop() {
+                    Ok(Command::SetGain(gain)) => gains.push(gain),
+                    Ok(_) => panic!("another command"),
+                    Err(_) => std::thread::sleep(Duration::from_millis(2)),
+                }
+            }
+            gains
+        });
+        control.send((0..11).map(|i| Command::SetGain(i as f32)).collect());
+        let expect: Vec<f32> = (0..11).map(|i| i as f32).collect();
+        assert_eq!(reader.join().unwrap(), expect);
+    }
+
+    #[test]
+    fn the_oldest_dop_claim_owns_the_rate_whatever_order_the_events_come_in() {
+        let (commands, _engine_commands) = rtrb::RingBuffer::new(64);
+        let (mut engine_events, events) = rtrb::RingBuffer::new(64);
+        let audio = std::thread::current();
+        let mut control = Control::new(
+            &Config::default(),
+            12.0,
+            Vec::new(),
+            commands,
+            events,
+            audio,
+        );
+        let now = Instant::now();
+        for (conn, rate) in [(1, 176400), (2, 352800)] {
+            control.connected(conn, "test".into());
+            let hello = Request::Hello {
+                version: proto::VERSION,
+            };
+            control.request(conn, Some(hello), now);
+            let buffer = min_buffer_frames(rate, 12.0);
+            let answer = control.request(conn, Some(configure(rate, buffer)), now);
+            assert_eq!(answer.reply, Some(Reply::Configured));
+            let start = control.request(conn, Some(Request::Start), now);
+            assert_eq!(start.reply, Some(Reply::Ok));
+        }
+        // The audio thread saw client 2 play DoP first, but its event could
+        // not be sent until after the one for client 1.
+        assert!(engine_events.push(Event::DopStarted(1, 8)).is_ok());
+        assert!(engine_events.push(Event::DopStarted(2, 7)).is_ok());
+        control.handle_events(now);
+        assert_eq!(control.dop_owner, Some(2));
+        assert_eq!(control.policy.current(), 352800);
+        // Once the older claim ends, the other one holds the output.
+        assert!(engine_events.push(Event::DopStopped(2)).is_ok());
+        control.handle_events(now);
+        assert_eq!(control.dop_owner, Some(1));
+        assert_eq!(control.policy.current(), 176400);
+    }
+
+    #[test]
+    fn a_drain_is_held_until_the_last_of_two_opens_is_done() {
+        let (commands, mut engine_commands) = rtrb::RingBuffer::new(64);
+        let (mut engine_events, events) = rtrb::RingBuffer::new(64);
+        let audio = std::thread::current();
+        let mut control = Control::new(
+            &Config::default(),
+            12.0,
+            Vec::new(),
+            commands,
+            events,
+            audio,
+        );
+        let now = Instant::now();
+        control.connected(1, "test".into());
+        let hello = Request::Hello {
+            version: proto::VERSION,
+        };
+        control.request(1, Some(hello), now);
+        let answer = control.request(1, Some(configure(48000, 4096)), now);
+        assert_eq!(answer.reply, Some(Reply::Configured));
+        let source = added(&mut engine_commands);
+        source.ring.write(&[[1, 1]; 4096]);
+        // The start opens the output, and new rates of the card open it
+        // again at once.
+        control.request(1, Some(Request::Start), now);
+        control.set_supported(vec![44100], now);
+        assert!(
+            control
+                .request(1, Some(Request::Drain), now)
+                .reply
+                .is_none()
+        );
+        // The first open is done. The second is still under way.
+        assert!(engine_events.push(Event::Reconfigured).is_ok());
+        control.handle_events(now);
+        let mut t = now;
+        for _ in 0..20 {
+            t += Duration::from_millis(400);
+            control.tick(t);
+            assert!(control.take_replies().is_empty(), "answered unplayed");
+        }
+        assert!(engine_events.push(Event::Reconfigured).is_ok());
+        control.handle_events(t);
+        control.tick(t + Duration::from_millis(1000));
+        assert_eq!(control.take_replies(), vec![(1, Reply::Ok)]);
+    }
+
+    #[test]
     fn a_ring_holds_one_period_of_input_at_any_output_rate() {
+        // Every rate a card is asked about. A ring of the least size never
+        // makes `sync_resamplers` log that it is too small to resample from.
         let rates = [
-            8000, 11025, 22050, 44100, 48000, 96000, 176400, 192000, 384000,
+            8000, 11025, 16000, 22050, 32000, 44100, 48000, 64000, 88200, 96000, 176400, 192000,
+            352800, 384000,
         ];
         for latency_ms in [4.0, 12.0, 100.0] {
             for from in rates {

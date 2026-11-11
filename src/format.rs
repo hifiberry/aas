@@ -41,10 +41,16 @@ pub fn db_to_gain(db: f32) -> f32 {
 /// One arithmetic format for mixing.
 pub trait Processing {
     type Acc: Copy;
+    /// A gain in the form `accumulate` multiplies by.
+    type Gain: Copy;
     fn zero() -> Self::Acc;
+    /// Converts a gain. `mix_add` does this once per frame, or once per call
+    /// when the gain does not move, not once per sample.
+    fn gain(gain: f32) -> Self::Gain;
     /// Add `sample * gain` to `acc`.
-    fn accumulate(acc: &mut Self::Acc, sample: i32, gain: f32);
-    /// Convert to S32, saturating at the limits.
+    fn accumulate(acc: &mut Self::Acc, sample: i32, gain: Self::Gain);
+    /// Convert to S32, saturating at the limits. A float that is not a
+    /// number becomes 0, and an infinite one the limit of its sign.
     fn finish(acc: Self::Acc) -> i32;
     /// Copies `acc` into a block in `scratch` for the plugins. Float blocks
     /// have full scale at 1.0 and are not clipped. An `i32` block is clipped
@@ -88,15 +94,23 @@ const Q32_ONE: f64 = 4_294_967_296.0;
 
 impl Processing for I32 {
     type Acc = i64;
+    /// Q32 fixed point.
+    type Gain = i64;
 
     fn zero() -> i64 {
         0
     }
 
-    fn accumulate(acc: &mut i64, sample: i32, gain: f32) {
-        let q = (f64::from(gain) * Q32_ONE).round() as i64;
-        // The product can pass 64 bits at large gains. Add half for rounding.
-        let p = i128::from(sample) * i128::from(q) + (1i128 << 31);
+    fn gain(gain: f32) -> i64 {
+        (f64::from(gain) * Q32_ONE).round() as i64
+    }
+
+    fn accumulate(acc: &mut i64, sample: i32, q: i64) {
+        // The product can pass 64 bits at large gains. Add half for rounding,
+        // and one less below zero, so that an exact half rounds away from
+        // zero as the float formats do.
+        let p = i128::from(sample) * i128::from(q);
+        let p = p + (1i128 << 31) + (p >> 127);
         let v = (p >> 32).clamp(i128::from(i64::MIN / 2), i128::from(i64::MAX / 2));
         *acc = acc.saturating_add(v as i64);
     }
@@ -125,9 +139,14 @@ impl Processing for I32 {
 
 impl Processing for F32 {
     type Acc = f32;
+    type Gain = f32;
 
     fn zero() -> f32 {
         0.0
+    }
+
+    fn gain(gain: f32) -> f32 {
+        gain
     }
 
     fn accumulate(acc: &mut f32, sample: i32, gain: f32) {
@@ -155,13 +174,18 @@ impl Processing for F32 {
 
 impl Processing for F64 {
     type Acc = f64;
+    type Gain = f64;
 
     fn zero() -> f64 {
         0.0
     }
 
-    fn accumulate(acc: &mut f64, sample: i32, gain: f32) {
-        *acc += f64::from(sample) / SCALE * f64::from(gain);
+    fn gain(gain: f32) -> f64 {
+        f64::from(gain)
+    }
+
+    fn accumulate(acc: &mut f64, sample: i32, gain: f64) {
+        *acc += f64::from(sample) / SCALE * gain;
     }
 
     fn finish(acc: f64) -> i32 {
@@ -185,12 +209,14 @@ impl Processing for F64 {
 
 /// Sum the sources, each with its gain ramp, into `out`.
 ///
-/// Every source and `acc` must be as long as `out`; extra frames are ignored.
+/// Every source and `acc` must be as long as `out`. A shorter `acc` would
+/// leave the tail of `out` as it was, so debug builds refuse it.
 pub fn mix<P: Processing>(
     sources: &[(&[[i32; 2]], Ramp)],
     acc: &mut [[P::Acc; 2]],
     out: &mut [[i32; 2]],
 ) {
+    debug_assert_eq!(acc.len(), out.len());
     let n = out.len().min(acc.len());
     mix_clear::<P>(&mut acc[..n]);
     for (samples, ramp) in sources {
@@ -207,9 +233,18 @@ pub fn mix_clear<P: Processing>(acc: &mut [[P::Acc; 2]]) {
 
 /// Adds one source. The ramp spans all of `acc`.
 pub fn mix_add<P: Processing>(samples: &[[i32; 2]], ramp: Ramp, acc: &mut [[P::Acc; 2]]) {
+    if ramp.from == ramp.to {
+        // The usual case: the volume is not moving.
+        let g = P::gain(ramp.from);
+        for (a, s) in acc.iter_mut().zip(samples.iter()) {
+            P::accumulate(&mut a[0], s[0], g);
+            P::accumulate(&mut a[1], s[1], g);
+        }
+        return;
+    }
     let n = acc.len();
     for (i, (a, s)) in acc.iter_mut().zip(samples.iter()).enumerate() {
-        let g = ramp.at(i, n);
+        let g = P::gain(ramp.at(i, n));
         P::accumulate(&mut a[0], s[0], g);
         P::accumulate(&mut a[1], s[1], g);
     }
@@ -294,11 +329,24 @@ mod tests {
 
     #[test]
     fn i32_volume_rounds_rather_than_truncates() {
-        // 3 * 0.5 = 1.5 rounds to 2; -3 * 0.5 = -1.5 rounds to -1 (half up).
+        // 3 * 0.5 = 1.5 rounds to 2.
         assert_eq!(mix_one::<I32>(&[3, 1, 5], 0.5), [2, 1, 3]);
         // 7 * 0.25 = 1.75 truncates to 1, rounds to 2.
         assert_eq!(mix_one::<I32>(&[7], 0.25), [2]);
         assert_eq!(mix_one::<I32>(&[-7], 0.25), [-2]);
+    }
+
+    #[test]
+    fn every_format_rounds_an_exact_half_away_from_zero() {
+        // 3 * 0.5 = 1.5 and -3 * 0.5 = -1.5: the negative of a signal mixes
+        // to the negative of the result.
+        let input = [3, -3, 1, -1, 5, -5, 2, -2];
+        let expect = [2, -2, 1, -1, 3, -3, 1, -1];
+        assert_eq!(mix_one::<I32>(&input, 0.5), expect);
+        assert_eq!(mix_one::<F32>(&input, 0.5), expect);
+        assert_eq!(mix_one::<F64>(&input, 0.5), expect);
+        // Just under a half still rounds towards zero.
+        assert_eq!(mix_one::<I32>(&[-5, 5, -7, 7], 0.25), [-1, 1, -2, 2]);
     }
 
     #[test]
@@ -312,6 +360,61 @@ mod tests {
         let got: Vec<i32> = out.iter().map(|f| f[0]).collect();
         assert_eq!(got, [0, 1 << 18, 1 << 19, 3 << 18]);
         assert_eq!(ramp.at(n, n), 1.0);
+    }
+
+    #[test]
+    fn a_ramp_continues_over_two_mix_calls_without_a_step() {
+        // Two blocks of four frames, the second starting at the gain the
+        // first ended on, give the same as one ramp over eight frames.
+        let input = [[1 << 24; 2]; 4];
+        let mut acc = [[0i64; 2]; 4];
+        let mut out = [[0; 2]; 4];
+        let mut got = Vec::new();
+        for (from, to) in [(0.0, 0.5), (0.5, 1.0)] {
+            mix::<I32>(&[(&input, Ramp { from, to })], &mut acc, &mut out);
+            got.extend(out.iter().map(|f| f[0]));
+        }
+        let expect: Vec<i32> = (0..8).map(|i| i << 21).collect();
+        assert_eq!(got, expect);
+    }
+
+    #[test]
+    fn i32_sums_many_sources_at_a_large_gain_and_saturates_once() {
+        // 64 sources at a gain of 1000: each product is far over full scale,
+        // and the sum is exact in the wide accumulator until the end.
+        let up = [[1 << 20, i32::MAX]];
+        let down = [[-(1 << 20), i32::MIN]];
+        let r = Ramp::flat(1000.0);
+        let mut acc = [[0i64; 2]];
+        let mut out = [[0; 2]];
+        let mut sources = vec![(&up[..], r); 32];
+        sources.extend(vec![(&down[..], r); 32]);
+        mix::<I32>(&sources, &mut acc, &mut out);
+        // MAX and MIN differ by one, so 32 pairs leave -32 at a gain of 1000.
+        assert_eq!(out, [[0, -32_000]]);
+        mix::<I32>(&sources[..33], &mut acc, &mut out);
+        assert_eq!(out, [[i32::MAX, i32::MAX]]);
+        mix::<I32>(&sources[31..], &mut acc, &mut out);
+        assert_eq!(out, [[i32::MIN, i32::MIN]]);
+    }
+
+    #[test]
+    fn a_float_that_is_not_a_number_finishes_as_silence() {
+        assert_eq!(F32::finish(f32::NAN), 0);
+        assert_eq!(F64::finish(f64::NAN), 0);
+        assert_eq!(F32::finish(f32::INFINITY), i32::MAX);
+        assert_eq!(F32::finish(f32::NEG_INFINITY), i32::MIN);
+        assert_eq!(F64::finish(f64::INFINITY), i32::MAX);
+        assert_eq!(F64::finish(f64::NEG_INFINITY), i32::MIN);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic]
+    fn mix_refuses_an_accumulator_shorter_than_the_output() {
+        let mut acc = [[0i64; 2]; 1];
+        let mut out = [[7; 2]; 2];
+        mix::<I32>(&[], &mut acc, &mut out);
     }
 
     #[test]

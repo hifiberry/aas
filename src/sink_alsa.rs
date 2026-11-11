@@ -43,6 +43,21 @@ pub fn is_present(card: &str, ids: &[String]) -> bool {
     card.parse::<u32>().is_ok() || ids.iter().any(|id| id == card)
 }
 
+/// Whether the card to play to is among `ids`: the one the config names,
+/// or else one that `find_card` takes. The same choice as at an open.
+pub fn wanted_card_is_among(card: Option<&str>, ids: &[String]) -> bool {
+    match card {
+        Some(card) => is_present(card, ids),
+        None => find_card(ids).is_some(),
+    }
+}
+
+/// Whether the card to play to is present now. Reads the kernel's list of
+/// cards, so it belongs on the control thread.
+pub fn card_is_present(card: Option<&str>) -> bool {
+    wanted_card_is_among(card, &card_ids())
+}
+
 /// The sample format the card is opened with, best first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CardFormat {
@@ -602,6 +617,21 @@ mod tests {
         assert!(is_present("Loopback", &cards));
         assert!(!is_present("Headphones", &cards));
         assert!(is_present("3", &cards));
+    }
+
+    #[test]
+    fn the_card_to_play_to_is_looked_for_as_at_an_open() {
+        let cards = ids(&["Headphones", "sndrpihifiberry"]);
+        assert!(wanted_card_is_among(None, &cards));
+        assert!(wanted_card_is_among(Some("sndrpihifiberry"), &cards));
+        assert!(!wanted_card_is_among(Some("DAC"), &cards));
+        // Only cards that are never chosen: nothing to open.
+        let cards = ids(&["Headphones", "vc4hdmi0"]);
+        assert!(!wanted_card_is_among(None, &cards));
+        assert!(wanted_card_is_among(Some("Headphones"), &cards));
+        assert!(!wanted_card_is_among(None, &[]));
+        // A card named by index is left for ALSA to find.
+        assert!(wanted_card_is_among(Some("1"), &[]));
     }
 
     #[test]
