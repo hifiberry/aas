@@ -1534,7 +1534,9 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         let volumes = volumes_apply(self.mode);
         // A detector fading the analog input has changed its frames.
         let fading = self.analog.audible && self.analog.plays != Plays::Captured;
-        let copy = !fade_out && !fading && decide(&self.situation()).is_ok();
+        // Nor is a fade in after a mute for a chain at another rate over.
+        let unmuting = self.unmute_left > 0;
+        let copy = !fade_out && !fading && !unmuting && decide(&self.situation()).is_ok();
         let (next_gain, fade_frames) = self.next_fade_step();
         let (from, to) = if volumes {
             (self.gain, next_gain)
@@ -1600,7 +1602,7 @@ impl<P: Processing, S: Sink> Engine<P, S> {
                 P::from_block(block, acc);
             }
             mix_finish::<P>(acc, out);
-            if chains_ran && self.unmute_left > 0 {
+            if self.unmute_left > 0 {
                 let fade = (rate * FADE_MS / 1000) as usize;
                 unmute(out, &mut self.unmute_left, fade);
             }
@@ -5081,6 +5083,41 @@ mod tests {
         check::<I32>();
         check::<F32>();
         check::<F64>();
+    }
+
+    #[test]
+    fn after_a_mute_the_copy_path_fades_in_too_and_no_dip_comes_later() {
+        let mut rig = Rig::<I32>::new(BitPerfect::Auto);
+        let (mut a, mut b) = (client(1), client(2));
+        rig.add(&mut a);
+        rig.add(&mut b);
+        // A neutral mix chain built for 96 kHz: two clients are mixed, so
+        // the chain would run, and the output is silent.
+        let chain = chain_of::<I32>(vec![times(1.0).neutral()]);
+        rig.send(Command::SetChain(
+            Place::Mix,
+            Box::new((*chain).for_rate(96000)),
+        ));
+        a.ring.write(&frames(1 << 20, PERIOD));
+        b.ring.write(&frames(0, PERIOD));
+        rig.cycle();
+        assert_eq!(rig.last_periods(1), frames(0, PERIOD));
+        // One client is left, and the chain fits: the copy path would
+        // start at full level at once.
+        rig.send(Command::Remove(2));
+        let chain = chain_of::<I32>(vec![times(1.0).neutral()]);
+        rig.send(Command::SetChain(
+            Place::Mix,
+            Box::new((*chain).for_rate(RATE)),
+        ));
+        let mut out = Vec::new();
+        for _ in 0..20 {
+            a.ring.write(&frames(1 << 20, PERIOD));
+            rig.cycle();
+            out.extend(rig.last_periods(1));
+        }
+        assert!(out[0][0] <= (1 << 20) / 480 + 1, "{:?}", out[0]);
+        assert!(out[480..].iter().all(|f| f[0] == 1 << 20));
     }
 
     #[test]
