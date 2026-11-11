@@ -85,6 +85,8 @@ pub enum ParamKind {
     Switch,
     /// One of the named values, numbered from 0.
     Enumeration(Vec<String>),
+    /// Text, set with `Plugin::set_text`, only while a chain is built.
+    Text,
 }
 
 /// Why a plugin, or a chain, could not be built.
@@ -158,6 +160,11 @@ pub trait Plugin: Send {
     fn latency_frames(&self) -> u32;
     /// Processes one block in place. Runs on the audio thread.
     fn process(&mut self, block: Block<'_>) -> Status;
+    /// Sets text parameter `index`, on the control thread while the chain
+    /// is built, never later. Fails with why the plugin refuses the value.
+    fn set_text(&mut self, _index: usize, _text: &str) -> Result<(), String> {
+        Err("it takes no text".into())
+    }
     /// Forgets what it kept from earlier blocks, such as a filter's state.
     /// Called when the plugin runs again after blocks that did not pass it.
     /// Runs on the audio thread, so it must not allocate.

@@ -41,6 +41,7 @@ static DESCRIPTOR: Descriptor = Descriptor {
     process: Some(process),
     // A gain keeps nothing from one block to the next.
     reset: None,
+    set_param_text: None,
 };
 
 /// The plugin's entry point.

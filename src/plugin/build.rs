@@ -3,8 +3,8 @@
 use super::builtin;
 use super::chain::Chain;
 use super::native::Library;
-use super::{BuildError, Failure, Plugin};
-use crate::config::{Format, PluginConfig, PluginPlace};
+use super::{BuildError, Failure, Param, ParamKind, Plugin};
+use crate::config::{Format, ParamValue, PluginConfig, PluginPlace};
 use crate::engine::Place;
 use crate::latency::MAX_PERIOD;
 use std::collections::BTreeMap;
@@ -89,7 +89,7 @@ pub fn build_chain(
                 }
             },
         };
-        for (name, &value) in &p.params {
+        for (name, value) in &p.params {
             let index = plugin.params().iter().position(|q| q.name == *name);
             let Some(index) = index else {
                 return Err(config_error(format!(
@@ -97,7 +97,19 @@ pub fn build_chain(
                     p.kind
                 )));
             };
-            plugin.set_param(index, value);
+            let param = &plugin.params()[index];
+            check_value(param, value).map_err(|e| config_error(format!("{prefix}{e}")))?;
+            match value {
+                ParamValue::Number(v) => plugin.set_param(index, *v),
+                ParamValue::Text(text) => {
+                    plugin.set_text(index, text).map_err(|e| {
+                        config_error(format!(
+                            "{prefix}{} refused {name} = \"{text}\": {e}",
+                            plugin.name()
+                        ))
+                    })?;
+                }
+            }
         }
         plugins.push(plugin);
     }
@@ -112,6 +124,40 @@ pub fn build_chain(
         return Ok(Chain::empty());
     }
     Ok(Chain::new(plugins, format, max_frames).for_rate(rate))
+}
+
+/// Whether `value` fits the type of `param`: text for a text parameter, and
+/// for the others a number, whole for an integer, 0 or 1 for a switch, and
+/// one of the values for an enumeration.
+fn check_value(param: &Param, value: &ParamValue) -> Result<(), String> {
+    let name = &param.name;
+    let number = match (&param.kind, value) {
+        (ParamKind::Text, ParamValue::Text(_)) => return Ok(()),
+        (ParamKind::Text, ParamValue::Number(_)) => {
+            return Err(format!("{name} takes text, in quotes, not a number"));
+        }
+        (_, ParamValue::Text(_)) => return Err(format!("{name} takes a number, not text")),
+        (_, ParamValue::Number(v)) => *v,
+    };
+    let fits = match &param.kind {
+        ParamKind::Float | ParamKind::Text => true,
+        ParamKind::Integer => number.fract() == 0.0,
+        ParamKind::Switch => number == 0.0 || number == 1.0,
+        ParamKind::Enumeration(names) => {
+            number.fract() == 0.0 && number >= 0.0 && number < names.len() as f64
+        }
+    };
+    if fits {
+        Ok(())
+    } else {
+        let wants = match &param.kind {
+            ParamKind::Integer => "a whole number".to_string(),
+            ParamKind::Switch => "0 or 1".to_string(),
+            ParamKind::Enumeration(names) => format!("0 to {}", names.len() - 1),
+            _ => unreachable!("every float fits"),
+        };
+        Err(format!("{name} takes {wants}, not {number}"))
+    }
 }
 
 /// The three chains, built for one rate.
@@ -191,7 +237,10 @@ mod tests {
             place,
             kind: kind.into(),
             path: None,
-            params: params.iter().map(|&(k, v)| (k.into(), v)).collect(),
+            params: params
+                .iter()
+                .map(|&(k, v)| (k.into(), ParamValue::Number(v)))
+                .collect(),
         }
     }
 
@@ -311,6 +360,24 @@ mod tests {
         let fine = [plugin(PluginPlace::Mix, "balance", &[])];
         let chains = start(&fine, &mut libraries).unwrap().unwrap();
         assert_eq!(chains.rate, 96000);
+    }
+
+    #[test]
+    fn text_for_a_numeric_parameter_is_a_config_error() {
+        let mut config = [plugin(PluginPlace::Analog, "detect", &[])];
+        let text = ParamValue::Text("-40".into());
+        config[0].params.insert("threshold".into(), text);
+        let mut libraries = Libraries::default();
+        let e = build_chain(
+            &config,
+            PluginPlace::Analog,
+            48000,
+            Format::F32,
+            &mut libraries,
+        );
+        let e = e.err().unwrap();
+        assert_eq!(e.kind, Failure::Config);
+        assert!(e.message.contains("threshold takes a number"), "{e}");
     }
 
     #[test]

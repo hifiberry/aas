@@ -142,7 +142,11 @@ the file. `analog` runs on the analog input before it is mixed, `mix` on the mix
 and `output` last. Both `mix` and `output` run after the output volume. `type`
 is a built-in (`detect`, which runs only at `analog` and may appear once, or
 `balance`) or `library` with a `path`, which is absolute. Every other key is a
-parameter and must be a finite number. `detect` takes `threshold` in dBFS and
+parameter: a finite number, or text in quotes for a parameter that takes
+text, such as a file a plugin reads. Text is passed to the plugin as written,
+so a path should be absolute. Each value must fit its parameter: text for
+text, a whole number for an integer, 0 or 1 for a switch, and one of the
+values for an enumeration. `detect` takes `threshold` in dBFS and
 `hold` in seconds. Without a `detect` table it runs last at `analog` with its
 defaults. `balance` takes `balance`, from -1 (left) to 1 (right). A plugin that
 cannot be loaded stops the daemon with an error.

@@ -736,6 +736,17 @@ nothing is allocated across it. The API describes each parameter by its type,
 and a user interface builds its control from that. The daemon passes whole
 numbers to every type but a float.
 
+A text parameter, such as the filter file of a convolver, is set through a
+function of its own, with UTF-8 the plugin copies, on the control thread only,
+while the chain is built and before it reaches the audio thread, so the plugin
+may read a file there *(call)*. It is never set on the audio thread: changing
+one at run time means building a new chain. The plugin can refuse a value; the
+chain is then not built, with an error naming the plugin, the parameter and the
+value. That is a configuration error, not a rate the plugin does not support:
+at startup the daemon does not start. In the config a text parameter takes text
+in quotes and every other one a number, and each value is checked against its
+parameter's type.
+
 Details *(call)*:
 
 - The loader refuses a library without the symbol, another ABI version, a null or
@@ -851,7 +862,8 @@ as its value on a fresh install. Each `[[plugin]]` table adds one plugin to the 
 `place`, `analog`, `mix` or `output`, in the order of the file. Its `type` is
 `detect`, `balance` or `library`, and a `library` has a `path` to the shared
 library, which is absolute. `detect` runs only at `analog` and appears at most
-once. Every other key is a parameter and must be a finite number.
+once. Every other key is a parameter: a finite number, or text in quotes for a
+text parameter.
 
 Volumes and other values changed at runtime are state, not configuration. They
 are kept in a separate state file owned by the daemon and restored at startup

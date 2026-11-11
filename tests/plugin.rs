@@ -1,6 +1,8 @@
 //! Plugins loaded from shared libraries: the example gain plugin and a
 //! fixture that breaks the ABI in the ways the loader refuses.
 
+use aas::config::{Format, ParamValue, PluginConfig, PluginPlace};
+use aas::plugin::build::{Chains, Libraries as Loaded, build_chain};
 use aas::plugin::native::Library;
 use aas::plugin::{Block, Formats, ParamKind, Plugin, Status};
 use assert_no_alloc::assert_no_alloc;
@@ -554,5 +556,98 @@ fn a_create_that_succeeds_without_an_instance_is_a_failure() {
             assert_eq!(e.kind, Failure::Failed, "{e}");
             assert!(e.message.contains("gave no instance"), "{e}");
         },
+    );
+}
+
+/// One library plugin on the mix, from `path`, with `params`.
+fn library_at(path: &Path, params: &[(&str, ParamValue)]) -> Vec<PluginConfig> {
+    vec![PluginConfig {
+        place: PluginPlace::Mix,
+        kind: "library".into(),
+        path: Some(path.to_path_buf()),
+        params: params
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect(),
+    }]
+}
+
+/// Builds the mix chain of `library_at(path, params)` at 48 kHz.
+fn build_with(path: &Path, params: &[(&str, ParamValue)]) -> Result<(), aas::plugin::BuildError> {
+    let mut loaded = Loaded::default();
+    let config = library_at(path, params);
+    build_chain(&config, PluginPlace::Mix, 48000, Format::F32, &mut loaded).map(|_| ())
+}
+
+#[test]
+fn a_text_parameter_is_set_while_the_chain_is_built_and_may_be_refused() {
+    use aas::plugin::Failure;
+    with_fixture(
+        "a_text_parameter_is_set_while_the_chain_is_built_and_may_be_refused",
+        "text",
+        |path| {
+            let p = Library::open(path).unwrap().create(48000, 64).unwrap();
+            assert_eq!(p.params()[1].kind, ParamKind::Text);
+            let text = |t: &str| ParamValue::Text(t.into());
+            assert!(build_with(path, &[("file", text("/etc/aas/room.wav"))]).is_ok());
+            // Refused: a config error naming the plugin, the parameter and
+            // the value, not a rate the plugin does not support.
+            let e = build_with(path, &[("file", text("missing.wav"))])
+                .err()
+                .unwrap();
+            assert_eq!(e.kind, Failure::Config);
+            let m = &e.message;
+            assert!(m.contains("plugin 1") && m.contains("fixture"), "{m}");
+            assert!(m.contains("file") && m.contains("missing.wav"), "{m}");
+            // The value must fit the type, both ways.
+            let e = build_with(path, &[("file", ParamValue::Number(1.0))])
+                .err()
+                .unwrap();
+            assert!(e.message.contains("file takes text"), "{e}");
+            let e = build_with(path, &[("level", text("loud"))]).err().unwrap();
+            assert!(e.message.contains("level takes a number"), "{e}");
+            // At the start, the daemon does not start.
+            let mut loaded = Loaded::default();
+            let config = library_at(path, &[("file", text("missing.wav"))]);
+            let start = Chains::build_for_start(&config, 48000, &[44100], Format::F32, &mut loaded);
+            assert!(start.err().unwrap().contains("missing.wav"));
+        },
+    );
+}
+
+#[test]
+fn values_must_fit_integer_switch_and_enumeration_parameters() {
+    with_fixture(
+        "values_must_fit_integer_switch_and_enumeration_parameters",
+        "typed",
+        |path| {
+            let n = ParamValue::Number;
+            let fine = [("taps", n(8.0)), ("bypass", n(1.0)), ("curve", n(2.0))];
+            assert!(build_with(path, &fine).is_ok());
+            let e = build_with(path, &[("taps", n(4.5))]).err().unwrap();
+            assert!(e.message.contains("taps takes a whole number"), "{e}");
+            let e = build_with(path, &[("bypass", n(2.0))]).err().unwrap();
+            assert!(e.message.contains("bypass takes 0 or 1"), "{e}");
+            let e = build_with(path, &[("curve", n(3.0))]).err().unwrap();
+            assert!(e.message.contains("curve takes 0 to 2"), "{e}");
+        },
+    );
+}
+
+#[test]
+fn a_text_parameter_without_its_setter_is_refused() {
+    refused_fixture(
+        "a_text_parameter_without_its_setter_is_refused",
+        "textnosetter",
+        |msg, _| assert!(msg.contains("set_param_text"), "{msg}"),
+    );
+}
+
+#[test]
+fn a_text_parameter_without_a_name_is_refused() {
+    refused_fixture(
+        "a_text_parameter_without_a_name_is_refused",
+        "textnullname",
+        |msg, _| assert!(msg.contains("name is null"), "{msg}"),
     );
 }

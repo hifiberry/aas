@@ -2982,7 +2982,8 @@ mod tests {
     fn a_chain_is_never_sent_short_of_its_plugins() {
         // A parameter the plugin does not have fails at every rate.
         let mut nope = entry(config::PluginPlace::Mix, "balance");
-        nope.params.insert("nope".into(), 1.0);
+        nope.params
+            .insert("nope".into(), config::ParamValue::Number(1.0));
         let config = Config {
             plugins: vec![nope, entry(config::PluginPlace::Output, "balance")],
             ..analog_config()

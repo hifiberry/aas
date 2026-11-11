@@ -19,7 +19,11 @@
 //! audio thread:
 //!
 //! - `create`, `destroy`, and `set_param` while an instance is being set
-//!   up from the config, run on the control thread.
+//!   up from the config, run on the control thread. So does
+//!   `set_param_text`, always: text parameters are set only there, before
+//!   the instance is handed to the audio thread, so a plugin may read a
+//!   file in it. They are never set on the audio thread; changing one at
+//!   run time means building a new instance.
 //! - `process`, `reset`, `neutral` and `latency` run on the audio thread,
 //!   and so will `set_param` once parameters can be changed at run time
 //!   (the API, a later stage). These must not allocate, lock or block.
@@ -112,6 +116,7 @@
 //!     latency: Some(latency),
 //!     process: Some(process),
 //!     reset: None,
+//!     set_param_text: None,
 //! };
 //!
 //! #[unsafe(no_mangle)]
@@ -163,6 +168,10 @@ pub const PARAM_SWITCH: u32 = 2;
 /// number of values less one, its default one of them, and `value_names`
 /// names each value.
 pub const PARAM_ENUMERATION: u32 = 3;
+/// Text, such as the path of a file, set through `set_param_text`. Its
+/// range and default are 0; an instance starts without the text, and is
+/// given one only if the config names it.
+pub const PARAM_TEXT: u32 = 4;
 
 /// One parameter of a plugin. Values always travel as `f64`; the type says
 /// which of them the parameter takes, so that a user interface can build
@@ -248,6 +257,15 @@ pub struct Descriptor {
     /// so that it does not play an old tail. May be `None` for an instance
     /// that keeps nothing.
     pub reset: Option<extern "C" fn(*mut c_void)>,
+    /// Sets text parameter `index` to the `len` bytes of UTF-8 at `text`,
+    /// which are not NUL terminated and are valid only for the call: the
+    /// plugin copies what it needs. Runs on the control thread only.
+    /// Returns 0, or anything else to refuse the value, such as a file
+    /// that is not there; the daemon then does not build the chain, and
+    /// names the plugin, the parameter and the value. Must be given if any
+    /// parameter is [`PARAM_TEXT`], may be `None` otherwise.
+    pub set_param_text:
+        Option<extern "C" fn(*mut c_void, index: u32, text: *const u8, len: u32) -> u32>,
 }
 
 /// The size of a version 1 [`Descriptor`], for its `size`.

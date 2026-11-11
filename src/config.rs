@@ -97,8 +97,18 @@ pub struct PluginConfig {
     pub kind: String,
     /// The shared library of a `library` plugin.
     pub path: Option<PathBuf>,
-    /// Every other key of the table. The chain builder checks the names.
-    pub params: BTreeMap<String, f64>,
+    /// Every other key of the table. The chain builder checks the names,
+    /// and each value against the type of its parameter.
+    pub params: BTreeMap<String, ParamValue>,
+}
+
+/// The value of a plugin parameter in the config.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ParamValue {
+    /// For every parameter but a text one. Finite.
+    Number(f64),
+    /// For a text parameter, passed to the plugin as written.
+    Text(String),
 }
 
 /// The settings, after the defaults are filled in. The README lists the
@@ -207,12 +217,16 @@ fn plugin_from_table(n: usize, mut table: toml::Table) -> Result<PluginConfig, S
         let number = match value {
             toml::Value::Float(f) => f,
             toml::Value::Integer(i) => i as f64,
-            _ => return Err(format!("plugin {n}: {key} must be a number")),
+            toml::Value::String(text) => {
+                params.insert(key, ParamValue::Text(text));
+                continue;
+            }
+            _ => return Err(format!("plugin {n}: {key} must be a number or text")),
         };
         if !number.is_finite() {
             return Err(format!("plugin {n}: {key} must be a finite number"));
         }
-        params.insert(key, number);
+        params.insert(key, ParamValue::Number(number));
     }
     Ok(PluginConfig {
         place,
@@ -472,8 +486,8 @@ mod tests {
         let detect = &c.plugins[0];
         assert_eq!(detect.kind, "detect");
         assert_eq!(detect.path, None);
-        assert_eq!(detect.params["threshold"], -50.0);
-        assert_eq!(detect.params["hold"], 3.5);
+        assert_eq!(detect.params["threshold"], ParamValue::Number(-50.0));
+        assert_eq!(detect.params["hold"], ParamValue::Number(3.5));
         assert_eq!(detect.params.len(), 2);
         let lib = &c.plugins[1];
         assert_eq!(lib.place, PluginPlace::Output);
@@ -483,7 +497,7 @@ mod tests {
             Some(Path::new("/usr/lib/aas/libaas_gain.so"))
         );
         assert_eq!(lib.params.len(), 1);
-        assert_eq!(lib.params["gain"], -3.0);
+        assert_eq!(lib.params["gain"], ParamValue::Number(-3.0));
     }
 
     #[test]
@@ -561,13 +575,24 @@ mod tests {
     }
 
     #[test]
-    fn a_parameter_that_is_not_a_number_is_an_error() {
-        for v in ["\"loud\"", "true", "{ a = 1 }", "[1, 2]"] {
+    fn a_parameter_that_is_not_a_number_or_text_is_an_error() {
+        for v in ["true", "{ a = 1 }", "[1, 2]"] {
             let e = err(&format!(
                 "[[plugin]]\nplace = \"mix\"\ntype = \"balance\"\ngain = {v}\n"
             ));
             assert!(e.contains("plugin 1") && e.contains("gain"), "{v}: {e}");
         }
+    }
+
+    #[test]
+    fn a_parameter_in_quotes_is_text_as_written() {
+        let c = load_str(
+            "[[plugin]]\nplace = \"mix\"\ntype = \"library\"\n\
+             path = \"/usr/lib/aas/libconv.so\"\nfilter = \"/etc/aas/room 1.wav\"\n",
+        )
+        .unwrap();
+        let text = ParamValue::Text("/etc/aas/room 1.wav".into());
+        assert_eq!(c.plugins[0].params["filter"], text);
     }
 
     #[test]

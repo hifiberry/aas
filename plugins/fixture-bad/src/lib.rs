@@ -18,12 +18,15 @@
 //! as a later plugin of the same version would. `stateful` counts the
 //! `process` calls since it was created or reset and writes the count into
 //! the samples, and has `reset`. `slow` reports a latency of `u32::MAX`.
+//! `text` has a text parameter, `file`, and refuses the value
+//! `missing.wav`; `textnosetter` has one without `set_param_text`, and
+//! `textnullname` one without a name.
 //! Anything else, `nodesc` among them, returns no descriptor at all.
 
 use aas_plugin::{
     ABI, CREATE_FAILED, CREATE_OK, CREATE_UNSUPPORTED, DESCRIPTOR_SIZE, Descriptor, FORMAT_F32,
-    PARAM_ENUMERATION, PARAM_FLOAT, PARAM_INFO_SIZE, PARAM_INTEGER, PARAM_SWITCH, ParamInfo,
-    STATUS_NO_SIGNAL, ValueNames,
+    PARAM_ENUMERATION, PARAM_FLOAT, PARAM_INFO_SIZE, PARAM_INTEGER, PARAM_SWITCH, PARAM_TEXT,
+    ParamInfo, STATUS_NO_SIGNAL, ValueNames,
 };
 use std::ffi::c_void;
 
@@ -45,6 +48,7 @@ const fn fixture(abi: u32, channels_in: u32) -> Descriptor {
         latency: Some(latency),
         process: Some(process),
         reset: None,
+        set_param_text: None,
     }
 }
 
@@ -226,6 +230,39 @@ static STATEFUL: Descriptor = Descriptor {
     ..fixture(ABI, 2)
 };
 
+static TEXT_PARAMS: [ParamInfo; 2] = [
+    param(c"level", PARAM_FLOAT, (0.0, 10.0, 0.5)),
+    param(c"file", PARAM_TEXT, (0.0, 0.0, 0.0)),
+];
+static TEXT: Descriptor = Descriptor {
+    param_count: 2,
+    params: TEXT_PARAMS.as_ptr(),
+    set_param_text: Some(set_param_text),
+    ..fixture(ABI, 2)
+};
+static TEXT_NO_SETTER: Descriptor = Descriptor {
+    param_count: 2,
+    params: TEXT_PARAMS.as_ptr(),
+    ..fixture(ABI, 2)
+};
+static NAMELESS: [ParamInfo; 1] = [ParamInfo {
+    name: std::ptr::null(),
+    ..param(c"file", PARAM_TEXT, (0.0, 0.0, 0.0))
+}];
+static TEXT_NULL_NAME: Descriptor = Descriptor {
+    param_count: 1,
+    params: NAMELESS.as_ptr(),
+    set_param_text: Some(set_param_text),
+    ..fixture(ABI, 2)
+};
+
+/// Takes any text but `missing.wav`.
+extern "C" fn set_param_text(_: *mut c_void, _: u32, text: *const u8, len: u32) -> u32 {
+    // SAFETY: the ABI passes `len` bytes at `text`, valid for the call.
+    let text = unsafe { std::slice::from_raw_parts(text, len as usize) };
+    u32::from(text == b"missing.wav")
+}
+
 static SLOW: Descriptor = Descriptor {
     latency: Some(latency_max),
     ..fixture(ABI, 2)
@@ -256,6 +293,9 @@ pub extern "C" fn aas_plugin() -> *const Descriptor {
         Ok("bigger") => &BIGGER.known,
         Ok("stateful") => &STATEFUL,
         Ok("slow") => &SLOW,
+        Ok("text") => &TEXT,
+        Ok("textnosetter") => &TEXT_NO_SETTER,
+        Ok("textnullname") => &TEXT_NULL_NAME,
         _ => std::ptr::null(),
     }
 }

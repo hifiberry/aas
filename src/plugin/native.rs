@@ -10,7 +10,7 @@ use super::{Block, BuildError, Failure, Formats, Param, ParamKind, Plugin, Statu
 use aas_plugin::{
     ABI, CREATE_OK, CREATE_UNSUPPORTED, DESCRIPTOR_SIZE, Descriptor, FORMAT_F32, FORMAT_F64,
     FORMAT_I32, PARAM_ENUMERATION, PARAM_FLOAT, PARAM_INFO_SIZE, PARAM_INTEGER, PARAM_SWITCH,
-    ParamInfo, STATUS_NO_SIGNAL,
+    PARAM_TEXT, ParamInfo, STATUS_NO_SIGNAL,
 };
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::os::unix::ffi::OsStrExt;
@@ -135,6 +135,12 @@ impl Library {
                 })
                 .collect::<Result<_, _>>()?
         };
+        if fns.set_param_text.is_none() && params.iter().any(|p: &Param| p.kind == ParamKind::Text)
+        {
+            return Err(fail(
+                "it has a text parameter but no function set_param_text".into(),
+            ));
+        }
         Ok(Library {
             path: shown,
             fns,
@@ -214,6 +220,8 @@ struct Fns {
     process: extern "C" fn(*mut c_void, u32, *mut c_void, u32) -> u32,
     /// Optional.
     reset: Option<extern "C" fn(*mut c_void)>,
+    /// Given if any parameter is text.
+    set_param_text: Option<extern "C" fn(*mut c_void, u32, *const u8, u32) -> u32>,
 }
 
 impl Fns {
@@ -227,6 +235,7 @@ impl Fns {
             latency: d.latency.ok_or("latency")?,
             process: d.process.ok_or("process")?,
             reset: d.reset,
+            set_param_text: d.set_param_text,
         })
     }
 }
@@ -270,6 +279,7 @@ fn param(info: &ParamInfo) -> Result<Param, String> {
         PARAM_INTEGER => ParamKind::Integer,
         PARAM_SWITCH => ParamKind::Switch,
         PARAM_ENUMERATION => ParamKind::Enumeration(value_names(info, name)?),
+        PARAM_TEXT => ParamKind::Text,
         other => {
             return Err(format!(
                 "{name}: it has type {other}, which is not one of the ABI's"
@@ -281,6 +291,11 @@ fn param(info: &ParamInfo) -> Result<Param, String> {
     }
     match &kind {
         ParamKind::Float => {}
+        ParamKind::Text => {
+            if info.min != 0.0 || info.max != 0.0 || info.default != 0.0 {
+                return Err(format!("{name}: a text parameter has range and default 0"));
+            }
+        }
         ParamKind::Integer => {
             if ![info.min, info.max, info.default].into_iter().all(whole) {
                 return Err(format!(
@@ -431,6 +446,10 @@ impl Plugin for Native {
         if let Some(p) = self.params.get(index)
             && !value.is_nan()
         {
+            if p.kind == ParamKind::Text {
+                // Text is set with `set_text`, while the chain is built.
+                return;
+            }
             let mut value = value.clamp(p.min, p.max);
             if p.kind != ParamKind::Float {
                 // A whole range keeps a rounded value inside it.
@@ -443,6 +462,22 @@ impl Plugin for Native {
 
     fn neutral(&self) -> bool {
         (self.fns.neutral)(self.instance) != 0
+    }
+
+    fn set_text(&mut self, index: usize, text: &str) -> Result<(), String> {
+        let (Some(p), Some(set)) = (self.params.get(index), self.fns.set_param_text) else {
+            return Err("it takes no text".into());
+        };
+        if p.kind != ParamKind::Text {
+            return Err(format!("{} is not a text parameter", p.name));
+        }
+        let len = u32::try_from(text.len()).map_err(|_| "the text is too long".to_string())?;
+        // The index fits, as in `set_param`. The text is valid for the
+        // call, as the ABI says.
+        match set(self.instance, index as u32, text.as_ptr(), len) {
+            0 => Ok(()),
+            code => Err(format!("the plugin refused it (status {code})")),
+        }
     }
 
     fn reset(&mut self) {
