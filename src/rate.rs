@@ -88,14 +88,21 @@ impl RatePolicy {
         self.drop_unneeded_switch();
     }
 
-    /// A client stops or pauses.
+    /// A client stops or pauses. When the last one goes, the card keeps the
+    /// rate it runs at, also one a DoP stream set.
     pub fn client_stopped(&mut self, id: ClientId, now: Duration) {
+        let output = self.current();
         let before = self.clients.len();
         self.clients.retain(|c| c.id != id);
         if self.dop == Some(id) {
             self.dop = None;
         }
         if self.clients.len() == before {
+            return;
+        }
+        if self.clients.is_empty() {
+            self.base = output;
+            self.switch_at = None;
             return;
         }
         if self.settle_target().is_some() {
@@ -142,12 +149,6 @@ impl RatePolicy {
         self.supported = rates;
         self.base = self.nearest(self.base);
         self.drop_unneeded_switch();
-    }
-
-    /// The rate the ordinary rules set, whatever rate a DoP stream holds
-    /// the output at.
-    pub fn base(&self) -> u32 {
-        self.base
     }
 
     /// The output rate.
@@ -333,19 +334,6 @@ mod tests {
     }
 
     #[test]
-    fn the_base_rate_ignores_dop() {
-        let mut p = policy();
-        p.client_started(1, 44100, T0);
-        assert_eq!(p.base(), 44100);
-        p.client_started(2, 192000, T0);
-        p.dop_started(2);
-        assert_eq!(p.current(), 192000);
-        assert_eq!(p.base(), 44100);
-        p.dop_stopped(2);
-        assert_eq!(p.base(), 44100);
-    }
-
-    #[test]
     fn three_clients_first_stops_and_the_others_share_their_rate() {
         let mut p = policy();
         p.client_started(1, 44100, T0);
@@ -436,6 +424,19 @@ mod tests {
         p.client_stopped(2, T0 + ms(100));
         p.tick(T0 + ms(5000));
         assert_eq!(p.current(), 44100);
+    }
+
+    #[test]
+    fn the_card_keeps_a_dop_rate_when_the_last_client_leaves() {
+        let mut p = policy();
+        p.client_started(1, 44100, T0);
+        p.client_started(2, 192000, T0);
+        p.dop_started(2);
+        // The 44.1 kHz client leaves within the settle time, then DoP.
+        p.client_stopped(1, T0 + ms(100));
+        p.client_stopped(2, T0 + ms(200));
+        p.tick(T0 + ms(5000));
+        assert_eq!(p.current(), 192000);
     }
 
     #[test]

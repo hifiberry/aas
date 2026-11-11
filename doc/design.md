@@ -209,16 +209,21 @@ Further rules *(call)*:
 - If the card does not support a client's rate, the output uses the nearest
   supported rate and the client is resampled. In a tie, the lower rate wins.
 - A source that reports no signal (see Analog input) does not count as active.
-- The analog input takes part in these rules at the rate they set without DoP,
-  never at a rate a DoP stream forces. A DoP stream changes the output rate as it
-  does for players. When it stops, the earlier rules apply again and the output
-  returns to the earlier rate, with the analog input still active.
+- The analog input takes part in these rules at the rate the output runs at, so
+  it never sets a rate. If it has signal first it counts as the first client,
+  and a later player at another rate is resampled. When the output rate changes,
+  for DoP included, the input follows it.
+- After a DoP stream ends with only the analog input left, the card keeps the
+  DoP rate. The reopen for DoP closes the capture, which is silent for 1 s once
+  it opens again, so the input is quiet within the settle time and DoP is left
+  as the only client. When its signal is back, the input runs at that rate.
 - A reopen of the output closes the card's capture and opens it again, so the
   analog input goes quiet for a moment. If its signal is not back within the
   settle time, it counts as a client that stopped. A detector built for the new
   rate has no hold yet, so in a quiet passage this can happen at the moment the
   rate changes.
-- The card keeps its current rate when idle. It does not return to a default.
+- The card keeps its current rate when idle, a rate a DoP stream set included.
+  It does not return to a default.
   The configured default rate applies only from startup until the first client
   sets a rate. So the ADC never forces a rate change: it starts at whatever rate
   the card is at, and no signal is lost to a card restart.

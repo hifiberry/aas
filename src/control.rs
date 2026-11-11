@@ -212,9 +212,9 @@ struct Conn {
 /// The analog input as the control thread keeps it.
 struct AnalogInput {
     open: OpenCapture,
-    /// The rate the rate rules have for the input while it has signal: the
-    /// base rate, the one the ordinary rules set. A rate DoP forces is
-    /// never its own, so that the rules resume when DoP stops.
+    /// The rate the rate rules have for the input while it has signal.
+    /// Always the rate the output runs at: the input follows it and never
+    /// sets it.
     active: Option<u32>,
     /// `SetCapture` commands the audio thread has not answered yet. A
     /// failure reported meanwhile belongs to a capture they replace.
@@ -1019,13 +1019,14 @@ impl Control {
     /// once; otherwise it waits for the settle time, so that a stop and a
     /// start in quick succession leave the rate alone.
     fn decide(&mut self, now: Instant, urgent: bool, batch: &mut Vec<Command>) {
-        // An active analog input stays at the base rate when that changes,
-        // by a settle or the card's rates, also while DoP holds the output.
+        // An active analog input follows the output rate, whatever moved
+        // it. Updating a client's rate never moves the output itself.
         if let Some(analog) = &mut self.analog {
-            let base = self.policy.base();
-            if analog.active.is_some_and(|r| r != base) {
-                analog.active = Some(base);
-                self.policy.client_started(ANALOG, base, now - self.epoch);
+            let current = self.policy.current();
+            if analog.active.is_some_and(|r| r != current) {
+                analog.active = Some(current);
+                self.policy
+                    .client_started(ANALOG, current, now - self.epoch);
             }
         }
         let running = self.running_count() > 0;
@@ -1192,9 +1193,10 @@ impl Control {
     }
 
     /// The analog input has signal or not. With signal it is a client of
-    /// the rate rules at the base rate, and the rate is decided again as for
-    /// a player that starts or stops. Its capture runs at whatever rate the
-    /// output does, a DoP rate included.
+    /// the rate rules at the rate the output runs at, a DoP rate included,
+    /// so it never sets a rate. As a client it counts as the first one if
+    /// it came first, and the rate is decided again as for a player that
+    /// starts or stops.
     fn input_signal(&mut self, on: bool, now: Instant, batch: &mut Vec<Command>) {
         let Some(analog) = &mut self.analog else {
             return;
@@ -1202,9 +1204,9 @@ impl Control {
         let t = now - self.epoch;
         if on {
             eprintln!("aas: analog input: signal");
-            let base = self.policy.base();
-            analog.active = Some(base);
-            self.policy.client_started(ANALOG, base, t);
+            let current = self.policy.current();
+            analog.active = Some(current);
+            self.policy.client_started(ANALOG, current, t);
         } else {
             eprintln!("aas: analog input: quiet");
             analog.active = None;
@@ -2262,10 +2264,15 @@ mod tests {
         control.analog.as_ref().unwrap().active
     }
 
+    /// The capture is silent for `SETTLE_MS` after each start and the
+    /// detector needs a window, so on a board the signal is back no sooner
+    /// than this after a reopen.
+    const SIGNAL_BACK: Duration = Duration::from_millis(1050);
+
     #[test]
-    fn dop_leaves_an_active_analog_input_at_the_base_rate() {
+    fn after_dop_a_lone_analog_input_leaves_the_card_at_the_dop_rate() {
         let ms = Duration::from_millis;
-        // DoP stops within the settle time, and well after it.
+        // DoP stops before the signal is back, and well after.
         for held in [ms(300), ms(5000)] {
             let opener = Opener::default();
             let (mut control, mut engine, now) = started(&analog_config(), Some(&opener));
@@ -2283,42 +2290,63 @@ mod tests {
             control.handle_events(now);
             let seen = engine.take(false);
             assert!(has(&seen, "Reconfigure 176400 1024"), "{seen:?}");
-            // The input stays at the base rate in the rules.
-            assert_eq!(analog_rate(&control), Some(48000));
-            assert_eq!(control.policy.base(), 48000);
-            // The reopen closes the capture, so the input goes quiet, and
-            // the capture opens again at the rate the output runs at.
+            // The input follows the output rate in the rules.
+            assert_eq!(analog_rate(&control), Some(176400));
+            // The reopen closes the capture and the new detector has no
+            // hold, so the input goes quiet. The capture opens again at the
+            // rate the output runs at.
             engine.send(Event::InputSignal(false));
             engine.send(Event::Reconfigured);
             control.handle_events(now + ms(10));
             assert_eq!(opener.asked(), [(48000, 256), (176400, 1024)]);
             assert_eq!(engine.take(true), ["SetCapture true"]);
-            // Signal again on the new capture changes nothing.
-            engine.send(Event::InputSignal(true));
-            control.handle_events(now + ms(100));
-            assert_eq!(analog_rate(&control), Some(48000));
+            // DoP ends: the player stops.
+            let stop = control.request(1, Some(Request::Stop), now + held);
+            assert_eq!(stop.reply, Some(Reply::Ok));
             control.tick(now + held);
-            assert!(!has(&engine.take(true), "Reconfigure"), "{held:?}");
-            assert_eq!(control.policy.current(), 176400);
-            assert_eq!(control.policy.base(), 48000, "{held:?}");
-            // DoP stops: the output goes back to the base rate, and the
-            // capture follows it.
-            engine.send(Event::DopStopped(1));
-            control.handle_events(now + held);
-            control.tick(now + held + ms(600));
-            let seen = engine.take(true);
-            assert!(has(&seen, "Reconfigure 48000 256"), "{held:?}: {seen:?}");
-            control.handle_events(now + held + ms(600));
-            let asked = opener.asked();
-            assert_eq!(asked.last(), Some(&(48000, 256)), "{held:?}");
-            assert_eq!(asked.len(), 3, "{held:?}");
+            // The signal is back once the capture's mute is over.
+            let back = now + ms(10) + SIGNAL_BACK;
+            control.tick(back);
+            engine.send(Event::InputSignal(true));
+            control.handle_events(back.max(now + held));
+            assert_eq!(analog_rate(&control), Some(176400), "{held:?}");
+            // Nothing returns the card to 48 kHz: it keeps its rate, as it
+            // does when idle, and the input runs at it.
             control.tick(now + held + ms(10000));
-            assert!(!has(&engine.take(true), "Reconfigure"), "{held:?}");
+            let seen = engine.take(true);
+            assert!(!has(&seen, "Reconfigure"), "{held:?}: {seen:?}");
+            assert_eq!(control.policy.current(), 176400, "{held:?}");
+            assert_eq!(opener.asked().len(), 2, "{held:?}");
         }
     }
 
     #[test]
-    fn an_analog_input_with_signal_during_dop_registers_at_the_base_rate() {
+    fn a_dop_stream_that_is_the_first_client_leaves_the_analog_input_at_its_rate() {
+        let ms = Duration::from_millis;
+        let opener = Opener::default();
+        let (mut control, mut engine, now) = started(&analog_config(), Some(&opener));
+        engine.take(true);
+        control.handle_events(now);
+        engine.take(true);
+        play(&mut control, 1, 176400, now);
+        engine.send(Event::DopStarted(1, 1));
+        control.handle_events(now);
+        assert!(has(&engine.take(true), "Reconfigure 176400 1024"));
+        control.handle_events(now);
+        engine.take(true);
+        let back = now + SIGNAL_BACK;
+        engine.send(Event::InputSignal(true));
+        control.handle_events(back);
+        assert_eq!(analog_rate(&control), Some(176400));
+        let stop = control.request(1, Some(Request::Stop), back + ms(1000));
+        assert_eq!(stop.reply, Some(Reply::Ok));
+        control.tick(back + ms(10000));
+        assert!(!has(&engine.take(true), "Reconfigure"));
+        assert_eq!(control.policy.current(), 176400);
+    }
+
+    #[test]
+    fn an_analog_input_with_signal_during_dop_follows_the_output_back() {
         let ms = Duration::from_millis;
         let opener = Opener::default();
         let (mut control, mut engine, now) = started(&analog_config(), Some(&opener));
@@ -2333,22 +2361,23 @@ mod tests {
         assert!(has(&engine.take(true), "Reconfigure 176400 1024"));
         control.handle_events(now);
         engine.take(true);
-        // The input gets signal while DoP holds the output.
+        // The input gets signal while DoP holds the output, and is in the
+        // rules at the rate the output runs at.
+        let back = now + SIGNAL_BACK;
         engine.send(Event::InputSignal(true));
-        control.handle_events(now + ms(100));
-        assert_eq!(analog_rate(&control), Some(48000));
-        // The 48 kHz player leaves: the input holds the base rate.
-        let stop = control.request(1, Some(Request::Stop), now + ms(200));
+        control.handle_events(back);
+        assert_eq!(analog_rate(&control), Some(176400));
+        // DoP stops: the 48 kHz player takes the output back, and the
+        // input follows it.
+        let stop = control.request(2, Some(Request::Stop), back + ms(100));
         assert_eq!(stop.reply, Some(Reply::Ok));
-        control.tick(now + ms(5000));
-        assert_eq!(control.policy.base(), 48000);
-        engine.take(true);
-        // Once DoP stops the output is at the base rate.
-        engine.send(Event::DopStopped(2));
-        control.handle_events(now + ms(5000));
-        control.tick(now + ms(5600));
+        control.tick(back + ms(700));
         assert!(has(&engine.take(true), "Reconfigure 48000 256"));
-        control.tick(now + ms(15000));
+        assert_eq!(analog_rate(&control), Some(48000));
+        // The player leaves. The input does not move the output.
+        let stop = control.request(1, Some(Request::Stop), back + ms(800));
+        assert_eq!(stop.reply, Some(Reply::Ok));
+        control.tick(back + ms(10000));
         assert!(!has(&engine.take(true), "Reconfigure"));
         assert_eq!(control.policy.current(), 48000);
     }
