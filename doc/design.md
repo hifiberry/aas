@@ -314,23 +314,29 @@ skipped on this path (see Plugins). There are two ways to get it:
   calculates are at 0 dB and every plugin is neutral. A hardware output volume
   does not touch the samples, so it does not block bit-perfect *(call)*.
   Automatic is the default *(call)*.
-- **Forced:** a setting. Volumes that `aas` calculates have no effect. Plugins
-  still run, so a plugin that is not neutral stops bit-perfect in forced mode as
-  in automatic *(call)*. A hardware output volume keeps working *(call)*.
+- **Forced:** a setting. Volumes that `aas` calculates have no effect and plugins
+  are bypassed *(call for plugins)*. A hardware output volume keeps working
+  *(call)*.
 
 A setting can also turn automatic bit-perfect off for testing *(call)*.
 
 With forced bit-perfect, a second client is mixed in. The output is not
 bit-perfect while they overlap. Volumes that `aas` calculates still have no
-effect, and bit-perfect resumes once one client is left.
+effect, plugins stay bypassed *(call)*, and bit-perfect resumes once one client
+is left.
 
-Input detection is never bypassed, because analog input must never pass ungated
-*(call)*. Below the threshold the analog input is not a source, so it does not
-stop bit-perfect in either mode. Above it the ADC is mixed in like a second
-client, which follows the rule above. When it is the only source and its chain
-alters nothing, its captured frames are copied to the card as they are, so the
-copy path stays bit-exact *(call)*. In the one period in which the detector
-opens, a few frames that it would have silenced are heard.
+Forced bit-perfect does not bypass input detection, because analog input must
+never pass ungated *(call)*. This is the one exception to plugins being
+bypassed. The analog chain still runs so that the detector can measure, but its
+output is not used: the captured frames are played as they are *(call)*. Below
+the threshold the analog input is not a source, so it does not stop bit-perfect
+in either mode. Above it the ADC is mixed in like a second client, which follows
+the rule above.
+
+In automatic mode, when the analog input is the only source and its chain alters
+nothing, its captured frames are copied to the card as they are, so the copy
+path stays bit-exact *(call)*. In the one period in which the detector opens, a
+few frames that it would have silenced are heard.
 
 A resampled client is never bit-perfect.
 
