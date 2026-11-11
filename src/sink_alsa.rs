@@ -211,7 +211,8 @@ pub fn decode(format: CardFormat, bytes: &[u8], out: &mut [[i32; 2]]) {
 /// long to bring below -60 dBFS: measured on the CM5 test board, it
 /// stays above the detector's -50 dBFS for up to 650 ms at 44.1 kHz,
 /// less at higher rates. Played through, it would open the analog input
-/// for its hold time at every start and every change of rate.
+/// for its hold time at every start, the restart after an overrun
+/// included, and at every change of rate.
 pub const SETTLE_MS: u32 = 1000;
 
 /// Zeros the front of `out` while `left` frames are still to settle, and
@@ -726,6 +727,8 @@ mod capture {
         bytes: Vec<u8>,
         /// Frames still to be muted while the ADC settles.
         settling: usize,
+        /// `SETTLE_MS` in frames at the capture's rate, for each start.
+        settle: usize,
     }
 
     impl AlsaCapture {
@@ -798,6 +801,7 @@ mod capture {
                 chunk,
                 bytes: vec![0; chunk * format.bytes() * CHANNELS],
                 settling: (u64::from(rate) * u64::from(SETTLE_MS) / 1000) as usize,
+                settle: (u64::from(rate) * u64::from(SETTLE_MS) / 1000) as usize,
             })
         }
 
@@ -807,16 +811,20 @@ mod capture {
 
         /// What an error leaves. Nothing queued is not an error. An overrun
         /// restarts the stream at once, and the frames lost are what the
-        /// engine pads. Anything else, a card gone or suspended, fails the
-        /// capture, and the control thread opens it again.
-        fn recover(pcm: &PCM, err: alsa::Error) -> Result<(), SinkError> {
+        /// engine pads; `restarted` is then set, so that the settle mute is
+        /// armed again, as a start can bring the ADC's transient. Anything
+        /// else, a card gone or suspended, fails the capture, and the
+        /// control thread opens it again.
+        fn recover(pcm: &PCM, err: alsa::Error, restarted: &mut bool) -> Result<(), SinkError> {
             // alsa::Error holds the positive errno.
             match err.errno() {
                 libc::EAGAIN | libc::EINTR => Ok(()),
-                libc::EPIPE => pcm
-                    .prepare()
-                    .and_then(|()| pcm.start())
-                    .map_err(|_| SinkError::Gone),
+                libc::EPIPE => {
+                    let started = pcm.prepare().and_then(|()| pcm.start());
+                    started.map_err(|_| SinkError::Gone)?;
+                    *restarted = true;
+                    Ok(())
+                }
                 _ => Err(SinkError::Gone),
             }
         }
@@ -827,17 +835,18 @@ mod capture {
         /// rather than an error, fails here instead of being read as empty
         /// for ever. The state comes from the status ALSA maps, without a
         /// system call where the driver maps it.
-        fn queued(pcm: &PCM) -> Result<usize, SinkError> {
+        fn queued(pcm: &PCM, restarted: &mut bool) -> Result<usize, SinkError> {
             match pcm.avail_update() {
                 Ok(n) if n > 0 => Ok(n as usize),
                 Ok(_) => match pcm.state() {
                     State::Running => Ok(0),
                     State::XRun => {
-                        Self::recover(pcm, alsa::Error::new("state", libc::EPIPE)).map(|()| 0)
+                        let overrun = alsa::Error::new("state", libc::EPIPE);
+                        Self::recover(pcm, overrun, restarted).map(|()| 0)
                     }
                     _ => Err(SinkError::Gone),
                 },
-                Err(err) => Self::recover(pcm, err).map(|()| 0),
+                Err(err) => Self::recover(pcm, err, restarted).map(|()| 0),
             }
         }
 
@@ -847,21 +856,36 @@ mod capture {
         fn read_bytes(&mut self, frames: usize) -> Result<usize, SinkError> {
             let frame_bytes = self.frame_bytes();
             let pcm = self.pcm.as_ref().ok_or(SinkError::Gone)?;
-            let want = frames.min(self.chunk).min(Self::queued(pcm)?);
-            if want == 0 {
-                return Ok(0);
+            let mut restarted = false;
+            let queued = Self::queued(pcm, &mut restarted);
+            let want = frames.min(self.chunk).min(queued.unwrap_or(0));
+            let read = match queued {
+                Err(e) => Err(e),
+                Ok(_) if want == 0 => Ok(0),
+                Ok(_) => {
+                    let len = want * frame_bytes;
+                    match pcm.io_bytes().readi(&mut self.bytes[..len]) {
+                        Ok(n) => Ok(n.min(want)),
+                        Err(err) => Self::recover(pcm, err, &mut restarted).map(|()| 0),
+                    }
+                }
+            };
+            if restarted {
+                self.settling = self.settle;
             }
-            let len = want * frame_bytes;
-            match pcm.io_bytes().readi(&mut self.bytes[..len]) {
-                Ok(n) => Ok(n.min(want)),
-                Err(err) => Self::recover(pcm, err).map(|()| 0),
-            }
+            read
         }
     }
 
     impl Capture for AlsaCapture {
         fn available(&mut self) -> Result<usize, SinkError> {
-            Self::queued(self.pcm.as_ref().ok_or(SinkError::Gone)?)
+            let pcm = self.pcm.as_ref().ok_or(SinkError::Gone)?;
+            let mut restarted = false;
+            let queued = Self::queued(pcm, &mut restarted);
+            if restarted {
+                self.settling = self.settle;
+            }
+            queued
         }
 
         fn read(&mut self, out: &mut [[i32; 2]]) -> Result<usize, SinkError> {
