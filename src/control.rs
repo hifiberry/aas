@@ -1309,8 +1309,11 @@ mod tests {
 
     #[test]
     fn a_ring_holds_one_period_of_input_at_any_output_rate() {
+        // Every rate a card is asked about. A ring of the least size never
+        // makes `sync_resamplers` log that it is too small to resample from.
         let rates = [
-            8000, 11025, 22050, 44100, 48000, 96000, 176400, 192000, 384000,
+            8000, 11025, 16000, 22050, 32000, 44100, 48000, 64000, 88200, 96000, 176400, 192000,
+            352800, 384000,
         ];
         for latency_ms in [4.0, 12.0, 100.0] {
             for from in rates {
