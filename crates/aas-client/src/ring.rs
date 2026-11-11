@@ -1,5 +1,7 @@
 //! Single producer, single consumer ring of stereo `i32` frames in shared
-//! memory. The writer is the client, the reader is the daemon.
+//! memory. For a playback stream the writer is the client and the reader
+//! the daemon. A capture stream swaps them: the daemon writes, the client
+//! reads.
 //!
 //! The mapped memory is written by another process, so nothing in it is
 //! trusted. The capacity is read once at map time and kept in the `Ring`.
@@ -19,7 +21,7 @@ use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 pub const MAGIC: u32 = 0x4141_5352;
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 
 /// Bytes before the frame data. Keeps the data 64 byte aligned.
 const DATA_OFFSET: usize = 64;
@@ -38,13 +40,20 @@ pub struct Header {
     pub write_pos: AtomicU64,
     /// Frames consumed since creation. Never wraps back.
     pub read_pos: AtomicU64,
+    /// Times the daemon found the ring short while the stream was running.
+    /// For a capture stream: frames the daemon dropped because the ring
+    /// was full.
     pub underruns: AtomicU64,
     pub output_delay_frames: AtomicU32,
     pub draining: AtomicU32,
-    /// The read position the client waits for. The daemon writes the
-    /// wake-up once `read_pos` has reached it, and once more only after it
-    /// has changed. Zero asks for a wake-up after every period.
+    /// The position the client waits for: the read position for a playback
+    /// stream, the write position for a capture stream. The daemon writes
+    /// the wake-up once that position has reached it, and once more only
+    /// after it has changed. Zero asks for a wake-up after every period.
     pub wake_at: AtomicU64,
+    /// Set by the daemon when it can no longer serve the stream, such as a
+    /// capture stream after the output rate has changed. Never cleared.
+    pub ended: AtomicU32,
 }
 
 const _: () = assert!(std::mem::size_of::<Header>() <= DATA_OFFSET);
@@ -60,7 +69,8 @@ const _: () = {
     assert!(offset_of!(Header, output_delay_frames) == 40);
     assert!(offset_of!(Header, draining) == 44);
     assert!(offset_of!(Header, wake_at) == 48);
-    assert!(std::mem::size_of::<Header>() == 56);
+    assert!(offset_of!(Header, ended) == 56);
+    assert!(std::mem::size_of::<Header>() == 64);
 };
 
 pub struct Ring {

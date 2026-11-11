@@ -21,7 +21,7 @@ use std::path::PathBuf;
 
 /// The protocol version a client sends in `Hello`, and the daemon in its
 /// reply.
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 // The ring's layout is part of the protocol, and the two versions move
 // together. A ring that changes without the protocol would get past
 // `Hello` and fail at `Configure`, where a player takes it for a bad
@@ -31,6 +31,9 @@ pub const REQUEST_LEN: usize = 20;
 pub const REPLY_LEN: usize = 8;
 /// Largest buffer a client may ask for. Bounds the ring memory.
 pub const MAX_BUFFER_FRAMES: u32 = 1 << 20;
+/// The bit of `Configure`'s channels word that asks for a capture stream.
+/// The word has room to spare, so the request keeps its size.
+const CAPTURE: u32 = 1 << 31;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Request {
@@ -39,12 +42,21 @@ pub enum Request {
     Hello {
         version: u32,
     },
+    /// Answered by `Configured`, with the ring and the wake-up.
+    ///
+    /// With `capture` the stream records: the daemon writes the analog
+    /// input into the ring and the client reads it. It is always S32
+    /// stereo at the daemon's rate, so `rate`, `format` and `channels` are
+    /// ignored, and the reply names the rate. `buffer_frames` is rounded up
+    /// to what the daemon needs, never refused for being small.
     Configure {
         rate: u32,
         format: ClientFormat,
         channels: u8,
         buffer_frames: u32,
+        capture: bool,
     },
+    /// For a capture stream, fails with `ENODEV` once the stream has ended.
     Start,
     Stop,
     Drain,
@@ -64,7 +76,11 @@ pub enum Request {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reply {
     Ok,
-    Configured,
+    /// For a capture stream, `rate` is the rate it records at. Zero for a
+    /// playback stream.
+    Configured {
+        rate: u32,
+    },
     /// The reply to `GetVolume` and `SubscribeVolume`.
     Volume {
         percent: u8,
@@ -124,10 +140,12 @@ pub fn encode_request(r: &Request) -> [u8; REQUEST_LEN] {
             format,
             channels,
             buffer_frames,
-        } => pack(
-            2,
-            [rate, format_code(format), channels as u32, buffer_frames],
-        ),
+            capture,
+        } => {
+            let flag = if capture { CAPTURE } else { 0 };
+            let channels = u32::from(channels) | flag;
+            pack(2, [rate, format_code(format), channels, buffer_frames])
+        }
         Request::Start => pack(3, [0; 4]),
         Request::Stop => pack(4, [0; 4]),
         Request::Drain => pack(5, [0; 4]),
@@ -151,8 +169,9 @@ pub fn decode_request(b: &[u8]) -> Option<Request> {
         2 => Request::Configure {
             rate: word(b, 1),
             format: format_from_code(word(b, 2))?,
-            channels: u8::try_from(word(b, 3)).ok()?,
+            channels: u8::try_from(word(b, 3) & !CAPTURE).ok()?,
             buffer_frames: Some(word(b, 4)).filter(|&n| n <= MAX_BUFFER_FRAMES)?,
+            capture: word(b, 3) & CAPTURE != 0,
         },
         3 => Request::Start,
         4 => Request::Stop,
@@ -170,7 +189,7 @@ pub fn decode_request(b: &[u8]) -> Option<Request> {
 pub fn encode_reply(r: &Reply) -> [u8; REPLY_LEN] {
     let (tag, arg) = match *r {
         Reply::Ok => (1u32, 0u32),
-        Reply::Configured => (2, 0),
+        Reply::Configured { rate } => (2, rate),
         Reply::Volume { percent } => (3, percent as u32),
         Reply::Error { code } => (4, code),
         Reply::VolumeChanged { percent } => (5, percent as u32),
@@ -190,7 +209,7 @@ pub fn decode_reply(b: &[u8]) -> Option<Reply> {
     }
     Some(match word(b, 0) {
         1 => Reply::Ok,
-        2 => Reply::Configured,
+        2 => Reply::Configured { rate: word(b, 1) },
         3 => Reply::Volume {
             percent: u8::try_from(word(b, 1)).ok()?,
         },
@@ -232,6 +251,7 @@ mod tests {
                 format: ClientFormat::S24Packed,
                 channels: 2,
                 buffer_frames: 4096,
+                capture: false,
             },
             Request::Start,
             Request::Stop,
@@ -246,7 +266,7 @@ mod tests {
         }
         let replies = [
             Reply::Ok,
-            Reply::Configured,
+            Reply::Configured { rate: 0 },
             Reply::Volume { percent: 100 },
             Reply::Error { code: 22 },
             Reply::VolumeChanged { percent: 40 },
@@ -266,9 +286,41 @@ mod tests {
                 format: f,
                 channels: 1,
                 buffer_frames: 1,
+                capture: false,
             };
             assert_eq!(decode_request(&encode_request(&r)), Some(r));
         }
+    }
+
+    #[test]
+    fn a_capture_configure_round_trips() {
+        let capture = Request::Configure {
+            rate: 0,
+            format: ClientFormat::S32,
+            channels: 2,
+            buffer_frames: 4096,
+            capture: true,
+        };
+        assert_eq!(decode_request(&encode_request(&capture)), Some(capture));
+        // The flag is all that tells it from a playback request.
+        let playback = Request::Configure {
+            rate: 0,
+            format: ClientFormat::S32,
+            channels: 2,
+            buffer_frames: 4096,
+            capture: false,
+        };
+        assert_ne!(encode_request(&capture), encode_request(&playback));
+        assert_eq!(decode_request(&encode_request(&playback)), Some(playback));
+        // A playback request reads as before: the flag is clear.
+        assert_eq!(
+            encode_request(&playback),
+            pack(2, [0, format_code(ClientFormat::S32), 2, 4096])
+        );
+        let rate = Reply::Configured { rate: 44100 };
+        assert_eq!(decode_reply(&encode_reply(&rate)), Some(rate));
+        // Any other bit in the channels word is still refused.
+        assert_eq!(decode_request(&pack(2, [0, 3, 2 | 1 << 30, 64])), None);
     }
 
     #[test]

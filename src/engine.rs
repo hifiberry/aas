@@ -31,6 +31,10 @@ pub const ANALOG: ClientId = ClientId::MAX;
 /// `Grow` before it adds more.
 pub const INITIAL_SOURCES: usize = 16;
 
+/// Capture streams the tap table of a new engine has room for. The control
+/// thread sends `GrowTaps` before it adds more.
+pub const INITIAL_TAPS: usize = 4;
+
 /// Length of a gain change.
 const FADE_MS: u32 = 10;
 
@@ -524,6 +528,151 @@ impl<P: Processing> Analog<P> {
     }
 }
 
+/// A capture stream as the audio thread sees it: a ring it writes the
+/// analog input into, after the input's chain, for a client to read. The
+/// roles of the ring are those of a source swapped: the engine moves only
+/// `write_pos`, and the client only `read_pos`.
+pub struct Tap {
+    pub id: ClientId,
+    pub ring: Ring,
+    /// An eventfd, non-blocking, written as `notify` decides.
+    pub wake: OwnedFd,
+    pub running: bool,
+    /// The position in the header's `wake_at` that has had its wake-up.
+    woken_at: u64,
+    /// The overruns the client has been woken for.
+    overruns_told: u64,
+}
+
+impl Tap {
+    /// A stopped tap.
+    pub fn new(id: ClientId, ring: Ring, wake: OwnedFd) -> Tap {
+        Tap {
+            id,
+            ring,
+            wake,
+            running: false,
+            woken_at: 0,
+            overruns_told: 0,
+        }
+    }
+
+    /// Writes what fits of `block`. The rest is dropped and counted in the
+    /// header's `underruns`, which for a tap counts frames lost to a full
+    /// ring. The engine never waits for a recorder.
+    fn write(&mut self, block: &[[i32; 2]]) {
+        let n = self.ring.write(block);
+        if n < block.len() {
+            let overruns = &self.ring.header().underruns;
+            overruns.fetch_add((block.len() - n) as u64, Ordering::Relaxed);
+        }
+    }
+
+    /// Wakes the client if it is due: after every period, or once the write
+    /// position reaches the one it waits for, and after each overrun. The
+    /// rule a source follows, with the read position swapped for the write
+    /// position.
+    fn notify(&mut self) {
+        let header = self.ring.header();
+        // The client stores the position it waits for and then loads ours.
+        // With a full barrier on both sides, one of the two sees the other.
+        fence(Ordering::SeqCst);
+        let wake_at = header.wake_at.load(Ordering::SeqCst);
+        let reached = header.write_pos.load(Ordering::Relaxed) >= wake_at;
+        let overruns = header.underruns.load(Ordering::Relaxed);
+        let due = wake_at == 0 || (reached && wake_at != self.woken_at);
+        if !due && overruns == self.overruns_told {
+            return;
+        }
+        self.woken_at = wake_at;
+        self.overruns_told = overruns;
+        let one = 1u64;
+        // SAFETY: a plain write of 8 bytes. The fd is non-blocking, and a full
+        // counter only means the client has plenty of wake-ups waiting.
+        unsafe {
+            libc::write(
+                self.wake.as_raw_fd(),
+                (&raw const one).cast(),
+                size_of::<u64>(),
+            )
+        };
+    }
+}
+
+/// The capture streams, in a table that grows as the source table does:
+/// the control thread sends a bigger empty one, and the old one goes back.
+struct Taps {
+    #[allow(clippy::vec_box)] // Moving a boxed tap moves only a pointer.
+    table: Vec<Box<Tap>>,
+    /// The period converted from the chain's processing format, or zeros.
+    buf: Vec<[i32; 2]>,
+}
+
+impl Taps {
+    fn new(max_frames: usize) -> Taps {
+        Taps {
+            table: Vec::with_capacity(INITIAL_TAPS),
+            buf: vec![[0; 2]; max_frames],
+        }
+    }
+
+    fn find(&mut self, id: ClientId) -> Option<&mut Tap> {
+        let found = self.table.iter_mut().find(|t| t.id == id);
+        found.map(|t| t.as_mut())
+    }
+
+    /// Takes the tap in, or hands it back if the table is full.
+    fn add(&mut self, tap: Box<Tap>) -> Option<Box<Tap>> {
+        if self.table.len() < self.table.capacity() {
+            self.table.push(tap);
+            None
+        } else {
+            Some(tap)
+        }
+    }
+
+    fn remove(&mut self, id: ClientId) -> Option<Box<Tap>> {
+        let index = self.table.iter().position(|t| t.id == id)?;
+        Some(self.table.remove(index))
+    }
+
+    /// Moves the taps into `table` and returns the table they leave, or
+    /// returns `table` itself if it has no room for them.
+    #[allow(clippy::vec_box)] // Moving a boxed tap moves only a pointer.
+    fn grow(&mut self, mut table: Vec<Box<Tap>>) -> Vec<Box<Tap>> {
+        if table.capacity() - table.len() < self.table.len() {
+            return table;
+        }
+        table.append(&mut self.table);
+        std::mem::replace(&mut self.table, table)
+    }
+
+    /// Writes this cycle's analog period to every running tap and wakes
+    /// it as due: the period after the chain while the input has signal,
+    /// else zeros, so that a tap keeps real time without a signal or a
+    /// capture. Never the mix.
+    fn deliver<P: Processing>(&mut self, analog: &Analog<P>, period: usize) {
+        let Taps { table, buf } = self;
+        if !table.iter().any(|t| t.running) {
+            return;
+        }
+        let block = if !analog.audible {
+            buf[..period].fill([0; 2]);
+            &buf[..period]
+        } else if analog.is_processed {
+            // Into 32 bits as the mix's last step does it.
+            mix_finish::<P>(&analog.processed[..period], &mut buf[..period]);
+            &buf[..period]
+        } else {
+            &analog.buf[..period]
+        };
+        for tap in table.iter_mut().filter(|t| t.running) {
+            tap.write(block);
+            tap.notify();
+        }
+    }
+}
+
 /// Fills `buf` with the latest period the capture has. More than two periods
 /// queued are cut back to two, and a short read is padded with zeros in
 /// front. Both are counted.
@@ -647,6 +796,15 @@ pub enum Command {
     SetCapture(Option<Box<dyn Capture>>),
     /// The gain of the analog input. Applies at once, as a source's does.
     SetAnalogGain(f32),
+    /// A capture stream. Refused with `Event::DroppedTap` if the table is
+    /// full. `SetRunning` and `Flush` find it by its id; a flushed tap is
+    /// stopped, and its ring is left for the client to empty.
+    AddTap(Box<Tap>),
+    /// Answered by `Event::DroppedTap`.
+    RemoveTap(ClientId),
+    /// An empty tap table with more capacity. It replaces the current one.
+    #[allow(clippy::vec_box)] // Moving a boxed tap moves only a pointer.
+    GrowTaps(Vec<Box<Tap>>),
     Shutdown,
 }
 
@@ -681,6 +839,12 @@ pub enum Event {
     /// arrives before the `OldCapture` answering a `SetCapture` belongs to
     /// the capture that command replaced.
     CaptureFailed,
+    /// A tap removed, or refused for lack of room.
+    DroppedTap(Box<Tap>),
+    /// The tap table a `GrowTaps` replaced, or the one it brought if that
+    /// had no room for the taps.
+    #[allow(clippy::vec_box)] // Moving a boxed tap moves only a pointer.
+    OldTaps(Vec<Box<Tap>>),
 }
 
 /// Runs the cycles of one output.
@@ -701,6 +865,7 @@ pub struct Engine<P: Processing, S: Sink> {
     /// Where the mix is handed to the plugins.
     store: BlockStore,
     analog: Analog<P>,
+    taps: Taps,
     mix: Chain,
     output: Chain,
     rate: u32,
@@ -744,6 +909,7 @@ impl<P: Processing, S: Sink> Engine<P, S> {
             acc: vec![[P::zero(); 2]; frames],
             store: BlockStore::new(frames),
             analog: Analog::new(frames),
+            taps: Taps::new(frames),
             mix: Chain::empty(),
             output: Chain::empty(),
             rate: 0,
@@ -928,6 +1094,20 @@ impl<P: Processing, S: Sink> Engine<P, S> {
                 self.emit(Event::OldCapture(old));
             }
             Command::SetAnalogGain(gain) => self.analog.gain = gain,
+            Command::AddTap(tap) => {
+                if let Some(refused) = self.taps.add(tap) {
+                    self.emit(Event::DroppedTap(refused));
+                }
+            }
+            Command::RemoveTap(id) => {
+                if let Some(tap) = self.taps.remove(id) {
+                    self.emit(Event::DroppedTap(tap));
+                }
+            }
+            Command::GrowTaps(table) => {
+                let old = self.taps.grow(table);
+                self.emit(Event::OldTaps(old));
+            }
             Command::Shutdown => {
                 self.cancel_reopen();
                 self.close();
@@ -962,8 +1142,12 @@ impl<P: Processing, S: Sink> Engine<P, S> {
     /// same cycle makes it again. The stream resumes as DoP if it left
     /// frames behind. With nothing left there is nothing to protect, so the
     /// next frames are judged afresh, bar a tail of the run.
+    /// A tap, found when no source has the id, is only started or stopped.
     fn set_running(&mut self, id: ClientId, running: bool) {
         let Some(source) = self.find(id) else {
+            if let Some(tap) = self.taps.find(id) {
+                tap.running = running;
+            }
             return;
         };
         source.running = running;
@@ -1093,6 +1277,7 @@ impl<P: Processing, S: Sink> Engine<P, S> {
     fn render(&mut self, fade_out: bool, start: Instant) -> Result<(), SinkError> {
         let store = &mut self.store;
         self.analog.read(self.period, &self.counters, store);
+        self.taps.deliver(&self.analog, self.period);
         self.scan();
         self.order_claims();
         let rate = self.rate;
@@ -5585,5 +5770,358 @@ mod tests {
         no_allocation_with_a_capture::<I32>(only(false, false, true));
         no_allocation_with_a_capture::<F32>(only(true, false, false));
         no_allocation_with_a_capture::<F64>(only(false, true, false));
+    }
+
+    // Capture streams.
+
+    /// A recorder's side of a tap: its own mapping of the ring, and the
+    /// wake-up.
+    struct Recorder {
+        id: ClientId,
+        ring: Ring,
+        wake: OwnedFd,
+    }
+
+    impl Recorder {
+        /// Everything the ring holds.
+        fn take(&self) -> Vec<[i32; 2]> {
+            let mut out = vec![[0; 2]; self.ring.capacity()];
+            let n = self.ring.read(&mut out);
+            out.truncate(n);
+            out
+        }
+
+        fn overruns(&self) -> u64 {
+            self.ring.header().underruns.load(Relaxed)
+        }
+
+        /// How often the wake-up was written since it was last read.
+        fn wake_ups(&self) -> u64 {
+            let mut count = 0u64;
+            // SAFETY: 8 bytes from a non-blocking eventfd.
+            unsafe { libc::read(self.wake.as_raw_fd(), (&raw mut count).cast(), 8) };
+            count
+        }
+    }
+
+    /// A stopped tap with a ring of `capacity` frames, and its recorder.
+    fn tap_of(id: ClientId, capacity: u32) -> (Recorder, Box<Tap>) {
+        let (ring, fd) = Ring::create(capacity).unwrap();
+        let peer = Ring::map(fd.as_fd()).unwrap();
+        let wake = eventfd();
+        let theirs = wake.try_clone().unwrap();
+        let recorder = Recorder {
+            id,
+            ring: peer,
+            wake,
+        };
+        (recorder, Box::new(Tap::new(id, ring, theirs)))
+    }
+
+    /// A running tap with room for many periods.
+    fn add_tap<P: Processing>(rig: &mut Rig<P>, id: ClientId) -> Recorder {
+        let (recorder, tap) = tap_of(id, 1 << 16);
+        rig.send(Command::AddTap(tap));
+        rig.send(Command::SetRunning(id, true));
+        recorder
+    }
+
+    #[test]
+    fn a_tap_gets_the_analog_input_after_its_chain() {
+        fn check<P: Processing>() {
+            let (mut rig, feed) = with_capture::<P>(BitPerfect::Auto);
+            set_chain(&mut rig, Place::Analog, vec![times(2.0)]);
+            let recorder = add_tap(&mut rig, 5);
+            feed.push(&frames(1000, PERIOD));
+            rig.cycle();
+            assert_eq!(
+                recorder.take(),
+                frames(2000, PERIOD),
+                "{:?}",
+                format_of::<P>()
+            );
+            // Clipped to 32 bits as the mix's last step does it.
+            set_chain(&mut rig, Place::Analog, vec![times(4.0)]);
+            feed.push(&frames(0x4000_0000, PERIOD));
+            rig.cycle();
+            assert_eq!(recorder.take(), vec![[i32::MAX, i32::MIN]; PERIOD]);
+            // A neutral chain hands over the frames as captured.
+            set_chain(&mut rig, Place::Analog, vec![times(1.0).neutral()]);
+            let input = ramp(3 * PERIOD);
+            for period in input.chunks(PERIOD) {
+                feed.push(period);
+                rig.cycle();
+            }
+            assert_eq!(recorder.take(), input, "{:?}", format_of::<P>());
+            // The analog gain is the mix's, and does not apply.
+            rig.send(Command::SetAnalogGain(0.5));
+            feed.push(&input[..PERIOD]);
+            rig.cycle();
+            assert_eq!(recorder.take(), input[..PERIOD]);
+        }
+        check::<I32>();
+        check::<F32>();
+        check::<F64>();
+    }
+
+    #[test]
+    fn a_tap_gets_silence_while_there_is_no_signal() {
+        // No capture at all: a period of zeros every cycle, in real time.
+        let mut rig = Rig::<I32>::new(BitPerfect::Auto);
+        let recorder = add_tap(&mut rig, 5);
+        for _ in 0..3 {
+            rig.cycle();
+        }
+        assert_eq!(recorder.take(), frames(0, 3 * PERIOD));
+        // Below the threshold.
+        let (mut rig, feed) = with_capture::<I32>(BitPerfect::Auto);
+        set_chain(&mut rig, Place::Analog, vec![times(1.0).quiet()]);
+        let recorder = add_tap(&mut rig, 5);
+        for _ in 0..3 {
+            feed.push(&frames(1000, PERIOD));
+            rig.cycle();
+        }
+        assert_eq!(recorder.take(), frames(0, 3 * PERIOD));
+        // A capture that has failed.
+        let (mut rig, feed) = with_capture::<I32>(BitPerfect::Auto);
+        let recorder = add_tap(&mut rig, 5);
+        feed.push(&frames(1000, PERIOD));
+        rig.cycle();
+        feed.fail();
+        rig.cycle();
+        rig.cycle();
+        let mut want = frames(1000, PERIOD);
+        want.extend(frames(0, 2 * PERIOD));
+        assert_eq!(recorder.take(), want);
+    }
+
+    #[test]
+    fn a_tap_never_gets_the_mix() {
+        let mut rig = Rig::<I32>::new(BitPerfect::Auto);
+        let recorder = add_tap(&mut rig, 5);
+        let mut a = client(1);
+        rig.add(&mut a);
+        a.ring.write(&frames(ODD, 3 * PERIOD));
+        for _ in 0..3 {
+            rig.cycle();
+        }
+        assert_eq!(rig.last_periods(3), frames(ODD, 3 * PERIOD));
+        assert_eq!(recorder.take(), frames(0, 3 * PERIOD));
+        // With an input, the tap gets the input alone, the card both.
+        let (mut rig, feed) = with_capture::<I32>(BitPerfect::Auto);
+        let recorder = add_tap(&mut rig, 5);
+        let mut a = client(1);
+        rig.add(&mut a);
+        a.ring.write(&frames(1000, PERIOD));
+        feed.push(&frames(234, PERIOD));
+        rig.cycle();
+        assert_eq!(rig.last_periods(1), frames(1234, PERIOD));
+        assert_eq!(recorder.take(), frames(234, PERIOD));
+        // While DoP holds the output, the input is still measured and taken.
+        let mut d = client(2);
+        rig.add(&mut d);
+        let dop = dop_frames(4 * PERIOD);
+        d.ring.write(&dop);
+        for _ in 0..4 {
+            feed.push(&frames(234, PERIOD));
+            rig.cycle();
+        }
+        assert_eq!(rig.last_periods(4), dop);
+        assert_eq!(recorder.take(), frames(234, 4 * PERIOD));
+    }
+
+    #[test]
+    fn a_recorder_that_stops_reading_loses_only_its_own_audio() {
+        let (mut rig, feed) = with_capture::<I32>(BitPerfect::Auto);
+        let capacity = 2 * PERIOD + 10;
+        let (stalled, tap) = tap_of(5, capacity as u32);
+        rig.send(Command::AddTap(tap));
+        rig.send(Command::SetRunning(5, true));
+        let reading = add_tap(&mut rig, 6);
+        let mut a = client(1);
+        rig.add(&mut a);
+        let input = ramp(10 * PERIOD);
+        a.ring.write(&frames(1000, 10 * PERIOD));
+        let mut got = Vec::new();
+        for period in input.chunks(PERIOD) {
+            feed.push(period);
+            rig.cycle();
+            got.extend(reading.take());
+        }
+        // The full ring kept the oldest frames, and counts the rest.
+        assert_eq!(stalled.take(), input[..capacity]);
+        assert_eq!(stalled.overruns(), (10 * PERIOD - capacity) as u64);
+        // The other recorder and the card lost nothing.
+        assert_eq!(got, input);
+        assert_eq!(reading.overruns(), 0);
+        assert_eq!(underruns(&a), 0);
+        assert_eq!(a.ring.available(), 0);
+        assert_eq!(rig.log.frames().len(), PERIOD + 10 * PERIOD);
+    }
+
+    #[test]
+    fn a_stopped_tap_is_not_written() {
+        let (mut rig, feed) = with_capture::<I32>(BitPerfect::Auto);
+        let (recorder, tap) = tap_of(5, 1 << 16);
+        rig.send(Command::AddTap(tap));
+        feed.push(&frames(1, PERIOD));
+        rig.cycle();
+        assert!(recorder.take().is_empty());
+        assert_eq!(recorder.wake_ups(), 0);
+        rig.send(Command::SetRunning(5, true));
+        feed.push(&frames(2, PERIOD));
+        rig.cycle();
+        assert_eq!(recorder.take(), frames(2, PERIOD));
+        rig.send(Command::SetRunning(5, false));
+        feed.push(&frames(3, PERIOD));
+        rig.cycle();
+        assert!(recorder.take().is_empty());
+        // A flush stops it, and is answered. The ring is the reader's to
+        // empty, so the engine leaves it alone.
+        rig.send(Command::SetRunning(5, true));
+        feed.push(&frames(4, PERIOD));
+        rig.cycle();
+        rig.events();
+        rig.send(Command::Flush(5));
+        feed.push(&frames(5, PERIOD));
+        rig.cycle();
+        let events = rig.events();
+        assert!(matches!(events[..], [Event::Flushed(5)]));
+        assert_eq!(recorder.take(), frames(4, PERIOD));
+        assert_eq!(
+            recorder.ring.header().read_pos.load(Relaxed),
+            2 * PERIOD as u64
+        );
+    }
+
+    #[test]
+    fn a_tap_waiting_for_a_position_is_woken_once_when_it_is_reached() {
+        let mut rig = Rig::<I32>::new(BitPerfect::Auto);
+        let recorder = add_tap(&mut rig, 5);
+        // Zero asks for a wake-up after every period.
+        rig.cycle();
+        rig.cycle();
+        assert_eq!(recorder.wake_ups(), 2);
+        let header = recorder.ring.header();
+        header.wake_at.store(5 * PERIOD as u64, Ordering::SeqCst);
+        for _ in 0..2 {
+            rig.cycle();
+            assert_eq!(recorder.wake_ups(), 0);
+        }
+        rig.cycle();
+        assert_eq!(recorder.wake_ups(), 1);
+        rig.cycle();
+        assert_eq!(recorder.wake_ups(), 0);
+        // A full ring wakes it as an underrun wakes a player.
+        let (stalled, tap) = tap_of(6, PERIOD as u32);
+        rig.send(Command::AddTap(tap));
+        rig.send(Command::SetRunning(6, true));
+        stalled
+            .ring
+            .header()
+            .wake_at
+            .store(1 << 40, Ordering::SeqCst);
+        rig.cycle();
+        assert_eq!(stalled.wake_ups(), 0);
+        rig.cycle();
+        assert_eq!(stalled.wake_ups(), 1);
+        assert_eq!(stalled.overruns(), PERIOD as u64);
+    }
+
+    #[test]
+    fn a_removed_or_refused_tap_comes_back() {
+        let mut rig = Rig::<I32>::new(BitPerfect::Auto);
+        let recorders: Vec<Recorder> = (0..INITIAL_TAPS as u64 + 1)
+            .map(|id| {
+                let (recorder, tap) = tap_of(id, 1024);
+                rig.send(Command::AddTap(tap));
+                recorder
+            })
+            .collect();
+        rig.send(Command::RemoveTap(2));
+        rig.send(Command::RemoveTap(99));
+        rig.cycle();
+        let back: Vec<ClientId> = rig
+            .events()
+            .iter()
+            .filter_map(|e| match e {
+                Event::DroppedTap(t) => Some(t.id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(back, [INITIAL_TAPS as u64, 2]);
+        // A bigger table keeps every tap, and the old one comes back.
+        rig.send(Command::GrowTaps(Vec::with_capacity(2 * INITIAL_TAPS)));
+        for id in [0, 1, 3] {
+            rig.send(Command::SetRunning(id, true));
+        }
+        rig.cycle();
+        let events = rig.events();
+        assert!(matches!(&events[..], [Event::OldTaps(t)] if t.is_empty()));
+        for r in &recorders {
+            let want = if [0, 1, 3].contains(&r.id) { PERIOD } else { 0 };
+            assert_eq!(r.take().len(), want, "tap {}", r.id);
+        }
+    }
+
+    fn taps_without_allocation<P: Processing>() {
+        let (mut rig, feed) = with_capture::<P>(BitPerfect::Auto);
+        // Converted from the processing format.
+        set_chain(&mut rig, Place::Analog, vec![times(2.0)]);
+        let mut a = client(1);
+        rig.add(&mut a);
+        let reading = add_tap(&mut rig, 5);
+        let (full, tap) = tap_of(6, PERIOD as u32);
+        rig.send(Command::AddTap(tap));
+        rig.send(Command::SetRunning(6, true));
+        rig.cycle();
+        rig.events();
+        let (late, tap) = tap_of(7, 1 << 12);
+        let mut late_tap = Some(tap);
+        let mut grown = Some(Vec::with_capacity(4 * INITIAL_TAPS));
+        let input = frames(1 << 20, PERIOD);
+        let mut out = vec![[0; 2]; 4 * PERIOD];
+        let engine = &mut rig.engine;
+        let commands = &mut rig.commands;
+        assert_no_alloc(|| {
+            for round in 0..200 {
+                a.ring.write(&input);
+                feed.push(&input);
+                match round {
+                    20 => {
+                        let _ = commands.push(Command::GrowTaps(grown.take().unwrap()));
+                        let _ = commands.push(Command::AddTap(late_tap.take().unwrap()));
+                        let _ = commands.push(Command::SetRunning(7, true));
+                    }
+                    60 => {
+                        let _ = commands.push(Command::Flush(5));
+                    }
+                    80 => {
+                        let _ = commands.push(Command::SetRunning(5, true));
+                    }
+                    100 => {
+                        let _ = commands.push(Command::RemoveTap(6));
+                    }
+                    150 => feed.fail(),
+                    _ => {}
+                }
+                engine.cycle().unwrap();
+                reading.ring.read(&mut out);
+                late.ring.read(&mut out);
+            }
+        });
+        assert!(full.overruns() > 0);
+        assert_eq!(reading.overruns(), 0);
+        // The returned items are freed here, off the audio thread.
+        let events = rig.events();
+        assert_eq!(count(&events, |e| matches!(e, Event::OldTaps(_))), 1);
+        assert_eq!(count(&events, |e| matches!(e, Event::DroppedTap(_))), 1);
+    }
+
+    #[test]
+    fn taps_do_not_allocate() {
+        taps_without_allocation::<I32>();
+        taps_without_allocation::<F32>();
+        taps_without_allocation::<F64>();
     }
 }

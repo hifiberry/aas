@@ -8,7 +8,7 @@
 use crate::capture::Capture;
 use crate::config::{Config, Format, Idle, PluginConfig, PluginPlace, Quality};
 use crate::dop;
-use crate::engine::{ANALOG, Command, Event, INITIAL_SOURCES, Source};
+use crate::engine::{ANALOG, Command, Event, INITIAL_SOURCES, INITIAL_TAPS, Source, Tap};
 use crate::format::db_to_gain;
 use crate::latency::{PERIODS, period_frames};
 use crate::plugin::build::{Chains, Libraries, build_chain, engine_place};
@@ -58,6 +58,8 @@ const SEND_WARN: Duration = Duration::from_secs(1);
 const SAVE_DELAY: Duration = Duration::from_secs(1);
 /// How often a capture that failed, or would not open, is tried again.
 const CAPTURE_RETRY: Duration = Duration::from_secs(1);
+/// Periods of the output a capture stream's ring holds at least.
+const RECORDER_PERIODS: u32 = 4;
 
 /// Frames a client's ring holds at least, so that one period's input fits
 /// whatever rate the output runs at. One period takes at most what the
@@ -79,28 +81,39 @@ pub fn min_buffer_frames(rate: u32, latency_ms: f32) -> u32 {
     min_ring_frames(rate, latency_ms) + refill
 }
 
-/// A read-only view of a ring's header, for the control thread. It maps
-/// the header alone, which is one page. A second mapping of the whole ring
-/// would lock the ring's memory once more for each client.
+/// A view of a ring's header, for the control thread. It maps the header
+/// alone, which is one page. A second mapping of the whole ring would lock
+/// the ring's memory once more for each client. Read-only for a playback
+/// stream; a capture stream's is writable, to mark the stream ended.
 struct HeaderView {
     base: NonNull<Header>,
 }
 
-// SAFETY: the mapping is shared memory that is only read, through atomics.
+// SAFETY: the mapping is shared memory that is only accessed through atomics.
 unsafe impl Send for HeaderView {}
 
 impl HeaderView {
     const LEN: usize = size_of::<Header>();
 
     /// Maps the header of a ring this process made, so its size is known
-    /// to hold one.
+    /// to hold one, for reading.
     fn map(fd: BorrowedFd) -> io::Result<HeaderView> {
+        Self::map_as(fd, libc::PROT_READ)
+    }
+
+    /// Maps the header for reading and writing. Only before the ring is
+    /// sealed, which refuses a new writable mapping.
+    fn map_writable(fd: BorrowedFd) -> io::Result<HeaderView> {
+        Self::map_as(fd, libc::PROT_READ | libc::PROT_WRITE)
+    }
+
+    fn map_as(fd: BorrowedFd, prot: libc::c_int) -> io::Result<HeaderView> {
         // SAFETY: a fresh shared mapping, the result is checked.
         let p = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
                 Self::LEN,
-                libc::PROT_READ,
+                prot,
                 libc::MAP_SHARED,
                 fd.as_raw_fd(),
                 0,
@@ -182,10 +195,28 @@ struct Stream {
     drained: bool,
 }
 
+/// A capture stream as the control thread keeps it. It is no client of the
+/// rate rules, never counts as active and has no resampler.
+struct Recorder {
+    id: ClientId,
+    /// The output's rate when it was configured, which it records at.
+    rate: u32,
+    /// Kept until the ring is sealed, on the first start.
+    memfd: Option<OwnedFd>,
+    running: bool,
+    /// Writable, to set `ended`.
+    view: HeaderView,
+    /// The output's rate has changed: the audio thread has been told to
+    /// remove the tap, and the client has to configure again.
+    ended: bool,
+}
+
 struct Conn {
     name: String,
     hello: bool,
+    /// A connection has one stream at a time, this or a recorder.
     stream: Option<Stream>,
+    recorder: Option<Recorder>,
     /// Told of every change to the output volume.
     subscribed: bool,
 }
@@ -226,6 +257,9 @@ pub struct Control {
     next_id: ClientId,
     table_capacity: usize,
     table_len: usize,
+    /// The same for the audio thread's table of capture streams.
+    taps_capacity: usize,
+    taps_len: usize,
     /// The rate and period the output was last told to open at. None while
     /// it is closed.
     output: Option<(u32, u32)>,
@@ -294,6 +328,8 @@ impl Control {
             next_id: 1,
             table_capacity: INITIAL_SOURCES,
             table_len: 0,
+            taps_capacity: INITIAL_TAPS,
+            taps_len: 0,
             output: None,
             reopening: 0,
             switch_at: None,
@@ -407,6 +443,7 @@ impl Control {
             name,
             hello: false,
             stream: None,
+            recorder: None,
             subscribed: false,
         };
         self.conns.insert(conn, state);
@@ -422,6 +459,11 @@ impl Control {
             let mut batch = Vec::new();
             self.remove_stream(stream, now, &mut batch);
             self.decide(now, false, &mut batch);
+            self.send(batch);
+        }
+        if let Some(recorder) = state.recorder {
+            let mut batch = Vec::new();
+            self.remove_recorder(recorder, &mut batch);
             self.send(batch);
         }
     }
@@ -496,16 +538,28 @@ impl Control {
         ) {
             self.cancel_drain(conn);
         }
+        let recording = self.recorder_mut(conn).is_some();
         match request {
             Request::Hello { .. } => Answer::reply(Reply::Hello {
                 version: proto::VERSION,
             }),
             Request::Configure {
+                buffer_frames,
+                capture: true,
+                ..
+            } => self.configure_recorder(conn, buffer_frames, now),
+            Request::Configure {
                 rate,
                 format,
                 channels,
                 buffer_frames,
+                capture: false,
             } => self.configure(conn, rate, format, channels, buffer_frames, now),
+            Request::Start if recording => self.start_recorder(conn),
+            Request::Stop if recording => self.stop_recorder(conn),
+            Request::Reset if recording => self.reset_recorder(conn),
+            // A capture stream never ends by itself.
+            Request::Drain if recording => Answer::error(libc::EINVAL),
             Request::Start => self.start_stream(conn, now),
             Request::Stop => self.stop_stream(conn, now),
             Request::Drain => self.drain(conn, now),
@@ -584,6 +638,9 @@ impl Control {
         if let Some(old) = self.conns.get_mut(&conn).and_then(|c| c.stream.take()) {
             self.remove_stream(old, now, &mut batch);
         }
+        if let Some(old) = self.conns.get_mut(&conn).and_then(|c| c.recorder.take()) {
+            self.remove_recorder(old, &mut batch);
+        }
         let capacity = buffer_frames.max(min_ring_frames(rate, self.latency_ms));
         let made = Ring::create(capacity).and_then(|(ring, memfd)| {
             let view = HeaderView::map(memfd.as_fd())?;
@@ -627,7 +684,7 @@ impl Control {
         self.decide(now, false, &mut batch);
         self.send(batch);
         Answer {
-            reply: Some(Reply::Configured),
+            reply: Some(Reply::Configured { rate: 0 }),
             fds: vec![memfd_theirs, theirs],
             close: false,
         }
@@ -694,12 +751,13 @@ impl Control {
         }
     }
 
-    /// The audio thread has emptied a stream's ring: its reset is answered.
+    /// The audio thread has emptied a stream's ring, or stopped a capture
+    /// stream: its reset is answered.
     fn flushed(&mut self, id: ClientId) {
-        let conn = self
-            .conns
-            .iter()
-            .find(|(_, c)| c.stream.as_ref().is_some_and(|s| s.id == id));
+        let conn = self.conns.iter().find(|(_, c)| {
+            c.stream.as_ref().is_some_and(|s| s.id == id)
+                || c.recorder.as_ref().is_some_and(|r| r.id == id)
+        });
         if let Some((&conn, _)) = conn {
             self.outbox.push((conn, Reply::Ok));
         }
@@ -781,6 +839,142 @@ impl Control {
         self.table_len -= 1;
         self.dop_claims.retain(|&(_, c)| c != stream.id);
         self.update_dop(now, batch);
+    }
+
+    /// Sets up a capture stream: S32 stereo at the rate the output runs at,
+    /// or opens at next if it is closed. The ring holds what is asked for,
+    /// and at least a few periods. Sends the tap to the audio thread, which
+    /// writes it once it is started.
+    fn configure_recorder(&mut self, conn: ConnId, buffer_frames: u32, now: Instant) -> Answer {
+        let rate = match self.output {
+            Some((rate, _)) => rate,
+            None => self.policy.current(),
+        };
+        let least = RECORDER_PERIODS * period_frames(rate, self.latency_ms);
+        let capacity = buffer_frames.max(least);
+        let mut batch = Vec::new();
+        if let Some(old) = self.conns.get_mut(&conn).and_then(|c| c.stream.take()) {
+            self.remove_stream(old, now, &mut batch);
+            self.decide(now, false, &mut batch);
+        }
+        if let Some(old) = self.conns.get_mut(&conn).and_then(|c| c.recorder.take()) {
+            self.remove_recorder(old, &mut batch);
+        }
+        let made = Ring::create(capacity).and_then(|(ring, memfd)| {
+            let view = HeaderView::map_writable(memfd.as_fd())?;
+            let wake = eventfd()?;
+            let theirs = wake.try_clone()?;
+            let memfd_theirs = memfd.try_clone()?;
+            Ok((ring, view, memfd, memfd_theirs, wake, theirs))
+        });
+        let (ring, view, memfd, memfd_theirs, wake, theirs) = match made {
+            Ok(made) => made,
+            Err(e) => {
+                eprintln!("aas: no ring for a recorder: {e}");
+                self.send(batch);
+                return Answer::error(e.raw_os_error().unwrap_or(libc::ENOMEM));
+            }
+        };
+        let id = self.next_id;
+        self.next_id += 1;
+        if self.taps_len == self.taps_capacity {
+            self.taps_capacity *= 2;
+            batch.push(Command::GrowTaps(Vec::with_capacity(self.taps_capacity)));
+        }
+        batch.push(Command::AddTap(Box::new(Tap::new(id, ring, wake))));
+        self.taps_len += 1;
+        let recorder = Recorder {
+            id,
+            rate,
+            memfd: Some(memfd),
+            running: false,
+            view,
+            ended: false,
+        };
+        if let Some(state) = self.conns.get_mut(&conn) {
+            state.recorder = Some(recorder);
+        }
+        self.send(batch);
+        Answer {
+            reply: Some(Reply::Configured { rate }),
+            fds: vec![memfd_theirs, theirs],
+            close: false,
+        }
+    }
+
+    /// Starts a capture stream, unless it has ended. As for a player, a
+    /// ring that cannot be sealed is not trusted, and the client is dropped.
+    fn start_recorder(&mut self, conn: ConnId) -> Answer {
+        let Some(recorder) = self.recorder_mut(conn) else {
+            return Answer::error(libc::EBADFD);
+        };
+        if recorder.ended {
+            return Answer::error(libc::ENODEV);
+        }
+        if let Some(memfd) = recorder.memfd.take() {
+            if let Err(e) = ring::seal_writes(memfd.as_fd()) {
+                eprintln!("aas: could not seal a recorder's ring: {e}");
+                return Answer::fatal(e.raw_os_error().unwrap_or(libc::EIO));
+            }
+        }
+        if !std::mem::replace(&mut recorder.running, true) {
+            let id = recorder.id;
+            self.send(vec![Command::SetRunning(id, true)]);
+        }
+        Answer::reply(Reply::Ok)
+    }
+
+    fn stop_recorder(&mut self, conn: ConnId) -> Answer {
+        let Some(recorder) = self.recorder_mut(conn) else {
+            return Answer::error(libc::EBADFD);
+        };
+        if std::mem::take(&mut recorder.running) {
+            let id = recorder.id;
+            self.send(vec![Command::SetRunning(id, false)]);
+        }
+        Answer::reply(Reply::Ok)
+    }
+
+    /// Stops a capture stream. The reply comes once the audio thread has
+    /// stopped writing, so that the client can empty the ring, which is
+    /// the reader's to do.
+    fn reset_recorder(&mut self, conn: ConnId) -> Answer {
+        let Some(recorder) = self.recorder_mut(conn) else {
+            return Answer::error(libc::EBADFD);
+        };
+        recorder.running = false;
+        let id = recorder.id;
+        self.send(vec![Command::Flush(id)]);
+        Answer {
+            reply: None,
+            fds: Vec::new(),
+            close: false,
+        }
+    }
+
+    fn remove_recorder(&mut self, recorder: Recorder, batch: &mut Vec<Command>) {
+        if !recorder.ended {
+            batch.push(Command::RemoveTap(recorder.id));
+            self.taps_len -= 1;
+        }
+    }
+
+    /// Ends every capture stream that records at another rate than `rate`.
+    /// The capture runs at the output's rate only, so the client has to
+    /// configure again, and is told through the ring.
+    fn end_recorders(&mut self, rate: u32, batch: &mut Vec<Command>) {
+        let recorders = self.conns.values_mut().filter_map(|c| c.recorder.as_mut());
+        for recorder in recorders.filter(|r| !r.ended && r.rate != rate) {
+            recorder.view.header().ended.store(1, Ordering::Release);
+            recorder.ended = true;
+            recorder.running = false;
+            batch.push(Command::RemoveTap(recorder.id));
+            self.taps_len -= 1;
+        }
+    }
+
+    fn recorder_mut(&mut self, conn: ConnId) -> Option<&mut Recorder> {
+        self.conns.get_mut(&conn)?.recorder.as_mut()
     }
 
     fn stream_mut(&mut self, conn: ConnId) -> Option<&mut Stream> {
@@ -894,6 +1088,7 @@ impl Control {
             analog.reading = false;
             analog.retry_at = None;
         }
+        self.end_recorders(rate, batch);
         batch.push(Command::Reconfigure { rate, period });
     }
 
@@ -1092,7 +1287,9 @@ impl Control {
                 Event::Dropped(_)
                 | Event::Replaced(_)
                 | Event::OldTable(_)
-                | Event::OldChain(_) => {}
+                | Event::OldChain(_)
+                | Event::DroppedTap(_)
+                | Event::OldTaps(_) => {}
                 Event::OldCapture(_) => {
                     if let Some(analog) = &mut self.analog {
                         analog.unanswered = analog.unanswered.saturating_sub(1);
@@ -1266,9 +1463,10 @@ mod tests {
             format: ClientFormat::S32,
             channels: 2,
             buffer_frames: 4096,
+            capture: false,
         };
         let answer = control.request(1, Some(configure), now);
-        assert_eq!(answer.reply, Some(Reply::Configured));
+        assert_eq!(answer.reply, Some(Reply::Configured { rate: 0 }));
         let start = control.request(1, Some(Request::Start), now);
         assert_eq!(start.reply, Some(Reply::Ok));
         // The client set the flag, and the audio thread saw the ring empty
@@ -1317,6 +1515,7 @@ mod tests {
             format: ClientFormat::S16,
             channels: 2,
             buffer_frames,
+            capture: false,
         }
     }
 
@@ -1392,7 +1591,7 @@ mod tests {
             let code = libc::EINVAL as u32;
             assert_eq!(short.reply, Some(Reply::Error { code }), "{rate}");
             let enough = control.request(1, Some(configure(rate, least)), now);
-            assert_eq!(enough.reply, Some(Reply::Configured), "{rate}");
+            assert_eq!(enough.reply, Some(Reply::Configured { rate: 0 }), "{rate}");
         }
     }
 
@@ -1417,7 +1616,7 @@ mod tests {
     fn a_request_during_a_drain_answers_the_drain_first() {
         let (mut control, _commands, now) = hello();
         let answer = control.request(1, Some(configure(48000, 4096)), now);
-        assert_eq!(answer.reply, Some(Reply::Configured));
+        assert_eq!(answer.reply, Some(Reply::Configured { rate: 0 }));
         assert_eq!(
             control.request(1, Some(Request::Start), now).reply,
             Some(Reply::Ok)
@@ -1441,7 +1640,7 @@ mod tests {
     fn a_drain_that_makes_progress_is_not_cut_short() {
         let (mut control, mut commands, now) = hello();
         let answer = control.request(1, Some(configure(48000, 4096)), now);
-        assert_eq!(answer.reply, Some(Reply::Configured));
+        assert_eq!(answer.reply, Some(Reply::Configured { rate: 0 }));
         let source = added(&mut commands);
         source.ring.write(&[[1, 1]; 4096]);
         assert_eq!(
@@ -1475,7 +1674,7 @@ mod tests {
     fn a_drain_is_not_answered_while_the_output_is_still_opening() {
         let (mut control, mut commands, now) = hello();
         let answer = control.request(1, Some(configure(48000, 4096)), now);
-        assert_eq!(answer.reply, Some(Reply::Configured));
+        assert_eq!(answer.reply, Some(Reply::Configured { rate: 0 }));
         let source = added(&mut commands);
         source.ring.write(&[[1, 1]; 4096]);
         let start = control.request(1, Some(Request::Start), now);
@@ -1600,7 +1799,7 @@ mod tests {
             control.request(conn, Some(hello), now);
             let buffer = min_buffer_frames(rate, 12.0);
             let answer = control.request(conn, Some(configure(rate, buffer)), now);
-            assert_eq!(answer.reply, Some(Reply::Configured));
+            assert_eq!(answer.reply, Some(Reply::Configured { rate: 0 }));
             let start = control.request(conn, Some(Request::Start), now);
             assert_eq!(start.reply, Some(Reply::Ok));
         }
@@ -1638,7 +1837,7 @@ mod tests {
         };
         control.request(1, Some(hello), now);
         let answer = control.request(1, Some(configure(48000, 4096)), now);
-        assert_eq!(answer.reply, Some(Reply::Configured));
+        assert_eq!(answer.reply, Some(Reply::Configured { rate: 0 }));
         let source = added(&mut engine_commands);
         source.ring.write(&[[1, 1]; 4096]);
         // The start opens the output, and new rates of the card open it
@@ -1740,6 +1939,9 @@ mod tests {
                         (name, Some(Event::OldCapture(old)))
                     }
                     Command::SetAnalogGain(g) => (format!("SetAnalogGain {g}"), None),
+                    Command::AddTap(t) => (format!("AddTap {}", t.id), None),
+                    Command::RemoveTap(id) => (format!("RemoveTap {id}"), None),
+                    Command::GrowTaps(t) => ("GrowTaps".into(), Some(Event::OldTaps(t))),
                     Command::Shutdown => ("Shutdown".into(), None),
                 };
                 seen.push(name);
@@ -1784,7 +1986,7 @@ mod tests {
         control.request(conn, Some(hello), now);
         let buffer = min_buffer_frames(rate, 12.0);
         let answer = control.request(conn, Some(configure(rate, buffer)), now);
-        assert_eq!(answer.reply, Some(Reply::Configured));
+        assert_eq!(answer.reply, Some(Reply::Configured { rate: 0 }));
         let start = control.request(conn, Some(Request::Start), now);
         assert_eq!(start.reply, Some(Reply::Ok));
     }

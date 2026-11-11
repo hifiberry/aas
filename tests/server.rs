@@ -1346,3 +1346,150 @@ fn an_enabled_input_on_a_card_without_an_adc_opens_nothing() {
     assert_eq!(log.closes(), 0);
     drop(daemon);
 }
+
+/// Reads what the recorder's ring holds, until `want` frames have come or
+/// the patience runs out.
+fn record(recorder: &mut Client, want: usize) -> Vec<[i32; 2]> {
+    let mut got = Vec::new();
+    let mut buf = [[0i32; 2]; 1024];
+    let deadline = Instant::now() + PATIENCE;
+    while got.len() < want && Instant::now() < deadline {
+        let room = buf.len().min(want - got.len());
+        let n = recorder.read(&mut buf[..room]).unwrap();
+        got.extend_from_slice(&buf[..n]);
+        if n == 0 {
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+    got
+}
+
+#[test]
+fn a_recorder_reads_what_the_capture_delivers() {
+    let (sink, log) = memory_sink();
+    let feeds: Arc<Mutex<Vec<CaptureFeed>>> = Arc::default();
+    let opened = feeds.clone();
+    let capture: SendCapture = Box::new(move |_, _| {
+        let (capture, feed) = MemoryCapture::new();
+        opened.lock().unwrap().push(feed);
+        Ok(Box::new(capture) as Box<dyn Capture>)
+    });
+    let setup: CaptureSetup = Box::new(move |_| Some(capture as OpenCapture));
+    let daemon = Daemon::start_analog(analog_config(), sink, setup);
+    assert!(wait_for(|| !feeds.lock().unwrap().is_empty()));
+    let feed = feeds.lock().unwrap()[0].clone();
+    let mut recorder = daemon.client();
+    assert_eq!(recorder.configure_capture(4096).unwrap(), 48000);
+    // Nothing is written before the start.
+    thread::sleep(Duration::from_millis(20));
+    let mut buf = [[0i32; 2]; 1024];
+    assert_eq!(recorder.read(&mut buf).unwrap(), 0);
+    assert_eq!(recorder.hw_position().unwrap(), 0);
+    recorder.start().unwrap();
+    // Silence first: the input has no signal yet.
+    let quiet = record(&mut recorder, 4 * PERIOD as usize);
+    assert!(
+        quiet.iter().all(|f| *f == [0, 0]),
+        "audio before any signal"
+    );
+    // A signal at -18 dBFS, delivered as a card would.
+    let v = 1 << 28;
+    let done = Arc::new(AtomicBool::new(false));
+    let feeder = {
+        let (feed, done) = (feed.clone(), done.clone());
+        thread::spawn(move || {
+            while !done.load(Ordering::Relaxed) {
+                if feed.queued() < 2 * PERIOD as usize {
+                    feed.push(&[[v, -v]; PERIOD as usize]);
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+        })
+    };
+    let mut heard = false;
+    let deadline = Instant::now() + PATIENCE;
+    while !heard && Instant::now() < deadline {
+        heard = record(&mut recorder, PERIOD as usize).contains(&[v, -v]);
+    }
+    done.store(true, Ordering::Relaxed);
+    feeder.join().unwrap();
+    assert!(heard, "the input never reached the recorder");
+    assert!(
+        log.frames().contains(&[v, -v]),
+        "the input never reached the card"
+    );
+    // A reset empties the ring from the reader's side and stops the stream.
+    recorder.reset().unwrap();
+    let at = recorder.hw_position().unwrap();
+    thread::sleep(Duration::from_millis(20));
+    assert_eq!(recorder.hw_position().unwrap(), at);
+    assert_eq!(recorder.read(&mut buf).unwrap(), 0);
+    assert_eq!(recorder.delay_frames(), 0);
+    recorder.start().unwrap();
+    assert_eq!(record(&mut recorder, 64).len(), 64);
+    assert!(!recorder.ended());
+}
+
+#[test]
+fn a_rate_change_ends_an_open_capture_stream() {
+    let (sink, log) = memory_sink();
+    let daemon = Daemon::start(default_config(), sink);
+    assert!(wait_for(|| last_open(&log) == Some((48000, PERIOD))));
+    let mut recorder = daemon.client();
+    assert_eq!(recorder.configure_capture(4096).unwrap(), 48000);
+    recorder.start().unwrap();
+    // Without an input it records silence in real time.
+    assert_eq!(record(&mut recorder, 256).len(), 256);
+    // A player at the same rate leaves it alone.
+    let mut same = daemon.client_at(48000, 4096);
+    write_all(&mut same, &left_pattern(1024));
+    same.start().unwrap();
+    wait_played(&same, 1024);
+    assert!(!recorder.ended());
+    same.stop().unwrap();
+    // One at another rate takes the output there, and ends the recorder.
+    let mut player = daemon.client_at(44100, 4096);
+    player.start().unwrap();
+    assert!(wait_for(|| last_open(&log) == Some((44100, PERIOD))));
+    assert!(wait_for(|| recorder.ended()));
+    let start = recorder.start().err().and_then(|e| e.raw_os_error());
+    assert_eq!(start, Some(libc::ENODEV));
+    // What it had recorded can still be read, and nothing more comes.
+    let mut buf = [[0i32; 2]; 1024];
+    while recorder.read(&mut buf).unwrap() > 0 {}
+    let at = recorder.hw_position().unwrap();
+    thread::sleep(Duration::from_millis(20));
+    assert_eq!(recorder.hw_position().unwrap(), at);
+    // Reopened, it records at the new rate.
+    assert_eq!(recorder.configure_capture(4096).unwrap(), 44100);
+    recorder.start().unwrap();
+    assert_eq!(record(&mut recorder, 256).len(), 256);
+    assert!(!recorder.ended());
+}
+
+#[test]
+fn a_recorder_does_not_count_as_a_client() {
+    let (sink, log) = memory_sink();
+    let daemon = Daemon::start(config(Idle::Off { delay_s: 1 }), sink);
+    let mut recorder = daemon.client();
+    assert_eq!(recorder.configure_capture(0).unwrap(), 48000);
+    recorder.start().unwrap();
+    // The smallest ring is four periods. One that is not read fills, and
+    // counts what it could not take.
+    assert!(wait_for(|| recorder.underruns() > 0));
+    let mut buf = [[0i32; 2]; 1024];
+    assert_eq!(recorder.read(&mut buf).unwrap(), 4 * PERIOD as usize);
+    // It does not keep the output open.
+    assert!(
+        wait_for(|| log.closes() >= 1),
+        "the recorder kept the output on"
+    );
+    // Configured while the output is off, it gets the rate it will open at.
+    let mut second = daemon.client();
+    assert_eq!(second.configure_capture(4096).unwrap(), 48000);
+    // It does not hold the rate: the first player sets it.
+    let mut player = daemon.client_at(44100, 4096);
+    player.start().unwrap();
+    assert!(wait_for(|| last_open(&log) == Some((44100, PERIOD))));
+    assert!(wait_for(|| recorder.ended() && second.ended()));
+}
