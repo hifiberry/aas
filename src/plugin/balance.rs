@@ -76,15 +76,16 @@ impl Plugin for Balance {
             return Status::default();
         }
         let (gl, gr) = self.gains();
+        let (ql, qr) = (q32(gl), q32(gr));
         // The channel at gain 1 is left alone, so it stays bit-identical.
         match block {
             Block::I32(d) => {
                 for f in d {
                     if gl != 1.0 {
-                        f[0] = scale(f[0], gl);
+                        f[0] = scale(f[0], ql);
                     }
                     if gr != 1.0 {
-                        f[1] = scale(f[1], gr);
+                        f[1] = scale(f[1], qr);
                     }
                 }
             }
@@ -113,10 +114,17 @@ impl Plugin for Balance {
     }
 }
 
-/// `x * gain` for a gain in 0 to 1, rounded to the nearest integer. The
-/// product of a 32 bit sample and a gain is exact in 64 bit floats.
-fn scale(x: i32, gain: f64) -> i32 {
-    (x as f64 * gain).round() as i32
+/// A gain in 0 to 1 as a Q32 fixed point number.
+fn q32(gain: f64) -> i64 {
+    (gain * 4_294_967_296.0).round() as i64
+}
+
+/// `x * q / 2^32`, rounded to the nearest integer, halves away from zero.
+/// The product needs up to 64 bits, so it is taken in 128.
+fn scale(x: i32, q: i64) -> i32 {
+    let p = i128::from(x).abs() * i128::from(q) + (1 << 31);
+    let v = (p >> 32) as i32;
+    if x < 0 { -v } else { v }
 }
 
 #[cfg(test)]
@@ -201,6 +209,56 @@ mod tests {
         p.set_param(0, f64::NAN);
         p.process(Block::F64(&mut d));
         assert_eq!(d, [[1.0, 0.0]]);
+    }
+
+    #[test]
+    fn an_i32_block_is_scaled_exactly_and_rounded_to_nearest() {
+        // 0.3 to the right leaves the left at 0.7, which is 3006477107 / 2^32.
+        // 651086875 * 0.7 is 455760812.5 up to a 1e-9 error: one f64
+        // multiply would land one LSB high.
+        let mut p = with(0.3);
+        let mut i = [
+            [651_086_875, 5],
+            [-651_086_875, 5],
+            [i32::MAX, 5],
+            [i32::MIN, 5],
+            [1 << 30, 5],
+            [-(1 << 30) + 1, 5],
+            [1, 5],
+            [-1, 5],
+        ];
+        p.process(Block::I32(&mut i));
+        let left: Vec<i32> = i.iter().map(|f| f[0]).collect();
+        assert_eq!(
+            left,
+            [
+                455_760_812,
+                -455_760_812,
+                1_503_238_553,
+                -1_503_238_554,
+                751_619_277,
+                -751_619_276,
+                1,
+                -1
+            ]
+        );
+        assert!(i.iter().all(|f| f[1] == 5));
+    }
+
+    #[test]
+    fn full_right_silences_the_left_channel_and_keeps_the_right_bit_identical() {
+        let mut p = with(1.0);
+        let mut i = [[1000, i32::MIN], [i32::MAX, -7]];
+        p.process(Block::I32(&mut i));
+        assert_eq!(i, [[0, i32::MIN], [0, -7]]);
+        let mut f = [[0.5f32, 0.1]];
+        p.process(Block::F32(&mut f));
+        assert_eq!(f[0][0], 0.0);
+        assert_eq!(f[0][1].to_bits(), 0.1f32.to_bits());
+        let mut d = [[0.5f64, 1.0 / 3.0]];
+        p.process(Block::F64(&mut d));
+        assert_eq!(d[0][0], 0.0);
+        assert_eq!(d[0][1].to_bits(), (1.0f64 / 3.0).to_bits());
     }
 
     #[test]

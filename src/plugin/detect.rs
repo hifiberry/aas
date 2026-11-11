@@ -4,6 +4,11 @@
 //! window above the threshold opens the detector. It closes when no window
 //! has been above the threshold for the hold time. While closed the samples
 //! are overwritten with zeros and the block reports `no_signal`.
+//!
+//! A hold of zero closes at the end of the first window that is not above
+//! the threshold. A NaN sample makes its own window not above the
+//! threshold and leaves no trace in the next. An infinite sample is above
+//! any threshold.
 
 use super::{Block, Formats, Param, Plugin, Status};
 
@@ -77,7 +82,8 @@ impl Detect {
             }
             self.seen += 1;
             let mut loud = false;
-            if self.seen == self.window {
+            let ended = self.seen == self.window;
+            if ended {
                 let mean = self.sum / (2.0 * f64::from(self.window));
                 loud = 10.0 * mean.log10() > self.threshold;
                 self.seen = 0;
@@ -87,9 +93,14 @@ impl Detect {
                 self.open = true;
                 self.quiet = 0;
             } else if self.open {
-                self.quiet += 1;
-                if self.quiet >= self.hold_frames {
-                    self.open = false;
+                if self.hold_frames == 0 {
+                    // No hold: the first window not above the threshold closes.
+                    self.open = !ended;
+                } else {
+                    self.quiet += 1;
+                    if self.quiet >= self.hold_frames {
+                        self.open = false;
+                    }
                 }
             }
         }
@@ -358,6 +369,78 @@ mod tests {
         assert_eq!(d.threshold, 0.0);
         assert_eq!(d.hold_frames, 60 * 48_000);
         assert_eq!(d.params().len(), 2);
+    }
+
+    #[test]
+    fn a_hold_of_zero_closes_at_the_end_of_the_first_window_not_above() {
+        let mut d = Detect::new(RATE);
+        d.set_param(1, 0.0);
+        feed(&mut d, tone(-30.0, 2400, RATE));
+        assert!(d.open());
+        // Open through a window above the threshold, and into the next.
+        feed(&mut d, tone(-30.0, 2400, RATE));
+        assert!(d.open());
+        feed(&mut d, silence(2399));
+        assert!(d.open());
+        feed(&mut d, silence(1));
+        assert!(!d.open());
+    }
+
+    #[test]
+    fn samples_after_a_close_in_the_middle_of_a_call_are_zero_in_that_call() {
+        let mut d = Detect::new(RATE);
+        let mut x = tone(-30.0, 2400, RATE);
+        // Quiet, constant and below the threshold, for more than the hold.
+        x.extend(vec![[1e-4, 1e-4]; 150_000]);
+        d.process(Block::F64(&mut x));
+        // The hold ends 144000 frames after the loud window.
+        assert!(x[2400..2400 + 144_000].iter().all(|f| *f == [1e-4, 1e-4]));
+        assert!(x[2400 + 144_000..].iter().all(|f| *f == [0.0, 0.0]));
+        assert!(!d.open());
+    }
+
+    #[test]
+    fn calls_of_one_frame_give_the_same_result_as_one_large_call() {
+        let mut data = tone(-30.0, 4800, RATE);
+        data.extend(vec![[1e-4, -1e-4]; 160_000]);
+        data.extend(tone(-30.0, 4800, RATE));
+        let mut whole = Detect::new(RATE);
+        let mut a = data.clone();
+        let status = whole.process(Block::F64(&mut a));
+        let mut ones = Detect::new(RATE);
+        let mut b = data.clone();
+        for f in b.chunks_mut(1) {
+            ones.process(Block::F64(f));
+        }
+        assert_eq!(a, b);
+        assert_eq!(whole.open(), ones.open());
+        assert!(!status.no_signal);
+    }
+
+    #[test]
+    fn nan_poisons_only_its_own_window_and_infinity_counts_as_loud() {
+        let mut d = Detect::new(RATE);
+        let mut x = tone(-30.0, 2400, RATE);
+        x[10] = [f64::NAN, 0.0];
+        assert!(d.process(Block::F64(&mut x)).no_signal);
+        assert!(!d.open());
+        // The next window is clean and opens it.
+        feed(&mut d, tone(-30.0, 2400, RATE));
+        assert!(d.open());
+        // A NaN while open does not close it by itself, and does not stick.
+        let mut x = tone(-30.0, 2400, RATE);
+        x[0] = [f64::NAN, f64::NAN];
+        feed(&mut d, x);
+        assert!(d.open());
+        feed(&mut d, silence(144_000));
+        assert!(!d.open());
+        // Infinity is above any threshold, and the state recovers from it.
+        let mut x = silence(2400);
+        x[5] = [f64::INFINITY, 0.0];
+        feed(&mut d, x);
+        assert!(d.open());
+        feed(&mut d, silence(144_000));
+        assert!(!d.open());
     }
 
     #[test]
