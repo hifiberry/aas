@@ -2,6 +2,7 @@
 
 pub mod bitperfect;
 pub mod board;
+pub mod capture;
 pub mod cards;
 pub mod config;
 pub mod control;

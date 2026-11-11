@@ -861,7 +861,10 @@ impl Control {
                 Event::Dropped(_)
                 | Event::Replaced(_)
                 | Event::OldTable(_)
-                | Event::OldChain(_) => {}
+                | Event::OldChain(_)
+                | Event::OldCapture(_) => {}
+                // The control thread does not run the analog input yet.
+                Event::InputSignal(_) | Event::CaptureFailed => {}
                 Event::Reconfigured => self.reopening = self.reopening.saturating_sub(1),
                 Event::DopStarted(id, claim) => {
                     // The events can come in another order than the claims
