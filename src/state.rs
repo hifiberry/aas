@@ -4,7 +4,9 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::thread::{self, JoinHandle};
 
 /// Default state path. Under systemd this is the service's StateDirectory.
 pub const DEFAULT_PATH: &str = "/var/lib/aas/state.toml";
@@ -54,7 +56,8 @@ impl State {
 
     /// Writes the file to a temporary file beside it and renames that into
     /// place, so that a crash or power loss leaves the old or the new file,
-    /// never part of one.
+    /// never part of one. The directory is synced after the rename, so
+    /// that the new name survives a power loss too.
     pub fn save(&self, path: &Path) -> io::Result<()> {
         let text = toml::to_string(self).map_err(io::Error::other)?;
         let mut temporary = path.as_os_str().to_owned();
@@ -69,7 +72,89 @@ impl State {
         if written.is_err() {
             let _ = fs::remove_file(temporary);
         }
-        written
+        written?;
+        fs::File::open(directory_of(path))?.sync_all()
+    }
+}
+
+/// The directory a file is in. A bare file name is in the current one.
+fn directory_of(path: &Path) -> &Path {
+    match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    }
+}
+
+/// Stack for the thread that saves. It formats a few bytes and calls the
+/// file system, and with memory locked its whole stack is resident.
+const SAVER_STACK: usize = 256 * 1024;
+
+/// Writes the state file from a thread of its own. The sync to disk can
+/// take long on a slow SD card, and would hold up the clients' requests on
+/// the control thread.
+pub struct Saver {
+    path: PathBuf,
+    queue: Option<mpsc::Sender<State>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Saver {
+    /// Starts the thread. Without one the file is written in place.
+    pub fn new(path: PathBuf) -> Saver {
+        let (queue, waiting) = mpsc::channel::<State>();
+        let target = path.clone();
+        let builder = thread::Builder::new()
+            .name("aas-state".into())
+            .stack_size(SAVER_STACK);
+        let spawned = builder.spawn(move || {
+            while let Ok(mut state) = waiting.recv() {
+                // Only the latest state matters.
+                while let Ok(newer) = waiting.try_recv() {
+                    state = newer;
+                }
+                write(&state, &target);
+            }
+        });
+        match spawned {
+            Ok(thread) => Saver {
+                path,
+                queue: Some(queue),
+                thread: Some(thread),
+            },
+            Err(e) => {
+                eprintln!("aas: no thread to save the state, saving in place: {e}");
+                Saver {
+                    path,
+                    queue: None,
+                    thread: None,
+                }
+            }
+        }
+    }
+
+    /// Hands the state over to be written. Returns at once.
+    pub fn save(&self, state: State) {
+        if let Some(queue) = &self.queue {
+            if queue.send(state).is_ok() {
+                return;
+            }
+        }
+        write(&state, &self.path);
+    }
+
+    /// Returns once everything handed over is on disk. A later `save`
+    /// writes in place.
+    pub fn finish(&mut self) {
+        self.queue = None;
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn write(state: &State, path: &Path) {
+    if let Err(e) = state.save(path) {
+        eprintln!("aas: could not save {}: {e}", path.display());
     }
 }
 
@@ -92,6 +177,43 @@ mod tests {
             std::fs::write(&path, text).unwrap();
             assert_eq!(State::load(&path).output_percent, 100, "{text:?}");
         }
+    }
+
+    #[test]
+    fn a_bare_file_name_is_in_the_current_directory() {
+        assert_eq!(
+            directory_of(Path::new("/var/lib/aas/state.toml")),
+            Path::new("/var/lib/aas")
+        );
+        assert_eq!(directory_of(Path::new("aas/state.toml")), Path::new("aas"));
+        assert_eq!(directory_of(Path::new("state.toml")), Path::new("."));
+    }
+
+    #[test]
+    fn the_saver_has_written_the_latest_state_when_it_finishes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        let mut saver = Saver::new(path.clone());
+        for output_percent in [10, 20, 30] {
+            saver.save(State { output_percent });
+        }
+        saver.finish();
+        assert_eq!(State::load(&path).output_percent, 30);
+        // After that it writes in place.
+        saver.save(State { output_percent: 40 });
+        assert_eq!(State::load(&path).output_percent, 40);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn a_save_that_fails_leaves_no_temporary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // The target is a directory with something in it, so the rename fails.
+        let path = dir.path().join("state.toml");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("x"), "").unwrap();
+        assert!(State { output_percent: 5 }.save(&path).is_err());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[test]

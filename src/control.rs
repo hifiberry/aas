@@ -11,7 +11,7 @@ use crate::engine::{Command, Event, INITIAL_SOURCES, Source};
 use crate::latency::{PERIODS, period_frames};
 use crate::rate::{ClientId, MAX_RATE, MIN_RATE, RatePolicy, SETTLE};
 use crate::resample::Resampler;
-use crate::state::State;
+use crate::state::{Saver, State};
 use crate::volume::{HardwareVolume, OutputVolume};
 use aas_client::convert::ClientFormat;
 use aas_client::proto::{self, Reply, Request};
@@ -207,8 +207,9 @@ pub struct Control {
     /// Replies that were not ready when their request came.
     outbox: Vec<(ConnId, Reply)>,
     volume: OutputVolume,
-    /// Where the volume is kept across restarts. None keeps it nowhere.
-    state: Option<PathBuf>,
+    /// Writes the volume to the state file, to keep it across restarts.
+    /// None keeps it nowhere.
+    saver: Option<Saver>,
     /// When the state file is due to be written.
     save_at: Option<Instant>,
     /// Volume notifications for subscribers, not yet sent.
@@ -250,7 +251,7 @@ impl Control {
             dop_owner: None,
             outbox: Vec::new(),
             volume: OutputVolume::new(None, config.bit_perfect),
-            state: None,
+            saver: None,
             save_at: None,
             notices: Vec::new(),
         }
@@ -261,7 +262,7 @@ impl Control {
     pub fn restore_volume(&mut self, mut volume: OutputVolume, state: PathBuf) {
         volume.set(State::load(&state).output_percent);
         self.volume = volume;
-        self.state = Some(state);
+        self.saver = Some(Saver::new(state));
         eprintln!(
             "aas: output volume {}%, in {}",
             self.volume.percent(),
@@ -301,11 +302,15 @@ impl Control {
     }
 
     /// Stops the audio thread. It returns once it has seen this.
-    /// Writes the state file if a change is still waiting for it.
+    /// Writes the state file if a change is still waiting for it, and
+    /// returns only once the file is on disk.
     pub fn shutdown(&mut self) {
         self.send(vec![Command::Shutdown]);
         if self.save_at.is_some() {
             self.save();
+        }
+        if let Some(saver) = &mut self.saver {
+            saver.finish();
         }
     }
 
@@ -451,24 +456,19 @@ impl Control {
         let notice = Reply::VolumeChanged { percent };
         self.notices
             .extend(subscribers.map(|(&conn, _)| (conn, notice)));
-        if self.state.is_some() {
+        if self.saver.is_some() {
             self.save_at = Some(now + SAVE_DELAY);
         }
     }
 
-    /// Writes the state file. Its fsync runs on the control thread and can
-    /// hold up requests on a slow SD card, never the audio thread; the
-    /// save delay keeps it rare.
+    /// Has the state file written. The write and its sync to disk run on
+    /// the saver's thread, so a slow SD card holds up no request.
     fn save(&mut self) {
         self.save_at = None;
-        let Some(path) = &self.state else {
-            return;
-        };
-        let state = State {
-            output_percent: self.volume.percent(),
-        };
-        if let Err(e) = state.save(path) {
-            eprintln!("aas: could not save {}: {e}", path.display());
+        if let Some(saver) = &self.saver {
+            saver.save(State {
+                output_percent: self.volume.percent(),
+            });
         }
     }
 
