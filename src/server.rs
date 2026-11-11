@@ -140,6 +140,7 @@ pub fn run_probing(
         notices: BTreeMap::new(),
         next_conn: 1,
         accept_after: None,
+        accept_short: false,
         rates,
         card,
         search,
@@ -222,6 +223,8 @@ struct Server {
     /// get a descriptor. The connection stays queued, so the listener would
     /// stay readable and the poll would return at once, over and over.
     accept_after: Option<Instant>,
+    /// Accepting is failing for want of a descriptor, and that is logged.
+    accept_short: bool,
     /// The card's rates, when they change.
     rates: RatesWatch,
     /// When the card comes back.
@@ -336,8 +339,11 @@ impl Server {
             if raw < 0 {
                 let e = io::Error::last_os_error();
                 if accept_must_pause(&e) {
-                    let ms = ACCEPT_PAUSE.as_millis();
-                    eprintln!("aas: accept: {e}, not accepting for {ms} ms");
+                    // Logged once, not at every pause until it passes.
+                    if !std::mem::replace(&mut self.accept_short, true) {
+                        let ms = ACCEPT_PAUSE.as_millis();
+                        eprintln!("aas: accept: {e}, trying every {ms} ms until it works");
+                    }
                     self.accept_after = Some(Instant::now() + ACCEPT_PAUSE);
                 } else if e.kind() != io::ErrorKind::WouldBlock {
                     eprintln!("aas: accept: {e}");
@@ -345,6 +351,9 @@ impl Server {
                 return;
             }
             let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+            if std::mem::take(&mut self.accept_short) {
+                eprintln!("aas: accepting clients again");
+            }
             let conn = self.next_conn;
             self.next_conn += 1;
             let name = peer_name(&fd);
