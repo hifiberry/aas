@@ -86,7 +86,7 @@ pub fn build_chain(
     if plugins.is_empty() {
         return Ok(Chain::empty());
     }
-    Ok(Chain::new(plugins, format, max_frames))
+    Ok(Chain::new(plugins, format, max_frames).for_rate(rate))
 }
 
 /// The three chains, built for one rate.

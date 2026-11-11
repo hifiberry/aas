@@ -534,10 +534,11 @@ impl<P: Processing> Analog<P> {
             self.closed = true;
             return;
         }
-        if self.chain.is_empty() {
+        if self.chain.is_empty() || !self.chain.fits(rate) {
             // Nothing measures it, so it has no signal: the analog input
             // never passes ungated. The control thread always sends a
-            // chain with a detector.
+            // chain with a detector, built for the rate the engine runs at
+            // once the chain for a new rate has come.
             return;
         }
         // Into the processing format as the mix does it.
@@ -796,6 +797,19 @@ fn fetch(
     Ok(())
 }
 
+/// Fades `out` in after silence: `left` of `fade` frames of the fade are
+/// still to come, and fewer after the call.
+fn unmute(out: &mut [[i32; 2]], left: &mut usize, fade: usize) {
+    for frame in out.iter_mut() {
+        if *left == 0 {
+            break;
+        }
+        let gain = (fade - *left) as f64 / fade as f64;
+        *frame = frame.map(|v| (f64::from(v) * gain).round() as i32);
+        *left -= 1;
+    }
+}
+
 /// How the output gain moves over one period.
 #[derive(Clone, Copy)]
 struct Fade {
@@ -980,6 +994,10 @@ pub struct Engine<P: Processing, S: Sink> {
     target_gain: f32,
     /// Frames until `gain` reaches `target_gain`.
     fade_left: usize,
+    /// Frames of the fade in left after the mix or output chain was built
+    /// for another rate than the engine runs at, and the output was
+    /// silent for it.
+    unmute_left: usize,
     last_start: Option<Instant>,
     /// The last DoP claim handed out.
     claims: u64,
@@ -1020,6 +1038,7 @@ impl<P: Processing, S: Sink> Engine<P, S> {
             gain: 1.0,
             target_gain: 1.0,
             fade_left: 0,
+            unmute_left: 0,
             last_start: None,
             claims: 0,
         }
@@ -1547,6 +1566,16 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         }
         let has_plugins = !self.mix.is_empty() || !self.output.is_empty();
         let chains_ran = !copy && plugins_apply(self.mode) && has_plugins;
+        // A chain never runs at a rate it was not built for, such as after
+        // a DoP stream, until the one for this rate comes. Silence, not a
+        // bypass: a crossover or a protection filter must not be skipped.
+        if chains_ran && !(self.mix.fits(rate) && self.output.fits(rate)) {
+            out.fill([0; 2]);
+            self.unmute_left = (rate * FADE_MS / 1000) as usize;
+            self.gain = next_gain;
+            self.fade_left -= fade_frames;
+            return false;
+        }
         if !copy {
             // Without plugins the mix is not copied for them at all.
             if chains_ran {
@@ -1556,6 +1585,10 @@ impl<P: Processing, S: Sink> Engine<P, S> {
                 P::from_block(block, acc);
             }
             mix_finish::<P>(acc, out);
+            if chains_ran && self.unmute_left > 0 {
+                let fade = (rate * FADE_MS / 1000) as usize;
+                unmute(out, &mut self.unmute_left, fade);
+            }
         }
         self.gain = next_gain;
         self.fade_left -= fade_frames;
@@ -4988,6 +5021,67 @@ mod tests {
 
     fn set_chain<P: Processing>(rig: &mut Rig<P>, place: Place, plugins: Vec<Probe>) {
         rig.send(Command::SetChain(place, chain_of::<P>(plugins)));
+    }
+
+    #[test]
+    fn a_chain_built_for_another_rate_never_runs_and_its_place_is_silent() {
+        fn check<P: Processing>() {
+            let mut rig = Rig::<P>::new(BitPerfect::Auto);
+            let mut a = client(1);
+            rig.add(&mut a);
+            // Built for 96 kHz, while the engine runs at 48 kHz.
+            let chain = chain_of::<P>(vec![times(2.0)]);
+            rig.send(Command::SetChain(
+                Place::Mix,
+                Box::new((*chain).for_rate(96000)),
+            ));
+            for _ in 0..4 {
+                a.ring.write(&frames(1 << 20, PERIOD));
+                rig.cycle();
+            }
+            assert_eq!(rig.last_periods(4), frames(0, 4 * PERIOD));
+            // The chain for the engine's rate arrives: the audio fades back
+            // in over 10 ms, through it.
+            let chain = chain_of::<P>(vec![times(2.0)]);
+            rig.send(Command::SetChain(
+                Place::Mix,
+                Box::new((*chain).for_rate(RATE)),
+            ));
+            let mut out = Vec::new();
+            for _ in 0..12 {
+                a.ring.write(&frames(1 << 20, PERIOD));
+                rig.cycle();
+                out.extend(rig.last_periods(1));
+            }
+            let full = 1 << 21;
+            assert!(out[0][0] <= full / 480 + 1, "{:?}", out[0]);
+            let step = out.windows(2).map(|w| (w[1][0] - w[0][0]).abs()).max();
+            assert!(step.unwrap() <= full / 480 + 2, "{:?}", format_of::<P>());
+            assert!(
+                out[480..].iter().all(|f| f[0] == full),
+                "{:?}",
+                format_of::<P>()
+            );
+        }
+        check::<I32>();
+        check::<F32>();
+        check::<F64>();
+    }
+
+    #[test]
+    fn an_analog_chain_built_for_another_rate_gives_no_signal() {
+        let (mut rig, feed) = with_capture::<F32>(BitPerfect::Auto);
+        let chain = chain_of::<F32>(vec![times(1.0).neutral()]);
+        rig.send(Command::SetChain(
+            Place::Analog,
+            Box::new((*chain).for_rate(96000)),
+        ));
+        for _ in 0..3 {
+            feed.push(&frames(1 << 20, PERIOD));
+            rig.cycle();
+        }
+        assert_eq!(rig.last_periods(3), frames(0, 3 * PERIOD));
+        assert!(signals(&rig.events()).is_empty());
     }
 
     #[test]

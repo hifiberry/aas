@@ -15,6 +15,8 @@ pub struct Chain {
     convert: Vec<Option<Format>>,
     format: Format,
     store: BlockStore,
+    /// The rate its plugins were built for. None runs at any rate.
+    rate: Option<u32>,
 }
 
 impl Chain {
@@ -32,7 +34,21 @@ impl Chain {
             convert,
             format,
             store: BlockStore::new(max_frames),
+            rate: None,
         }
+    }
+
+    /// The same chain, marked as built for `rate`. The engine never runs
+    /// it at another.
+    pub fn for_rate(mut self, rate: u32) -> Chain {
+        self.rate = Some(rate);
+        self
+    }
+
+    /// Whether the chain may run at `rate`: its own, or any for a chain
+    /// that names none, such as one without plugins.
+    pub fn fits(&self, rate: u32) -> bool {
+        self.rate.is_none_or(|r| r == rate)
     }
 
     /// A chain without plugins. Allocates nothing.
@@ -42,6 +58,7 @@ impl Chain {
             convert: Vec::new(),
             format: Format::I32,
             store: BlockStore::new(0),
+            rate: None,
         }
     }
 

@@ -684,6 +684,10 @@ Details *(call)*:
   chains, so they are not built for its rate and keep their state through it;
   only the analog chain, which keeps measuring, is. If the output stays at the
   DoP rate afterwards, the others are built for it then, without a reopen.
+- A chain never runs at a rate it was not built for: until the chain for the
+  output's rate arrives, its place plays silence, not a bypass, and fades in
+  over 10 ms when it does. When a DoP stream stops and a chain lags, the output
+  and its chains follow at once rather than after the settle time.
 
 Built in are `detect`, the input detection plugin, and `balance`, from -1 (left)
 to 1 (right). That departs on purpose from plugins being libraries: the analog

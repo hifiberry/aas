@@ -1186,6 +1186,18 @@ impl Control {
         Ok(chains)
     }
 
+    /// Whether a mix or output chain with plugins on the audio thread is
+    /// built for another rate than the output runs at.
+    fn chains_behind(&self) -> bool {
+        let Some((rate, _)) = self.output else {
+            return false;
+        };
+        self.chain_places()
+            .into_iter()
+            .filter(|&place| place != PluginPlace::Analog)
+            .any(|place| self.built[slot(place)] != Some(rate))
+    }
+
     /// Sends the spare chains, which take effect from the next command on.
     fn send_spare(&mut self, batch: &mut Vec<Command>) {
         let Some(spare) = self.spare.take() else {
@@ -1408,7 +1420,13 @@ impl Control {
                 Event::DopStopped(id) => {
                     self.dop_claims.retain(|&(_, c)| c != id);
                     self.update_dop(now, &mut batch);
-                    self.decide(now, false, &mut batch);
+                    // At once if the mix or output chain on the audio
+                    // thread is built for another rate than the output's:
+                    // the engine keeps them silent until the output and
+                    // its chains follow. Otherwise after the settle time,
+                    // so that a stop and a start leave the rate alone.
+                    let urgent = self.chains_behind();
+                    self.decide(now, urgent, &mut batch);
                 }
                 Event::Drained(id) => self.drained(id, now, &mut batch),
                 Event::Flushed(id) => self.flushed(id),
@@ -2757,6 +2775,56 @@ mod tests {
         assert!(has(&seen, "Reconfigure 48000"), "{seen:?}");
         assert!(has(&seen, "SetChain Analog detect"), "{seen:?}");
         assert!(!has(&seen, "SetChain Mix"), "{seen:?}");
+    }
+
+    #[test]
+    fn when_dop_stops_the_output_and_its_chains_follow_at_once() {
+        let config = Config {
+            plugins: vec![entry(config::PluginPlace::Mix, "balance")],
+            ..analog_config()
+        };
+        let opener = Opener::default();
+        let (mut control, mut engine, now) = started(&config, Some(&opener));
+        engine.take(true);
+        control.handle_events(now);
+        engine.take(true);
+        play(&mut control, 1, 48000, now);
+        play(&mut control, 2, 176400, now);
+        engine.take(true);
+        engine.send(Event::DopStarted(2, 1));
+        control.handle_events(now);
+        assert!(has(&sent(&mut engine), "Reconfigure 176400"));
+        control.handle_events(now);
+        engine.take(true);
+        // The DoP stream turns to PCM: the 48 kHz player has the output
+        // back at once, not after the settle time.
+        engine.send(Event::DopStopped(2));
+        control.handle_events(now + Duration::from_secs(1));
+        let seen = sent(&mut engine);
+        assert!(has(&seen, "Reconfigure 48000"), "{seen:?}");
+        // And with only the DoP stream's player left, the card keeps the
+        // DoP rate and gets the mix chain for it at once.
+        let config = Config {
+            plugins: vec![entry(config::PluginPlace::Mix, "balance")],
+            ..analog_config()
+        };
+        let (mut control, mut engine, now) = started(&config, Some(&opener));
+        engine.take(true);
+        control.handle_events(now);
+        engine.take(true);
+        play(&mut control, 1, 48000, now);
+        play(&mut control, 2, 176400, now);
+        engine.send(Event::DopStarted(2, 1));
+        control.handle_events(now);
+        control.handle_events(now);
+        let stop = control.request(1, Some(Request::Stop), now);
+        assert_eq!(stop.reply, Some(Reply::Ok));
+        control.tick(now + Duration::from_secs(1));
+        engine.take(true);
+        engine.send(Event::DopStopped(2));
+        control.handle_events(now + Duration::from_secs(2));
+        let seen = sent(&mut engine);
+        assert!(has(&seen, "SetChain Mix balance"), "{seen:?}");
     }
 
     #[test]
