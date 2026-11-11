@@ -41,8 +41,21 @@ cargo build --release -p aas-alsa
 cargo build --release -p measure --features alsa-probes --bins
 ```
 
-On a Pi 3, add `-j2`, or the build can run out of memory. `cargo test
---workspace` also runs the plugin's tests, which need `cc` and the ALSA headers.
+On a Pi 3, add `-j2`, or the build can run out of memory.
+
+The plugin's own tests run where it builds, on the board:
+
+```sh
+cargo test -p aas-alsa
+```
+
+A plain `cargo test` skips them on every machine, because the crate is not a
+default member. `cargo test --workspace` includes them. They need `cc` and the
+ALSA headers: they compare the hand-written declarations in
+`crates/aas-alsa/src/ffi.rs` with the installed headers, and play the daemon on
+a socket for the control. On a machine without `libasound2-dev`,
+`cargo check -p aas-alsa --tests` and `cargo clippy -p aas-alsa --all-targets`
+still compile the crate and its tests, since neither links.
 
 ## Installing
 
@@ -91,8 +104,16 @@ is kept in `/var/lib/aas/state.toml`.
 ### After a daemon restart
 
 A player that is playing gets an error from its next write and must reopen the
-device, which ALSA players do. A mixer that holds the control open, such as
-`alsamixer`, does not reconnect. It has to be restarted.
+device, which ALSA players do.
+
+The control connects again by itself. A mixer that holds it open and waits for
+events is woken when the daemon goes, as for a card that is unplugged: its poll
+reports an error and reading an event fails. After that its descriptor is
+quiet, and reading an event keeps failing, until a read or write of the volume
+connects again. From then on it gets events as before, starting with one for
+the volume, which may have changed meanwhile. While the daemon is away, reads
+and writes of the volume fail. A mixer that quits when a card is unplugged
+still has to be started again.
 
 ### Removing
 
@@ -111,7 +132,11 @@ Then move `/etc/asound.conf.before-aas` back, if there is one.
 - `sh dist/test-plugin.sh` on the board, with the unit running and the plugin
   installed. It needs `aplay`, `amixer`, `alsactl`, `cc` and `libasound2-dev`,
   and `mpd`, `mpc` and `python3` for the mixer case. It prints PASS or FAIL for
-  each case.
+  each case. Case names as arguments run only those. On a board whose output is
+  wired to its input, `AAS_TEST_CAPTURE=plughw:<card> sh dist/test-plugin.sh`
+  also records what each sample format plays and checks the tone's level and
+  purity.
+- `cargo test -p aas-alsa` on the board, for the plugin's own tests.
 - `bit-check` proves that what a player sends reaches the card unchanged. Load
   `snd-aloop`, set `card = "Loopback"` and `latency_ms = 48` in the daemon's
   config, then run for example

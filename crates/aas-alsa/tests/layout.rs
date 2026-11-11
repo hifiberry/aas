@@ -338,6 +338,15 @@ fn in_c(rust: &str) -> String {
 /// The callback tables and the TLV union, field by field, must have the
 /// types the headers give them, parameter for parameter. Lengths alone
 /// would not catch a swapped or wrongly typed parameter.
+///
+/// Tried once on the Pi 3 test board, with `pause` declared to take an
+/// unsigned int. Changed in `ffi.rs` alone, the crate does not build: the
+/// plugin's own callback no longer fits the table (E0308, mismatched
+/// types). Changed in `ffi.rs` and in the callback, so that Rust agrees
+/// with itself, the crate builds and this test fails with `static
+/// assertion failed: "((snd_pcm_ioplug_callback_t *)0)->pause"`, while
+/// `ffi_layout_matches_the_headers` still passes, since the size of the
+/// table is the same.
 #[test]
 fn callback_signatures_match_the_headers() {
     let tables: [(&str, &[(&str, &str)]); 3] = [

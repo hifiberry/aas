@@ -292,6 +292,7 @@ unsafe extern "C" {
         list: *const c_uint,
     ) -> c_int;
     pub fn snd_pcm_ioplug_set_state(io: Io, state: snd_pcm_state_t) -> c_int;
+    pub fn snd_pcm_state(pcm: *mut snd_pcm_t) -> snd_pcm_state_t;
 
     pub fn snd_pcm_sw_params_malloc(params: *mut *mut snd_pcm_sw_params_t) -> c_int;
     pub fn snd_pcm_sw_params_free(params: *mut snd_pcm_sw_params_t);
