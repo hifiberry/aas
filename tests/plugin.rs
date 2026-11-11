@@ -612,6 +612,7 @@ fn a_text_parameter_is_set_while_the_chain_is_built_and_may_be_refused() {
                 .err()
                 .unwrap();
             assert!(e.message.contains("file takes text"), "{e}");
+            assert!(e.message.contains("not 1"), "{e}");
             let e = build_with(path, &[("level", text("loud"))]).err().unwrap();
             assert!(e.message.contains("level takes a number"), "{e}");
             // At the start, the daemon does not start.
@@ -632,6 +633,11 @@ fn values_must_fit_integer_switch_and_enumeration_parameters() {
             let n = ParamValue::Number;
             let fine = [("taps", n(8.0)), ("bypass", n(1.0)), ("curve", n(2.0))];
             assert!(build_with(path, &fine).is_ok());
+            let e = build_with(path, &[("taps", n(17.0))]).err().unwrap();
+            assert!(
+                e.message.contains("taps takes a whole number from 1 to 16"),
+                "{e}"
+            );
             let e = build_with(path, &[("taps", n(4.5))]).err().unwrap();
             assert!(e.message.contains("taps takes a whole number"), "{e}");
             let e = build_with(path, &[("bypass", n(2.0))]).err().unwrap();

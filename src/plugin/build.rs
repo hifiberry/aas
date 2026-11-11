@@ -131,35 +131,39 @@ pub fn build_chain(
 }
 
 /// Whether `value` fits the type of `param`: text for a text parameter, and
-/// for the others a number, whole for an integer, 0 or 1 for a switch, and
-/// one of the values for an enumeration.
+/// for the others a number, a whole one in the range for an integer, 0 or 1
+/// for a switch, and one of the values for an enumeration. A float outside
+/// its range is left to the plugin's clamping.
 fn check_value(param: &Param, value: &ParamValue) -> Result<(), String> {
     let name = &param.name;
     let number = match (&param.kind, value) {
         (ParamKind::Text, ParamValue::Text(_)) => return Ok(()),
-        (ParamKind::Text, ParamValue::Number(_)) => {
-            return Err(format!("{name} takes text, in quotes, not a number"));
+        (ParamKind::Text, ParamValue::Number(v)) => {
+            return Err(format!("{name} takes text, in quotes, not {v}"));
         }
-        (_, ParamValue::Text(_)) => return Err(format!("{name} takes a number, not text")),
+        (_, ParamValue::Text(t)) => {
+            return Err(format!("{name} takes a number, not the text \"{t}\""));
+        }
         (_, ParamValue::Number(v)) => *v,
     };
-    let fits = match &param.kind {
-        ParamKind::Float | ParamKind::Text => true,
-        ParamKind::Integer => number.fract() == 0.0,
-        ParamKind::Switch => number == 0.0 || number == 1.0,
-        ParamKind::Enumeration(names) => {
-            number.fract() == 0.0 && number >= 0.0 && number < names.len() as f64
-        }
+    let whole = number.fract() == 0.0;
+    let within = |min: f64, max: f64| whole && (min..=max).contains(&number);
+    let (fits, wants) = match &param.kind {
+        // A float outside its range is clamped by the plugin.
+        ParamKind::Float | ParamKind::Text => (true, String::new()),
+        ParamKind::Integer => (
+            within(param.min, param.max),
+            format!("a whole number from {} to {}", param.min, param.max),
+        ),
+        ParamKind::Switch => (within(0.0, 1.0), "0 or 1".to_string()),
+        ParamKind::Enumeration(names) => (
+            within(0.0, names.len() as f64 - 1.0),
+            format!("0 to {}", names.len() - 1),
+        ),
     };
     if fits {
         Ok(())
     } else {
-        let wants = match &param.kind {
-            ParamKind::Integer => "a whole number".to_string(),
-            ParamKind::Switch => "0 or 1".to_string(),
-            ParamKind::Enumeration(names) => format!("0 to {}", names.len() - 1),
-            _ => unreachable!("every float fits"),
-        };
         Err(format!("{name} takes {wants}, not {number}"))
     }
 }
