@@ -63,27 +63,35 @@ load in `doc/measurements.md` with ftrace's `irqsoff` and `wakeup_rt` tracers, m
 in RAM, and match the daemon's logged gap times (CLOCK_MONOTONIC) to the trace.
 Timing the parts of a cycle comes after, if the time turns out to be the engine's.
 
-## Pi 3: one hour at 44.1 kHz under full load fails with the analog input on
+Since then the stage 3a investigation found that compaction moving locked pages
+stalls the audio thread on this board (entry below). Those stalls are far longer
+than these cycles, so this may be another cause; repeat the measurement with
+`dist/90-aas.conf` installed before tracing.
 
-What is measured: `doc/measurements.md`, Stage 3a, "Hour runs with the analog
-input". On the Pi 3 test board (DAC+ ADC, no heatsink, throttled to about
-500 to 600 MHz), 256 frames at 44.1 kHz under the stage 1 full load, with the
-analog input on and music looped through the cable into it, failed twice: 2
-xruns with about 60 ms of wake-up gaps in the first run, 1 xrun and a worst gap
-of 11.09 ms against an 11.61 ms buffer in the repeat. The worst cycle was 3.8 to
-3.9 ms with the input on against 0.83 ms without it in stage 2; 96 kHz passed
-with 0.5 ms to spare. The CM5 passes all three runs.
+## Pi 3: what is left after the compaction finding
 
-What is open: why the input costs that much. Its candidates are the second DMA
-stream and its interrupts and the capture read in every cycle; the detector is
-about 0.1% of a period. Then a decision: a longer default period on the Pi 3
-with the analog input on, or a cheaper capture path.
+The 44.1 kHz hour under full load failed on the Pi 3 because memory compaction
+moved the daemon's locked pages and the audio thread waited for each move, 15 to
+34 ms at a time; the analog input is not the cause, and the stage 2 build fails
+the same way. `doc/measurements.md`, "Why the 44.1 kHz hour failed on the Pi 3",
+has the evidence. `dist/90-aas.conf` sets `vm.compact_unevictable_allowed = 0`
+and the daemon warns at its start while it is 1.
 
-An investigation is under way on branch `fix/pi3-load-441`, by another worker;
-leave that branch alone and read it before starting. First step to resume:
-check that branch and its notes; if it has no answer yet, repeat the 44.1 kHz
-hour run with ftrace's `irqsoff` and `wakeup_rt` tracers, as in the entry
-above, and time the capture read on its own.
+Still missing:
+
+- An hour at 44.1 kHz under full load with the analog input on and the file
+  installed through `/etc/sysctl.d`, on the Pi 3. The passing hour had the
+  setting made by hand with `sysctl -w`.
+- After an xrun the restart of the DAC+ ADC takes 12 to 15 ms, longer than the
+  11.6 ms buffer, so one stall shows as two gaps. Whether the restart can be
+  shorter, or moved off the audio thread, is not looked at.
+- Memory taken by the kernel's contiguous allocator can still move locked
+  pages. Not tested.
+- Why the CM5 passes is not measured.
+
+First step: install `dist/90-aas.conf` as the README says, check
+`sysctl vm.compact_unevictable_allowed` gives 0 after a reboot, and repeat the
+hour run from the stage 3a measurements.
 
 ## Owner decisions left by stage 3a
 

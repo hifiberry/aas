@@ -1125,11 +1125,13 @@ What this means for the earlier results:
 - **Why the CM5 passes** was not measured. It writes the load to an NVMe
   drive, so the load may leave it less to compact, and its faster cores
   finish a migration sooner.
-- **What would fix it** is the setting, `vm.compact_unevictable_allowed = 0`,
+- **What fixes it** is the setting, `vm.compact_unevictable_allowed = 0`,
   which is what kernels built for real time default to for this reason. It is
-  a setting of the whole system, so how `aas` gets it there, a file in
-  `/etc/sysctl.d` installed with the daemon or the daemon setting it at its
-  start, is still to be decided. Locking alone cannot keep the pages in place,
+  a setting of the whole system, so `aas` ships it as a file for
+  `/etc/sysctl.d`, `dist/90-aas.conf`, installed with the daemon, and the
+  daemon warns at its start while the setting is 1. The hour above passed with
+  the setting made by hand; the installed file has not been run for an hour
+  yet. Locking alone cannot keep the pages in place,
   and a process has no other way to. Memory taken for the contiguous
   allocator can still move locked pages; that was not tested.
 
