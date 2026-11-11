@@ -227,14 +227,35 @@ cargo build --release -p aas-plugin-gain
 sudo install -D -m 0644 target/release/libaas_gain.so /usr/lib/aas/libaas_gain.so
 ```
 
-Each parameter has a type, so that a user interface can build a control for it:
-`PARAM_FLOAT`, `PARAM_INTEGER`, `PARAM_SWITCH` (0 or 1) or `PARAM_ENUMERATION`,
-whose values are numbered from 0 and named in `value_names`. Values always
-travel as `f64`, whole numbers for every type but a float. Plugins are stereo in
-and out, in place; another channel count is ABI version 2.
+The descriptor and each parameter start with `size`, set to `DESCRIPTOR_SIZE`
+and `PARAM_INFO_SIZE`: fields are only ever appended within ABI version 1, and
+the daemon reads what it knows. Plugins are stereo in and out, in place;
+another channel count is ABI version 2.
 
-`process`, `set_param`, `neutral` and `latency` run on the audio thread and
-must not allocate, lock or block. A panic that leaves one of the plugin's
+`create` stores the instance through its last argument and returns
+`CREATE_OK`, `CREATE_UNSUPPORTED` for a rate (or block size) it does not
+support, which the daemon then never uses, or `CREATE_FAILED`, which stops the
+daemon at startup and is tried again at the next change of clients later.
+`reset`, which may be left out, clears what an instance keeps from earlier
+blocks; the daemon calls it when a chain runs again after a gap, such as after
+a DoP stream.
+
+Each parameter has a type, so that a user interface can build a control for it:
+`PARAM_FLOAT`, `PARAM_INTEGER`, `PARAM_SWITCH` (0 or 1), `PARAM_ENUMERATION`,
+whose values are numbered from 0 and named in `value_names`, or `PARAM_TEXT`.
+Numeric values travel as `f64`, whole numbers for every type but a float. A
+text parameter, such as a file to read, is set through `set_param_text` with
+UTF-8 that is not NUL terminated and is valid only for the call; it returns
+`TEXT_OK`, `TEXT_REFUSED`, which the daemon reports as a config error, or
+`TEXT_UNSUPPORTED` for a value that cannot be used at the instance's rate,
+which the daemon takes as a rate the plugin does not support.
+
+`create`, `destroy`, `set_param_text` and `set_param` while the config's
+values are set run on the daemon's control thread. `process`, `reset`,
+`neutral` and `latency` run on the audio thread, and so will `set_param` once
+the API changes parameters at run time; these must not allocate, lock or
+block. Another instance of the same library may be processing while one is
+created or destroyed. A panic that leaves one of the plugin's
 functions aborts the daemon, so a plugin in Rust must not panic there, or must
 catch the panic with `std::panic::catch_unwind`. The crate's documentation
 (`cargo doc -p aas-plugin --open`) has the rest.

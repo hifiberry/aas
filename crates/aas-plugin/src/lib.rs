@@ -27,6 +27,8 @@
 //! - `process`, `reset`, `neutral` and `latency` run on the audio thread,
 //!   and so will `set_param` once parameters can be changed at run time
 //!   (the API, a later stage). These must not allocate, lock or block.
+//!   `latency` is also called once on the control thread, just after
+//!   `create`, so that a latency beyond 10 s can be logged.
 //!
 //! An instance can move between threads but is never used by two at once.
 //! But `create` and `destroy` of one instance may run on the control
