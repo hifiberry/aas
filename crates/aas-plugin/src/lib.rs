@@ -37,11 +37,13 @@
 //! # Growing within a version
 //!
 //! [`Descriptor`] and [`ParamInfo`] start with their size, as the plugin
-//! was compiled. Within an ABI version fields are only ever appended. The
-//! daemon refuses a size smaller than version 1's, ignores trailing bytes
-//! it does not know, and steps through the parameter list by the size its
-//! entries state. A plugin sets them to [`DESCRIPTOR_SIZE`] and
-//! [`PARAM_INFO_SIZE`].
+//! was compiled. Within an ABI version fields are only ever appended: the
+//! layout of version 1 as first published is frozen, with
+//! [`DESCRIPTOR_SIZE_V1`] and [`PARAM_INFO_SIZE_V1`] its sizes. The daemon
+//! refuses a size smaller than those, larger than [`MAX_STRUCT_SIZE`] or
+//! not a multiple of the struct's alignment, ignores trailing bytes it does
+//! not know, and steps through the parameter list by the size its entries
+//! state. A plugin sets them to [`DESCRIPTOR_SIZE`] and [`PARAM_INFO_SIZE`].
 //!
 //! # Rates
 //!
@@ -287,10 +289,69 @@ pub struct Descriptor {
         Option<extern "C" fn(*mut c_void, index: u32, text: *const u8, len: u32) -> u32>,
 }
 
-/// The size of a version 1 [`Descriptor`], for its `size`.
+/// The size of [`Descriptor`] as this crate has it, for its `size`. It grows
+/// as fields are appended.
 pub const DESCRIPTOR_SIZE: u32 = std::mem::size_of::<Descriptor>() as u32;
-/// The size of a version 1 [`ParamInfo`], for its `size`.
+/// The size of [`ParamInfo`] as this crate has it, for its `size`.
 pub const PARAM_INFO_SIZE: u32 = std::mem::size_of::<ParamInfo>() as u32;
+
+/// The size of the first [`Descriptor`] of version 1. It never changes: the
+/// daemon refuses a smaller one.
+#[cfg(target_pointer_width = "64")]
+pub const DESCRIPTOR_SIZE_V1: u32 = 104;
+#[cfg(target_pointer_width = "32")]
+pub const DESCRIPTOR_SIZE_V1: u32 = 64;
+/// The size of the first [`ParamInfo`] of version 1. It never changes.
+#[cfg(target_pointer_width = "64")]
+pub const PARAM_INFO_SIZE_V1: u32 = 72;
+#[cfg(target_pointer_width = "32")]
+pub const PARAM_INFO_SIZE_V1: u32 = 48;
+
+/// The largest size the daemon takes for a [`Descriptor`] or a
+/// [`ParamInfo`]: far beyond any growth of a version, so that a broken
+/// size is refused rather than read.
+pub const MAX_STRUCT_SIZE: u32 = 4096;
+
+// Version 1 is frozen: these offsets and sizes never change. Fields are
+// only ever appended, after them.
+const _: () = {
+    use std::mem::{offset_of, size_of};
+    #[cfg(target_pointer_width = "64")]
+    const D: [usize; 16] = [0, 4, 8, 16, 20, 24, 28, 32, 40, 48, 56, 64, 72, 80, 88, 96];
+    #[cfg(target_pointer_width = "32")]
+    const D: [usize; 16] = [0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52, 56, 60];
+    assert!(offset_of!(Descriptor, size) == D[0]);
+    assert!(offset_of!(Descriptor, abi) == D[1]);
+    assert!(offset_of!(Descriptor, name) == D[2]);
+    assert!(offset_of!(Descriptor, formats) == D[3]);
+    assert!(offset_of!(Descriptor, channels_in) == D[4]);
+    assert!(offset_of!(Descriptor, channels_out) == D[5]);
+    assert!(offset_of!(Descriptor, param_count) == D[6]);
+    assert!(offset_of!(Descriptor, params) == D[7]);
+    assert!(offset_of!(Descriptor, create) == D[8]);
+    assert!(offset_of!(Descriptor, destroy) == D[9]);
+    assert!(offset_of!(Descriptor, set_param) == D[10]);
+    assert!(offset_of!(Descriptor, neutral) == D[11]);
+    assert!(offset_of!(Descriptor, latency) == D[12]);
+    assert!(offset_of!(Descriptor, process) == D[13]);
+    assert!(offset_of!(Descriptor, reset) == D[14]);
+    assert!(offset_of!(Descriptor, set_param_text) == D[15]);
+    assert!(size_of::<Descriptor>() == DESCRIPTOR_SIZE_V1 as usize);
+    #[cfg(target_pointer_width = "64")]
+    const P: [usize; 9] = [0, 8, 16, 24, 32, 40, 48, 56, 64];
+    #[cfg(target_pointer_width = "32")]
+    const P: [usize; 9] = [0, 4, 8, 12, 16, 24, 32, 40, 44];
+    assert!(offset_of!(ParamInfo, size) == P[0]);
+    assert!(offset_of!(ParamInfo, name) == P[1]);
+    assert!(offset_of!(ParamInfo, unit) == P[2]);
+    assert!(offset_of!(ParamInfo, kind) == P[3]);
+    assert!(offset_of!(ParamInfo, min) == P[4]);
+    assert!(offset_of!(ParamInfo, max) == P[5]);
+    assert!(offset_of!(ParamInfo, default) == P[6]);
+    assert!(offset_of!(ParamInfo, value_count) == P[7]);
+    assert!(offset_of!(ParamInfo, value_names) == P[8]);
+    assert!(size_of::<ParamInfo>() == PARAM_INFO_SIZE_V1 as usize);
+};
 
 /// The names of an enumeration's values, as a `static` can hold them: a
 /// plain array of pointers cannot be one, since pointers are not `Sync`.

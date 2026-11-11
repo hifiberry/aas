@@ -15,7 +15,9 @@
 //! 0 to 3, `manyvalues` one of 5000 values, and `nullname` one with a null
 //! name in its list. `small` states a descriptor size below version 1's;
 //! `bigger` has a descriptor and parameter entries larger than version 1's,
-//! as a later plugin of the same version would. `stateful` counts the
+//! as a later plugin of the same version would. `hugestride` and
+//! `oddstride` state a parameter size of 8192 bytes, and one that is no
+//! multiple of the entries' alignment. `stateful` counts the
 //! `process` calls since it was created or reset and writes the count into
 //! the samples, and has `reset`. `slow` reports a latency of `u32::MAX`.
 //! `text` has a text parameter, `file`, refuses the value `missing.wav`
@@ -222,6 +224,28 @@ static BIGGER: Grown<Descriptor> = Grown {
     later: u64::MAX,
 };
 
+/// Parameter entries that state a size of 8192 bytes, and one 4 bytes
+/// beyond version 1's, which is no multiple of their alignment. The loader
+/// refuses both before it reads past the first entry's size.
+static HUGE_STRIDE: [ParamInfo; 1] = [ParamInfo {
+    size: 8192,
+    ..param(c"level", PARAM_FLOAT, (0.0, 1.0, 0.0))
+}];
+static ODD_STRIDE: [ParamInfo; 1] = [ParamInfo {
+    size: PARAM_INFO_SIZE + 4,
+    ..param(c"level", PARAM_FLOAT, (0.0, 1.0, 0.0))
+}];
+static HUGE: Descriptor = Descriptor {
+    param_count: 1,
+    params: HUGE_STRIDE.as_ptr(),
+    ..fixture(ABI, 2)
+};
+static ODD: Descriptor = Descriptor {
+    param_count: 1,
+    params: ODD_STRIDE.as_ptr(),
+    ..fixture(ABI, 2)
+};
+
 static STATEFUL: Descriptor = Descriptor {
     create: Some(create_counter),
     destroy: Some(destroy_counter),
@@ -302,6 +326,8 @@ pub extern "C" fn aas_plugin() -> *const Descriptor {
         Ok("small") => &SMALL,
         Ok("bigger") => &BIGGER.known,
         Ok("stateful") => &STATEFUL,
+        Ok("hugestride") => &HUGE,
+        Ok("oddstride") => &ODD,
         Ok("slow") => &SLOW,
         Ok("text") => &TEXT,
         Ok("textnosetter") => &TEXT_NO_SETTER,

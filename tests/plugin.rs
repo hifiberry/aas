@@ -455,7 +455,7 @@ fn a_descriptor_smaller_than_version_1_is_refused() {
         "small",
         |msg, path| {
             assert!(msg.contains(path), "{msg}");
-            assert!(msg.contains("bytes, fewer than"), "{msg}");
+            assert!(msg.contains("bytes, not version 1's"), "{msg}");
         },
     );
 }
@@ -666,4 +666,22 @@ fn a_latency_beyond_10_s_is_capped() {
         let p = Library::open(path).unwrap().create(48000, 64).unwrap();
         assert_eq!(p.latency_frames(), 480_000);
     });
+}
+
+#[test]
+fn a_parameter_size_too_large_is_refused() {
+    refused_fixture(
+        "a_parameter_size_too_large_is_refused",
+        "hugestride",
+        |msg, _| assert!(msg.contains("8192 bytes"), "{msg}"),
+    );
+}
+
+#[test]
+fn a_parameter_size_out_of_step_with_the_alignment_is_refused() {
+    refused_fixture(
+        "a_parameter_size_out_of_step_with_the_alignment_is_refused",
+        "oddstride",
+        |msg, _| assert!(msg.contains("in steps of"), "{msg}"),
+    );
 }

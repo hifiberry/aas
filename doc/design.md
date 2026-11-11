@@ -728,7 +728,9 @@ library is loaded once and never unloaded.
 
 The descriptor and each parameter entry start with their size as the plugin
 was compiled. Within an ABI version fields are only ever appended: the daemon
-refuses a size smaller than version 1's and ignores bytes it does not know. A
+refuses a size smaller than version 1's first one, which is frozen with every
+field's offset, or larger than 4096 bytes or out of step with the struct's
+alignment, and ignores bytes it does not know. A
 plugin may give a `reset` function, which clears what it keeps from earlier
 blocks. The daemon calls it when a chain runs again after periods that did not
 pass it (DoP, the bit-perfect copy path, a mute for a chain at another rate, a

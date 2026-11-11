@@ -8,9 +8,9 @@
 
 use super::{Block, BuildError, Failure, Formats, Param, ParamKind, Plugin, Status};
 use aas_plugin::{
-    ABI, CREATE_OK, CREATE_UNSUPPORTED, DESCRIPTOR_SIZE, Descriptor, FORMAT_F32, FORMAT_F64,
-    FORMAT_I32, PARAM_ENUMERATION, PARAM_FLOAT, PARAM_INFO_SIZE, PARAM_INTEGER, PARAM_SWITCH,
-    PARAM_TEXT, ParamInfo, STATUS_NO_SIGNAL, TEXT_OK, TEXT_UNSUPPORTED,
+    ABI, CREATE_OK, CREATE_UNSUPPORTED, DESCRIPTOR_SIZE_V1, Descriptor, FORMAT_F32, FORMAT_F64,
+    FORMAT_I32, MAX_STRUCT_SIZE, PARAM_ENUMERATION, PARAM_FLOAT, PARAM_INFO_SIZE_V1, PARAM_INTEGER,
+    PARAM_SWITCH, PARAM_TEXT, ParamInfo, STATUS_NO_SIGNAL, TEXT_OK, TEXT_UNSUPPORTED,
 };
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::os::unix::ffi::OsStrExt;
@@ -66,14 +66,17 @@ impl Library {
                 "it has ABI version {abi}, this daemon takes {ABI}"
             )));
         }
-        if size < DESCRIPTOR_SIZE {
+        let align = std::mem::align_of::<Descriptor>() as u32;
+        if !(DESCRIPTOR_SIZE_V1..=MAX_STRUCT_SIZE).contains(&size) || size % align != 0 {
             return Err(fail(format!(
-                "its descriptor has {size} bytes, fewer than the {DESCRIPTOR_SIZE} of version {ABI}"
+                "its descriptor has {size} bytes, not version {ABI}'s {DESCRIPTOR_SIZE_V1} to \
+                 {MAX_STRUCT_SIZE} in steps of {align}"
             )));
         }
-        // SAFETY: as above, and at least as large as this version's
-        // descriptor; bytes beyond it are fields of a later plugin that
-        // are not read.
+        // SAFETY: as above, and at least as large as version 1's first
+        // descriptor, which is all the daemon's `Descriptor` has; bytes
+        // beyond it are fields of a later plugin that are not read. A field
+        // appended later is read only where `size` covers it.
         let desc: &'static Descriptor = unsafe { &*desc };
         if desc.channels_in != 2 || desc.channels_out != 2 {
             return Err(fail(format!(
@@ -114,10 +117,10 @@ impl Library {
             // loaded, each starting with its size.
             let stride = unsafe { desc.params.cast::<u32>().read() };
             let align = std::mem::align_of::<ParamInfo>() as u32;
-            if stride < PARAM_INFO_SIZE || stride % align != 0 {
+            if !(PARAM_INFO_SIZE_V1..=MAX_STRUCT_SIZE).contains(&stride) || stride % align != 0 {
                 return Err(fail(format!(
-                    "its parameters have {stride} bytes, not a size of version {ABI}'s \
-                     {PARAM_INFO_SIZE} or more, in steps of {align}"
+                    "its parameters have {stride} bytes, not version {ABI}'s \
+                     {PARAM_INFO_SIZE_V1} to {MAX_STRUCT_SIZE} in steps of {align}"
                 )));
             }
             let base = desc.params.cast::<u8>();
