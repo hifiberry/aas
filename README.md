@@ -98,7 +98,7 @@ is kept in `/var/lib/aas/state.toml`.
 | `card` | an ALSA card id or index | the first card that is not `Loopback`, `Headphones` or HDMI | The card to play to. |
 | `format` | `"f32"`, `"f64"`, `"i32"` | `"f32"` | The arithmetic used to mix and to apply volume. |
 | `resampling` | `"high"`, `"medium"` | `"high"` | Quality of the resampler for a client at another rate than the output. |
-| `bit_perfect` | `"auto"`, `"forced"`, `"off"` | `"auto"` | `auto` copies the samples untouched while one client plays at the output rate with no software volume. `forced` also ignores the software volume. `off` always mixes. |
+| `bit_perfect` | `"auto"`, `"forced"`, `"off"` | `"auto"` | `auto` copies the samples untouched while one client plays at the output rate with no software volume. `forced` also ignores the software volume and bypasses plugins, except input detection. `off` always mixes. |
 | `idle` | `"off"`, `"zeros"` | `"off"` | What the output does when nothing plays: close the card after a delay, or keep it open and send zeros. |
 | `idle_delay_s` | whole seconds | 60 | The delay before `idle = "off"` closes the card. An error with `idle = "zeros"`. |
 | `volume_mode` | `"hardware"`, `"software"` | the card's control if it has one | Who applies the volume: the card's mixer, or the daemon. `hardware` on a card without a control warns and uses software. |
