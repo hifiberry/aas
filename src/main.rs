@@ -111,6 +111,14 @@ fn hardware_volume(config: &Config) -> Option<OpenVolume> {
     None
 }
 
+/// Looks for the card on the control thread while it is gone, so that the
+/// audio thread tries to open it only once it is there. A build without
+/// ALSA never asks: its output is never gone.
+fn card_probe(config: &Config) -> server::CardProbe {
+    let card = config.card.clone();
+    Box::new(move || aas::sink_alsa::card_is_present(card.as_deref()))
+}
+
 fn main() -> ExitCode {
     let args = match parse_args(std::env::args_os().skip(1)) {
         Ok(args) => args,
@@ -134,7 +142,9 @@ fn main() -> ExitCode {
     handle_signals(shutdown.clone());
     let sink = output(&config);
     let hardware = hardware_volume(&config);
-    match server::run(config, sink, &args.socket, &args.state, hardware, shutdown) {
+    let probe = Some(card_probe(&config));
+    let (socket, state) = (&args.socket, &args.state);
+    match server::run_probing(config, sink, socket, state, hardware, probe, shutdown) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("aas: {e}");

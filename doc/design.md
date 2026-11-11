@@ -573,8 +573,9 @@ All of this is *(call)*:
   open must be restarted.
 - If the card is missing at startup, the daemon keeps running and waits for it.
   Meanwhile audio goes to a timed null sink, so players keep running in real
-  time rather than hanging, and the daemon retries the card every second
-  *(call)*.
+  time rather than hanging, and the daemon looks for the card every second
+  *(call)*. The control thread does the looking. The audio thread opens the
+  card once it is there, and does nothing for it before.
 - After an xrun on the card, the daemon recovers without client involvement.
 - The daemon locks each client's ring in memory, so that the audio thread never
   waits for a page. A ring is at most 8 MiB, for the largest buffer a client may

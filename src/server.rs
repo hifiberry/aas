@@ -8,7 +8,7 @@ use crate::counters::Counters;
 use crate::engine::Engine;
 use crate::format::{F32, F64, I32, Processing};
 use crate::rt;
-use crate::sink::{CardWatch, FallbackSink, RatesWatch, Sink};
+use crate::sink::{CardSearch, CardWatch, FallbackSink, RETRY, RatesWatch, Sink};
 use crate::volume::{OpenVolume, OutputVolume};
 use aas_client::client::socket_address;
 use aas_client::proto::{self, REQUEST_LEN, Reply};
@@ -44,17 +44,40 @@ fn check(rc: isize) -> io::Result<usize> {
     }
 }
 
-/// Runs the daemon until `shutdown` is set. The sink is wrapped in a
-/// `FallbackSink`, so a missing card does not stop playback. The output
-/// volume is kept in the file `state`. It is set on the control that
-/// `hardware` opens, if given and found, else in software. `hardware` is
-/// called again each time the card goes or comes back.
+/// Says whether the card the sink plays to is present. Called on the
+/// control thread, once a second while the sink is gone.
+pub type CardProbe = Box<dyn FnMut() -> bool + Send>;
+
+/// Runs the daemon as `run_probing` does, with no probe for the card: the
+/// audio thread then tries a sink that is gone every second by itself.
 pub fn run(
     config: Config,
     sink: Box<dyn Sink>,
     socket: &Path,
     state: &Path,
+    hardware: Option<OpenVolume>,
+    shutdown: Arc<AtomicBool>,
+) -> Result<(), String> {
+    run_probing(config, sink, socket, state, hardware, None, shutdown)
+}
+
+/// Runs the daemon until `shutdown` is set. The sink is wrapped in a
+/// `FallbackSink`, so a missing card does not stop playback. The output
+/// volume is kept in the file `state`. It is set on the control that
+/// `hardware` opens, if given and found, else in software. `hardware` is
+/// called again each time the card goes or comes back.
+///
+/// With a `probe`, the control thread looks for a card that is gone and
+/// has the audio thread try the sink only once the card is there. So the
+/// audio thread neither reads the list of cards nor allocates while it
+/// waits for one.
+pub fn run_probing(
+    config: Config,
+    sink: Box<dyn Sink>,
+    socket: &Path,
+    state: &Path,
     mut hardware: Option<OpenVolume>,
+    probe: Option<CardProbe>,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), String> {
     raise_file_limit();
@@ -68,6 +91,7 @@ pub fn run(
     let mut sink = FallbackSink::new(sink);
     let rates = sink.rates_watch();
     let card = sink.card_watch();
+    let search = probe.map(|probe| (sink.card_search(), probe));
     let (commands, command_queue) = RingBuffer::new(COMMAND_SLOTS);
     let (event_queue, events) = RingBuffer::new(EVENT_SLOTS);
     let counters = Arc::new(Counters::default());
@@ -118,6 +142,8 @@ pub fn run(
         accept_after: None,
         rates,
         card,
+        search,
+        probe_at: Instant::now(),
         hardware,
     };
     server.control.start(Instant::now());
@@ -200,6 +226,10 @@ struct Server {
     rates: RatesWatch,
     /// When the card comes back.
     card: CardWatch,
+    /// Looks for a card that is gone, and has the audio thread try it.
+    search: Option<(CardSearch, CardProbe)>,
+    /// When to look for the card next.
+    probe_at: Instant,
     /// Opens the card's volume control, unless the volume is in software
     /// by config.
     hardware: Option<OpenVolume>,
@@ -231,6 +261,14 @@ impl Server {
             return;
         }
         let now = Instant::now();
+        if let Some((search, probe)) = &mut self.search {
+            if search.is_gone() && now >= self.probe_at {
+                self.probe_at = now + RETRY;
+                if probe() {
+                    search.retry();
+                }
+            }
+        }
         if let Some(rates) = self.rates.take() {
             self.control.set_supported(rates, now);
         }
