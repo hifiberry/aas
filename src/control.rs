@@ -1046,7 +1046,8 @@ impl Control {
         if pcm.is_empty() && !self.refused.is_empty() {
             return false;
         }
-        let dop = (!self.analog_refused.is_empty()).then(|| self.usable(&self.analog_refused));
+        // DoP needs only the analog chain, so only its refusals limit DoP.
+        let dop = (self.refused != self.analog_refused).then(|| self.usable(&self.analog_refused));
         self.policy.set_supported(pcm);
         self.policy.set_dop_supported(dop);
         true
@@ -2740,6 +2741,32 @@ mod tests {
         let seen = sent(&mut engine);
         assert!(!has(&seen, "Reconfigure 176400"), "{seen:?}");
         assert_eq!(control.policy.current(), 48000);
+    }
+
+    #[test]
+    fn a_rate_only_the_mix_chain_refuses_still_carries_dop() {
+        let config = Config {
+            plugins: vec![entry(config::PluginPlace::Mix, "only-up-to-48k")],
+            ..Config::default()
+        };
+        let (mut control, mut engine, now) = started(&config, None);
+        control.set_supported(vec![48000, 176400], now);
+        engine.take(true);
+        control.handle_events(now);
+        // A PCM player at 176.4 kHz: the mix chain refuses the rate.
+        play(&mut control, 1, 176400, now);
+        engine.take(true);
+        assert_eq!(control.policy.current(), 48000);
+        let stop = control.request(1, Some(Request::Stop), now);
+        assert_eq!(stop.reply, Some(Reply::Ok));
+        engine.take(true);
+        // A DoP stream at that rate bypasses the mix chain, so it has it.
+        play(&mut control, 2, 176400, now);
+        engine.send(Event::DopStarted(2, 1));
+        control.handle_events(now);
+        let seen = sent(&mut engine);
+        assert!(has(&seen, "Reconfigure 176400"), "{seen:?}");
+        assert!(!has(&seen, "SetChain Mix"), "{seen:?}");
     }
 
     #[test]
