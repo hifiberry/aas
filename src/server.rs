@@ -143,7 +143,7 @@ pub fn run_probing(
         rates,
         card,
         search,
-        probe_at: Instant::now(),
+        probe_wait: ProbeWait::default(),
         hardware,
     };
     server.control.start(Instant::now());
@@ -229,7 +229,7 @@ struct Server {
     /// Looks for a card that is gone, and has the audio thread try it.
     search: Option<(CardSearch, CardProbe)>,
     /// When to look for the card next.
-    probe_at: Instant,
+    probe_wait: ProbeWait,
     /// Opens the card's volume control, unless the volume is in software
     /// by config.
     hardware: Option<OpenVolume>,
@@ -261,14 +261,6 @@ impl Server {
             return;
         }
         let now = Instant::now();
-        if let Some((search, probe)) = &mut self.search {
-            if search.is_gone() && now >= self.probe_at {
-                self.probe_at = now + RETRY;
-                if probe() {
-                    search.retry();
-                }
-            }
-        }
         if let Some(rates) = self.rates.take() {
             self.control.set_supported(rates, now);
         }
@@ -277,6 +269,13 @@ impl Server {
         if self.card.changed() {
             if let Some(open) = &mut self.hardware {
                 self.control.card_changed(open());
+            }
+        }
+        // After the card change above: the mixer of a card that has just
+        // gone is closed by now, so the card is no longer listed for that.
+        if let Some((search, probe)) = &mut self.search {
+            if self.probe_wait.due(search.is_gone(), now) && probe() {
+                search.retry();
             }
         }
         if fds[1].revents != 0 {
@@ -471,6 +470,37 @@ fn unread_bytes(fd: &OwnedFd) -> Option<usize> {
     (rc == 0).then_some(queued as usize)
 }
 
+/// When to look for a card that is gone: a second after it went, and
+/// every second from then. Never at once, since a card that has just gone
+/// can still be listed, and a try that is bound to fail costs the audio
+/// thread an open.
+#[derive(Default)]
+struct ProbeWait {
+    /// When to look next. None while the card is not gone.
+    at: Option<Instant>,
+}
+
+impl ProbeWait {
+    /// Whether to look now. `gone` is what the sink says in this step.
+    fn due(&mut self, gone: bool, now: Instant) -> bool {
+        if !gone {
+            self.at = None;
+            return false;
+        }
+        match self.at {
+            Some(at) if now >= at => {
+                self.at = Some(now + RETRY);
+                true
+            }
+            Some(_) => false,
+            None => {
+                self.at = Some(now + RETRY);
+                false
+            }
+        }
+    }
+}
+
 /// Whether an accept failed for want of a descriptor or memory. The
 /// connection is still queued then, and trying again at once cannot help.
 fn accept_must_pause(e: &io::Error) -> bool {
@@ -617,6 +647,25 @@ mod tests {
         let file = OwnedFd::from(fs::File::open("/dev/null").unwrap());
         assert_eq!(unread_bytes(&file), None);
         assert!(notice_is_due(&file));
+    }
+
+    #[test]
+    fn a_gone_card_is_looked_for_a_second_after_it_went_and_each_second_after() {
+        let mut wait = ProbeWait::default();
+        let t = Instant::now();
+        let ms = Duration::from_millis;
+        assert!(!wait.due(false, t));
+        // Just gone: not yet.
+        assert!(!wait.due(true, t + ms(50)));
+        assert!(!wait.due(true, t + ms(1000)));
+        assert!(wait.due(true, t + ms(1050)));
+        assert!(!wait.due(true, t + ms(1100)));
+        assert!(wait.due(true, t + ms(2050)));
+        // Back and gone again: the second starts anew.
+        assert!(!wait.due(false, t + ms(2100)));
+        assert!(!wait.due(true, t + ms(4000)));
+        assert!(!wait.due(true, t + ms(4900)));
+        assert!(wait.due(true, t + ms(5000)));
     }
 
     #[test]
