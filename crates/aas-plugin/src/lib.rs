@@ -11,7 +11,20 @@
 //! clipped. `create` and `destroy` run on the control thread. `process`,
 //! `set_param`, `neutral` and `latency` run on the audio thread and must
 //! not allocate, lock or block. An instance can move between threads but
-//! is never used by two at once.
+//! is never used by two at once. `process` may be called with
+//! `frames == 0`.
+//!
+//! The daemon may call `aas_plugin` more than once. It must return the
+//! same descriptor every time.
+//!
+//! A panic that leaves an `extern "C" fn` aborts the whole daemon. A
+//! plugin written in Rust must not panic in the functions it exports, or
+//! must catch the panic with `std::panic::catch_unwind` first.
+//!
+//! The six functions are `Option`s of function pointers, which have the
+//! layout of a bare C function pointer with null as `None`. A C header
+//! declares them as plain function pointers. The daemon refuses a
+//! descriptor in which any of them is null.
 //!
 //! A plugin written in Rust exports its descriptor as a `static`:
 //!
@@ -35,12 +48,12 @@
 //!     channels_out: 2,
 //!     param_count: PARAMS.len() as u32,
 //!     params: PARAMS.as_ptr(),
-//!     create,
-//!     destroy,
-//!     set_param,
-//!     neutral,
-//!     latency,
-//!     process,
+//!     create: Some(create),
+//!     destroy: Some(destroy),
+//!     set_param: Some(set_param),
+//!     neutral: Some(neutral),
+//!     latency: Some(latency),
+//!     process: Some(process),
 //! };
 //!
 //! #[unsafe(no_mangle)]
@@ -80,13 +93,16 @@ pub struct ParamInfo {
     pub name: *const c_char,
     /// A NUL terminated UTF-8 unit, such as `dB`. Null means none.
     pub unit: *const c_char,
+    /// The smallest value, inclusive. Not NaN.
     pub min: f64,
+    /// The largest value, inclusive. Not NaN, and not below `min`.
     pub max: f64,
+    /// The value an instance starts with. It lies in `min` to `max`.
     pub default: f64,
 }
 
 /// What a plugin is and the functions that run it. Every function must be
-/// given; none of them may be null.
+/// given; the daemon refuses a descriptor in which one is `None`.
 #[repr(C)]
 #[derive(Debug)]
 pub struct Descriptor {
@@ -102,25 +118,28 @@ pub struct Descriptor {
     pub channels_out: u32,
     /// The number of entries at `params`.
     pub param_count: u32,
-    /// `param_count` parameters, or null if there are none.
+    /// `param_count` parameters, or null if there are none. The daemon
+    /// takes at most 4096.
     pub params: *const ParamInfo,
     /// Builds an instance for `rate` Hz and blocks of up to `max_frames`
     /// frames, with every parameter at its default. Null means it failed.
-    pub create: extern "C" fn(rate: u32, max_frames: u32) -> *mut c_void,
+    pub create: Option<extern "C" fn(rate: u32, max_frames: u32) -> *mut c_void>,
     /// Frees an instance `create` returned.
-    pub destroy: extern "C" fn(*mut c_void),
+    pub destroy: Option<extern "C" fn(*mut c_void)>,
     /// Sets parameter `index` to `value`. The daemon passes only indices
     /// below `param_count` and values inside the parameter's range.
-    pub set_param: extern "C" fn(*mut c_void, index: u32, value: f64),
+    pub set_param: Option<extern "C" fn(*mut c_void, index: u32, value: f64)>,
     /// Not 0 if, with the parameters it has now, the instance leaves every
     /// block as it is.
-    pub neutral: extern "C" fn(*const c_void) -> u32,
+    pub neutral: Option<extern "C" fn(*const c_void) -> u32>,
     /// How many frames the instance delays the audio by.
-    pub latency: extern "C" fn(*const c_void) -> u32,
+    pub latency: Option<extern "C" fn(*const c_void) -> u32>,
     /// Processes `frames` frames in place: `2 * frames` interleaved samples
-    /// in `format`, one of the `FORMAT_` bits in `formats`. Returns a mask
-    /// of the `STATUS_` bits.
-    pub process: extern "C" fn(*mut c_void, format: u32, samples: *mut c_void, frames: u32) -> u32,
+    /// in `format`, one of the `FORMAT_` bits in `formats`. `frames` is at
+    /// most the `max_frames` of `create`, and may be 0. Returns a mask of
+    /// the `STATUS_` bits.
+    pub process:
+        Option<extern "C" fn(*mut c_void, format: u32, samples: *mut c_void, frames: u32) -> u32>,
 }
 
 // SAFETY: the pointers in a parameter are only read, and the data they

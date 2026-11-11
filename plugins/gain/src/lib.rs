@@ -25,12 +25,12 @@ static DESCRIPTOR: Descriptor = Descriptor {
     channels_out: 2,
     param_count: PARAMS.len() as u32,
     params: PARAMS.as_ptr(),
-    create,
-    destroy,
-    set_param,
-    neutral,
-    latency,
-    process,
+    create: Some(create),
+    destroy: Some(destroy),
+    set_param: Some(set_param),
+    neutral: Some(neutral),
+    latency: Some(latency),
+    process: Some(process),
 };
 
 /// The plugin's entry point.

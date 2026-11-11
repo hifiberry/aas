@@ -2,7 +2,7 @@
 //! fixture that breaks the ABI in the ways the loader refuses.
 
 use aas::plugin::native::Library;
-use aas::plugin::{Block, Formats, Plugin};
+use aas::plugin::{Block, Formats, Plugin, Status};
 use assert_no_alloc::assert_no_alloc;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -12,14 +12,22 @@ use std::sync::OnceLock;
 #[global_allocator]
 static ALLOCATOR: assert_no_alloc::AllocDisabler = assert_no_alloc::AllocDisabler;
 
-/// Builds the gain plugin and the fixture once per test process, in the
-/// profile of the tests, and returns the directory they are in.
-fn libraries() -> &'static Path {
-    static DIR: OnceLock<PathBuf> = OnceLock::new();
-    DIR.get_or_init(|| {
+/// The gain plugin and the fixture, built once per test process in the
+/// profile of the tests.
+struct Libraries {
+    gain: PathBuf,
+    fixture: PathBuf,
+}
+
+/// Builds the libraries and takes their paths from cargo's own report, so
+/// a `--target` or a custom target directory finds them too.
+fn libraries() -> &'static Libraries {
+    static LIBS: OnceLock<Libraries> = OnceLock::new();
+    LIBS.get_or_init(|| {
         let mut cmd = Command::new(env!("CARGO"));
         cmd.args([
             "build",
+            "--message-format=json",
             "-p",
             "aas-plugin-gain",
             "-p",
@@ -29,23 +37,37 @@ fn libraries() -> &'static Path {
             cmd.arg("--release");
         }
         let out = cmd.output().expect("cargo runs");
+        let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(
             out.status.success(),
-            "building the plugins failed:\n{}",
+            "building the plugins failed:\n{stdout}\n{}",
             String::from_utf8_lossy(&out.stderr)
         );
-        // The test runs from <target>/<profile>/deps.
-        let exe = std::env::current_exe().unwrap();
-        exe.parent().unwrap().parent().unwrap().to_path_buf()
+        // The `filenames` of each `compiler-artifact` line. A path is a
+        // JSON string, so it lies between two quotes.
+        let built: Vec<PathBuf> = stdout
+            .lines()
+            .filter(|l| l.contains(r#""reason":"compiler-artifact""#))
+            .flat_map(|l| l.split('"'))
+            .filter(|s| s.ends_with(".so"))
+            .map(PathBuf::from)
+            .collect();
+        let find = |name: &str| {
+            built
+                .iter()
+                .find(|p| p.file_name().is_some_and(|f| f == name))
+                .unwrap_or_else(|| panic!("cargo reported no {name}:\n{stdout}"))
+                .clone()
+        };
+        Libraries {
+            gain: find("libaas_gain.so"),
+            fixture: find("libaas_fixture_bad.so"),
+        }
     })
 }
 
 fn gain_path() -> PathBuf {
-    libraries().join("libaas_gain.so")
-}
-
-fn fixture_path() -> PathBuf {
-    libraries().join("libaas_fixture_bad.so")
+    libraries().gain.clone()
 }
 
 fn gain() -> Box<dyn Plugin> {
@@ -62,23 +84,20 @@ fn unwrap_err<T>(r: Result<T, String>) -> String {
     }
 }
 
-/// Loads the fixture in `case` and returns why it was refused. The test
-/// re-runs itself as a child process with `AAS_FIXTURE` set, so tests that
-/// run at the same time never share the variable. In the child this does
-/// the load and checks `check` on the message; the parent checks that the
-/// child passed.
-fn refused_fixture(test: &str, case: &str, check: impl FnOnce(&str, &str)) {
+/// Runs `body` on the fixture in `case`. The test re-runs itself as a
+/// child process with `AAS_FIXTURE` set, so tests that run at the same
+/// time never share the variable. In the child this runs `body` with the
+/// fixture's path; the parent checks that the child passed.
+fn with_fixture(test: &str, case: &str, body: impl FnOnce(&Path)) {
     if let Some(path) = std::env::var_os("AAS_FIXTURE_LIB") {
-        let path = PathBuf::from(path);
         assert_eq!(std::env::var("AAS_FIXTURE").unwrap(), case);
-        let msg = unwrap_err(Library::open(&path).and_then(|l| l.create(48000, 1024)));
-        check(&msg, path.to_str().unwrap());
+        body(Path::new(&path));
         return;
     }
     let out = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", test, "--nocapture", "--test-threads=1"])
         .env("AAS_FIXTURE", case)
-        .env("AAS_FIXTURE_LIB", fixture_path())
+        .env("AAS_FIXTURE_LIB", &libraries().fixture)
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -87,6 +106,15 @@ fn refused_fixture(test: &str, case: &str, check: impl FnOnce(&str, &str)) {
         "the child failed:\n{stdout}\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+/// Loads the fixture in `case` and checks why it was refused with `check`,
+/// which is given the message and the path.
+fn refused_fixture(test: &str, case: &str, check: impl FnOnce(&str, &str)) {
+    with_fixture(test, case, |path| {
+        let msg = unwrap_err(Library::open(path).and_then(|l| l.create(48000, 1024)));
+        check(&msg, path.to_str().unwrap());
+    });
 }
 
 #[test]
@@ -253,4 +281,62 @@ fn two_instances_do_not_share_state() {
     b.set_param(0, 20.0);
     b.process(Block::F64(&mut db));
     assert!((db[0][0] - 10.0).abs() < 1e-9, "{db:?}");
+}
+
+#[test]
+fn a_block_in_a_format_the_plugin_lacks_is_left_alone() {
+    // The gain plugin takes no i32. A chain never hands it one, but if
+    // anything did, the block must not reach the library.
+    let mut p = gain();
+    p.set_param(0, -6.02);
+    let mut i = [[1000, -1000]; 4];
+    assert_eq!(p.process(Block::I32(&mut i)), Status::default());
+    assert_eq!(i, [[1000, -1000]; 4]);
+}
+
+#[test]
+fn a_block_longer_than_max_frames_is_passed_in_parts() {
+    // The `chunks` fixture writes the frame count of each call into the
+    // samples it was given, and reports no signal for an odd count.
+    with_fixture(
+        "a_block_longer_than_max_frames_is_passed_in_parts",
+        "chunks",
+        |path| {
+            let mut p = Library::open(path).unwrap().create(48000, 4).unwrap();
+            let mut f = [[0.0f32; 2]; 9];
+            let s = assert_no_alloc(|| p.process(Block::F32(&mut f)));
+            let counts: Vec<f32> = f.iter().map(|x| x[0]).collect();
+            assert_eq!(counts, [4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 1.0]);
+            assert!(f.iter().all(|x| x[0] == x[1]));
+            // Only the last part had an odd count; its bit is kept.
+            assert!(s.no_signal);
+            let mut f = [[0.0f32; 2]; 8];
+            assert!(!p.process(Block::F32(&mut f)).no_signal);
+            assert!(f.iter().all(|x| x[0] == 4.0));
+        },
+    );
+}
+
+#[test]
+fn a_plugin_without_a_function_is_refused() {
+    refused_fixture(
+        "a_plugin_without_a_function_is_refused",
+        "nofn",
+        |msg, path| {
+            assert!(msg.contains(path), "{msg}");
+            assert!(msg.contains("process"), "{msg}");
+        },
+    );
+}
+
+#[test]
+fn a_parameter_whose_default_is_outside_its_range_is_refused() {
+    refused_fixture(
+        "a_parameter_whose_default_is_outside_its_range_is_refused",
+        "default",
+        |msg, path| {
+            assert!(msg.contains(path), "{msg}");
+            assert!(msg.contains("default"), "{msg}");
+        },
+    );
 }
