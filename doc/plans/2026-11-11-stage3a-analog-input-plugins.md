@@ -201,7 +201,8 @@ These are not in the design. Task 12 adds them to it, marked *(call)*.
 - Consumes: `Chain`, `Processing::to_block`, `from_block` from Task 1.
 - Produces, `bitperfect.rs`: `NotBitPerfect::Plugin`, and `Situation` gains
   `pub plugins_neutral: bool`. Checked after `Resampled` and before `Volume`, in every
-  mode but `Off`. Forced mode does not skip plugins.
+  mode but `Off`. Forced mode bypasses plugins, as the design says; the analog chain
+  still runs there, for detection and the recorders.
 - Produces, `engine.rs`:
   - `pub enum Place { Analog, Mix, Output }`
   - `Command::SetChain(Place, Box<Chain>)`, answered by `Event::OldChain(Box<Chain>)`
@@ -218,7 +219,7 @@ These are not in the design. Task 12 adds them to it, marked *(call)*.
 #[test] fn the_mix_chain_runs_before_the_output_chain()
 #[test] fn a_plugin_that_is_not_neutral_stops_bit_perfect()   // decide() gives Plugin
 #[test] fn a_neutral_plugin_leaves_one_source_bit_exact()
-#[test] fn forced_bit_perfect_still_runs_plugins()
+#[test] fn forced_bit_perfect_bypasses_plugins()
 #[test] fn dop_passes_by_every_chain()
 #[test] fn a_replaced_chain_comes_back()                       // Event::OldChain
 #[test] fn a_parameter_set_takes_effect_on_the_next_cycle()
