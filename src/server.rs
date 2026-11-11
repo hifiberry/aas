@@ -30,6 +30,9 @@ use std::time::{Duration, Instant};
 const TICK_MS: i32 = 50;
 /// How long the audio thread waits for a command while the output is closed.
 const PARK: Duration = Duration::from_millis(100);
+/// How long the listener is left alone after an accept that failed for
+/// want of a descriptor or memory.
+const ACCEPT_PAUSE: Duration = Duration::from_millis(250);
 const COMMAND_SLOTS: usize = 4096;
 const EVENT_SLOTS: usize = 1024;
 
@@ -107,6 +110,7 @@ pub fn run(
         conns: BTreeMap::new(),
         notices: BTreeMap::new(),
         next_conn: 1,
+        accept_after: None,
         rates,
         card,
         hardware,
@@ -183,6 +187,10 @@ struct Server {
     /// The latest volume notification each subscriber has waiting.
     notices: BTreeMap<ConnId, Reply>,
     next_conn: ConnId,
+    /// Set while the listener is not polled, after an accept that could not
+    /// get a descriptor. The connection stays queued, so the listener would
+    /// stay readable and the poll would return at once, over and over.
+    accept_after: Option<Instant>,
     /// The card's rates, when they change.
     rates: RatesWatch,
     /// When the card comes back.
@@ -200,10 +208,15 @@ impl Server {
             events: libc::POLLIN,
             revents: 0,
         };
-        let mut fds = vec![
-            poll_in(self.listener.as_raw_fd()),
-            poll_in(self.notify.as_raw_fd()),
-        ];
+        if self.accept_after.is_some_and(|at| Instant::now() >= at) {
+            self.accept_after = None;
+        }
+        // poll skips a negative descriptor.
+        let listener = match self.accept_after {
+            Some(_) => -1,
+            None => self.listener.as_raw_fd(),
+        };
+        let mut fds = vec![poll_in(listener), poll_in(self.notify.as_raw_fd())];
         let ids: Vec<ConnId> = self.conns.keys().copied().collect();
         fds.extend(self.conns.values().map(|fd| poll_in(fd.as_raw_fd())));
         // SAFETY: fds is a valid array of its length.
@@ -280,7 +293,11 @@ impl Server {
             };
             if raw < 0 {
                 let e = io::Error::last_os_error();
-                if e.kind() != io::ErrorKind::WouldBlock {
+                if accept_must_pause(&e) {
+                    let ms = ACCEPT_PAUSE.as_millis();
+                    eprintln!("aas: accept: {e}, not accepting for {ms} ms");
+                    self.accept_after = Some(Instant::now() + ACCEPT_PAUSE);
+                } else if e.kind() != io::ErrorKind::WouldBlock {
                     eprintln!("aas: accept: {e}");
                 }
                 return;
@@ -409,6 +426,15 @@ fn unread_bytes(fd: &OwnedFd) -> Option<usize> {
     // SAFETY: TIOCOUTQ, which is SIOCOUTQ on a socket, writes one int.
     let rc = unsafe { libc::ioctl(fd.as_raw_fd(), libc::TIOCOUTQ, &mut queued) };
     (rc == 0).then_some(queued as usize)
+}
+
+/// Whether an accept failed for want of a descriptor or memory. The
+/// connection is still queued then, and trying again at once cannot help.
+fn accept_must_pause(e: &io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM)
+    )
 }
 
 /// Whether a subscriber's notice can go out now: it has read everything
@@ -548,5 +574,15 @@ mod tests {
         let file = OwnedFd::from(fs::File::open("/dev/null").unwrap());
         assert_eq!(unread_bytes(&file), None);
         assert!(notice_is_due(&file));
+    }
+
+    #[test]
+    fn only_running_out_of_descriptors_or_memory_pauses_accepting() {
+        for errno in [libc::EMFILE, libc::ENFILE, libc::ENOBUFS, libc::ENOMEM] {
+            assert!(accept_must_pause(&io::Error::from_raw_os_error(errno)));
+        }
+        for errno in [libc::EAGAIN, libc::ECONNABORTED, libc::EINTR] {
+            assert!(!accept_must_pause(&io::Error::from_raw_os_error(errno)));
+        }
     }
 }
