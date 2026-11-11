@@ -14,15 +14,20 @@ use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::atomic::{Ordering, fence};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Descriptors a reply may carry: the ring and the wake-up.
 const MAX_FDS: usize = 2;
 /// Frames converted per step of `write`. Kept on the stack.
 const CHUNK: usize = 512;
-/// How long a request waits for the daemon's answer. A drain waits as long
-/// as the audio takes to play.
-const TIMEOUT: Duration = Duration::from_secs(2);
+/// How long a request waits for the daemon's answer. Long enough for a
+/// daemon that is only slow: a reset waits for the audio thread, which may
+/// itself wait half a second for the card, or be opening it again. A drain
+/// waits as long as the audio takes to play.
+const TIMEOUT: Duration = Duration::from_secs(5);
+/// How long after the buffer has played the daemon answers a drain at the
+/// latest. The same as the daemon's own spare.
+const DRAIN_SPARE: Duration = Duration::from_millis(500);
 
 /// The address of a Unix socket at `path`, and its length.
 pub fn socket_address(path: &Path) -> io::Result<(libc::sockaddr_un, libc::socklen_t)> {
