@@ -49,6 +49,10 @@ const MIN_PERIOD_BYTES: c_uint = 128;
 /// Pi 3's. A smaller buffer at a higher rate is refused at hw_params.
 const MIN_BUFFER_BYTES: c_uint = 8192;
 const MAX_PERIODS: c_uint = 1024;
+/// How often a blocking drain looks at the PCM again while no reply comes.
+/// A drop from another thread answers the drain, so this only bounds the
+/// wait if that answer is read by the other thread first.
+const DRAIN_RECHECK_MS: c_int = 100;
 
 type Io = *mut snd_pcm_ioplug_t;
 
@@ -120,11 +124,13 @@ fn client_format(format: snd_pcm_format_t) -> Option<ClientFormat> {
 }
 
 /// The positive errno for a failed call. A daemon that has gone is
-/// `ENODEV`, as for an unplugged card.
+/// `ENODEV`, as for an unplugged card. One that speaks another protocol
+/// version is `EPROTONOSUPPORT`.
 pub(crate) fn errno(e: &io::Error) -> c_int {
     match e.raw_os_error() {
         Some(libc::ECONNRESET | libc::EPIPE | libc::ENOTCONN) => libc::ENODEV,
         Some(n) if n > 0 => n,
+        _ if e.kind() == io::ErrorKind::Unsupported => libc::EPROTONOSUPPORT,
         _ => libc::EIO,
     }
 }
@@ -150,11 +156,24 @@ unsafe fn with<T>(io: Io, f: impl FnOnce(&mut Inner) -> Result<T, c_int>) -> Res
     f(&mut inner)
 }
 
-/// The PCM state as libasound keeps it.
+/// The PCM state, read under libasound's lock, which every write of it
+/// holds. For the callbacks libasound calls with its lock released:
+/// `poll_revents` and `drain`. The plugin's own lock must not be held: a
+/// thread in `snd_pcm_drop` holds libasound's lock and waits for the
+/// plugin's in `stop`.
 ///
 /// # Safety
-/// As for `with`.
+/// As for `with`, and the caller holds neither lock.
 unsafe fn state(io: Io) -> snd_pcm_state_t {
+    unsafe { snd_pcm_state((*io).pcm) }
+}
+
+/// The PCM state, for a callback libasound calls with its lock held, as
+/// it does `pointer`. The field is then safe to read as it is.
+///
+/// # Safety
+/// As for `with`, and libasound's lock is held by the calling thread.
+unsafe fn state_locked(io: Io) -> snd_pcm_state_t {
     unsafe { (*io).state }
 }
 
@@ -310,7 +329,7 @@ unsafe extern "C" fn stop(io: Io) -> c_int {
 
 unsafe extern "C" fn pointer(io: Io) -> snd_pcm_sframes_t {
     guard(|| unsafe {
-        let running = state(io) == SND_PCM_STATE_RUNNING;
+        let running = state_locked(io) == SND_PCM_STATE_RUNNING;
         with(io, |inner| {
             let Some(stream) = &inner.stream else {
                 return Ok(0);
@@ -366,6 +385,22 @@ unsafe extern "C" fn hw_params(io: Io, _params: *mut snd_pcm_hw_params_t) -> c_i
     guard(|| unsafe { with(io, |inner| inner.set_up(io).map(|_| 0)) })
 }
 
+/// Gives the stream up: its ring is unmapped and its positions are
+/// forgotten. libasound calls this in SETUP or PREPARED, where the daemon's
+/// side is stopped already. The daemon keeps that side, idle, until the
+/// next hw_params replaces it or the PCM closes. The wake-up is armed, so
+/// a player that still polls finds the PCM without a stream.
+unsafe extern "C" fn hw_free(io: Io) -> c_int {
+    guard(|| unsafe {
+        with(io, |inner| {
+            inner.stream = None;
+            inner.client.release();
+            inner.arm();
+            Ok(0)
+        })
+    })
+}
+
 /// Starts the stream empty, its positions at zero, as ALSA's are after
 /// prepare. A stream not used since it was set up is kept; any other is
 /// emptied on the daemon, in the ring it has.
@@ -409,20 +444,39 @@ unsafe extern "C" fn sw_params(io: Io, params: *mut snd_pcm_sw_params_t) -> c_in
 /// stream first if it was not running. A non-blocking PCM gets `-EAGAIN`
 /// until then, as alsa-lib's own ioplug drain gives it: the player polls,
 /// and the PCM leaves DRAINING when the drain is done.
+///
+/// A blocking drain waits on the socket with the plugin's lock released,
+/// as libasound has released its own, so another thread can drop, write
+/// or ask for the position meanwhile. A drop from another thread cancels
+/// the drain on the daemon, which answers it, and the drain returns.
 unsafe extern "C" fn drain(io: Io) -> c_int {
     guard(|| unsafe {
         let nonblock = (*io).nonblock != 0;
-        with(io, |inner| {
-            if !nonblock {
-                inner.client.drain().map_err(|e| errno(&e))?;
+        let socket = with(io, |inner| {
+            inner.client.start_drain().map_err(|e| errno(&e))?;
+            Ok(inner.client.poll_fds()[1])
+        })?;
+        loop {
+            // Read before the plugin's lock is taken, see `state`.
+            let draining = state(io) == SND_PCM_STATE_DRAINING;
+            let done = with(io, |inner| inner.client.poll_drain().map_err(|e| errno(&e)))?;
+            // A PCM that is no longer draining was dropped meanwhile. The
+            // drop took the drain's reply, so `done` says the same.
+            if done || !draining {
                 return Ok(0);
             }
-            inner.client.start_drain().map_err(|e| errno(&e))?;
-            match inner.client.poll_drain().map_err(|e| errno(&e))? {
-                true => Ok(0),
-                false => Err(libc::EAGAIN),
+            if nonblock {
+                return Err(libc::EAGAIN);
             }
-        })
+            let mut pfd = libc::pollfd {
+                fd: socket,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one valid pollfd. A signal or a timeout only brings
+            // the next look forward.
+            libc::poll(&mut pfd, 1, DRAIN_RECHECK_MS);
+        }
     })
 }
 
@@ -483,6 +537,13 @@ unsafe extern "C" fn poll_descriptors(io: Io, pfd: *mut libc::pollfd, space: c_u
 /// player's avail_min, so a poll that returns is one the player can use. While a non-blocking
 /// drain waits, the socket brings its reply; then the PCM is set up again,
 /// as alsa-lib's ioplug leaves it after a drain, and may be written.
+///
+/// A PCM that cannot be written, in OPEN, SETUP or XRUN, is `POLLERR` with
+/// the wake-up armed, which is what the kernel reports for a card in those
+/// states. `snd_pcm_wait` turns that into `-EPIPE` for XRUN and `-EIO` for
+/// the others, and returns at once. Reporting nothing there would leave a
+/// player that waits on a PCM it has not prepared asleep for good. DRAINING
+/// reports nothing until the drain is done, as the kernel does for playback.
 unsafe extern "C" fn poll_revents(
     io: Io,
     pfd: *mut libc::pollfd,
@@ -579,7 +640,7 @@ static CALLBACKS: snd_pcm_ioplug_callback_t = snd_pcm_ioplug_callback_t {
     transfer: Some(transfer),
     close: Some(close),
     hw_params: Some(hw_params),
-    hw_free: None,
+    hw_free: Some(hw_free),
     sw_params: Some(sw_params),
     prepare: Some(prepare),
     drain: Some(drain),
@@ -665,7 +726,12 @@ unsafe fn open(
     if stream != SND_PCM_STREAM_PLAYBACK {
         return Err(libc::EINVAL);
     }
-    let client = Client::connect(proto::default_socket_path()).map_err(|e| errno(&e))?;
+    let client = Client::connect(proto::default_socket_path()).map_err(|e| {
+        if e.kind() == io::ErrorKind::Unsupported {
+            eprintln!("aas: {e}");
+        }
+        errno(&e)
+    })?;
     let socket = client.poll_fds()[1];
     let wake = eventfd()?;
     let io = Box::into_raw(Box::new(snd_pcm_ioplug_t {

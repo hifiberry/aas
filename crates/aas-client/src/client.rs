@@ -282,6 +282,13 @@ impl Client {
         Ok(())
     }
 
+    /// Gives the stream up on this side: the ring is unmapped and the
+    /// wake-up closed. The daemon keeps its side, stopped or not, until
+    /// the next `configure` replaces it or the connection closes.
+    pub fn release(&mut self) {
+        self.stream = None;
+    }
+
     /// Starts playing what is in the ring and what is written after.
     pub fn start(&mut self) -> io::Result<()> {
         let stream = self.stream()?;
@@ -634,6 +641,31 @@ mod tests {
         );
         assert!(start.elapsed() < SHORT);
         assert!(client.check_alive().is_err());
+        drop(client);
+        daemon.join().unwrap();
+    }
+
+    #[test]
+    fn a_released_stream_is_gone_until_the_next_configure() {
+        let (path, daemon) = fake_daemon(|conn| {
+            greet(&conn);
+            let _first = configure(&conn);
+            let _second = configure(&conn);
+            assert_eq!(request(&conn), None);
+        });
+        let mut client = Client::connect(&path).unwrap();
+        client.configure(48000, ClientFormat::S16, 2, 1024).unwrap();
+        assert!(client.poll_fds()[0] >= 0);
+        assert_eq!(client.write(&[0u8; 400]).unwrap(), 100);
+        client.release();
+        assert_eq!(client.poll_fds()[0], -1);
+        let err = client.hw_position().err().and_then(|e| e.raw_os_error());
+        assert_eq!(err, Some(libc::EBADFD));
+        // Nothing is sent for a stream that is not there.
+        assert!(client.start().is_err());
+        assert!(client.write(&[0u8; 400]).is_err());
+        client.configure(48000, ClientFormat::S16, 2, 1024).unwrap();
+        assert_eq!(client.hw_position().unwrap(), 0);
         drop(client);
         daemon.join().unwrap();
     }
