@@ -9,11 +9,19 @@
 //! writing the chirp to capturing it is then measured by the clock. The
 //! player's own buffer is taken off, which leaves what the path behind it
 //! adds, converters included.
+//!
+//! With `--echo`, through a daemon whose analog input is on, the chirp comes
+//! back twice in a recording of the analog input: once from the player, and
+//! again after one trip through the analog input, the mix and the cable.
+//! The frames between the two arrivals are that trip. A tone plays first,
+//! so that the input's detector is open when the chirp comes.
 
 use alsa::Direction;
 use alsa::pcm::PCM;
 use clap::Parser;
-use measure::correlate::{chirp_level_dbfs, find_delay, test_chirp, write_to_capture_frames};
+use measure::correlate::{
+    chirp_level_dbfs, find_delay, find_echo, test_chirp, write_to_capture_frames,
+};
 use measure::hw::{self, CHANNELS};
 use measure::rt;
 use measure::sample::{f64_to_s32, s32_to_f64};
@@ -38,6 +46,14 @@ const CAPTURE_LEAD_S: f64 = 0.1;
 /// Played after the chirp. Longer than any delay this can measure.
 const UNLINKED_TAIL_S: f64 = 0.3;
 const CAPTURE_PERIODS: u32 = 4;
+/// With `--echo`: a 1 kHz tone at -20 dBFS from the start, to open the
+/// analog input's detector before the chirp. It ends well before the
+/// capture opens, and the detector holds for 3 s.
+const OPENER_S: f64 = 0.2;
+const OPENER_PEAK: f64 = 0.1;
+/// Echoes are looked for this many frames after the first arrival and
+/// later, past the first arrival's side lobes, and up to the end of the tail.
+const ECHO_MIN_FRAMES: usize = 100;
 
 #[derive(Parser)]
 struct Args {
@@ -55,6 +71,10 @@ struct Args {
     periods: u32,
     #[arg(long, default_value_t = 20, value_parser = at_least_one)]
     repeats: usize,
+    /// With `--capture`: find the chirp's second arrival, through the
+    /// daemon's analog input, and report the frames between the two.
+    #[arg(long, requires = "capture")]
+    echo: bool,
 }
 
 fn at_least_one(text: &str) -> Result<usize, String> {
@@ -158,13 +178,27 @@ fn capture_unlinked(args: &Args, capture: &str, chirp: &[f64]) -> Result<Unlinke
     let wait_until = (UNLINKED_PREROLL_S + CAPTURE_OPEN_WAIT.as_secs_f64()) * rate;
     while written < end {
         if input.is_none() && written >= preroll {
-            match hw::open(
-                capture,
-                Direction::Capture,
-                args.rate,
-                args.period,
-                CAPTURE_PERIODS,
-            ) {
+            // The daemon's capture device takes the period and buffer near
+            // what is asked, not exactly. Only the frame count matters there.
+            let opened = if args.echo {
+                hw::open_near(
+                    capture,
+                    Direction::Capture,
+                    args.rate,
+                    args.period,
+                    CAPTURE_PERIODS,
+                )
+                .map(|(pcm, _, _)| pcm)
+            } else {
+                hw::open(
+                    capture,
+                    Direction::Capture,
+                    args.rate,
+                    args.period,
+                    CAPTURE_PERIODS,
+                )
+            };
+            match opened {
                 Ok(pcm) => {
                     pcm.start().map_err(|e| format!("capture start: {e}"))?;
                     input = Some(pcm);
@@ -180,10 +214,11 @@ fn capture_unlinked(args: &Args, capture: &str, chirp: &[f64]) -> Result<Unlinke
             end = written + chirp.len() + (UNLINKED_TAIL_S * rate) as usize;
         }
         for (i, frame) in block.chunks_exact_mut(channels).enumerate() {
+            let at = written + i;
             let value = chirp_at
-                .and_then(|c| (written + i).checked_sub(c))
+                .and_then(|c| at.checked_sub(c))
                 .and_then(|n| chirp.get(n))
-                .map_or(0, |v| f64_to_s32(*v));
+                .map_or_else(|| opener(args, at), |v| f64_to_s32(*v));
             frame.fill(value);
         }
         let mut done = 0;
@@ -225,6 +260,62 @@ fn capture_unlinked(args: &Args, capture: &str, chirp: &[f64]) -> Result<Unlinke
         period,
         buffer,
     })
+}
+
+/// The opener tone's sample at frame `at`, or 0 without `--echo` or after
+/// the opener.
+fn opener(args: &Args, at: usize) -> i32 {
+    let rate = f64::from(args.rate);
+    if !args.echo || at as f64 >= OPENER_S * rate {
+        return 0;
+    }
+    let phase = 2.0 * std::f64::consts::PI * 1000.0 * at as f64 / rate;
+    f64_to_s32(OPENER_PEAK * phase.sin())
+}
+
+/// Plays the chirp after the opener and reports, for each repeat, the
+/// frames between its first and second arrival in the recording.
+fn run_echo(args: &Args, capture: &str) -> Result<(), String> {
+    let chirp = test_chirp(CHIRP_FRAMES);
+    let rate = f64::from(args.rate);
+    let mut delays = Vec::with_capacity(args.repeats);
+    for repeat in 0..args.repeats {
+        let run = capture_unlinked(args, capture, &chirp)?;
+        let first = find_delay(&chirp, &run.captured, MIN_PEAK_RATIO)
+            .ok_or("no signal: check the cable, the input level and that the input is on")?;
+        let level = chirp_level_dbfs(&run.captured, first, CHIRP_FRAMES);
+        if level < MIN_LEVEL_DBFS {
+            return Err(format!("no signal: peak {level:.1} dBFS"));
+        }
+        let longest = (UNLINKED_TAIL_S * rate) as usize - CHIRP_FRAMES;
+        let echo = find_echo(
+            &chirp,
+            &run.captured,
+            first,
+            ECHO_MIN_FRAMES..longest,
+            MIN_PEAK_RATIO,
+        )
+        .ok_or(format!(
+            "repeat {repeat}: no echo found, first arrival at peak {level:.1} dBFS"
+        ))?;
+        let frames = echo.at - first;
+        println!(
+            "repeat {repeat}: echo after {frames} frames, {:.3} ms, {:.1} dB below the first \
+             arrival at peak {level:.1} dBFS",
+            frames as f64 / rate * 1000.0,
+            echo.below_db
+        );
+        delays.push(frames);
+    }
+    let min = delays.iter().min().copied().unwrap_or(0);
+    let max = delays.iter().max().copied().unwrap_or(0);
+    let mean = delays.iter().sum::<usize>() as f64 / delays.len().max(1) as f64;
+    println!(
+        "rate {}: echo min {min} mean {mean:.1} max {max} frames, mean {:.3} ms",
+        args.rate,
+        mean / rate * 1000.0
+    );
+    Ok(())
 }
 
 fn run_unlinked(args: &Args, capture: &str) -> Result<(), String> {
@@ -271,6 +362,9 @@ fn run(args: &Args) -> Result<(), String> {
     rt::lock_memory()?;
     rt::set_fifo(FIFO_PRIORITY)?;
     if let Some(capture) = &args.capture {
+        if args.echo {
+            return run_echo(args, capture);
+        }
         return run_unlinked(args, capture);
     }
     let chirp = test_chirp(CHIRP_FRAMES);

@@ -50,6 +50,68 @@ pub fn find_delay(reference: &[f64], captured: &[f64], min_peak_ratio: f64) -> O
     (peak >= next * min_peak_ratio).then_some(best)
 }
 
+/// A later arrival of a signal already found once.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Echo {
+    /// Its offset in the capture.
+    pub at: usize,
+    /// How far its correlation peak is below the first arrival's, in dB.
+    pub below_db: f64,
+}
+
+/// The strongest arrival of `reference` in `captured` whose delay after the
+/// arrival at `first` is within `delays`. The search starts some way after
+/// the first arrival, so that the first arrival's own side lobes are not
+/// taken for an echo. Returns `None` when the echo's peak is below
+/// `min_peak_ratio` times the strongest other lag in the search.
+pub fn find_echo(
+    reference: &[f64],
+    captured: &[f64],
+    first: usize,
+    delays: std::ops::Range<usize>,
+    min_peak_ratio: f64,
+) -> Option<Echo> {
+    let score = |lag: usize| {
+        captured[lag..lag + reference.len()]
+            .iter()
+            .zip(reference)
+            .map(|(a, b)| a * b)
+            .sum::<f64>()
+            .abs()
+    };
+    let last = captured.len().checked_sub(reference.len())?;
+    if first > last {
+        return None;
+    }
+    let from = first + delays.start;
+    let to = (first + delays.end).min(last + 1);
+    if from >= to {
+        return None;
+    }
+    let scores: Vec<f64> = (from..to).map(score).collect();
+    let (best, peak) = scores
+        .iter()
+        .copied()
+        .enumerate()
+        .max_by(|a, b| a.1.total_cmp(&b.1))?;
+    if peak == 0.0 {
+        return None;
+    }
+    let next = scores
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| i.abs_diff(best) > PEAK_WIDTH)
+        .map(|(_, s)| *s)
+        .fold(0.0, f64::max);
+    if peak < next * min_peak_ratio {
+        return None;
+    }
+    Some(Echo {
+        at: from + best,
+        below_db: 20.0 * (score(first) / peak).log10(),
+    })
+}
+
 /// The loudest sample, in dB relative to full scale.
 /// The level of the chirp alone, so that a start-up click cannot pass for a cable.
 pub fn chirp_level_dbfs(captured: &[f64], found: usize, chirp_frames: usize) -> f64 {
@@ -122,6 +184,47 @@ mod tests {
     #[test]
     fn write_to_output_adds_the_queue_to_the_converter_delay() {
         assert_eq!(write_to_capture_frames(50, 64, 2), 178);
+    }
+
+    /// The chirp at `first`, and again `delay` frames later at `gain`.
+    fn with_echo(first: usize, delay: usize, gain: f64) -> (Vec<f64>, Vec<f64>) {
+        let reference = test_chirp(2048);
+        let mut captured = vec![0.0; 8192];
+        for (i, v) in reference.iter().enumerate() {
+            captured[first + i] += v;
+            captured[first + delay + i] += v * gain;
+        }
+        (reference, captured)
+    }
+
+    #[test]
+    fn finds_an_echo_twenty_db_down_inside_the_chirp() {
+        let (reference, captured) = with_echo(1000, 300, 0.1);
+        let first = find_delay(&reference, &captured, 2.0).unwrap();
+        assert_eq!(first, 1000);
+        let echo = find_echo(&reference, &captured, first, 100..4096, 2.0).unwrap();
+        assert_eq!(echo.at, 1300);
+        assert!((echo.below_db - 20.0).abs() < 0.5, "{}", echo.below_db);
+    }
+
+    #[test]
+    fn finds_an_echo_after_the_chirp_has_ended() {
+        let (reference, captured) = with_echo(500, 2500, 0.05);
+        let echo = find_echo(&reference, &captured, 500, 100..4096, 2.0).unwrap();
+        assert_eq!(echo.at, 3000);
+    }
+
+    #[test]
+    fn no_echo_is_reported_without_one() {
+        let (reference, captured) = with_echo(1000, 300, 0.0);
+        assert!(find_echo(&reference, &captured, 1000, 100..4096, 2.0).is_none());
+    }
+
+    #[test]
+    fn an_echo_later_than_the_search_is_not_found() {
+        let (reference, captured) = with_echo(500, 3000, 0.1);
+        let echo = find_echo(&reference, &captured, 500, 100..2000, 2.0);
+        assert!(echo.is_none_or(|e| e.at != 3500));
     }
 
     #[test]
