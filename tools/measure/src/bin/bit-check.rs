@@ -161,14 +161,20 @@ fn capture(args: &Args, stop: &AtomicBool, capacity: usize) -> Result<Captured, 
 fn write(pcm: &PCM, format: SampleFormat, samples: &[i32]) -> Result<(), String> {
     let e = |x: alsa::Error| format!("write: {x}");
     let channels = CHANNELS as usize;
+    // Converted once, not on every pass of the loop.
+    let narrow: Vec<i16> = match format {
+        SampleFormat::S16 => samples.iter().map(|s| *s as i16).collect(),
+        _ => Vec::new(),
+    };
     let mut done = 0;
     while done < samples.len() {
         let rest = &samples[done..];
         let frames = match format {
-            SampleFormat::S16 => {
-                let narrow: Vec<i16> = rest.iter().map(|s| *s as i16).collect();
-                pcm.io_i16().map_err(e)?.writei(&narrow).map_err(e)?
-            }
+            SampleFormat::S16 => pcm
+                .io_i16()
+                .map_err(e)?
+                .writei(&narrow[done..])
+                .map_err(e)?,
             SampleFormat::S24 => pcm.io_i32_s24().map_err(e)?.writei(rest).map_err(e)?,
             SampleFormat::S32 => pcm.io_i32().map_err(e)?.writei(rest).map_err(e)?,
         };

@@ -74,27 +74,18 @@ fn map_shared() -> Result<&'static Shared, String> {
     }
 }
 
-fn set_priority(priority: i32, no_rt: bool) -> Result<(), String> {
-    match rt::lock_memory().and_then(|()| rt::set_fifo(priority)) {
-        Err(e) if no_rt => {
-            eprintln!("continuing without real-time rights: {e}");
-            Ok(())
-        }
-        other => other,
-    }
-}
-
 fn signal(fd: i32) {
     let one = 1u64;
     // SAFETY: writes 8 bytes from a valid u64 to an eventfd.
     unsafe { libc::write(fd, (&raw const one).cast(), 8) };
 }
 
-fn child(shared: &Shared, fd: i32, args: &Args) -> Result<(), String> {
-    set_priority(CHILD_PRIORITY, args.no_rt)?;
+/// `started` is taken before the fork, so the child's report covers the
+/// sender's whole run and does not read as cut short.
+fn child(shared: &Shared, fd: i32, args: &Args, started: Instant) -> Result<(), String> {
+    let rt = rt::acquire(CHILD_PRIORITY, args.no_rt)?;
     let mut latency = Stats::with_warmup(WARMUP);
     let mut tracker = Tracker::default();
-    let started = Instant::now();
     loop {
         let mut count = 0u64;
         // SAFETY: reads 8 bytes into a valid u64 from an eventfd.
@@ -114,9 +105,13 @@ fn child(shared: &Shared, fd: i32, args: &Args) -> Result<(), String> {
     let s = latency.summary();
     println!(
         "{}",
-        report_header(Duration::from_secs(args.seconds), started.elapsed())
+        report_header(
+            Duration::from_secs(args.seconds),
+            started.elapsed(),
+            s.count
+        )
     );
-    println!("period {} us rt {}", args.period_us, !args.no_rt);
+    println!("period {} us rt {}", args.period_us, rt);
     println!("missed wake-ups {}", tracker.missed());
     println!(
         "wake-up latency ns: count {} min {} mean {} p99 {} p99.9 {} max {}",
@@ -125,12 +120,13 @@ fn child(shared: &Shared, fd: i32, args: &Args) -> Result<(), String> {
     Ok(())
 }
 
-fn parent(shared: &Shared, fd: i32, args: &Args) -> Result<(), String> {
-    set_priority(PARENT_PRIORITY, args.no_rt)?;
+fn parent(shared: &Shared, fd: i32, args: &Args, started: Instant) -> Result<(), String> {
+    if !rt::acquire(PARENT_PRIORITY, args.no_rt)? {
+        println!("sender runs without real-time rights");
+    }
     let period = args.period_us as i64 * 1000;
     let mut next = now();
     let planned = Duration::from_secs(args.seconds);
-    let started = Instant::now();
     let mut sequence = 0u64;
     while started.elapsed() < planned && !stop::requested() {
         next.tv_nsec += period;
@@ -152,8 +148,6 @@ fn parent(shared: &Shared, fd: i32, args: &Args) -> Result<(), String> {
         shared.sequence.store(sequence, Ordering::Release);
         signal(fd);
     }
-    shared.done.store(true, Ordering::Release);
-    signal(fd);
     Ok(())
 }
 
@@ -165,12 +159,16 @@ fn run(args: &Args) -> Result<(), String> {
     if fd < 0 {
         return Err(format!("eventfd: {}", std::io::Error::last_os_error()));
     }
+    let started = Instant::now();
     // SAFETY: this process is single-threaded here, so fork is safe.
     match unsafe { libc::fork() } {
         -1 => Err(format!("fork: {}", std::io::Error::last_os_error())),
-        0 => child(shared, fd, args),
+        0 => child(shared, fd, args, started),
         pid => {
-            let result = parent(shared, fd, args);
+            let result = parent(shared, fd, args, started);
+            // Also when the sender failed, or the child would wait for ever.
+            shared.done.store(true, Ordering::Release);
+            signal(fd);
             let mut status = 0;
             // SAFETY: status is a valid int and pid is our child.
             unsafe { libc::waitpid(pid, &mut status, 0) };

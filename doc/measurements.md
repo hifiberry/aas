@@ -395,9 +395,10 @@ at 44.1 kHz and the minute of idle after it.
 The worst cycles of 4.65 and 7.91 ms are long next to the work in them, which
 stage 1 timed at a few percent of a period. With the loop waiting for room first,
 the work must fit in the one period still queued, 5.3 to 5.8 ms here, and the
-7.91 ms cycle did not cause an xrun. Where that time went is not known: the cycle
-time counts everything but the wait, so time taken from the audio thread by
-interrupts counts as well.
+7.91 ms cycle did not cause an xrun. Where that time went is not known. The cycle
+time runs from the end of the wait for room to the end of the cycle, without the
+write to the card. It includes reading the commands and waking the clients, and
+any time interrupts take from the audio thread.
 
 No hour run was made on an otherwise idle Pi 3. The design's criterion is an hour
 at 44.1 kHz and at 96 kHz on an idle system, so stage 2 neither meets nor fails it

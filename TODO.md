@@ -17,8 +17,8 @@ in the capture. Both test boards have the cable connected.
 ## Measure the sound of medium resampling
 
 `medium` is no longer a default, and since the resampler uses exact phases a Pi 3
-no longer needs it to fit. It stays a config option. Its cost is measured, its sound is not. Measure its
-passband and stopband against `high`.
+no longer needs it to fit. It stays a config option. Its cost is measured, its
+sound is not. Measure its passband and stopband against `high`.
 
 ## Find why the CM5 test board stopped responding under load
 
@@ -43,9 +43,9 @@ completion work delays the audio thread on the CM5 too.
 In the stage 2 hour runs on the Pi 3 under full load, throttled to about 550 MHz,
 the daemon's worst cycle was 4.65 ms at 96 kHz and 7.91 ms at 44.1 kHz with a
 resampled second client, for work that stage 1 timed at well under a millisecond.
-The runs passed, but the audio loop now waits for room before it works, so a cycle
-longer than the one queued period (5.3 to 5.8 ms there) is an xrun waiting to
-happen. The cycle time counts everything after the wait, including time interrupts
+The runs passed, and the 7.91 ms cycle gave no xrun. But the audio loop now waits
+for room before it works, so its work has only the one queued period, 5.3 to 5.8 ms
+there, and a cycle that long leaves no margin. The cycle time counts everything after the wait, including time interrupts
 take from the audio thread, so the first step is to find out whether it is the
 engine or the system: trace an hour at 44.1 kHz with a 96 kHz client under the full
 load in `doc/measurements.md` with ftrace's `irqsoff` and `wakeup_rt` tracers, music
@@ -244,22 +244,3 @@ are from the end of stage 2 and will drift, so search for the name given.
 - `crates/aas-alsa/src/ctl.rs`: the control does not reconnect after the daemon
   restarts. The README and design say so. Fix: reconnect on the next call after a
   hang-up.
-
-### Measurement tools
-
-- `handoff-probe` can print `run INCOMPLETE` on a full run: the reporting process
-  starts its timer after the sender. Counts are unaffected.
-- `handoff-probe` hangs if only the parent fails to get its priority.
-- The `rt` field prints the flag, not the state achieved.
-- A run shorter than the warm-up prints zeros under "complete".
-- `loopback-latency` accepts negative delays and `--repeats 0`.
-- `period-probe` prints no buffer time or verdict.
-- `tools/measure/src/hw.rs`, `open_near`: duplicates the daemon's card setup.
-  Fix: share it, or note the copy in both places.
-- `tools/measure/src/bin/bit-check.rs`, `write`: S16 allocates a `Vec` on every
-  write. Fix: convert into a buffer made once.
-- `doc/measurements.md`, Stage 2: says the cycle time "counts everything but the
-  wait". It leaves out the write to the card too and includes waking the
-  clients. The TODO entry on long cycles calls them "an xrun waiting to happen",
-  which overstates it. A few lines there are wrapped unlike the rest. Fix: reword
-  both and rewrap.

@@ -26,3 +26,18 @@ pub fn set_fifo(priority: i32) -> Result<(), String> {
         Err(format!("sched_setscheduler: {}", Error::last_os_error()))
     }
 }
+
+/// Lock memory and move the calling thread to SCHED_FIFO at `priority`.
+///
+/// Returns whether the thread now runs with real-time rights. With
+/// `may_fail`, a refusal is reported and the run goes on without them.
+pub fn acquire(priority: i32, may_fail: bool) -> Result<bool, String> {
+    match lock_memory().and_then(|()| set_fifo(priority)) {
+        Ok(()) => Ok(true),
+        Err(e) if may_fail => {
+            eprintln!("continuing without real-time rights: {e}");
+            Ok(false)
+        }
+        Err(e) => Err(e),
+    }
+}
