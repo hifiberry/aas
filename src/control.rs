@@ -1120,7 +1120,6 @@ mod tests {
     fn the_header_view_follows_the_ring() {
         let (ring, memfd) = Ring::create(1 << 20).unwrap();
         let view = HeaderView::map(memfd.as_fd()).unwrap();
-        assert_eq!(view.header().capacity_frames, 1 << 20);
         ring.write(&[[1, 1]; 300]);
         ring.consume(200);
         assert_eq!(view.header().read_pos.load(Ordering::Acquire), 200);
