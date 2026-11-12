@@ -22,6 +22,13 @@
 # With AAS_TEST_CAPTURE set the matrix case runs too: it restarts the
 # daemon with a matrix that swaps left and right, and checks that a tone
 # played on the left comes back on the right. Without it, it is skipped.
+#
+# With AAS_TEST_LOOPBACK set to the capture end of a loaded snd-aloop, for
+# example hw:Loopback,1,0, the further output case runs: it restarts the
+# daemon with the loopback as a further output whose own matrix swaps left
+# and right, and checks that a tone played on the left reaches the
+# loopback on the right, and, with AAS_TEST_CAPTURE set too, the master's
+# output on the left still. Without it, it is skipped.
 set -u
 # alsactl is in sbin.
 PATH=$PATH:/usr/sbin
@@ -68,9 +75,9 @@ wait_daemon() {
 	return 1
 }
 
-# Restarts the daemon with the TOML in $2 added to the config it has. A
-# config that already has a table matching the pattern $1 is left alone
-# and the case fails.
+# Restarts the daemon with the TOML in $2 added to the config it has, and
+# the TOML in $3, if given, put before it. A config that already has a
+# table matching the pattern $1 is left alone and the case fails.
 config_with() {
 	if [ -e $conf ]; then
 		grep -q "$1" $conf && return 1
@@ -82,6 +89,7 @@ config_with() {
 		changed_conf=added
 	fi
 	{
+		[ -n "${3:-}" ] && printf '%s\n\n' "$3"
 		cat "$work/aas.toml.before"
 		printf '\n%s\n' "$2"
 	} >"$work/changed.toml"
@@ -1890,6 +1898,87 @@ to = 1'; then
 	fi
 }
 
+# Records a tone played on the left only from the loopback, and from the
+# cable when AAS_TEST_CAPTURE is set, at once. Prints the loopback's level,
+# share and tenths per channel as `hear` gives them, then the cable's, or
+# nothing for it.
+heard_left_tone_twice() {
+	"$work/tone" gen S16_LE 2 left >"$work/left.raw"
+	arecord -q -D "$AAS_TEST_LOOPBACK" -t raw -f S32_LE -c 2 -r $rate -s $((rate * 16 / 10)) \
+		"$work/loop.raw" 2>"$work/looperr" &
+	looped=$!
+	cabled=""
+	if [ -n "${AAS_TEST_CAPTURE:-}" ]; then
+		arecord -q -D "$AAS_TEST_CAPTURE" -t raw -f S32_LE -c 2 -r $rate -s $((rate * 16 / 10)) \
+			"$work/heard.raw" 2>"$work/caperr" &
+		cabled=$!
+	fi
+	sleep 0.3
+	aplay -q -D default -t raw -f S16_LE -c 2 -r $rate "$work/left.raw" 2>"$work/err" || return 1
+	wait $looped || return 1
+	[ -n "$cabled" ] && { wait $cabled || return 1; }
+	"$work/tone" hear <"$work/loop.raw"
+	[ -n "$cabled" ] && "$work/tone" hear <"$work/heard.raw"
+	return 0
+}
+
+# A further output on snd-aloop with a matrix of its own that swaps left
+# and right: a tone played on the left reaches the loopback on the right,
+# nine tenths of the power in the tone, the left at least 40 dB lower. The
+# master has no matrix of its own in the case, so through the cable the
+# tone stays on the left. The further output needs the master's card named,
+# which the case takes from the daemon's log when the config has none.
+case_further_output_follows_its_own_matrix() {
+	name=further_output_follows_its_own_matrix
+	if grep -q '^[[:space:]]*\[\[matrix\]\]' $conf 2>/dev/null; then
+		fail $name "the config has a matrix of its own"
+		return
+	fi
+	card=""
+	if ! grep -q '^[[:space:]]*card[[:space:]]*=' $conf 2>/dev/null; then
+		master_card=$(daemon_log "$(main_pid)" | sed -n 's/.* card hw:\([^ ]*\) takes .*/\1/p' | head -n1)
+		if [ -z "$master_card" ]; then
+			fail $name "the master's card is not in the daemon's log"
+			return
+		fi
+		card="card = \"$master_card\""
+	fi
+	volume=$(master)
+	if ! config_with '^[[:space:]]*\[\[output\]\]' '[[output]]
+card = "Loopback"
+latency_ms = 48
+
+[[output.matrix]]
+from = "players.left"
+to = 2
+
+[[output.matrix]]
+from = "players.right"
+to = 1' "$card"; then
+		fail $name "the daemon did not start with the further output, or the config has one"
+		config_back
+		return
+	fi
+	amixer -q -D default sset Master 100%
+	heard=$(heard_left_tone_twice) || heard=""
+	# One line: the loopback's six fields, then the cable's.
+	heard=$(echo $heard)
+	amixer -q -D default sset Master "$volume%"
+	config_back
+	if [ -z "$heard" ]; then
+		fail $name "a player or a recording failed: $(head -n1 "$work/err") $(head -n1 "$work/looperr") $(head -n1 "$work/caperr" 2>/dev/null)"
+	elif echo "$heard" | awk '{
+		# The loopback, left then right, as level, share and tenths.
+		if ($5 < 0.9 || $6 < 9 || $6 > 11 || $1 > $4 - 40) exit 1
+		# The cable, if recorded: the tone stays on the left.
+		if (NF >= 12 && ($8 < 0.9 || $9 < 9 || $9 > 11 || $10 > $7 - 40)) exit 1
+	}'; then
+		pass $name "left only, per channel as level, share and tenths: loopback, then cable: $heard"
+	else
+		fail $name "left only, per channel as level, share and tenths: loopback, then cable: $heard"
+	fi
+}
+
 cases="aplay_plays_each_format drain_returns pause_and_resume delay_is_plausible
 underrun_returns_epipe poll_descriptors_survive_a_reset nonblocking_drain
 drop_during_a_blocking_drain hw_free_gives_the_stream_up
@@ -1902,7 +1991,7 @@ monitor_sleeps_when_the_daemon_is_gone arecord_records_each_format
 capture_is_silent_without_signal capture_never_hears_a_player
 capture_ends_on_a_rate_change recorder_killed_keeps_daemon_up
 capture_overrun_returns_epipe capture_polls_and_survives_a_reset
-matrix_swaps_the_channels"
+matrix_swaps_the_channels further_output_follows_its_own_matrix"
 analog_cases="analog_input_opens_on_signal analog_input_stays_closed_on_silence
 rate_change_with_capture_open capture_hears_the_analog_input"
 [ "${ANALOG:-}" = 1 ] && cases="$cases $analog_cases"
@@ -1914,6 +2003,10 @@ for name in $cases; do
 	fi
 	if [ -z "${AAS_TEST_CAPTURE:-}" ] && [ "$name" = matrix_swaps_the_channels ]; then
 		echo "SKIP $name: needs AAS_TEST_CAPTURE"
+		continue
+	fi
+	if [ -z "${AAS_TEST_LOOPBACK:-}" ] && [ "$name" = further_output_follows_its_own_matrix ]; then
+		echo "SKIP $name: needs AAS_TEST_LOOPBACK"
 		continue
 	fi
 	if ! command -v "case_$name" >/dev/null; then
