@@ -161,6 +161,9 @@ struct Shared {
     last: AtomicU64,
     /// The writer plays. While it does not, the feed takes nothing.
     open: AtomicBool,
+    /// The most samples the feed holds at the configuration the writer
+    /// plays, at most the ring's capacity; 0 for the whole ring.
+    limit: AtomicU64,
 }
 
 impl Shared {
@@ -251,6 +254,16 @@ impl Feed {
         if samples == 0 || !self.shared.open.load(Acquire) {
             return true;
         }
+        let capacity = self.ring.buffer().capacity();
+        let limit = match self.shared.limit.load(Acquire) as usize {
+            0 => capacity,
+            limit => limit.min(capacity),
+        };
+        let queued = capacity - self.ring.slots();
+        if queued + samples > limit {
+            self.counters.overflows.fetch_add(1, Relaxed);
+            return false;
+        }
         let Ok(chunk) = self.ring.write_chunk_uninit(samples) else {
             self.counters.overflows.fetch_add(1, Relaxed);
             return false;
@@ -327,8 +340,10 @@ pub enum FurtherEvent {
     Gone,
     /// The card plays again.
     Back,
-    /// The path's delay has stayed on its target for the lock time.
-    Locked { ppm: f64 },
+    /// The path's delay has stayed on its target for the lock time, with
+    /// the card's offset from the master once its estimate has averaged
+    /// over its whole window, `None` before.
+    Locked { ppm: Option<f64> },
     /// It no longer is, or the writer started over.
     Unlocked,
     /// The card needs more than the ratio's clamp allows.
@@ -348,6 +363,8 @@ struct Path {
     period: u32,
     /// The path's delay to hold, master frames.
     target: f64,
+    /// The most samples the feed holds at this configuration.
+    feed_samples: usize,
     resampler: Box<Adaptive>,
     drift: Drift,
     input: Vec<i32>,
@@ -466,6 +483,7 @@ impl Writer {
             };
             match command {
                 Command::Reconfigure(path) => {
+                    self.shared.limit.store(path.feed_samples as u64, Release);
                     if let Some(old) = self.path.replace(path) {
                         self.retire(old);
                     }
@@ -599,7 +617,12 @@ impl Writer {
 
     /// How long a full feed lasts, ns.
     fn feed_ns(&self) -> u64 {
-        let frames = (self.ring.buffer().capacity() / self.channels) as u64;
+        let capacity = self.ring.buffer().capacity();
+        let samples = match self.path.as_ref().map_or(0, |p| p.feed_samples) {
+            0 => capacity,
+            limit => limit.min(capacity),
+        };
+        let frames = (samples / self.channels) as u64;
         let rate = self.path.as_ref().map_or(1, |p| p.master_rate);
         frames * 1_000_000_000 / u64::from(rate)
     }
@@ -781,7 +804,9 @@ impl Writer {
         let Some(path) = &self.path else {
             return;
         };
-        let (ppm, locked, clamped) = (path.drift.ppm(), path.drift.locked(), path.drift.clamped());
+        let drift = &path.drift;
+        let (ppm, locked, clamped) = (drift.ppm(), drift.locked(), drift.clamped());
+        let estimate = drift.estimate_ready().then_some(ppm);
         self.counters
             .ppm_milli
             .store((ppm * 1e3).round() as i64, Relaxed);
@@ -789,7 +814,7 @@ impl Writer {
             self.locked = locked;
             self.counters.locked.store(locked, Relaxed);
             self.emit(if locked {
-                FurtherEvent::Locked { ppm }
+                FurtherEvent::Locked { ppm: estimate }
             } else {
                 FurtherEvent::Unlocked
             });
@@ -921,9 +946,9 @@ impl FurtherHandle {
     /// Plays from now on with the master at `master_rate`, the card at
     /// `card_rate` with `period` frames a period, through `resampler`, made
     /// for those rates, the output's channels and at most `period` frames.
-    /// The path's delay is held at `target` master frames. Allocates the
-    /// writer's buffers here, on the control thread. An open output opens
-    /// its card again.
+    /// The path's delay is held at `target` master frames. The feed holds
+    /// all it was made with. Allocates the writer's buffers here, on the
+    /// control thread. An open output opens its card again.
     pub fn reconfigure(
         &self,
         master_rate: u32,
@@ -932,24 +957,46 @@ impl FurtherHandle {
         resampler: Box<Adaptive>,
         target: f64,
     ) {
+        let feed = self.feed_frames;
+        self.reconfigure_holding(master_rate, card_rate, period, resampler, target, feed);
+    }
+
+    /// `reconfigure` with a feed that holds at most `feed_frames` frames at
+    /// this configuration, at most what it was made with: the feed is sized
+    /// in time, and is made once for the longest that any rate needs.
+    pub fn reconfigure_holding(
+        &self,
+        master_rate: u32,
+        card_rate: u32,
+        period: u32,
+        resampler: Box<Adaptive>,
+        target: f64,
+        feed_frames: usize,
+    ) {
         assert!(master_rate > 0 && card_rate > 0 && period > 0);
+        assert!(
+            feed_frames > 0 && feed_frames <= self.feed_frames,
+            "output {}: a feed of {feed_frames} frames, made for {}",
+            self.index + 1,
+            self.feed_frames
+        );
         let scale = f64::from(master_rate) / f64::from(card_rate);
         let writer_period = f64::from(period) * scale;
         // A full feed has to read as a delay the drift believes, or a path
         // that overflows starts over every second.
         let believed = target + SANE * writer_period;
         assert!(
-            (self.feed_frames as f64) < believed,
-            "output {}: a full feed of {} frames reads over {believed:.0}, \
+            (feed_frames as f64) < believed,
+            "output {}: a full feed of {feed_frames} frames reads over {believed:.0}, \
              the most the drift believes at a target of {target:.0}",
             self.index + 1,
-            self.feed_frames
         );
         let path = Path {
             master_rate,
             card_rate,
             period,
             target,
+            feed_samples: feed_frames * self.channels,
             drift: Drift::new(target, master_rate, writer_period.round() as u32),
             input: vec![0; resampler.input_frames_max() * self.channels],
             output: vec![0; period as usize * self.channels],
@@ -1090,7 +1137,9 @@ fn parts(
 
 /// Starts the writer of output `index`, 0 being the master, on a thread
 /// `aas-out-N` with N = `index + 1`, at [`rt::WRITER_PRIORITY`]. Its feed
-/// holds `feed_frames` frames of `channels` channels: [`FEED_PERIODS`]
+/// holds at most `feed_frames` frames of `channels` channels, the most any
+/// configuration lets it hold (`control::feed_capacity`); each
+/// configuration says how many of them it uses, at least [`FEED_PERIODS`]
 /// master periods. The output stays closed until the handle configures and
 /// opens it. Dropping the handle stops the thread.
 pub fn spawn(
@@ -1729,6 +1778,49 @@ mod tests {
         // A full feed means the writer fell behind: all of it is from before
         // the gap, and goes.
         assert_eq!(rig.world().feed.as_ref().unwrap().queued(), 0);
+    }
+
+    #[test]
+    fn a_feed_holds_no_more_than_its_configuration_allows() {
+        let mut rig = Rig::new(Sim::new(48_000, 256, 48_000, 256));
+        let resampler = Box::new(Adaptive::new(
+            48_000,
+            48_000,
+            rig.sim.channels,
+            256,
+            Quality::Medium,
+            Format::F32,
+        ));
+        // Made for four periods, holding two at this configuration.
+        rig.handle
+            .reconfigure_holding(48_000, 48_000, 256, resampler, rig.target, 512);
+        rig.cycle();
+        {
+            let mut w = rig.world();
+            let feed = w.feed.as_mut().unwrap();
+            assert!(feed.push(&[1; 256]));
+            assert!(feed.push(&[2; 256]));
+            assert!(!feed.push(&[3; 256]));
+            assert_eq!(feed.queued(), 512);
+        }
+        assert_eq!(rig.count(&rig.counters.overflows), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "made for")]
+    fn a_feed_cannot_hold_more_than_it_was_made_with() {
+        let rig = Rig::new(Sim::new(48_000, 256, 48_000, 256));
+        let resampler = Box::new(Adaptive::new(
+            48_000,
+            48_000,
+            rig.sim.channels,
+            256,
+            Quality::Medium,
+            Format::F32,
+        ));
+        let more = FEED_PERIODS * 256 + 1;
+        rig.handle
+            .reconfigure_holding(48_000, 48_000, 256, resampler, rig.target, more);
     }
 
     /// Plays `before` for a second, holds the writer for 100 ms while the

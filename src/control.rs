@@ -5,23 +5,31 @@
 //! back is freed here. Commands that belong together go into the queue in
 //! one commit, so the audio thread never sees half a decision.
 
+use crate::adaptive::{Adaptive, MAX_DRIFT};
 use crate::capture::{Capture, OpenError};
-use crate::config::{Config, Format, Idle, PluginConfig, PluginPlace, Quality};
+use crate::config::{Config, Format, Idle, OutputConfig, PluginConfig, PluginPlace, Quality};
 use crate::dop;
-use crate::engine::{Command, Event, INITIAL_SOURCES, INITIAL_TAPS, Source, Tap, Target};
-use crate::format::db_to_gain;
-use crate::latency::{PERIODS, period_frames};
+use crate::drift::SANE;
+use crate::engine::{
+    Command, Event, INITIAL_SOURCES, INITIAL_TAPS, MAX_DELAY, Source, Tap, Target,
+};
+use crate::format::{F32, F64, I32, Processing, db_to_gain};
+use crate::further::{BUFFERED, FEED_PERIODS, Feed, FurtherEvent, FurtherHandle};
+use crate::latency::{MAX_PERIOD, PERIODS, period_frames};
+use crate::matrix::Matrix;
+use crate::output_mix::OutputMix;
 use crate::plugin::build::{Chains, Libraries, build_chain, engine_place, widths};
 use crate::plugin::chain::Chain;
 use crate::plugin::{BuildError, Failure};
 use crate::rate::{ClientId, MAX_RATE, MIN_RATE, RatePolicy, SETTLE, STANDARD_RATES};
-use crate::resample::Resampler;
+use crate::resample::{Resampler, taps};
 use crate::state::{Saver, State};
 use crate::volume::{HardwareVolume, OutputVolume};
 use aas_client::convert::ClientFormat;
 use aas_client::proto::{self, Reply, Request};
 use aas_client::ring::{self, Header, Ring};
 use rtrb::{Consumer, Producer};
+use std::any::Any;
 use std::collections::BTreeMap;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
@@ -104,6 +112,266 @@ pub fn min_buffer_frames(rate: u32, latency_ms: f32) -> u32 {
     let shortest = f64::from(MIN_PERIOD) / f64::from(MIN_RATE);
     let refill = (f64::from(rate) * per_period.max(shortest)).ceil() as u32;
     min_ring_frames(rate, latency_ms) + refill
+}
+
+/// The margin a further output's path holds beyond what its parts need:
+/// half a master period, at least 2 ms, in master frames. The writer's
+/// measurement needs a quarter to a half of a period, and the first lock
+/// overshoots a little.
+fn margin_frames(master_rate: u32, master_period: u32) -> f64 {
+    (f64::from(master_period) / 2.0).max(f64::from(master_rate) / 500.0)
+}
+
+/// What a card's buffer and its resampler hold, in master frames: `BUFFERED`
+/// periods and the filter, `(card rate, card period, resampler delay in
+/// card frames)`.
+fn card_part(master_rate: u32, (rate, period, delay): (u32, u32, f64)) -> f64 {
+    let scale = f64::from(master_rate) / f64::from(rate);
+    (f64::from(BUFFERED * period) + delay) * scale
+}
+
+/// The delay every output is held at, in master frames: a master period in
+/// the feed, then the card's buffer and the resampler of each further output,
+/// given as `(card rate, card period, resampler delay in card frames)`, and
+/// the margin, rounded up and taken over the slowest path. 0 without
+/// further outputs.
+pub fn align_frames(master_rate: u32, master_period: u32, further: &[(u32, u32, f64)]) -> u32 {
+    let margin = margin_frames(master_rate, master_period);
+    further
+        .iter()
+        .map(|&part| f64::from(master_period) + card_part(master_rate, part) + margin)
+        .fold(0.0f64, f64::max)
+        .ceil() as u32
+}
+
+/// The frames the feed of a further output holds at a configuration: what
+/// the target leaves to the feed and two master periods more, at least
+/// `FEED_PERIODS` master periods, and two of the card's periods and the
+/// margin, which a card period much longer than the master's needs.
+fn feed_frames(master_rate: u32, master_period: u32, target: u32, part: (u32, u32, f64)) -> usize {
+    let share = f64::from(target) - card_part(master_rate, part);
+    let fed = share.ceil().max(0.0) as usize + 2 * master_period as usize;
+    let (rate, period, _) = part;
+    let card = f64::from(2 * period) * f64::from(master_rate) / f64::from(rate);
+    let least = (card + margin_frames(master_rate, master_period)).ceil() as usize;
+    fed.max(FEED_PERIODS * master_period as usize).max(least)
+}
+
+/// The frames a further output's feed is made with: the most it holds at
+/// any rate the master and its card may run at, with a master period to
+/// spare for a rate between the standard ones.
+pub fn feed_capacity(latency_ms: f32, quality: Quality) -> usize {
+    let half = taps(quality) as f64 / 2.0;
+    STANDARD_RATES
+        .iter()
+        .map(|&master| {
+            let period = period_frames(master, latency_ms);
+            let parts: Vec<(u32, u32, f64)> = STANDARD_RATES
+                .iter()
+                .map(|&rate| {
+                    let delay = half * f64::from(rate) / f64::from(master);
+                    (rate, card_period(master, period, rate), delay)
+                })
+                .collect();
+            let target = align_frames(master, period, &parts) as usize;
+            let most = (target + 2 * period as usize).max(FEED_PERIODS * period as usize);
+            most + period as usize
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// The rate a further card runs at: the master's if it takes it, else the
+/// nearest it takes, the lower of two as near. `rates` empty takes any.
+pub fn card_rate(rates: &[u32], master_rate: u32) -> u32 {
+    if rates.is_empty() || rates.contains(&master_rate) {
+        return master_rate;
+    }
+    let nearest = rates.iter().min_by_key(|&&r| (r.abs_diff(master_rate), r));
+    nearest.copied().unwrap_or(master_rate)
+}
+
+/// A further card's period: as long as the master's, to the nearest power
+/// of two in frames, the lower of two as near, within the periods a card
+/// is opened with.
+pub fn card_period(master_rate: u32, master_period: u32, rate: u32) -> u32 {
+    let exact = f64::from(master_period) * f64::from(rate) / f64::from(master_rate);
+    let low = 1u32 << (exact.max(1.0).log2().floor() as u32);
+    let high = low * 2;
+    let nearest = if f64::from(high) - exact < exact - f64::from(low) {
+        high
+    } else {
+        low
+    };
+    nearest.clamp(MIN_PERIOD, MAX_PERIOD)
+}
+
+/// The line logged for an event of further output `number`, if any.
+/// Starves and overflows are counted, and logged with the counters.
+pub fn event_line(number: usize, event: FurtherEvent) -> Option<String> {
+    let line = match event {
+        FurtherEvent::Gone => format!(
+            "aas: output {number}: its card is gone, it plays to nothing and is looked for every second"
+        ),
+        FurtherEvent::Back => format!("aas: output {number}: its card is back"),
+        FurtherEvent::Locked { ppm: None } => format!("aas: output {number} locked"),
+        FurtherEvent::Locked { ppm: Some(ppm) } => {
+            format!("aas: output {number} locked, its card runs {ppm:+.1} ppm from the master")
+        }
+        FurtherEvent::Unlocked => format!("aas: output {number} lost its lock"),
+        FurtherEvent::Clamped => format!(
+            "aas: output {number}: its card runs more than {:.0} ppm from the master, \
+             it plays on with gaps",
+            MAX_DRIFT * 1e6
+        ),
+        FurtherEvent::Starved | FurtherEvent::Overflowed => return None,
+    };
+    Some(line)
+}
+
+/// The control thread's side of a further output's writer: a
+/// [`FurtherHandle`], or a stand-in in tests.
+pub trait FurtherWriter {
+    /// As [`FurtherHandle::reconfigure_holding`].
+    fn reconfigure(
+        &self,
+        master_rate: u32,
+        card_rate: u32,
+        period: u32,
+        resampler: Box<Adaptive>,
+        target: f64,
+        feed_frames: usize,
+    );
+    fn set_open(&self, open: bool);
+    fn event(&self) -> Option<FurtherEvent>;
+}
+
+impl FurtherWriter for FurtherHandle {
+    fn reconfigure(
+        &self,
+        master_rate: u32,
+        card_rate: u32,
+        period: u32,
+        resampler: Box<Adaptive>,
+        target: f64,
+        feed_frames: usize,
+    ) {
+        self.reconfigure_holding(
+            master_rate,
+            card_rate,
+            period,
+            resampler,
+            target,
+            feed_frames,
+        );
+    }
+
+    fn set_open(&self, open: bool) {
+        FurtherHandle::set_open(self, open);
+    }
+
+    fn event(&self) -> Option<FurtherEvent> {
+        FurtherHandle::event(self)
+    }
+}
+
+/// A further output, as the server hands it to the control thread before
+/// the start.
+pub struct FurtherSetup {
+    /// 1 to 3; the master is 0.
+    pub index: usize,
+    pub config: OutputConfig,
+    /// The output's matrix, checked against its chains.
+    pub matrix: Matrix,
+    /// The rates its card takes, empty for any.
+    pub rates: Vec<u32>,
+    pub writer: Box<dyn FurtherWriter>,
+    /// The feed the audio thread fills, which goes to it at the start.
+    pub feed: Feed,
+    /// The frames the feed was made with.
+    pub feed_frames: usize,
+}
+
+/// A configuration for a writer, made when the master opens and handed
+/// over once it is open.
+struct Pending {
+    card_rate: u32,
+    period: u32,
+    resampler: Box<Adaptive>,
+    target: u32,
+    feed: usize,
+}
+
+/// A further output as the control thread keeps it.
+struct FurtherOutput {
+    index: usize,
+    channels: usize,
+    idle: Idle,
+    volume_db: f32,
+    plugins: Vec<PluginConfig>,
+    rates: Vec<u32>,
+    writer: Box<dyn FurtherWriter>,
+    capacity: usize,
+    /// The matrix and the feed, until the start sends them.
+    unsent: Option<(Matrix, Feed)>,
+    /// The rate the mix and output chain on the audio thread are built for.
+    built: [Option<u32>; 2],
+    /// Its chains do not build at the master's rate: it plays at gain 0.
+    silenced: bool,
+    pending: Option<Pending>,
+    /// The writer has a configuration.
+    configured: bool,
+    /// The writer has been told to play.
+    open: bool,
+}
+
+impl FurtherOutput {
+    /// Its number in the log: the master is output 1.
+    fn number(&self) -> usize {
+        self.index + 1
+    }
+}
+
+/// The mix of a further output in the engine's processing format, at
+/// `gain`. Further outputs are never bit-perfect.
+fn further_mix(format: Format, matrix: Matrix, channels: usize, gain: f32) -> Box<dyn Any + Send> {
+    fn made<P: Processing>(matrix: Matrix, channels: usize, gain: f32) -> Box<dyn Any + Send> {
+        let mut mix = OutputMix::<P>::new(matrix, channels, false, MAX_PERIOD as usize);
+        mix.set_gain(gain, None);
+        Box::new(mix)
+    }
+    match format {
+        Format::I32 => made::<I32>(matrix, channels, gain),
+        Format::F32 => made::<F32>(matrix, channels, gain),
+        Format::F64 => made::<F64>(matrix, channels, gain),
+    }
+}
+
+/// Builds the mix and output chains of `output` at `rate` that the audio
+/// thread does not have for it, into `batch`. Fails with the first error;
+/// the chains built before it go anyway.
+fn further_chains(
+    output: &mut FurtherOutput,
+    rate: u32,
+    format: Format,
+    libraries: &mut Libraries,
+    batch: &mut Vec<Command>,
+) -> Result<(), BuildError> {
+    let w = widths(&output.plugins, output.channels, libraries).map_err(|(_, e)| e)?;
+    let places = [(PluginPlace::Mix, w.mix), (PluginPlace::Output, w.output)];
+    for (slot, (place, channels)) in places.into_iter().enumerate() {
+        if output.built[slot] == Some(rate) || !output.plugins.iter().any(|p| p.place == place) {
+            continue;
+        }
+        let chain = build_chain(&output.plugins, place, rate, format, channels, libraries)?;
+        output.built[slot] = Some(rate);
+        let target = Target {
+            output: output.index,
+            place: engine_place(place),
+        };
+        batch.push(Command::SetChain(target, Box::new(chain)));
+    }
+    Ok(())
 }
 
 /// A read-only view of a ring's header, for the control thread. It maps
@@ -332,6 +600,12 @@ pub struct Control {
     analog_gain: f32,
     /// None unless the config enables the input and the card has an ADC.
     analog: Option<AnalogInput>,
+    /// The further outputs, in the order of the config.
+    further: Vec<FurtherOutput>,
+    /// Since when no player runs and the analog input has no signal.
+    quiet_since: Option<Instant>,
+    /// The master's delay line as last sent.
+    delay: Option<u32>,
 }
 
 impl Control {
@@ -387,6 +661,41 @@ impl Control {
             no_fallback: false,
             analog_gain: db_to_gain(config.analog.volume_db),
             analog: None,
+            further: Vec::new(),
+            quiet_since: None,
+            delay: None,
+        }
+    }
+
+    /// Adds a further output. Call before `start`, once for each, in the
+    /// order of the config.
+    pub fn add_output(&mut self, setup: FurtherSetup) {
+        let config = setup.config;
+        self.further.push(FurtherOutput {
+            index: setup.index,
+            channels: config.channels,
+            idle: config.idle,
+            volume_db: config.volume_db,
+            plugins: config.plugins,
+            rates: setup.rates,
+            writer: setup.writer,
+            capacity: setup.feed_frames,
+            unsent: Some((setup.matrix, setup.feed)),
+            built: [None; 2],
+            silenced: false,
+            pending: None,
+            configured: false,
+            open: false,
+        });
+    }
+
+    /// The gain of a further output: the master's volume in software and
+    /// its offset, or 0 while its chains do not build.
+    fn further_gain(&self, output: &FurtherOutput) -> f32 {
+        if output.silenced {
+            0.0
+        } else {
+            self.volume.further_gain(output.volume_db)
         }
     }
 
@@ -457,6 +766,14 @@ impl Control {
     /// is on.
     pub fn start(&mut self, now: Instant) {
         let mut batch = vec![Command::SetGain(0, self.volume.gain())];
+        for i in 0..self.further.len() {
+            let gain = self.further_gain(&self.further[i]);
+            let output = &mut self.further[i];
+            if let Some((matrix, feed)) = output.unsent.take() {
+                let mix = further_mix(self.format, matrix, output.channels, gain);
+                batch.push(Command::AddOutput(output.index, mix, feed));
+            }
+        }
         if self.analog.is_some() {
             batch.push(Command::SetAnalogGain(self.analog_gain));
         }
@@ -637,7 +954,11 @@ impl Control {
         if !changed {
             return;
         }
-        self.send(vec![Command::SetGain(0, self.volume.gain())]);
+        let mut batch = vec![Command::SetGain(0, self.volume.gain())];
+        for output in &self.further {
+            batch.push(Command::SetGain(output.index, self.further_gain(output)));
+        }
+        self.send(batch);
         let subscribers = self.conns.iter().filter(|(_, c)| c.subscribed);
         let notice = Reply::VolumeChanged { percent };
         self.notices
@@ -1172,6 +1493,7 @@ impl Control {
                 self.send_spare(batch);
             }
         }
+        self.sync_further(now);
     }
 
     /// The rate the rules want, once chains are built for it. A rate at
@@ -1400,7 +1722,186 @@ impl Control {
             analog.retry_at = None;
         }
         self.end_recorders(rate, batch);
+        // The writers close while the master reopens, and hear of its new
+        // configuration once it is open.
+        for output in &mut self.further {
+            if std::mem::take(&mut output.open) {
+                output.writer.set_open(false);
+            }
+        }
+        self.plan_further(rate, period, batch);
         batch.push(Command::Reconfigure { rate, period });
+    }
+
+    /// Prepares every further output for the master at `rate` and
+    /// `period`: its chains, its card's rate and period, a fresh resampler,
+    /// and the delay every output is held at, which the master's delay line
+    /// makes up. A chain that does not build at the rate silences its output
+    /// alone. The writers get it all once the master is open.
+    fn plan_further(&mut self, rate: u32, period: u32, batch: &mut Vec<Command>) {
+        if self.further.is_empty() {
+            return;
+        }
+        let (quality, format) = (self.quality, self.format);
+        let mut parts = Vec::new();
+        let mut resamplers = Vec::new();
+        for i in 0..self.further.len() {
+            let output = &mut self.further[i];
+            let built = further_chains(output, rate, format, &mut self.libraries, batch);
+            let silenced = match built {
+                Ok(()) => false,
+                Err(e) => {
+                    let number = output.number();
+                    eprintln!("aas: output {number}: {e}; it is silent at {rate} Hz");
+                    true
+                }
+            };
+            if silenced != output.silenced {
+                output.silenced = silenced;
+                let gain = self.further_gain(&self.further[i]);
+                batch.push(Command::SetGain(self.further[i].index, gain));
+            }
+            let output = &self.further[i];
+            let card = card_rate(&output.rates, rate);
+            let card_period = card_period(rate, period, card);
+            let resampler =
+                Adaptive::new(rate, card, output.channels, card_period, quality, format);
+            parts.push((card, card_period, resampler.delay_frames()));
+            resamplers.push(resampler);
+        }
+        let target = align_frames(rate, period, &parts);
+        let mut delay = target.saturating_sub(PERIODS * period);
+        if delay > MAX_DELAY {
+            eprintln!(
+                "aas: warning: the master can be held back by {MAX_DELAY} frames, not {delay}: \
+                 it plays {} frames ahead of the other outputs",
+                delay - MAX_DELAY
+            );
+            delay = MAX_DELAY;
+        }
+        if self.delay != Some(delay) {
+            self.delay = Some(delay);
+            batch.push(Command::SetDelay(delay));
+        }
+        let margin = margin_frames(rate, period);
+        let parts = parts.into_iter().zip(resamplers);
+        for (output, (part, resampler)) in self.further.iter_mut().zip(parts) {
+            let (card, card_period, _) = part;
+            let feed = feed_frames(rate, period, target, part);
+            let writer_period = f64::from(card_period) * f64::from(rate) / f64::from(card);
+            // The drift believes a full feed, so an overflow does not make
+            // it start over; the feed holds two card periods and the margin
+            // whatever the phase of the two clocks; and the feed was made
+            // for it.
+            let number = output.number();
+            assert!(
+                (feed as f64) < f64::from(target) + SANE * writer_period,
+                "output {number}: a feed of {feed} frames at a target of {target}"
+            );
+            assert!(
+                feed as f64 >= 2.0 * writer_period + margin,
+                "output {number}: a feed of {feed} frames for periods of {writer_period}"
+            );
+            assert!(
+                feed <= output.capacity,
+                "output {number}: a feed of {feed} frames, made for {}",
+                output.capacity
+            );
+            eprintln!(
+                "aas: output {number} at {card} Hz, {card_period} frames per period, \
+                 {target} frames behind the mix like every output"
+            );
+            output.pending = Some(Pending {
+                card_rate: card,
+                period: card_period,
+                resampler: Box::new(resampler),
+                target,
+                feed,
+            });
+        }
+    }
+
+    /// Hands each further output its configuration, once the master is
+    /// open at it, and opens it as its idle rule says.
+    fn hand_over(&mut self, now: Instant) {
+        let (Some((rate, _)), 0) = (self.output, self.reopening) else {
+            return;
+        };
+        for output in &mut self.further {
+            let Some(p) = output.pending.take() else {
+                continue;
+            };
+            let target = f64::from(p.target);
+            let writer = &output.writer;
+            writer.reconfigure(rate, p.card_rate, p.period, p.resampler, target, p.feed);
+            // An open writer opens its card again at the configuration.
+            output.configured = true;
+        }
+        self.sync_further(now);
+    }
+
+    /// Opens each further output while the master is open, unless its idle
+    /// rule has closed it, and closes it otherwise.
+    fn sync_further(&mut self, now: Instant) {
+        if self.further.is_empty() {
+            return;
+        }
+        let signal = self.analog.as_ref().is_some_and(|a| a.active);
+        if self.running_count() > 0 || signal {
+            self.quiet_since = None;
+        } else {
+            self.quiet_since.get_or_insert(now);
+        }
+        let master = self.output.is_some() && self.reopening == 0;
+        for output in &mut self.further {
+            let idle = match output.idle {
+                Idle::Off { delay_s } => {
+                    let delay = Duration::from_secs(u64::from(delay_s));
+                    self.quiet_since.is_some_and(|since| now >= since + delay)
+                }
+                Idle::Zeros => false,
+            };
+            let want = master && output.configured && !idle;
+            if want == output.open {
+                continue;
+            }
+            if let (Idle::Off { delay_s }, true) = (output.idle, master && idle) {
+                eprintln!("aas: output {} off after {delay_s} s idle", output.number());
+            }
+            output.writer.set_open(want);
+            output.open = want;
+        }
+    }
+
+    /// The rates a further output's card takes have changed, such as when
+    /// it is found. An open master moves it to the rate it now takes.
+    pub fn set_output_rates(&mut self, index: usize, rates: Vec<u32>, now: Instant) {
+        let Some(output) = self.further.iter_mut().find(|o| o.index == index) else {
+            return;
+        };
+        eprintln!(
+            "aas: output {}: the card takes the rates {rates:?}",
+            output.number()
+        );
+        output.rates = rates;
+        let Some((rate, period)) = self.output else {
+            return;
+        };
+        let mut batch = Vec::new();
+        self.plan_further(rate, period, &mut batch);
+        self.send(batch);
+        self.hand_over(now);
+    }
+
+    /// Logs what the further outputs' writers report.
+    fn further_events(&mut self) {
+        for output in &self.further {
+            while let Some(event) = output.writer.event() {
+                if let Some(line) = event_line(output.number(), event) {
+                    eprintln!("{line}");
+                }
+            }
+        }
     }
 
     /// The places that get a chain: those the config lists plugins at, and
@@ -1579,6 +2080,7 @@ impl Control {
                 Event::Reconfigured => {
                     self.reopening = self.reopening.saturating_sub(1);
                     self.open_capture(now, &mut batch);
+                    self.hand_over(now);
                 }
                 Event::DopStarted(id, claim) => {
                     // The events can come in another order than the claims
@@ -1605,6 +2107,7 @@ impl Control {
             }
         }
         self.send(batch);
+        self.further_events();
     }
 
     /// Applies what is due by the clock: a settled rate change, the end of
@@ -1660,6 +2163,7 @@ impl Control {
             }
         }
         self.send(batch);
+        self.sync_further(now);
         if self.save_at.is_some_and(|at| now >= at) {
             self.save();
         }
@@ -1722,9 +2226,14 @@ pub(crate) fn eventfd() -> io::Result<OwnedFd> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adaptive::Adaptive;
     use crate::capture::MemoryCapture;
-    use crate::config::{self, Format, Quality};
+    use crate::config::{self, Format, OutputConfig, Quality};
+    use crate::format::F32;
+    use crate::further::{FeedProbe, FurtherEvent};
+    use crate::output_mix::OutputMix;
     use crate::plugin::chain::Chain;
+    use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
 
     #[test]
@@ -2188,9 +2697,23 @@ mod tests {
         commands: rtrb::Consumer<Command>,
         events: rtrb::Producer<Event>,
         capture: Option<Box<dyn Capture>>,
+        /// Every `SetGain`, by output.
+        gains: Vec<(usize, f32)>,
+        /// Every further output put in place, with the gain of its mix.
+        outputs: Vec<(usize, f32)>,
     }
 
     impl FakeEngine {
+        fn new(commands: rtrb::Consumer<Command>, events: rtrb::Producer<Event>) -> FakeEngine {
+            FakeEngine {
+                commands,
+                events,
+                capture: None,
+                gains: Vec::new(),
+                outputs: Vec::new(),
+            }
+        }
+
         /// Takes every queued command and answers it. A reopen answers at
         /// once only with `opened`.
         fn take(&mut self, opened: bool) -> Vec<String> {
@@ -2210,12 +2733,18 @@ mod tests {
                         opened.then_some(Event::Reconfigured),
                     ),
                     Command::CloseOutput => ("CloseOutput".into(), None),
-                    Command::SetGain(..) => ("SetGain".into(), None),
+                    Command::SetGain(output, gain) => {
+                        self.gains.push((output, gain));
+                        ("SetGain".into(), None)
+                    }
                     Command::Grow(t) => ("Grow".into(), Some(Event::OldTable(t))),
                     Command::SetChain(target, chain) => {
                         let names: Vec<&str> = chain.names().collect();
                         let place = target.place;
-                        let name = format!("SetChain {place:?} {}", names.join(","));
+                        let name = match target.output {
+                            0 => format!("SetChain {place:?} {}", names.join(",")),
+                            n => format!("SetChain {n} {place:?} {}", names.join(",")),
+                        };
                         (name, Some(Event::OldChain(target.output, chain)))
                     }
                     Command::SetParam { .. } => ("SetParam".into(), None),
@@ -2231,10 +2760,11 @@ mod tests {
                     Command::SetMatrix(output, m) => {
                         ("SetMatrix".into(), Some(Event::OldMatrix(output, m)))
                     }
-                    Command::AddOutput(index, mix, feed) => (
-                        format!("AddOutput {index}"),
-                        Some(Event::OldOutput(index, mix, feed)),
-                    ),
+                    Command::AddOutput(index, mix, _feed) => {
+                        let mix = mix.downcast::<OutputMix<F32>>().expect("an f32 mix");
+                        self.outputs.push((index, mix.target_gain));
+                        (format!("AddOutput {index}"), None)
+                    }
                     Command::RemoveOutput(index) => (format!("RemoveOutput {index}"), None),
                     Command::SetDelay(frames) => (format!("SetDelay {frames}"), None),
                     Command::Shutdown => ("Shutdown".into(), None),
@@ -2264,11 +2794,7 @@ mod tests {
         }
         let now = Instant::now();
         control.start(now);
-        let engine = FakeEngine {
-            commands: engine_commands,
-            events: engine_events,
-            capture: None,
-        };
+        let engine = FakeEngine::new(engine_commands, engine_events);
         (control, engine, now)
     }
 
@@ -2953,11 +3479,7 @@ mod tests {
         }));
         let now = Instant::now();
         control.start(now);
-        let mut engine = FakeEngine {
-            commands: engine_commands,
-            events: engine_events,
-            capture: None,
-        };
+        let mut engine = FakeEngine::new(engine_commands, engine_events);
         engine.take(true);
         control.handle_events(now);
         assert_eq!(*asked.lock().unwrap(), 1);
@@ -3371,11 +3893,7 @@ mod tests {
         let now = Instant::now();
         control.set_supported(vec![176400], now);
         control.start(now);
-        let mut engine = FakeEngine {
-            commands: engine_commands,
-            events: engine_events,
-            capture: None,
-        };
+        let mut engine = FakeEngine::new(engine_commands, engine_events);
         play(&mut control, 1, 176400, now);
         let seen = sent(&mut engine);
         assert!(!has(&seen, "Reconfigure"), "{seen:?}");
@@ -3465,11 +3983,7 @@ mod tests {
         chains.mix = Chain::empty();
         control.set_plugins(libraries, Some(chains));
         control.start(Instant::now());
-        let mut engine = FakeEngine {
-            commands: engine_commands,
-            events: engine_events,
-            capture: None,
-        };
+        let mut engine = FakeEngine::new(engine_commands, engine_events);
         assert_eq!(
             engine.take(true),
             ["SetGain", "SetChain Mix ", "Reconfigure 48000 256"]
@@ -3498,5 +4012,387 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// What a further output's writer was told, as the control thread
+    /// tells it, and the events it has for the control thread.
+    #[derive(Clone, Default)]
+    struct WriterLog {
+        calls: Arc<Mutex<Vec<String>>>,
+        /// The target and the feed of each `reconfigure`, and the delay of
+        /// the resampler it brought.
+        paths: Arc<Mutex<Vec<(f64, usize, f64)>>>,
+        events: Arc<Mutex<VecDeque<FurtherEvent>>>,
+    }
+
+    impl WriterLog {
+        /// The calls since the last time.
+        fn take(&self) -> Vec<String> {
+            std::mem::take(&mut *self.calls.lock().unwrap())
+        }
+
+        fn last_path(&self) -> (f64, usize, f64) {
+            *self.paths.lock().unwrap().last().expect("no reconfigure")
+        }
+    }
+
+    struct FakeWriter(WriterLog);
+
+    impl FurtherWriter for FakeWriter {
+        fn reconfigure(
+            &self,
+            master_rate: u32,
+            card_rate: u32,
+            period: u32,
+            resampler: Box<Adaptive>,
+            target: f64,
+            feed_frames: usize,
+        ) {
+            let call = format!("reconfigure {master_rate} {card_rate} {period}");
+            self.0.calls.lock().unwrap().push(call);
+            let path = (target, feed_frames, resampler.delay_frames());
+            self.0.paths.lock().unwrap().push(path);
+        }
+
+        fn set_open(&self, open: bool) {
+            self.0.calls.lock().unwrap().push(format!("open {open}"));
+        }
+
+        fn event(&self) -> Option<FurtherEvent> {
+            self.0.events.lock().unwrap().pop_front()
+        }
+    }
+
+    /// A stereo `[[output]]` on a card that takes `rates`, any for none.
+    fn further(rates: &[u32]) -> (OutputConfig, Vec<u32>) {
+        let config = OutputConfig {
+            card: "Loopback".into(),
+            channels: 2,
+            idle: Idle::Zeros,
+            volume_db: 0.0,
+            plugins: Vec::new(),
+            matrix: None,
+        };
+        (config, rates.to_vec())
+    }
+
+    /// A started control thread with the further outputs given, its fake
+    /// engine and each writer's log.
+    fn started_with(
+        config: &Config,
+        outputs: Vec<(OutputConfig, Vec<u32>)>,
+    ) -> (Control, FakeEngine, Vec<WriterLog>, Instant) {
+        let (commands, engine_commands) = rtrb::RingBuffer::new(256);
+        let (engine_events, events) = rtrb::RingBuffer::new(256);
+        let audio = std::thread::current();
+        let mut control = Control::new(config, 12.0, Vec::new(), commands, events, audio);
+        let capacity = feed_capacity(12.0, config.resampling);
+        let mut logs = Vec::new();
+        for (i, (output, rates)) in outputs.into_iter().enumerate() {
+            let log = WriterLog::default();
+            let (feed, _probe) = FeedProbe::new(output.channels, capacity);
+            control.add_output(FurtherSetup {
+                index: i + 1,
+                matrix: Matrix::default_for(output.channels),
+                config: output,
+                rates,
+                writer: Box::new(FakeWriter(log.clone())),
+                feed,
+                feed_frames: capacity,
+            });
+            logs.push(log);
+        }
+        let now = Instant::now();
+        control.start(now);
+        let engine = FakeEngine::new(engine_commands, engine_events);
+        (control, engine, logs, now)
+    }
+
+    /// The delay a resampler from `from` to `to` brings, in frames at `to`.
+    fn resampler_delay(from: u32, to: u32, period: u32) -> f64 {
+        Adaptive::new(from, to, 2, period, Quality::High, Format::F32).delay_frames()
+    }
+
+    #[test]
+    fn the_target_is_the_longest_path_with_its_margin() {
+        // A master period, three card periods, the resampler and a margin
+        // of half a master period.
+        assert_eq!(align_frames(48000, 256, &[(48000, 256, 63.0)]), 1215);
+        // At short periods the margin is 2 ms.
+        assert_eq!(align_frames(48000, 64, &[(48000, 64, 63.0)]), 415);
+        // A card at another rate counts at the master's.
+        let target = 64.0 + (3.0 * 32.0 + 31.0) * 2.0 + 96.0;
+        assert_eq!(align_frames(48000, 64, &[(24000, 32, 31.0)]), target as u32);
+        // The slowest path sets it for all.
+        let two = [(48000, 64, 31.0), (24000, 32, 31.0)];
+        assert_eq!(align_frames(48000, 64, &two), target as u32);
+        assert_eq!(align_frames(48000, 64, &[]), 0);
+    }
+
+    #[test]
+    fn a_feed_holds_what_its_card_and_the_drift_need_at_any_rate() {
+        let quality = Quality::High;
+        for latency_ms in [4.0, 12.0, 100.0] {
+            let capacity = feed_capacity(latency_ms, quality);
+            for master in STANDARD_RATES {
+                let period = period_frames(master, latency_ms);
+                let margin = margin_frames(master, period);
+                for card in STANDARD_RATES {
+                    let card_period = card_period(master, period, card);
+                    let delay = resampler_delay(master, card, card_period);
+                    let part = (card, card_period, delay);
+                    let target = align_frames(master, period, &[part]);
+                    let feed = feed_frames(master, period, target, part);
+                    let writer = f64::from(card_period) * f64::from(master) / f64::from(card);
+                    let what = format!("{master} to {card} at {latency_ms} ms: {feed}");
+                    assert!((feed as f64) < f64::from(target) + SANE * writer, "{what}");
+                    assert!(feed as f64 >= 2.0 * writer + margin, "{what}");
+                    assert!(feed <= capacity, "{what} > {capacity}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_card_runs_at_the_masters_rate_or_the_nearest_lower_in_a_tie() {
+        assert_eq!(card_rate(&[], 96000), 96000);
+        assert_eq!(card_rate(&[44100, 48000, 96000], 96000), 96000);
+        assert_eq!(card_rate(&[44100, 48000], 96000), 48000);
+        assert_eq!(card_rate(&[32000, 64000], 48000), 32000);
+        // Its period lasts as long as the master's, to a power of two.
+        assert_eq!(card_period(48000, 256, 44100), 256);
+        assert_eq!(card_period(96000, 512, 48000), 256);
+        assert_eq!(card_period(48000, 64, 8000), 32);
+    }
+
+    #[test]
+    fn a_master_rate_change_reopens_every_further_output() {
+        let outputs = vec![further(&[44100, 48000, 96000]), further(&[44100, 48000])];
+        let (mut control, mut engine, logs, now) = started_with(&Config::default(), outputs);
+        let seen = engine.take(false);
+        assert!(
+            has(&seen, "AddOutput 1") && has(&seen, "AddOutput 2"),
+            "{seen:?}"
+        );
+        // Nothing reaches a writer before the master is open.
+        assert!(logs.iter().all(|log| log.take().is_empty()));
+        engine.send(Event::Reconfigured);
+        control.handle_events(now);
+        for log in &logs {
+            assert_eq!(log.take(), ["reconfigure 48000 48000 256", "open true"]);
+        }
+        // A player at 96 kHz takes the master there. The writers close
+        // while it reopens, and hear of the new rate only once it is open.
+        play(&mut control, 1, 96000, now);
+        assert!(has(&engine.take(false), "Reconfigure 96000 512"));
+        for log in &logs {
+            assert_eq!(log.take(), ["open false"]);
+        }
+        engine.send(Event::Reconfigured);
+        control.handle_events(now);
+        assert_eq!(logs[0].take(), ["reconfigure 96000 96000 512", "open true"]);
+        // The second card does not take 96 kHz: its nearest rate, through
+        // a resampler made for it.
+        assert_eq!(logs[1].take(), ["reconfigure 96000 48000 256", "open true"]);
+        let (_, _, delay) = logs[1].last_path();
+        assert_eq!(delay, resampler_delay(96000, 48000, 256));
+        let (_, _, delay) = logs[0].last_path();
+        assert_eq!(delay, resampler_delay(96000, 96000, 512));
+    }
+
+    #[test]
+    fn a_further_card_found_with_other_rates_moves_to_one_it_takes() {
+        let (mut control, mut engine, logs, now) =
+            started_with(&Config::default(), vec![further(&[])]);
+        engine.take(true);
+        control.handle_events(now);
+        assert_eq!(logs[0].take(), ["reconfigure 48000 48000 256", "open true"]);
+        // The card comes back taking 44.1 kHz only: the open writer is
+        // reconfigured, which reopens its card, and the master stays.
+        control.set_output_rates(1, vec![44100], now);
+        assert_eq!(logs[0].take(), ["reconfigure 48000 44100 256"]);
+        let seen = engine.take(true);
+        assert!(!has(&seen, "Reconfigure"), "{seen:?}");
+    }
+
+    #[test]
+    fn master_volume_moves_every_output_with_its_offset() {
+        let (mut output, rates) = further(&[]);
+        output.volume_db = -6.0;
+        let (mut control, mut engine, _logs, now) =
+            started_with(&Config::default(), vec![(output, rates)]);
+        engine.take(true);
+        // The mix comes with its gain, at 100 %.
+        let close = |a: f32, b: f32| (a - b).abs() < 1e-6;
+        assert_eq!(engine.outputs.len(), 1);
+        assert!(close(engine.outputs[0].1, db_to_gain(-6.0)));
+        let volume = |percent| Some(Request::SetVolume { percent });
+        control.connected(1, "test".into());
+        let hello = Request::Hello {
+            version: proto::VERSION,
+        };
+        control.request(1, Some(hello), now);
+        engine.gains.clear();
+        assert_eq!(control.request(1, volume(50), now).reply, Some(Reply::Ok));
+        engine.take(true);
+        let gains = std::mem::take(&mut engine.gains);
+        assert_eq!(gains.len(), 2, "{gains:?}");
+        assert_eq!(gains[0], (0, db_to_gain(-30.0)));
+        assert_eq!(gains[1].0, 1);
+        assert!(close(gains[1].1, db_to_gain(-36.0)), "{gains:?}");
+        // With the volume on the master's card, the master's samples are
+        // left alone; the further output still follows, in software.
+        let set = Arc::new(Mutex::new(Vec::new()));
+        control.card_changed(Some(Box::new(FakeMixer(set))));
+        engine.take(true);
+        engine.gains.clear();
+        assert_eq!(control.request(1, volume(40), now).reply, Some(Reply::Ok));
+        engine.take(true);
+        let gains = std::mem::take(&mut engine.gains);
+        assert_eq!(gains[0], (0, 1.0));
+        assert!(close(gains[1].1, db_to_gain(-42.0)), "{gains:?}");
+    }
+
+    #[test]
+    fn the_master_is_delayed_to_the_further_outputs_target() {
+        let (mut control, mut engine, logs, now) =
+            started_with(&Config::default(), vec![further(&[44100])]);
+        // The card takes only 44.1 kHz: a period of 256 frames there lasts
+        // nearest to the master's 256 at 48 kHz.
+        let delay = resampler_delay(48000, 44100, 256);
+        let target = align_frames(48000, 256, &[(44100, 256, delay)]);
+        let seen = engine.take(true);
+        let line = seen.iter().position(|s| s.starts_with("SetDelay"));
+        let open = seen.iter().position(|s| s.starts_with("Reconfigure"));
+        // The master's two periods are part of its path already.
+        let expected = format!("SetDelay {}", target - 2 * 256);
+        assert_eq!(line.map(|i| seen[i].clone()), Some(expected), "{seen:?}");
+        assert!(line < open, "{seen:?}");
+        control.handle_events(now);
+        let (held, feed, _) = logs[0].last_path();
+        assert_eq!(held, f64::from(target));
+        // The feed holds what a further output needs and the drift believes.
+        let scale = 48000.0 / 44100.0;
+        let writer_period = 256.0 * scale;
+        assert!((feed as f64) < held + crate::drift::SANE * writer_period);
+        assert!(feed as f64 >= 2.0 * writer_period + 128.0);
+        assert!(feed >= crate::further::FEED_PERIODS * 256);
+    }
+
+    #[test]
+    fn no_further_output_means_no_delay() {
+        let (mut control, mut engine, now) = started(&Config::default(), None);
+        assert_eq!(engine.take(true), ["SetGain", "Reconfigure 48000 256"]);
+        control.handle_events(now);
+        play(&mut control, 1, 96000, now);
+        let seen = engine.take(true);
+        assert!(has(&seen, "Reconfigure 96000"), "{seen:?}");
+        assert!(
+            !has(&seen, "SetDelay") && !has(&seen, "AddOutput"),
+            "{seen:?}"
+        );
+    }
+
+    #[test]
+    fn a_further_output_goes_off_by_its_own_idle_rule() {
+        let config = Config {
+            idle: Idle::Zeros,
+            ..Config::default()
+        };
+        let (mut output, rates) = further(&[]);
+        output.idle = Idle::Off { delay_s: 2 };
+        let (mut control, mut engine, logs, now) = started_with(&config, vec![(output, rates)]);
+        engine.take(true);
+        control.handle_events(now);
+        assert_eq!(logs[0].take(), ["reconfigure 48000 48000 256", "open true"]);
+        let s = Duration::from_secs;
+        control.tick(now + s(1));
+        assert!(logs[0].take().is_empty());
+        control.tick(now + s(2));
+        assert_eq!(logs[0].take(), ["open false"]);
+        // The master keeps playing zeros.
+        control.tick(now + s(60));
+        assert!(control.output_is_open());
+        assert!(!has(&engine.take(true), "CloseOutput"));
+        // A player opens it again, at the rate it had: the writer relocks.
+        play(&mut control, 1, 48000, now + s(61));
+        assert_eq!(logs[0].take(), ["open true"]);
+        // Playing, it stays open.
+        control.tick(now + s(70));
+        assert!(logs[0].take().is_empty());
+    }
+
+    #[test]
+    fn a_further_output_closes_with_the_master() {
+        let config = Config {
+            idle: Idle::Off { delay_s: 1 },
+            ..Config::default()
+        };
+        let (mut control, mut engine, logs, now) = started_with(&config, vec![further(&[])]);
+        engine.take(true);
+        control.handle_events(now);
+        logs[0].take();
+        control.tick(now + Duration::from_secs(2));
+        assert!(has(&engine.take(true), "CloseOutput"));
+        assert_eq!(logs[0].take(), ["open false"]);
+    }
+
+    #[test]
+    fn a_further_chain_that_cannot_build_at_the_rate_silences_that_output_only() {
+        let (mut output, rates) = further(&[]);
+        output.plugins = vec![entry(config::PluginPlace::Mix, "only-up-to-48k")];
+        let (mut control, mut engine, logs, now) =
+            started_with(&Config::default(), vec![(output, rates)]);
+        let seen = engine.take(true);
+        assert!(has(&seen, "SetChain 1 Mix balance"), "{seen:?}");
+        control.handle_events(now);
+        engine.gains.clear();
+        // A player at 96 kHz: the master goes there, as without the output,
+        // and the output, whose chain does not build there, is silent.
+        play(&mut control, 1, 96000, now);
+        let seen = engine.take(true);
+        assert!(has(&seen, "Reconfigure 96000"), "{seen:?}");
+        assert!(!has(&seen, "SetChain"), "{seen:?}");
+        assert_eq!(engine.gains, [(1, 0.0)]);
+        assert_eq!(control.output.unwrap().0, 96000);
+        control.handle_events(now);
+        // It still follows the master, in silence.
+        assert_eq!(
+            logs[0].take(),
+            [
+                "reconfigure 48000 48000 256",
+                "open true",
+                "open false",
+                "reconfigure 96000 96000 512",
+                "open true"
+            ]
+        );
+        // Back at 48 kHz it plays again, with the chain it had.
+        engine.gains.clear();
+        let stop = control.request(1, Some(Request::Stop), now);
+        assert_eq!(stop.reply, Some(Reply::Ok));
+        play(&mut control, 2, 48000, now + Duration::from_secs(1));
+        control.tick(now + Duration::from_secs(2));
+        let seen = engine.take(true);
+        assert!(has(&seen, "Reconfigure 48000"), "{seen:?}");
+        assert!(!has(&seen, "SetChain"), "{seen:?}");
+        assert_eq!(engine.gains, [(1, 1.0)]);
+    }
+
+    #[test]
+    fn a_further_outputs_lock_is_logged_with_its_ppm_once_known() {
+        let line = |event| event_line(2, event);
+        let locked = line(FurtherEvent::Locked { ppm: None });
+        assert_eq!(locked.as_deref(), Some("aas: output 2 locked"));
+        let known = line(FurtherEvent::Locked { ppm: Some(12.5) });
+        assert_eq!(
+            known.as_deref(),
+            Some("aas: output 2 locked, its card runs +12.5 ppm from the master")
+        );
+        let lost = line(FurtherEvent::Unlocked);
+        assert_eq!(lost.as_deref(), Some("aas: output 2 lost its lock"));
+        // Starves and overflows are counted, not logged one by one.
+        assert_eq!(line(FurtherEvent::Starved), None);
+        assert_eq!(line(FurtherEvent::Overflowed), None);
     }
 }

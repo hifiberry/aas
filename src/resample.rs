@@ -20,7 +20,7 @@ const MAX_RATIO_CHANGE: f64 = 1.1;
 const SIZED: &str = "the buffers are sized in Stage::new";
 
 /// Taps of the filter for each quality, as `dsp-bench` measured them.
-fn taps(quality: Quality) -> usize {
+pub(crate) fn taps(quality: Quality) -> usize {
     match quality {
         Quality::High => 128,
         Quality::Medium => 64,

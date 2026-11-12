@@ -105,6 +105,13 @@ impl OutputVolume {
         self.hardware.is_some()
     }
 
+    /// The gain of a further output `offset_db` from this volume. It is
+    /// always applied in software, whatever carries the master's, and also
+    /// in forced bit-perfect, which applies to the master only.
+    pub fn further_gain(&self, offset_db: f32) -> f32 {
+        percent_to_db(self.percent).map_or(0.0, |db| db_to_gain(db + offset_db))
+    }
+
     /// The gain the engine applies to the output: 1 in hardware mode and
     /// with forced bit-perfect. At 0 percent on a control that cannot mute
     /// it is 0, since bit-perfect does not matter when nothing is heard.
@@ -296,6 +303,23 @@ mod tests {
         assert!(volume.is_hardware());
         assert_eq!(volume.gain(), 1.0);
         assert_eq!(last(&set), Some(-30.0));
+    }
+
+    #[test]
+    fn a_further_output_follows_in_software_with_its_offset() {
+        let mut software = OutputVolume::new(None, BitPerfect::Auto);
+        software.set(50);
+        assert_eq!(software.further_gain(-6.0), db_to_gain(-36.0));
+        assert_eq!(software.further_gain(0.0), software.gain());
+        // The master's card carries its own volume, and forced bit-perfect
+        // leaves the master alone: neither reaches a further output.
+        let (hw, _) = hardware((-103.5, 0.0));
+        let mut hardware = OutputVolume::new(Some(hw), BitPerfect::Forced);
+        hardware.set(50);
+        assert_eq!(hardware.gain(), 1.0);
+        assert_eq!(hardware.further_gain(-6.0), db_to_gain(-36.0));
+        hardware.set(0);
+        assert_eq!(hardware.further_gain(0.0), 0.0);
     }
 
     #[test]

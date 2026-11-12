@@ -251,6 +251,12 @@ impl Drift {
         self.mean * 1e6
     }
 
+    /// Whether [`Drift::ppm`] has averaged over its whole window of
+    /// [`ESTIMATE`] seconds since it last started.
+    pub fn estimate_ready(&self) -> bool {
+        self.updates >= self.estimate_updates
+    }
+
     /// Whether the error has stayed under a quarter period for the last
     /// [`LOCK`] seconds.
     pub fn locked(&self) -> bool {
@@ -424,6 +430,23 @@ mod tests {
         let seconds = path.seconds(at);
         assert!(seconds <= 30.0, "{ppm} ppm: locked only at {seconds} s");
         seconds
+    }
+
+    #[test]
+    fn the_estimate_is_ready_only_after_its_whole_window() {
+        let mut drift = Drift::new(TARGET, RATE, PERIOD);
+        let seconds = f64::from(PERIOD) / f64::from(RATE);
+        let updates = |s: f64| (s / seconds).ceil() as u32;
+        // It settles for 20 s and then averages over 120.
+        for _ in 0..updates(ESTIMATE) {
+            drift.update(TARGET);
+        }
+        assert!(drift.locked());
+        assert!(!drift.estimate_ready());
+        for _ in 0..updates(5.0 * ESTIMATE_SMOOTHING + 1.0) {
+            drift.update(TARGET);
+        }
+        assert!(drift.estimate_ready());
     }
 
     #[test]

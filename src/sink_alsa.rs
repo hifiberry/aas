@@ -61,6 +61,49 @@ pub fn card_driver(text: &str, card: Option<&str>) -> Option<(String, String)> {
     Some((id, driver.to_string()))
 }
 
+/// The index of a card in `/proc/asound/cards` text: one named by index or
+/// by id, or for `None` the one `find_card` takes. None if it is not there.
+pub fn card_index(text: &str, card: Option<&str>) -> Option<u32> {
+    let id = match card {
+        Some(card) => card.to_string(),
+        None => find_card(&parse_card_ids(text))?,
+    };
+    text.lines().find_map(|line| {
+        let index = line.split_whitespace().next()?.parse::<u32>().ok()?;
+        let named = parse_card_ids(line).first() == Some(&id) || index.to_string() == id;
+        named.then_some(index)
+    })
+}
+
+/// Refuses two outputs on the same card, which names compared as text let
+/// through: one by index and one by id, or the master's card found and
+/// named by an output. `cards` are the outputs' cards in order, the master
+/// first, `None` for one to find. A card not there now cannot be told, and
+/// passes.
+pub fn distinct_cards(text: &str, cards: &[Option<String>]) -> Result<(), String> {
+    let name = |card: &Option<String>| match card {
+        Some(card) => format!("card {card}"),
+        None => "the card found".to_string(),
+    };
+    let mut seen: Vec<(usize, u32)> = Vec::new();
+    for (i, card) in cards.iter().enumerate() {
+        let Some(index) = card_index(text, card.as_deref()) else {
+            continue;
+        };
+        if let Some(&(j, _)) = seen.iter().find(|&&(_, other)| other == index) {
+            return Err(format!(
+                "output {} ({}) and output {} ({}) are the same card, {index}",
+                j + 1,
+                name(&cards[j]),
+                i + 1,
+                name(card)
+            ));
+        }
+        seen.push((i, index));
+    }
+    Ok(())
+}
+
 /// The kernel's list of cards now, empty if it cannot be read.
 pub fn cards_text() -> String {
     fs::read_to_string(CARDS).unwrap_or_default()
@@ -566,11 +609,13 @@ mod card {
 
     /// Plays to `hw:<card>` with a fixed number of channels, as S32 if the
     /// card takes it, else S24 in 32 bits, else S16. Two periods are
-    /// buffered and the card starts once both are written.
+    /// buffered, or as many as it is made with, and the card starts once
+    /// all are written.
     pub struct AlsaSink {
         /// The card the config names. None finds one at each open.
         card: Option<String>,
         channels: usize,
+        periods: u32,
         open: Option<Open>,
         rates: Vec<u32>,
         /// The last failure logged, so that a retry every second does not
@@ -582,9 +627,16 @@ mod card {
         /// Looks at the card once for its rates. A card that is missing now
         /// is looked for again at each open.
         pub fn new(card: Option<String>, channels: usize) -> AlsaSink {
+            AlsaSink::buffering(card, channels, PERIODS)
+        }
+
+        /// The same with `periods` periods buffered, as a further output's
+        /// card is.
+        pub fn buffering(card: Option<String>, channels: usize, periods: u32) -> AlsaSink {
             let mut sink = AlsaSink {
                 card,
                 channels,
+                periods,
                 open: None,
                 rates: Vec::new(),
                 last_failure: None,
@@ -662,7 +714,7 @@ mod card {
                     .map_err(|x| e("rate", x))?;
                 hw.set_period_size_near(Frames::from(period), ValueOr::Nearest)
                     .map_err(|x| e("period", x))?;
-                hw.set_periods(PERIODS, ValueOr::Nearest)
+                hw.set_periods(self.periods, ValueOr::Nearest)
                     .map_err(|x| e("periods", x))?;
                 if let Err(x) = pcm.hw_params(&hw) {
                     // Some I2S controllers take a channel count in the
@@ -1126,6 +1178,41 @@ mod tests {
         " 1 [sndrpihifiberry]: HifiberryDacpAd - snd_rpi_hifiberry_dacplusadc\n",
         "                      snd_rpi_hifiberry_dacplusadc\n",
     );
+
+    #[test]
+    fn a_card_is_known_by_its_index_whatever_it_is_named_by() {
+        assert_eq!(card_index(CARDS_TEXT, Some("1")), Some(1));
+        assert_eq!(card_index(CARDS_TEXT, Some("sndrpihifiberry")), Some(1));
+        assert_eq!(card_index(CARDS_TEXT, Some("Headphones")), Some(0));
+        // The one found for the master when it names none.
+        assert_eq!(card_index(CARDS_TEXT, None), Some(1));
+        // A card not there now cannot be told.
+        assert_eq!(card_index(CARDS_TEXT, Some("Loopback")), None);
+        assert_eq!(card_index(CARDS_TEXT, Some("7")), None);
+    }
+
+    #[test]
+    fn two_outputs_on_the_same_card_are_refused_with_both_names() {
+        let named = |cards: &[Option<&str>]| -> Vec<Option<String>> {
+            cards.iter().map(|c| c.map(String::from)).collect()
+        };
+        let both = named(&[Some("1"), Some("sndrpihifiberry")]);
+        let e = distinct_cards(CARDS_TEXT, &both).unwrap_err();
+        assert!(e.contains("output 1 (card 1)"), "{e}");
+        assert!(e.contains("output 2 (card sndrpihifiberry)"), "{e}");
+        // The master's card found, and the same card named by an output.
+        let found = named(&[None, Some("Headphones"), Some("sndrpihifiberry")]);
+        let e = distinct_cards(CARDS_TEXT, &found).unwrap_err();
+        assert!(e.contains("output 1 (the card found)"), "{e}");
+        assert!(e.contains("output 3 (card sndrpihifiberry)"), "{e}");
+        assert_eq!(
+            distinct_cards(CARDS_TEXT, &named(&[None, Some("0")])),
+            Ok(())
+        );
+        // Cards not there now are let through.
+        let absent = named(&[Some("Loopback"), Some("Loopback")]);
+        assert_eq!(distinct_cards(CARDS_TEXT, &absent), Ok(()));
+    }
 
     #[test]
     fn the_driver_is_that_of_the_card_played_to() {

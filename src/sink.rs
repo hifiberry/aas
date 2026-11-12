@@ -96,17 +96,33 @@ impl Sink for Box<dyn Sink> {
     }
 }
 
-/// Keeps time like a card with two periods buffered: writes queue up, and
-/// `wait_room` returns once the queue has room for one more period.
-#[derive(Default)]
+/// Keeps time like a card with `periods` periods buffered, two by default:
+/// writes queue up, and `wait_room` returns once the queue has room for one
+/// more period.
 struct Pacer {
     rate: u32,
     period: u32,
+    periods: u32,
     /// When the frames written so far have played.
     next: Option<Instant>,
 }
 
+impl Default for Pacer {
+    fn default() -> Pacer {
+        Pacer::buffering(PERIODS)
+    }
+}
+
 impl Pacer {
+    fn buffering(periods: u32) -> Pacer {
+        Pacer {
+            rate: 0,
+            period: 0,
+            periods,
+            next: None,
+        }
+    }
+
     fn start(&mut self, rate: u32, period: u32) {
         self.rate = rate;
         self.period = period;
@@ -121,7 +137,7 @@ impl Pacer {
         let Some(next) = self.next else {
             return;
         };
-        let queue = self.length(u64::from(self.period) * u64::from(PERIODS - 1));
+        let queue = self.length(u64::from(self.period) * u64::from(self.periods - 1));
         let now = Instant::now();
         if let Some(due) = next.checked_sub(queue).filter(|&due| due > now) {
             std::thread::sleep(due - now);
@@ -156,8 +172,14 @@ pub struct NullSink {
 
 impl NullSink {
     pub fn new(channels: usize) -> NullSink {
+        NullSink::buffering(channels, PERIODS)
+    }
+
+    /// A null sink that keeps time like a card with `periods` periods
+    /// buffered.
+    pub fn buffering(channels: usize, periods: u32) -> NullSink {
         NullSink {
-            pacer: Pacer::default(),
+            pacer: Pacer::buffering(periods),
             channels,
         }
     }
@@ -240,8 +262,13 @@ impl MemorySink {
 
     /// A stereo sink that takes as long as a card would.
     pub fn paced() -> MemorySink {
+        MemorySink::paced_buffering(PERIODS)
+    }
+
+    /// The same for a card that buffers `periods` periods.
+    pub fn paced_buffering(periods: u32) -> MemorySink {
         MemorySink {
-            pacer: Some(Pacer::default()),
+            pacer: Some(Pacer::buffering(periods)),
             ..MemorySink::default()
         }
     }
@@ -510,8 +537,15 @@ pub struct FallbackSink {
 
 impl FallbackSink {
     pub fn new(inner: Box<dyn Sink>) -> FallbackSink {
+        FallbackSink::buffering(inner, PERIODS)
+    }
+
+    /// A fallback whose null sink keeps time like a card with `periods`
+    /// periods buffered, as the inner one does, so that what is queued in
+    /// the sink stays the same when the card goes.
+    pub fn buffering(inner: Box<dyn Sink>, periods: u32) -> FallbackSink {
         FallbackSink {
-            null: NullSink::new(inner.channels()),
+            null: NullSink::buffering(inner.channels(), periods),
             rates: inner.supported_rates(),
             watch: None,
             inner,
