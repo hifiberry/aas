@@ -564,10 +564,38 @@ fn a_larger_descriptor_and_parameter_entries_of_version_1_are_read() {
         "a_larger_descriptor_and_parameter_entries_of_version_1_are_read",
         "bigger",
         |path| {
-            let p = Library::open(path).unwrap().create(48000, 1024, 2).unwrap();
+            let lib = Library::open(path).unwrap();
+            assert_eq!(
+                lib.channels(),
+                Channels::Fixed {
+                    input: 2,
+                    output: 2
+                }
+            );
+            let mut p = lib.create(48000, 1024, 2).unwrap();
             let names: Vec<&str> = p.params().iter().map(|q| q.name.as_str()).collect();
             assert_eq!(names, ["level", "taps"]);
             assert_eq!(p.params()[1].kind, ParamKind::Integer);
+            // What lies where version 2 has `process_into` is not read.
+            let mut f = [0.0f32; 4];
+            p.process(Block {
+                channels: 2,
+                samples: Samples::F32(&mut f),
+            });
+            assert_eq!(f, [2.0; 4]);
+        },
+    );
+}
+
+#[test]
+fn a_larger_descriptor_of_version_2_is_read() {
+    with_fixture(
+        "a_larger_descriptor_of_version_2_is_read",
+        "biggerv2",
+        |path| {
+            let p = Library::open(path).unwrap().create(48000, 1024, 2).unwrap();
+            let names: Vec<&str> = p.params().iter().map(|q| q.name.as_str()).collect();
+            assert_eq!(names, ["level", "taps"]);
         },
     );
 }
@@ -887,6 +915,65 @@ fn a_version_2_library_for_any_count_runs_on_six_channels() {
     assert_eq!(four, [1.0; 8]);
     assert!(chain_of(&gain_path(), 6).is_ok());
     assert!(lib.create(48000, 1024, 9).is_err());
+}
+
+#[test]
+fn a_version_2_library_for_any_count_runs_on_one_and_eight_channels_in_every_format() {
+    for channels in [1, 8] {
+        for format in [Format::I32, Format::F32, Format::F64] {
+            let mut loaded = Loaded::default();
+            let params = [("gain", ParamValue::Number(-6.0206))];
+            let mut chain = build_chain(
+                &library_at(&gain_path(), &params),
+                PluginPlace::Mix,
+                48000,
+                format,
+                channels,
+                &mut loaded,
+            )
+            .unwrap();
+            assert_eq!(
+                (chain.channels_in(), chain.channels_out()),
+                (channels, channels)
+            );
+            let n = 4 * channels;
+            let (mut i, mut f, mut d) = (vec![1 << 20; n], vec![0.5f32; n], vec![0.5f64; n]);
+            let samples = match format {
+                Format::I32 => Samples::I32(&mut i),
+                Format::F32 => Samples::F32(&mut f),
+                Format::F64 => Samples::F64(&mut d),
+            };
+            let (block, _) = assert_no_alloc(|| chain.run(Block { channels, samples }));
+            assert_eq!(block.channels, channels);
+            match block.samples {
+                Samples::I32(o) => assert!(o.iter().all(|&x| (x - (1 << 19)).abs() < 300), "{o:?}"),
+                Samples::F32(o) => assert!(o.iter().all(|&x| (x - 0.25).abs() < 1e-4), "{o:?}"),
+                Samples::F64(o) => assert!(o.iter().all(|&x| (x - 0.25).abs() < 1e-4), "{o:?}"),
+            }
+        }
+    }
+}
+
+#[test]
+fn a_block_process_into_refuses_is_silence() {
+    let mut p = Library::open(&libraries().wide)
+        .unwrap()
+        .create(48000, 16, 2)
+        .unwrap();
+    let mut i = [1.0f32; 6];
+    let mut o = [7.0f32; 8];
+    // Three frames in, two out: the frame counts differ.
+    p.process_into(
+        Block {
+            channels: 2,
+            samples: Samples::F32(&mut i),
+        },
+        Block {
+            channels: 4,
+            samples: Samples::F32(&mut o),
+        },
+    );
+    assert_eq!(o, [0.0; 8]);
 }
 
 #[test]

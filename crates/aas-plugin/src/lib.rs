@@ -276,9 +276,9 @@ pub struct Descriptor {
     /// Processes `frames` frames in place: `frames * channels` interleaved
     /// samples in `format`, one of the `FORMAT_` bits in `formats`, where
     /// `channels` is that of `create`. `frames` is at most the `max_frames`
-    /// of `create`, and may be 0. Returns a mask of the `STATUS_` bits. For
-    /// a plugin whose counts differ the daemon calls `process_into` and
-    /// never this.
+    /// of `create`, and may be 0. Returns a mask of the `STATUS_` bits. Every
+    /// plugin gives it, and the daemon refuses a descriptor without; for a
+    /// plugin whose counts differ it is never called, and may do nothing.
     pub process:
         Option<extern "C" fn(*mut c_void, format: u32, samples: *mut c_void, frames: u32) -> u32>,
     /// Clears what the instance keeps from earlier blocks, such as a

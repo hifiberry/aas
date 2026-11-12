@@ -691,24 +691,34 @@ impl Plugin for Native {
         }
     }
 
-    /// As `process`, and `output` must have as many frames as `input`, else
-    /// nothing is passed. Both are in the same format.
-    fn process_into(&mut self, input: Block<'_>, output: Block<'_>) -> Status {
-        let Some(process_into) = self.fns.process_into else {
-            return Status::default();
-        };
-        if input.channels != self.input
-            || output.channels != self.output
-            || input.frames() != output.frames()
-            || !self.formats.has(input.format())
-        {
-            return Status::default();
-        }
-        let bits = match (input.samples, output.samples) {
-            (Samples::I32(i), Samples::I32(o)) => self.run_into(process_into, FORMAT_I32, i, o),
-            (Samples::F32(i), Samples::F32(o)) => self.run_into(process_into, FORMAT_F32, i, o),
-            (Samples::F64(i), Samples::F64(o)) => self.run_into(process_into, FORMAT_F64, i, o),
-            _ => 0,
+    /// As `process`, and `output` must have as many frames as `input` and
+    /// be in the same format, else nothing is passed and `output` is
+    /// filled with zeros.
+    fn process_into(&mut self, input: Block<'_>, mut output: Block<'_>) -> Status {
+        let fits = input.channels == self.input
+            && output.channels == self.output
+            && input.frames() == output.frames()
+            && self.formats.has(input.format());
+        let bits = match (self.fns.process_into, input.samples, &mut output.samples) {
+            (Some(f), Samples::I32(i), Samples::I32(o)) if fits => {
+                self.run_into(f, FORMAT_I32, i, o)
+            }
+            (Some(f), Samples::F32(i), Samples::F32(o)) if fits => {
+                self.run_into(f, FORMAT_F32, i, o)
+            }
+            (Some(f), Samples::F64(i), Samples::F64(o)) if fits => {
+                self.run_into(f, FORMAT_F64, i, o)
+            }
+            _ => {
+                // A block that is not passed on is silence, never what the
+                // output held before.
+                match &mut output.samples {
+                    Samples::I32(o) => o.fill(0),
+                    Samples::F32(o) => o.fill(0.0),
+                    Samples::F64(o) => o.fill(0.0),
+                }
+                return Status::default();
+            }
         };
         Status {
             no_signal: bits & STATUS_NO_SIGNAL != 0,

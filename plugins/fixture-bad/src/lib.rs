@@ -18,8 +18,9 @@
 //! 0 to 3, `manyvalues` one of 5000 values, and `nullname` one with a null
 //! name in its list. `small` states a version 1 descriptor size below version 1's and `smallv2`
 //! a version 2 one below version 2's;
-//! `bigger` has a descriptor and parameter entries larger than version 1's,
-//! as a later plugin of the same version would. `hugestride` and
+//! `bigger` has a version 1 descriptor and parameter entries larger than
+//! version 1's, as a later plugin of the same version would, with a function
+//! where version 2 has `process_into`; `biggerv2` the same for version 2. `hugestride` and
 //! `oddstride` state a parameter size of 8192 bytes, and one that is no
 //! multiple of the entries' alignment. `stateful` counts the
 //! `process` calls since it was created or reset and writes the count into
@@ -233,7 +234,7 @@ static BIGGER_PARAMS: [Grown<ParamInfo>; 2] = [
         later: u64::MAX,
     },
 ];
-static BIGGER: Grown<Descriptor> = Grown {
+static BIGGER_V2: Grown<Descriptor> = Grown {
     known: Descriptor {
         size: std::mem::size_of::<Grown<Descriptor>>() as u32,
         param_count: 2,
@@ -242,6 +243,45 @@ static BIGGER: Grown<Descriptor> = Grown {
     },
     later: u64::MAX,
 };
+
+/// A version 1 descriptor with bytes appended: where version 2 has
+/// `process_into` there is a function that aborts, as garbage would, and
+/// `create` is version 1's, which has no channel count.
+static BIGGER: Grown<Descriptor> = Grown {
+    known: Descriptor {
+        size: std::mem::size_of::<Grown<Descriptor>>() as u32,
+        param_count: 2,
+        params: BIGGER_PARAMS.as_ptr().cast(),
+        // SAFETY: the loader calls a version 1 `create` as its own type;
+        // both are function pointers of the same size.
+        create: Some(unsafe {
+            std::mem::transmute::<
+                extern "C" fn(u32, u32, *mut *mut c_void) -> u32,
+                extern "C" fn(u32, u32, u32, *mut *mut c_void) -> u32,
+            >(create_v1)
+        }),
+        process_into: Some(must_not_be_read),
+        ..fixture(1, 2)
+    },
+    later: u64::MAX,
+};
+
+extern "C" fn must_not_be_read(
+    _: *mut c_void,
+    _: u32,
+    _: *const c_void,
+    _: *mut c_void,
+    _: u32,
+) -> u32 {
+    std::process::abort()
+}
+
+/// `create` of version 1.
+extern "C" fn create_v1(_: u32, _: u32, instance: *mut *mut c_void) -> u32 {
+    // SAFETY: the ABI passes a place for the instance.
+    unsafe { *instance = std::ptr::NonNull::<u8>::dangling().as_ptr().cast() };
+    CREATE_OK
+}
 
 /// Parameter entries that state a size of 8192 bytes, and one 4 bytes
 /// beyond version 1's, which is no multiple of their alignment. The loader
@@ -348,6 +388,7 @@ pub extern "C" fn aas_plugin() -> *const Descriptor {
         Ok("small") => &SMALL,
         Ok("smallv2") => &SMALL_V2,
         Ok("bigger") => &BIGGER.known,
+        Ok("biggerv2") => &BIGGER_V2.known,
         Ok("stateful") => &STATEFUL,
         Ok("hugestride") => &HUGE,
         Ok("oddstride") => &ODD,

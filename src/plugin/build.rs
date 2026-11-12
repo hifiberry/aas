@@ -79,7 +79,7 @@ pub fn build_chain(
                     "{prefix}type \"library\" needs a path"
                 )));
             }
-            (kind, _) => match builtin::create(kind, rate, channels) {
+            (kind, _) => match builtin::create(kind, rate, width) {
                 Some(Ok(plugin)) => plugin,
                 Some(Err(failure)) => {
                     let what = match failure {
