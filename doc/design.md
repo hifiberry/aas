@@ -171,6 +171,59 @@ Details *(call)*:
 - The sample rate rules are applied to the master output. All outputs run at its
   rate, so sources routed only to another output still follow those rules.
 
+Built so far is one output with a matrix of its own. Several outputs come with
+part 2 of stage 3b. What is decided for the one *(call)*:
+
+- The matrix has four inputs: `players.left`, `players.right`, `analog.left` and
+  `analog.right`. `players` is the sum of all clients after their volumes. A row
+  per client waits for stage 4, where clients are known by name.
+- The matrix is a list of routes in the config. Each `[[matrix]]` table has
+  `from`, `to` (an output channel, counted from 1) and `gain_db`, from -100 to
+  0, 0 by default. What no route names is off. Without any `[[matrix]]` table,
+  left goes to channel 1 and right to channel 2, for both sources, at 0 dB, and
+  further channels are silent. `matrix = []` means the same. This is a third
+  table that is not flat, for the reason `[[plugin]]` is not.
+- The card's channel count is `channels` in the config, 2 by default, at most 8.
+  A card that does not take that count is not opened: the null sink plays and
+  "does not take N channels" is logged once.
+- A count the card refuses at open is not retried every second. A card can
+  answer the probe and still fail `snd_pcm_hw_params` with `EINVAL`. That counts
+  as not taking the count only when the count is above 2: stereo is what every
+  card takes, so an `EINVAL` there is something else, and it is logged as the
+  plain error and retried every second. A refused count is logged as "does not
+  take N channels" once. It is tried again when the list of cards changes, one
+  attempt for each change, and on a reopen. Retrying every second cost the
+  audio thread an open of 3 to 4 ms each time, a wake-up gap each time, and
+  two kernel lines each. An `EINVAL` of a count above 2 that was really about
+  the rate or the period is reported as a refusal of the count all the same. A
+  card that would take the count later needs a reopen or a change of the card
+  list to be asked again. The card list is read at the first poll after a
+  refusal, so a change in the second before it can be missed.
+- The output volume and the client volumes stay where they are, before the
+  matrix. The matrix gains come on top.
+- The width of the matrix follows from the chains. Walking the `mix` and then
+  the `output` chain, the first plugin with a fixed channel count sets the width
+  to its input count. If there is none, the width is `channels`. The chains
+  must end at `channels`, and a route to a channel above the width is an error.
+  Both stop the daemon at startup with a message. The message carries no file
+  path, as with plugin errors at startup.
+- A matrix change fades. The engine takes a new matrix as a command and moves
+  each gain to its new value over 10 ms, at once when nothing is audible or
+  while a DoP stream is held. A DoP stream that starts during a fade waits for
+  it, at most 10 ms. In this stage the matrix is set once, at startup; the
+  ramp is for the API in stage 4.
+- Buffers are sized for the configured channels, not for eight. A wide chain
+  costs about 0.25 MiB per channel.
+- Mixing takes a direct path when the matrix is the default one at 0 dB and no
+  gain is moving: the analog input is added to the players' bus as before, with
+  no pass through the matrix. So the default stereo config costs what it did
+  before the matrix. The routes are worked out once, when a matrix arrives, not
+  in every cycle.
+- The engine accepts a `mix` chain while the `output` chain is empty, because
+  the two arrive one at a time. Until the pair ends at the card's count the
+  engine plays silence, and it fades in when the pair fits. A chain never runs
+  on a count it was not built for.
+
 The card runs at S32 whenever it supports it, on both audio paths. S16 and S24
 samples fit into S32 exactly, so the values reaching the DAC are unchanged. This
 means going in and out of bit-perfect never requires reopening the card *(call)*.
@@ -330,6 +383,15 @@ skipped on this path (see Plugins). There are two ways to get it:
   are bypassed *(call for plugins)*. A hardware output volume keeps working
   *(call)*.
 
+Routing by the matrix counts too *(call)*. The routes from the one active
+source are pure when each is 0 dB and no output channel takes more than one of
+them. A swap is bit-perfect, a sum to mono is not. The copy path then copies
+each source channel to its output channels and writes zeros to the others. In
+forced bit-perfect every route counts as 0 dB, as volumes do, and chains are
+bypassed. So forced bit-perfect with chains that change the channel count, or
+a matrix width that differs from the card's, cannot work, and stops the daemon
+at startup with a message.
+
 A setting can also turn automatic bit-perfect off for testing *(call)*.
 
 With forced bit-perfect, a second client is mixed in. The output is not
@@ -373,6 +435,21 @@ turns it into loud noise. While a DoP stream plays:
 - it has exclusive use of the output. Other clients stay connected, but their
   audio is discarded until the DoP stream stops *(call)*. This is the one exception
   to mixing, because mixing would produce noise.
+
+With a matrix a DoP stream needs pure routing of `players` and chains that keep
+the count *(call)*. On a card of two or more channels the output channels are
+taken in pairs, 1 and 2, 3 and 4, and so on, as ALSA lays out a multichannel
+card, and a last odd channel is a pair alone. Every pair must be named by the
+matrix on both channels or on neither, and at least one pair must be named. A
+zero beside a marked channel drops the markers, and a DAC may play the pair as
+PCM noise. Left to channels 1 and 2 plays, with the markers on both channels
+of the pair unaltered. A one-sided routing plays no DSD: the stream is silent,
+like one at a rate the card does not take, and never takes the output. A
+1-channel card keeps the left channel only. Forced bit-perfect keeps the
+configured gains for DoP; they are not set to 0 dB. To the control thread an
+unroutable stream looks like PCM, so it may move the rate and get a resampler
+while it stays silent. A DoP stream at the wrong rate keeps its claim on the
+output, as before.
 
 How a DoP stream ends and what fills its gaps:
 
@@ -675,7 +752,7 @@ Details *(call)*:
   not stay closed under a client for this: it opens, for that decision only,
   at the nearest rate whose chains build, or stays closed with an error in the
   log if none does.
-- Plugins see stereo blocks in the processing format. Float blocks are scaled so
+- Plugins see blocks of their channel count in the processing format. Float blocks are scaled so
   full scale is 1.0 and are not clipped between plugins, and the analog chain's
   output keeps that headroom until the mix. In `i32` a block is clipped before
   the first plugin, as every stage clips there.
@@ -686,9 +763,22 @@ Details *(call)*:
   processing format *(call)*. A 20 Hz high-pass computed entirely in `f32` had an
   error of -90 dBFS at 48 kHz and -73 dBFS at 192 kHz, which is above the DAC's noise
   floor. This matters for the input processor and `speakereq`.
-- Plugins take two channels and give two, in place. Other channel counts come
-  with the matrix, and need ABI version 2 (stage 3b), since a plugin that
-  changes the count cannot work in place.
+- A plugin's channels are fixed, or any *(call)*. A fixed plugin names its
+  input and output counts, 1 to 8. A plugin for any count keeps the count and is
+  told it when created. `balance` and `detect` take two channels. A plugin
+  whose counts differ is never neutral, and cannot work in place, so it needs
+  ABI version 2. A chain checks its plugins' counts when it is built, on the
+  control thread, and refuses a pair that does not fit. An empty chain keeps
+  any count. Only `mix` and `output` take a plugin whose counts differ: the
+  analog input keeps two channels throughout and runs its chain in place, so
+  such a plugin there is a config error.
+- `mix` and `output` both belong to the output and run after the matrix, `mix`
+  first *(call)*. They differ only in order, as before. In part 2 of stage 3b a
+  plugin names its card.
+- A DoP stream bypasses the `mix` and `output` chains, but when it opens the
+  output before they were ever sent they are sent with it, so PCM at that rate
+  never plays without them. One that cannot be built at that rate is sent as
+  built for another, which the audio thread does not run: such PCM is silent.
 - A plugin can report "no signal" for its block.
 - Plugins run in-process on the audio thread, so a slow plugin causes dropouts.
 - Neutral is a property of a plugin's parameters, not of the audio. A plugin is
@@ -723,11 +813,17 @@ exists. It is not built yet.
 
 ### Plugin libraries
 
-A plugin in a shared library uses a C ABI, version 1 *(call)*. The crate
+A plugin in a shared library uses a C ABI, version 2 *(call)*. The crate
 `aas-plugin` describes it, and `plugins/gain` is an example. A library exports
 one symbol, `aas_plugin`, a function that returns a descriptor: the ABI version,
-a name, the formats it takes, its channels, its parameters and six functions. A
+a name, the formats it takes, its channels, its parameters and its functions. A
 library is loaded once and never unloaded.
+
+Version 2 adds the channel count to `create` and a `process_into` function for
+a plugin whose counts differ *(call)*. `channels_in` and `channels_out` both 0
+mean any count. The daemon still loads version 1 libraries, as plugins with two
+channels in and out. `process_into` reads from one buffer and writes to
+another, so it is the only way for a plugin whose counts differ.
 
 The descriptor and each parameter entry start with their size as the plugin
 was compiled. Within an ABI version fields are only ever appended: the daemon
@@ -762,7 +858,7 @@ parameter's type.
 Details *(call)*:
 
 - The loader refuses a library without the symbol, another ABI version, a null or
-  misaligned descriptor, a missing function, no format, other than two channels,
+  misaligned descriptor, a missing function, no format, a channel count of 0 on one side only or above 8, counts that differ and no `process_into`,
   more than 4096 parameters, a parameter range that is not a range, a default
   outside its range, or a parameter whose type it does not know or whose range
   does not fit its type: an integer needs whole numbers, a switch goes from 0 to
@@ -876,6 +972,14 @@ as its value on a fresh install. Each `[[plugin]]` table adds one plugin to the 
 library, which is absolute. `detect` runs only at `analog` and appears at most
 once. Every other key is a parameter: a finite number, or text in quotes for a
 text parameter.
+
+`channels` is the card's channel count, 2 by default and at most 8 *(call)*. A
+third table is not flat, for the same reason: each `[[matrix]]` table adds one
+route, with `from`, `to` and `gain_db`, in the order of the file. `from` is one
+of `players.left`, `players.right`, `analog.left` and `analog.right`, and `to`
+an output channel counted from 1. A route to a channel above the width of the
+matrix is an error, and so is a chain that does not end at `channels`. Both
+stop the daemon at startup.
 
 Volumes and other values changed at runtime are state, not configuration. They
 are kept in a separate state file owned by the daemon and restored at startup

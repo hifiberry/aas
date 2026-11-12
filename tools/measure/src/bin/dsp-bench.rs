@@ -2,7 +2,7 @@
 //! and mixing also in 32-bit integer? And the built-in plugins, `detect` and
 //! `balance`, in all three formats.
 
-use aas::plugin::{Block, Plugin, builtin};
+use aas::plugin::{Block, Plugin, Samples, builtin};
 use audioadapter_buffers::direct::InterleavedSlice;
 use clap::Parser;
 use measure::sample::{f32_to_s32, f64_to_s32, mix_gain, mix_i32, s32_to_f32, s32_to_f64};
@@ -124,7 +124,7 @@ fn mix_case_i32(sources: usize, frames: usize, cycles: usize) -> Summary {
 
 /// The built-in plugin `kind` at `rate`, with the parameters it is timed with.
 fn plugin_for(kind: &str, rate: u32) -> Option<Box<dyn Plugin>> {
-    let mut plugin = builtin::create(kind, rate)?.ok()?;
+    let mut plugin = builtin::create(kind, rate, 2)?.ok()?;
     if kind == "balance" {
         plugin.set_param(0, BALANCE);
     }
@@ -171,11 +171,35 @@ fn plugin_cases(kind: &str, rate: u32, frames: usize, cycles: usize) {
     let f32s: Vec<[f32; 2]> = source.iter().map(|f| f.map(s32_to_f32)).collect();
     let f64s: Vec<[f64; 2]> = source.iter().map(|f| f.map(s32_to_f64)).collect();
     let fresh = || plugin_for(kind, rate).expect("a built-in plugin");
-    let s = plugin_timing(fresh().as_mut(), &source, |b| Block::I32(b), cycles);
+    let s = plugin_timing(
+        fresh().as_mut(),
+        &source,
+        |b| Block {
+            channels: 2,
+            samples: Samples::I32(b.as_flattened_mut()),
+        },
+        cycles,
+    );
     print_row(&format!("plugin {kind} i32 @{rate}"), frames, rate, &s, "");
-    let s = plugin_timing(fresh().as_mut(), &f32s, |b| Block::F32(b), cycles);
+    let s = plugin_timing(
+        fresh().as_mut(),
+        &f32s,
+        |b| Block {
+            channels: 2,
+            samples: Samples::F32(b.as_flattened_mut()),
+        },
+        cycles,
+    );
     print_row(&format!("plugin {kind} f32 @{rate}"), frames, rate, &s, "");
-    let s = plugin_timing(fresh().as_mut(), &f64s, |b| Block::F64(b), cycles);
+    let s = plugin_timing(
+        fresh().as_mut(),
+        &f64s,
+        |b| Block {
+            channels: 2,
+            samples: Samples::F64(b.as_flattened_mut()),
+        },
+        cycles,
+    );
     print_row(&format!("plugin {kind} f64 @{rate}"), frames, rate, &s, "");
 }
 
@@ -369,7 +393,10 @@ mod tests {
     fn the_detector_is_open_on_the_timed_tone() {
         let mut plugin = plugin_for("detect", 48_000).unwrap();
         let mut block = tone_i32(48_000, 4800);
-        let status = plugin.process(Block::I32(&mut block));
+        let status = plugin.process(Block {
+            channels: 2,
+            samples: Samples::I32(block.as_flattened_mut()),
+        });
         assert!(!status.no_signal);
     }
 }

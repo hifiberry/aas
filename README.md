@@ -104,6 +104,7 @@ is kept in `/var/lib/aas/state.toml`.
 |---|---|---|---|
 | `latency_ms` | a number above 0 | 4 on a Pi 5 or CM5, 12 elsewhere | Target for the latency of the card's buffer. The period is the largest power of two that keeps two periods within it. |
 | `card` | an ALSA card id or index | the first card that is not `Loopback`, `Headphones` or HDMI | The card to play to. |
+| `channels` | 1 to 8 | 2 | The number of channels the card is opened with. A card that does not take the count is not opened: the output plays to nothing and the reason is logged once. |
 | `format` | `"f32"`, `"f64"`, `"i32"` | `"f32"` | The arithmetic used to mix and to apply volume. |
 | `resampling` | `"high"`, `"medium"` | `"high"` | Quality of the resampler for a client at another rate than the output. |
 | `bit_perfect` | `"auto"`, `"forced"`, `"off"` | `"auto"` | `auto` copies the samples untouched while one client plays at the output rate with no software volume. `forced` also ignores the software volume and bypasses plugins, except input detection. `off` always mixes. |
@@ -113,7 +114,7 @@ is kept in `/var/lib/aas/state.toml`.
 | `volume_control` | a mixer control name | the first of `Digital`, `Master`, `PCM` | The card's control that carries the volume. |
 | `default_rate` | 8000 to 384000 | 48000 | The rate the output opens at before the first client plays. |
 
-Two tables set up the analog input and the audio plugins.
+Three tables set up the analog input, the audio plugins and the mixing matrix.
 
 ```toml
 [analog]
@@ -131,6 +132,23 @@ place = "output"
 type = "library"
 path = "/usr/lib/aas/libaas_gain.so"
 gain = -3
+
+[[matrix]]
+from = "players.left"     # players.left, players.right, analog.left or analog.right
+to = 2                    # the output channel, counted from 1
+gain_db = 0               # -100 to 0, default 0
+
+[[matrix]]
+from = "players.right"
+to = 1
+
+[[matrix]]
+from = "analog.left"
+to = 2
+
+[[matrix]]
+from = "analog.right"
+to = 1
 ```
 
 `[analog]` turns on the card's analog input (`enabled`, default `false`) and sets
@@ -162,6 +180,48 @@ values for an enumeration. `detect` takes `threshold` in dBFS and
 `hold` in seconds. Without a `detect` table it runs last at `analog` with its
 defaults. `balance` takes `balance`, from -1 (left) to 1 (right). A plugin that
 cannot be loaded stops the daemon with an error.
+
+Each `[[matrix]]` table adds one route: a gain, `gain_db` from -100 to 0 and 0 by
+default, from the input `from` to the output channel `to`, counted from 1. The
+inputs are `players.left` and `players.right`, the sum of all clients after their
+volumes, and `analog.left` and `analog.right`. What no route names is off. Without
+any `[[matrix]]` table, left goes to channel 1 and right to channel 2 for both
+sources, and further channels are silent. With any `[[matrix]]` table only the
+routes listed exist, the analog input included, so a matrix that names only
+`players` leaves the analog input silent. The four routes above swap left and right
+for both sources. A sum to mono is two routes to the same channel, lowered by 6.03 dB
+each (a gain of 0.4995) so that full-scale input on both channels does not clip:
+
+```toml
+[[matrix]]
+from = "players.left"
+to = 1
+gain_db = -6.03
+
+[[matrix]]
+from = "players.right"
+to = 1
+gain_db = -6.03
+
+[[matrix]]
+from = "analog.left"
+to = 1
+gain_db = -6.03
+
+[[matrix]]
+from = "analog.right"
+to = 1
+gain_db = -6.03
+```
+
+The same `from` and `to` may not appear twice, and `to` may not be above the
+width of the matrix. That is the number of channels the first plugin with a fixed
+count takes, looking at the `mix` and then the `output` plugins, and `channels`
+if there is none. The `mix` and `output` plugins must end at `channels`, or the
+daemon stops with an error that gives both counts. An unknown key, a `from` that
+is not one of the four names, a `to` that is not a whole number from 1 to 8 and a
+`gain_db` outside -100 to 0 stop the daemon with an error naming the table by its
+position in the file.
 
 ### Recording
 
@@ -236,9 +296,26 @@ sudo install -D -m 0644 target/release/libaas_gain.so /usr/lib/aas/libaas_gain.s
 ```
 
 The descriptor and each parameter start with `size`, set to `DESCRIPTOR_SIZE`
-and `PARAM_INFO_SIZE`: fields are only ever appended within ABI version 1, and
-the daemon reads what it knows. Plugins are stereo in and out, in place;
-another channel count is ABI version 2.
+and `PARAM_INFO_SIZE`: fields are only ever appended within an ABI version, and
+the daemon reads what it knows. `abi` is `ABI`, 2.
+
+A plugin takes a fixed count of channels and gives a fixed count: `channels_in`
+and `channels_out`, each 1 to 8. A plugin that takes any count and keeps it, as
+`plugins/gain` does, has both 0, and `create` tells it the count in its
+`channels` argument; for a fixed plugin that is `channels_in`. A plugin whose
+counts are equal processes in place with `process`, `frames * channels`
+interleaved samples. One whose counts differ gives `process_into`, which reads
+`frames * channels_in` samples at `input` and writes `frames * channels_out` at
+`output`, two buffers that do not overlap; it may be left out otherwise. Every
+plugin still gives `process`, which is never called when the counts differ. The
+daemon refuses a library with one count 0 and the other not, a count above 8,
+or counts that differ and no `process_into`, and refuses a chain in which a
+plugin does not get the count it takes. A plugin whose counts differ is never
+neutral, and runs only at `mix` or `output`: the analog input keeps two channels
+throughout, and such a plugin there stops the daemon with an error.
+
+Libraries of ABI version 1, which are stereo and in place and whose `create` has
+no `channels` argument, still load, as plugins with two channels in and out.
 
 `create` stores the instance through its last argument and returns
 `CREATE_OK`, `CREATE_UNSUPPORTED` for a rate (or block size) it does not
@@ -259,10 +336,10 @@ UTF-8 that is not NUL terminated and is valid only for the call; it returns
 which the daemon takes as a rate the plugin does not support.
 
 `create`, `destroy`, `set_param_text` and `set_param` while the config's
-values are set run on the daemon's control thread. `process`, `reset`,
-`neutral` and `latency` run on the audio thread, and so will `set_param` once
-the API changes parameters at run time; these must not allocate, lock or
-block. Another instance of the same library may be processing while one is
+values are set run on the daemon's control thread. `process`, `process_into`,
+`reset`, `neutral` and `latency` run on the audio thread, and so will
+`set_param` once the API changes parameters at run time; these must not
+allocate, lock or block. Another instance of the same library may be processing while one is
 created or destroyed. A panic that leaves one of the plugin's
 functions aborts the daemon, so a plugin in Rust must not panic there, or must
 catch the panic with `std::panic::catch_unwind`. The crate's documentation

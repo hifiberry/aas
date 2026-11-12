@@ -5,17 +5,25 @@
 //! as the other end of `snd-aloop`. The capture is lined up with the stream
 //! once and then compared frame by frame. A frame out of place is a break,
 //! so a dropout shows up even when it is filled with silence.
+//!
+//! The stream is stereo. With `--channels` the capture takes more channels,
+//! and `--expect` says which of them carry the stream's left and right, so
+//! that a mixing matrix can be checked: the first channel of each side is
+//! compared with the stream, every other channel it names must be a copy of
+//! it, and every channel it does not name must be zero.
 
 use alsa::pcm::{Access, Format, HwParams, PCM};
 use alsa::{Direction, ValueOr};
 use clap::{Parser, ValueEnum};
 use measure::pattern::{Fault, Pattern, compare, faults};
+use measure::routing::Routing;
 use measure::rt;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
+/// The stream's channels, as the player sends them.
 const CHANNELS: u32 = 2;
 /// Silence played before the stream, while the daemon sets up the card.
 const PREROLL_S: f64 = 1.0;
@@ -75,6 +83,16 @@ struct Args {
     /// Where the card's output is captured, as S32.
     #[arg(long, default_value = "hw:Loopback,1,0")]
     capture: String,
+    /// Channels captured, as many as the card is opened with. The stream
+    /// itself is always stereo.
+    #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u32).range(2..=8))]
+    channels: u32,
+    /// Which captured channels carry the stream, counted from 1, as
+    /// `channel=side` with the side `L` or `R`, separated by commas: for
+    /// example `1=R,2=L` for a swap, or `1=L,2=R,7=L,8=R`. Each side must
+    /// appear at least once. A channel not named must be silent.
+    #[arg(long, default_value = "1=L,2=R")]
+    expect: String,
     #[arg(long, default_value_t = 1)]
     seed: u64,
 }
@@ -82,6 +100,7 @@ struct Args {
 fn open(
     device: &str,
     direction: Direction,
+    channels: u32,
     format: Format,
     rate: u32,
     buffer_us: u32,
@@ -91,7 +110,7 @@ fn open(
     let pcm = PCM::new(device, direction, false).map_err(|x| e("open", x))?;
     {
         let hw = HwParams::any(&pcm).map_err(|x| e("hw params", x))?;
-        hw.set_channels(CHANNELS).map_err(|x| e("channels", x))?;
+        hw.set_channels(channels).map_err(|x| e("channels", x))?;
         hw.set_rate(rate, ValueOr::Nearest)
             .map_err(|x| e("rate", x))?;
         hw.set_format(format).map_err(|x| e("format", x))?;
@@ -111,18 +130,30 @@ fn open(
 }
 
 struct Captured {
+    /// The stream's two channels, as the routing places them.
     frames: Vec<[i32; 2]>,
     overruns: u64,
+    /// Frames in which a channel did not follow the routing: a copy that
+    /// differs from its side, or a channel that should be silent and is not.
+    off_routing: u64,
+    /// The first such frame, by its place in the capture, all channels.
+    first_off_routing: Option<(usize, Vec<i32>)>,
 }
 
 /// Capture until `stop` is set.
-fn capture(args: &Args, stop: &AtomicBool, capacity: usize) -> Result<Captured, String> {
+fn capture(
+    args: &Args,
+    routing: &Routing,
+    stop: &AtomicBool,
+    capacity: usize,
+) -> Result<Captured, String> {
     if let Err(e) = rt::set_fifo(FIFO_PRIORITY) {
         eprintln!("capture without real-time priority: {e}");
     }
     let pcm = open(
         &args.capture,
         Direction::Capture,
+        args.channels,
         Format::S32LE,
         args.rate,
         CAPTURE_BUFFER_US,
@@ -134,18 +165,28 @@ fn capture(args: &Args, stop: &AtomicBool, capacity: usize) -> Result<Captured, 
         .map_err(|x| format!("capture period: {x}"))? as usize;
     let io = pcm.io_i32().map_err(|x| format!("capture io: {x}"))?;
     pcm.start().map_err(|x| format!("capture start: {x}"))?;
-    let mut block = vec![0i32; period * CHANNELS as usize];
+    let channels = args.channels as usize;
+    let mut block = vec![0i32; period * channels];
     let mut result = Captured {
         frames: Vec::with_capacity(capacity),
         overruns: 0,
+        off_routing: 0,
+        first_off_routing: None,
     };
     while !stop.load(Ordering::Relaxed) {
         match io.readi(&mut block) {
-            Ok(n) => result.frames.extend(
-                block[..n * CHANNELS as usize]
-                    .chunks_exact(2)
-                    .map(|f| [f[0], f[1]]),
-            ),
+            Ok(n) => {
+                for frame in block[..n * channels].chunks_exact(channels) {
+                    let (stereo, fits) = routing.split(frame);
+                    if !fits {
+                        result.off_routing += 1;
+                        result
+                            .first_off_routing
+                            .get_or_insert_with(|| (result.frames.len(), frame.to_vec()));
+                    }
+                    result.frames.push(stereo);
+                }
+            }
             Err(err) => {
                 result.overruns += 1;
                 pcm.try_recover(err, true)
@@ -184,6 +225,7 @@ fn write(pcm: &PCM, format: SampleFormat, samples: &[i32]) -> Result<(), String>
 }
 
 fn run(args: Args) -> Result<bool, String> {
+    let routing = Arc::new(Routing::parse(args.channels as usize, &args.expect)?);
     rt::lock_memory()?;
     let args = Arc::new(args);
     let rate = f64::from(args.rate);
@@ -192,6 +234,7 @@ fn run(args: Args) -> Result<bool, String> {
     let pcm = open(
         &args.device,
         Direction::Playback,
+        CHANNELS,
         args.format.alsa(),
         args.rate,
         PLAYBACK_BUFFER_US,
@@ -211,8 +254,10 @@ fn run(args: Args) -> Result<bool, String> {
     let mut written = 0u64;
     while written < total {
         if capturing.is_none() && written >= capture_after {
-            let (args, stop) = (args.clone(), stop.clone());
-            capturing = Some(thread::spawn(move || capture(&args, &stop, capacity)));
+            let (args, routing, stop) = (args.clone(), routing.clone(), stop.clone());
+            capturing = Some(thread::spawn(move || {
+                capture(&args, &routing, &stop, capacity)
+            }));
         }
         let end = (written + period as u64).min(total);
         block.clear();
@@ -242,6 +287,19 @@ fn run(args: Args) -> Result<bool, String> {
         captured.frames.len(),
         captured.overruns
     );
+    // Only for a capture that is not plain stereo, so that the output of a
+    // stereo check stays as it was.
+    if *routing != Routing::stereo() {
+        println!(
+            "channels {}, expected {}, frames off the routing {}",
+            args.channels,
+            routing.describe(),
+            captured.off_routing
+        );
+        if let Some((at, frame)) = &captured.first_off_routing {
+            println!("  first off the routing at capture {at}: {frame:?}");
+        }
+    }
     if let Some(at) = found.first_fault {
         println!(
             "first fault at frame {at} of the stream, {:.3} s",
@@ -253,7 +311,8 @@ fn run(args: Args) -> Result<bool, String> {
     Ok(found.compared == sent
         && found.differing == 0
         && found.breaks == 0
-        && captured.overruns == 0)
+        && captured.overruns == 0
+        && captured.off_routing == 0)
 }
 
 /// Lists the faults, with each run of consecutive differences on one line.

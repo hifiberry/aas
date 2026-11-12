@@ -74,13 +74,16 @@ fn handle_signals(shutdown: Arc<AtomicBool>) {
 
 #[cfg(feature = "alsa-output")]
 fn output(config: &Config) -> Box<dyn Sink> {
-    Box::new(aas::sink_alsa::AlsaSink::new(config.card.clone()))
+    Box::new(aas::sink_alsa::AlsaSink::new(
+        config.card.clone(),
+        config.channels,
+    ))
 }
 
 #[cfg(not(feature = "alsa-output"))]
-fn output(_config: &Config) -> Box<dyn Sink> {
+fn output(config: &Config) -> Box<dyn Sink> {
     eprintln!("aas: warning: built without ALSA, the output goes nowhere");
-    Box::new(aas::sink::NullSink::default())
+    Box::new(aas::sink::NullSink::new(config.channels))
 }
 
 /// Opens the card's volume control, unless the config asks for software
@@ -156,7 +159,15 @@ fn analog_input(config: &Config) -> Option<aas::control::OpenCapture> {
 /// ALSA never asks: its output is never gone.
 fn card_probe(config: &Config) -> server::CardProbe {
     let card = config.card.clone();
-    Box::new(move || aas::sink_alsa::card_is_present(card.as_deref()))
+    let mut list = server::ListChange::default();
+    Box::new(move |refused| {
+        if refused {
+            list.changed(aas::sink_alsa::card_ids())
+        } else {
+            list.reset();
+            aas::sink_alsa::card_is_present(card.as_deref())
+        }
+    })
 }
 
 fn main() -> ExitCode {

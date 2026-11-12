@@ -18,6 +18,8 @@ pub enum NotBitPerfect {
     Plugin,
     /// Nothing is playing.
     NoSource,
+    /// The matrix scales the one source, or sums its channels.
+    Routing,
 }
 
 /// What the engine knows about the current cycle.
@@ -32,6 +34,14 @@ pub struct Situation {
     /// Every plugin in the chains the output passes through leaves the
     /// audio as it is. Only automatic mode asks: forced mode bypasses them.
     pub plugins_neutral: bool,
+    /// The matrix routes the bus of the one active source purely: each
+    /// route at 0 dB, at most one into an output channel. In forced mode
+    /// every route counts as 0 dB. It also takes a matrix as wide as the
+    /// card and chains that keep the channel count, without which no
+    /// routing reaches the card's channels as a copy. False while a change
+    /// of matrix ramps, since the gains are then between two matrices, and
+    /// otherwise true with no source active.
+    pub routing_pure: bool,
 }
 
 /// Returns `Ok(())` when samples can be copied to the card untouched.
@@ -41,7 +51,9 @@ pub struct Situation {
 /// leave the audio as it is and volumes at 0 dB. Forced mode sets aside the
 /// volumes that aas calculates and bypasses the plugins, so neither counts
 /// there. A client at another rate than the output is still resampled, so
-/// it is not bit-perfect in either mode.
+/// it is not bit-perfect in either mode. Both modes take pure routing of
+/// the source's bus through the matrix, which forced mode judges with
+/// every route at 0 dB.
 pub fn decide(s: &Situation) -> Result<(), NotBitPerfect> {
     if s.mode == BitPerfect::Off {
         return Err(NotBitPerfect::Disabled);
@@ -59,6 +71,9 @@ pub fn decide(s: &Situation) -> Result<(), NotBitPerfect> {
     }
     if s.mode == BitPerfect::Auto && !s.software_volume_at_0db {
         return Err(NotBitPerfect::Volume);
+    }
+    if !s.routing_pure {
+        return Err(NotBitPerfect::Routing);
     }
     Ok(())
 }
@@ -96,6 +111,7 @@ mod tests {
             software_volume_at_0db: sw,
             resampled,
             plugins_neutral,
+            routing_pure: true,
         }
     }
 
@@ -212,6 +228,49 @@ mod tests {
         assert_eq!(
             decide(&with_plugins(BitPerfect::Off, 1, true, false, false)),
             Err(NotBitPerfect::Disabled)
+        );
+    }
+
+    #[test]
+    fn impure_routing_is_reported_as_the_reason() {
+        let routed = |mode, active, sw, resampled, plugins_neutral| {
+            decide(&Situation {
+                routing_pure: false,
+                ..with_plugins(mode, active, sw, resampled, plugins_neutral)
+            })
+        };
+        assert_eq!(
+            routed(BitPerfect::Auto, 1, true, false, true),
+            Err(NotBitPerfect::Routing)
+        );
+        assert_eq!(
+            routed(BitPerfect::Forced, 1, false, false, false),
+            Err(NotBitPerfect::Routing)
+        );
+        // The other reasons come first.
+        assert_eq!(
+            routed(BitPerfect::Off, 1, true, false, true),
+            Err(NotBitPerfect::Disabled)
+        );
+        assert_eq!(
+            routed(BitPerfect::Auto, 0, true, false, true),
+            Err(NotBitPerfect::NoSource)
+        );
+        assert_eq!(
+            routed(BitPerfect::Auto, 2, true, false, true),
+            Err(NotBitPerfect::SeveralSources)
+        );
+        assert_eq!(
+            routed(BitPerfect::Auto, 1, true, true, true),
+            Err(NotBitPerfect::Resampled)
+        );
+        assert_eq!(
+            routed(BitPerfect::Auto, 1, true, false, false),
+            Err(NotBitPerfect::Plugin)
+        );
+        assert_eq!(
+            routed(BitPerfect::Auto, 1, false, false, true),
+            Err(NotBitPerfect::Volume)
         );
     }
 

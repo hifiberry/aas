@@ -398,8 +398,12 @@ impl Sink for GatedSink {
         self.inner.wait_room()
     }
 
-    fn write(&mut self, frames: &[[i32; 2]]) -> Result<(), SinkError> {
-        self.inner.write(frames)
+    fn write(&mut self, samples: &[i32]) -> Result<(), SinkError> {
+        self.inner.write(samples)
+    }
+
+    fn channels(&self) -> usize {
+        self.inner.channels()
     }
 
     fn close(&mut self) {
@@ -601,7 +605,7 @@ fn a_gone_sink_is_tried_again_only_once_the_card_is_seen() {
     log.fail(Some(SinkError::Gone));
     let present = Arc::new(AtomicBool::new(false));
     let seen = present.clone();
-    let probe = Box::new(move || seen.load(Ordering::Relaxed));
+    let probe = Box::new(move |_refused: bool| seen.load(Ordering::Relaxed));
     let daemon = Daemon::start_probing(default_config(), sink, probe);
     let mut client = daemon.client_at(48000, 262144);
     write_all(&mut client, &vec![[0x100, 0x100]; 192000]);
@@ -616,6 +620,27 @@ fn a_gone_sink_is_tried_again_only_once_the_card_is_seen() {
     present.store(true, Ordering::Relaxed);
     assert!(wait_for(|| log.frames().contains(&[0x100, 0x100])));
     assert_eq!(last_open(&log), Some((48000, PERIOD)));
+}
+
+#[test]
+fn a_refused_sink_is_tried_again_only_when_the_card_list_changes() {
+    let (sink, log) = memory_sink();
+    log.fail(Some(SinkError::Refused));
+    let changed = Arc::new(AtomicBool::new(false));
+    let seen = changed.clone();
+    // Only a card that is refusing is asked about changes.
+    let probe = Box::new(move |refused: bool| refused && seen.load(Ordering::Relaxed));
+    let daemon = Daemon::start_probing(default_config(), sink, probe);
+    let mut client = daemon.client_at(48000, 262144);
+    write_all(&mut client, &vec![[0x100, 0x100]; 192000]);
+    client.start().unwrap();
+    wait_played(&client, 4800);
+    // The card would open now, but nothing changed: no try in seconds.
+    log.fail(None);
+    thread::sleep(Duration::from_millis(2500));
+    assert!(log.opens().is_empty());
+    changed.store(true, Ordering::Relaxed);
+    assert!(wait_for(|| log.frames().contains(&[0x100, 0x100])));
 }
 
 #[test]
@@ -980,8 +1005,12 @@ impl Sink for PanickingSink {
         Ok(())
     }
 
-    fn write(&mut self, _frames: &[[i32; 2]]) -> Result<(), SinkError> {
+    fn write(&mut self, _samples: &[i32]) -> Result<(), SinkError> {
         panic!("a test sink that panics on write");
+    }
+
+    fn channels(&self) -> usize {
+        2
     }
 
     fn close(&mut self) {}
@@ -1307,6 +1336,28 @@ fn a_plugin_that_cannot_be_loaded_stops_the_start() {
     let result = server::run(config, sink, &path, &state, None, None, shutdown);
     let e = result.expect_err("the daemon started");
     assert!(e.contains(missing), "{e}");
+    assert!(log.opens().is_empty());
+    assert!(!path.exists());
+}
+
+#[test]
+fn a_matrix_route_above_the_cards_channels_stops_the_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("aas.sock");
+    let state = dir.path().join("state.toml");
+    let config = Config {
+        matrix: Some(vec![aas::config::Route {
+            from: 0,
+            to: 3,
+            gain_db: 0.0,
+        }]),
+        ..default_config()
+    };
+    let (sink, log) = memory_sink();
+    let shutdown = Arc::new(AtomicBool::new(true));
+    let result = server::run(config, sink, &path, &state, None, None, shutdown);
+    let e = result.expect_err("the daemon started");
+    assert!(e.contains("matrix 1") && e.contains("channel 3"), "{e}");
     assert!(log.opens().is_empty());
     assert!(!path.exists());
 }

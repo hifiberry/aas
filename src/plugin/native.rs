@@ -6,11 +6,15 @@
 //! what it reports into Rust values when it is built, so the calls on the
 //! audio thread allocate nothing.
 
-use super::{Block, BuildError, Failure, Formats, Param, ParamKind, Plugin, Status};
+use super::{
+    Block, BuildError, Channels, Failure, Formats, Param, ParamKind, Plugin, Samples, Status,
+};
+use crate::matrix::MAX_CHANNELS;
 use aas_plugin::{
-    ABI, CREATE_OK, CREATE_UNSUPPORTED, DESCRIPTOR_SIZE_V1, Descriptor, FORMAT_F32, FORMAT_F64,
-    FORMAT_I32, MAX_STRUCT_SIZE, PARAM_ENUMERATION, PARAM_FLOAT, PARAM_INFO_SIZE_V1, PARAM_INTEGER,
-    PARAM_SWITCH, PARAM_TEXT, ParamInfo, STATUS_NO_SIGNAL, TEXT_OK, TEXT_UNSUPPORTED,
+    ABI, CREATE_OK, CREATE_UNSUPPORTED, DESCRIPTOR_SIZE_V1, DESCRIPTOR_SIZE_V2, Descriptor,
+    FORMAT_F32, FORMAT_F64, FORMAT_I32, MAX_STRUCT_SIZE, PARAM_ENUMERATION, PARAM_FLOAT,
+    PARAM_INFO_SIZE_V1, PARAM_INTEGER, PARAM_SWITCH, PARAM_TEXT, ParamInfo, STATUS_NO_SIGNAL,
+    TEXT_OK, TEXT_UNSUPPORTED,
 };
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::os::unix::ffi::OsStrExt;
@@ -23,6 +27,7 @@ pub struct Library {
     fns: Fns,
     name: String,
     formats: Formats,
+    channels: Channels,
     params: Vec<Param>,
 }
 
@@ -61,30 +66,56 @@ impl Library {
         // SAFETY: not null and aligned; the ABI promises a descriptor that
         // lives as long as the library, which is never unloaded.
         let (size, abi) = unsafe { (desc.cast::<u32>().read(), desc.cast::<u32>().add(1).read()) };
-        if abi != ABI {
+        if abi != 1 && abi != ABI {
             return Err(fail(format!(
-                "it has ABI version {abi}, this daemon takes {ABI}"
+                "it has ABI version {abi}, this daemon takes 1 and {ABI}"
             )));
         }
+        let first = if abi == 1 {
+            DESCRIPTOR_SIZE_V1
+        } else {
+            DESCRIPTOR_SIZE_V2
+        };
         let align = std::mem::align_of::<Descriptor>() as u32;
-        if !(DESCRIPTOR_SIZE_V1..=MAX_STRUCT_SIZE).contains(&size) || size % align != 0 {
+        if !(first..=MAX_STRUCT_SIZE).contains(&size) || size % align != 0 {
             return Err(fail(format!(
-                "its descriptor has {size} bytes, not version {ABI}'s {DESCRIPTOR_SIZE_V1} to \
+                "its descriptor has {size} bytes, not version {abi}'s {first} to \
                  {MAX_STRUCT_SIZE} in steps of {align}"
             )));
         }
-        // SAFETY: as above, and at least as large as version 1's first
-        // descriptor, which is all the daemon's `Descriptor` has; bytes
-        // beyond it are fields of a later plugin that are not read. A field
-        // appended later is read only where `size` covers it.
-        let desc: &'static Descriptor = unsafe { &*desc };
-        if desc.channels_in != 2 || desc.channels_out != 2 {
-            return Err(fail(format!(
-                "it takes {} channels in and {} out; plugins are stereo, other \
-                 channel counts come with the matrix in stage 3b",
-                desc.channels_in, desc.channels_out
-            )));
-        }
+        // The daemon's `Descriptor` is version 2's. A version 1 descriptor is
+        // shorter, so it is copied into a zeroed one, and only as far as its
+        // own version goes: a version 1 library's `process_into` is never
+        // read, and a later field is not either.
+        let known = if abi == 1 {
+            DESCRIPTOR_SIZE_V1
+        } else {
+            DESCRIPTOR_SIZE_V2
+        } as usize;
+        let mut copy = std::mem::MaybeUninit::<Descriptor>::zeroed();
+        // SAFETY: `size` bytes, at least `known`, are there as the ABI
+        // promises for as long as the library is loaded, and the copy has
+        // room for `known`, which is at most the size of a `Descriptor`.
+        // Zero bytes are a valid `Descriptor`: null pointers and `None`.
+        let desc: Descriptor = unsafe {
+            std::ptr::copy_nonoverlapping(desc.cast::<u8>(), copy.as_mut_ptr().cast(), known);
+            copy.assume_init()
+        };
+        let desc = &desc;
+        let channels = if abi == 1 {
+            if desc.channels_in != 2 || desc.channels_out != 2 {
+                return Err(fail(format!(
+                    "it has ABI version 1, which is stereo, but takes {} channels in and {} out",
+                    desc.channels_in, desc.channels_out
+                )));
+            }
+            Channels::Fixed {
+                input: 2,
+                output: 2,
+            }
+        } else {
+            channels(desc).map_err(fail)?
+        };
         let formats = Formats {
             i32: desc.formats & FORMAT_I32 != 0,
             f32: desc.formats & FORMAT_F32 != 0,
@@ -93,7 +124,15 @@ impl Library {
         if !(formats.i32 || formats.f32 || formats.f64) {
             return Err(fail("it names no format it takes".into()));
         }
-        let fns = Fns::of(desc).map_err(|f| fail(format!("it has no function {f}")))?;
+        let fns = Fns::of(desc, abi).map_err(|f| fail(format!("it has no function {f}")))?;
+        if let Channels::Fixed { input, output } = channels
+            && input != output
+            && fns.process_into.is_none()
+        {
+            return Err(fail(format!(
+                "it takes {input} channels and gives {output} but has no function process_into"
+            )));
+        }
         // SAFETY: the ABI promises the name is null or a C string that
         // lives as long as the library.
         let name = unsafe { text(desc.name) }.map_err(|e| fail(format!("its name {e}")))?;
@@ -149,18 +188,31 @@ impl Library {
             fns,
             name,
             formats,
+            channels,
             params,
         })
     }
 
+    /// The channel counts the library's plugin takes and gives.
+    pub fn channels(&self) -> Channels {
+        self.channels
+    }
+
     /// Builds an instance for `rate` Hz and blocks of up to `max_frames`
-    /// frames, with its parameters at their defaults. Runs on the control
+    /// frames, with its parameters at their defaults. `channels` is the
+    /// count of the blocks that reach the plugin: a plugin for any count is
+    /// built for it, a fixed one for its own input count. Runs on the control
     /// thread.
     ///
     /// A plugin that does not support `rate` gives a `Failure::Unsupported`
     /// error; one that failed, or answered something the ABI does not
     /// allow, a `Failure::Failed` one.
-    pub fn create(&self, rate: u32, max_frames: usize) -> Result<Box<dyn Plugin>, BuildError> {
+    pub fn create(
+        &self,
+        rate: u32,
+        max_frames: usize,
+        channels: usize,
+    ) -> Result<Box<dyn Plugin>, BuildError> {
         let fail = |kind, why: &str| {
             BuildError::new(
                 kind,
@@ -172,8 +224,22 @@ impl Library {
             Ok(n) => n,
             Err(_) => return Err(fail(Failure::Failed, "blocks too long")),
         };
+        let (input, output) = match self.channels {
+            Channels::Any => (channels, channels),
+            Channels::Fixed { input, output } => (input, output),
+        };
+        if !(1..=MAX_CHANNELS).contains(&input) {
+            return Err(fail(
+                Failure::Failed,
+                &format!("{input} channels is not from 1 to {MAX_CHANNELS}"),
+            ));
+        }
         let mut instance = std::ptr::null_mut();
-        let status = (self.fns.create)(rate, frames, &mut instance);
+        // `input` is at most `MAX_CHANNELS`.
+        let status = match self.fns.create {
+            Create::V1(create) => create(rate, frames, &mut instance),
+            Create::V2(create) => create(rate, frames, input as u32, &mut instance),
+        };
         match status {
             CREATE_OK if !instance.is_null() => {}
             CREATE_OK => {
@@ -212,6 +278,9 @@ impl Library {
             max_latency,
             name: self.name.clone(),
             formats: self.formats,
+            channels: self.channels,
+            input,
+            output,
             params: self.params.clone(),
             max_frames,
         }))
@@ -229,31 +298,78 @@ const MAX_PARAMS: u32 = 4096;
 /// The functions of a descriptor, each checked to be there.
 #[derive(Clone, Copy)]
 struct Fns {
-    create: extern "C" fn(u32, u32, *mut *mut c_void) -> u32,
+    create: Create,
     destroy: extern "C" fn(*mut c_void),
     set_param: extern "C" fn(*mut c_void, u32, f64),
     neutral: extern "C" fn(*const c_void) -> u32,
     latency: extern "C" fn(*const c_void) -> u32,
     process: extern "C" fn(*mut c_void, u32, *mut c_void, u32) -> u32,
+    /// Given for counts that differ; `None` for version 1.
+    process_into: Option<ProcessInto>,
     /// Optional.
     reset: Option<extern "C" fn(*mut c_void)>,
     /// Given if any parameter is text.
     set_param_text: Option<extern "C" fn(*mut c_void, u32, *const u8, u32) -> u32>,
 }
 
+/// `create` as the ABI version has it. A version 1 library has no channel
+/// count in it.
+#[derive(Clone, Copy)]
+enum Create {
+    V1(extern "C" fn(u32, u32, *mut *mut c_void) -> u32),
+    V2(extern "C" fn(u32, u32, u32, *mut *mut c_void) -> u32),
+}
+
+/// `process_into` of the ABI.
+type ProcessInto = extern "C" fn(*mut c_void, u32, *const c_void, *mut c_void, u32) -> u32;
+
 impl Fns {
-    /// The functions, or the name of the first one that is missing.
-    fn of(d: &Descriptor) -> Result<Fns, &'static str> {
+    /// The functions of a descriptor of version `abi`, or the name of the
+    /// first one that is missing. Version 1's `create` is read as the
+    /// version 1 function, and its `process_into` is `None`: the descriptor
+    /// was copied only as far as version 1 goes.
+    fn of(d: &Descriptor, abi: u32) -> Result<Fns, &'static str> {
+        let create = d.create.ok_or("create")?;
+        let create = if abi == 1 {
+            // SAFETY: a version 1 library has the version 1 function at this
+            // offset, which takes no channel count; both are `extern "C"`
+            // function pointers of the same size.
+            Create::V1(unsafe {
+                std::mem::transmute::<
+                    extern "C" fn(u32, u32, u32, *mut *mut c_void) -> u32,
+                    extern "C" fn(u32, u32, *mut *mut c_void) -> u32,
+                >(create)
+            })
+        } else {
+            Create::V2(create)
+        };
         Ok(Fns {
-            create: d.create.ok_or("create")?,
+            create,
             destroy: d.destroy.ok_or("destroy")?,
             set_param: d.set_param.ok_or("set_param")?,
             neutral: d.neutral.ok_or("neutral")?,
             latency: d.latency.ok_or("latency")?,
             process: d.process.ok_or("process")?,
+            process_into: d.process_into,
             reset: d.reset,
             set_param_text: d.set_param_text,
         })
+    }
+}
+
+/// The channel counts of a version 2 descriptor, or why they are refused.
+fn channels(desc: &Descriptor) -> Result<Channels, String> {
+    let (input, output) = (desc.channels_in as usize, desc.channels_out as usize);
+    match (input, output) {
+        (0, 0) => Ok(Channels::Any),
+        (0, _) | (_, 0) => Err(format!(
+            "it takes {input} channels in and {output} out; 0 means any count and goes with 0 \
+             on both sides"
+        )),
+        (i, o) if i > MAX_CHANNELS || o > MAX_CHANNELS => Err(format!(
+            "it takes {input} channels in and {output} out, more than the {MAX_CHANNELS} allowed"
+        )),
+        _ => Ok(Channels::Fixed { input, output }),
     }
 }
 
@@ -417,6 +533,12 @@ struct Native {
     instance: *mut c_void,
     name: String,
     formats: Formats,
+    channels: Channels,
+    /// The channels of the blocks the instance was created for, and of the
+    /// blocks it gives. They differ only for `Channels::Fixed` counts that
+    /// do.
+    input: usize,
+    output: usize,
     params: Vec<Param>,
     /// Not 0, and fits in a `u32`: `create` checked both.
     max_frames: usize,
@@ -427,14 +549,40 @@ struct Native {
 impl Native {
     /// Passes `data` to the plugin in parts of at most `max_frames`
     /// frames, and returns the status bits of all parts together.
-    fn run<T>(&mut self, format: u32, data: &mut [[T; 2]]) -> u32 {
+    fn run<T>(&mut self, format: u32, data: &mut [T]) -> u32 {
         let mut bits = 0;
-        for part in data.chunks_mut(self.max_frames) {
-            // A frame is two samples with no padding, so the part is the
-            // `2 * frames` interleaved samples the ABI passes. The length
-            // fits, as it is at most `max_frames`.
-            let frames = part.len() as u32;
+        for part in data.chunks_mut(self.max_frames * self.input) {
+            // The part is the `frames * channels` interleaved samples the
+            // ABI passes. The frame count fits, as it is at most
+            // `max_frames`.
+            let frames = (part.len() / self.input) as u32;
             bits |= (self.fns.process)(self.instance, format, part.as_mut_ptr().cast(), frames);
+        }
+        bits
+    }
+
+    /// Passes `input` and `output`, the same number of frames, to
+    /// `process_into` in parts of at most `max_frames` frames, and returns
+    /// the status bits of all parts together.
+    fn run_into<T>(
+        &mut self,
+        process_into: ProcessInto,
+        format: u32,
+        input: &mut [T],
+        output: &mut [T],
+    ) -> u32 {
+        let mut bits = 0;
+        let ins = input.chunks_mut(self.max_frames * self.input);
+        let outs = output.chunks_mut(self.max_frames * self.output);
+        for (i, o) in ins.zip(outs) {
+            let frames = (i.len() / self.input) as u32;
+            bits |= process_into(
+                self.instance,
+                format,
+                i.as_ptr().cast(),
+                o.as_mut_ptr().cast(),
+                frames,
+            );
         }
         bits
     }
@@ -452,6 +600,10 @@ impl Plugin for Native {
 
     fn formats(&self) -> Formats {
         self.formats
+    }
+
+    fn channels(&self) -> Channels {
+        self.channels
     }
 
     fn params(&self) -> &[Param] {
@@ -479,8 +631,9 @@ impl Plugin for Native {
         }
     }
 
+    /// A plugin whose counts differ is never neutral.
     fn neutral(&self) -> bool {
-        (self.fns.neutral)(self.instance) != 0
+        self.input == self.output && (self.fns.neutral)(self.instance) != 0
     }
 
     fn set_text(&mut self, index: usize, text: &str) -> Result<(), (Failure, String)> {
@@ -516,16 +669,56 @@ impl Plugin for Native {
     }
 
     /// A block in a format the plugin did not name never reaches it and is
-    /// left as it is. A chain converts such blocks, so it does not happen
-    /// there. A block longer than `max_frames` is passed in parts.
+    /// left as it is, and neither does one whose channel count is not the
+    /// one the instance was created for. A chain converts and fits such
+    /// blocks, so it does not happen there. A block longer than `max_frames`
+    /// is passed in parts.
     fn process(&mut self, block: Block<'_>) -> Status {
-        if !self.formats.has(block.format()) {
+        if self.input != self.output
+            || block.channels != self.input
+            || !self.formats.has(block.format())
+        {
             return Status::default();
         }
-        let bits = match block {
-            Block::I32(d) => self.run(FORMAT_I32, d),
-            Block::F32(d) => self.run(FORMAT_F32, d),
-            Block::F64(d) => self.run(FORMAT_F64, d),
+        let bits = match block.samples {
+            Samples::I32(d) => self.run(FORMAT_I32, d),
+            Samples::F32(d) => self.run(FORMAT_F32, d),
+            Samples::F64(d) => self.run(FORMAT_F64, d),
+        };
+        Status {
+            no_signal: bits & STATUS_NO_SIGNAL != 0,
+            changed: false,
+        }
+    }
+
+    /// As `process`, and `output` must have as many frames as `input` and
+    /// be in the same format, else nothing is passed and `output` is
+    /// filled with zeros.
+    fn process_into(&mut self, input: Block<'_>, mut output: Block<'_>) -> Status {
+        let fits = input.channels == self.input
+            && output.channels == self.output
+            && input.frames() == output.frames()
+            && self.formats.has(input.format());
+        let bits = match (self.fns.process_into, input.samples, &mut output.samples) {
+            (Some(f), Samples::I32(i), Samples::I32(o)) if fits => {
+                self.run_into(f, FORMAT_I32, i, o)
+            }
+            (Some(f), Samples::F32(i), Samples::F32(o)) if fits => {
+                self.run_into(f, FORMAT_F32, i, o)
+            }
+            (Some(f), Samples::F64(i), Samples::F64(o)) if fits => {
+                self.run_into(f, FORMAT_F64, i, o)
+            }
+            _ => {
+                // A block that is not passed on is silence, never what the
+                // output held before.
+                match &mut output.samples {
+                    Samples::I32(o) => o.fill(0),
+                    Samples::F32(o) => o.fill(0.0),
+                    Samples::F64(o) => o.fill(0.0),
+                }
+                return Status::default();
+            }
         };
         Status {
             no_signal: bits & STATUS_NO_SIGNAL != 0,

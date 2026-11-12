@@ -2,7 +2,10 @@
 //! how the loader calls `process`.
 //!
 //! `aas_plugin` reads `AAS_FIXTURE` when it is called and picks the case:
-//! `abi` has ABI version 99, `mono` takes one channel, `null` has a
+//! `abi` has ABI version 99, `mono` is a version 1 descriptor that takes one
+//! channel, `nointo` is a version 2 one that takes two channels and gives
+//! four but has no `process_into`, `zerocount` one with 0 channels in and 2
+//! out, `toomany` one with 9 in and out, `null` has a
 //! `create` that fails, `unsupported` one that supports no rate,
 //! `noinstance` one that succeeds without an instance, `nofn` has no
 //! `process`, `default` has a parameter whose default lies outside its range, and `chunks` is a working `f32`
@@ -13,9 +16,11 @@
 //! 0 to 2, and `badenum` an enumeration without names. `namesonfloat` has
 //! value names on a float, `enumrange` an enumeration of three values from
 //! 0 to 3, `manyvalues` one of 5000 values, and `nullname` one with a null
-//! name in its list. `small` states a descriptor size below version 1's;
-//! `bigger` has a descriptor and parameter entries larger than version 1's,
-//! as a later plugin of the same version would. `hugestride` and
+//! name in its list. `small` states a version 1 descriptor size below version 1's and `smallv2`
+//! a version 2 one below version 2's;
+//! `bigger` has a version 1 descriptor and parameter entries larger than
+//! version 1's, as a later plugin of the same version would, with a function
+//! where version 2 has `process_into`; `biggerv2` the same for version 2. `hugestride` and
 //! `oddstride` state a parameter size of 8192 bytes, and one that is no
 //! multiple of the entries' alignment. `stateful` counts the
 //! `process` calls since it was created or reset and writes the count into
@@ -26,13 +31,14 @@
 //! Anything else, `nodesc` among them, returns no descriptor at all.
 
 use aas_plugin::{
-    ABI, CREATE_FAILED, CREATE_OK, CREATE_UNSUPPORTED, DESCRIPTOR_SIZE, Descriptor, FORMAT_F32,
-    PARAM_ENUMERATION, PARAM_FLOAT, PARAM_INFO_SIZE, PARAM_INTEGER, PARAM_SWITCH, PARAM_TEXT,
-    ParamInfo, STATUS_NO_SIGNAL, TEXT_OK, TEXT_REFUSED, TEXT_UNSUPPORTED, ValueNames,
+    ABI, CREATE_FAILED, CREATE_OK, CREATE_UNSUPPORTED, DESCRIPTOR_SIZE, DESCRIPTOR_SIZE_V1,
+    DESCRIPTOR_SIZE_V2, Descriptor, FORMAT_F32, PARAM_ENUMERATION, PARAM_FLOAT, PARAM_INFO_SIZE,
+    PARAM_INTEGER, PARAM_SWITCH, PARAM_TEXT, ParamInfo, STATUS_NO_SIGNAL, TEXT_OK, TEXT_REFUSED,
+    TEXT_UNSUPPORTED, ValueNames,
 };
 use std::ffi::c_void;
 
-/// A fixture descriptor: stereo, `f32`, no parameters.
+/// A fixture descriptor: `channels_in` in and 2 out, `f32`, no parameters.
 const fn fixture(abi: u32, channels_in: u32) -> Descriptor {
     Descriptor {
         size: DESCRIPTOR_SIZE,
@@ -51,11 +57,21 @@ const fn fixture(abi: u32, channels_in: u32) -> Descriptor {
         process: Some(process),
         reset: None,
         set_param_text: None,
+        process_into: None,
     }
 }
 
 static ABI_99: Descriptor = fixture(99, 2);
-static MONO: Descriptor = fixture(ABI, 1);
+static MONO: Descriptor = fixture(1, 1);
+static NO_INTO: Descriptor = Descriptor {
+    channels_out: 4,
+    ..fixture(ABI, 2)
+};
+static ZERO_COUNT: Descriptor = fixture(ABI, 0);
+static TOO_MANY: Descriptor = Descriptor {
+    channels_out: 9,
+    ..fixture(ABI, 9)
+};
 static NULL_CREATE: Descriptor = Descriptor {
     create: Some(create_failed),
     ..fixture(ABI, 2)
@@ -183,7 +199,11 @@ one_param!(
 );
 
 static SMALL: Descriptor = Descriptor {
-    size: DESCRIPTOR_SIZE - 8,
+    size: DESCRIPTOR_SIZE_V1 - 8,
+    ..fixture(1, 2)
+};
+static SMALL_V2: Descriptor = Descriptor {
+    size: DESCRIPTOR_SIZE_V2 - 8,
     ..fixture(ABI, 2)
 };
 
@@ -214,7 +234,7 @@ static BIGGER_PARAMS: [Grown<ParamInfo>; 2] = [
         later: u64::MAX,
     },
 ];
-static BIGGER: Grown<Descriptor> = Grown {
+static BIGGER_V2: Grown<Descriptor> = Grown {
     known: Descriptor {
         size: std::mem::size_of::<Grown<Descriptor>>() as u32,
         param_count: 2,
@@ -223,6 +243,45 @@ static BIGGER: Grown<Descriptor> = Grown {
     },
     later: u64::MAX,
 };
+
+/// A version 1 descriptor with bytes appended: where version 2 has
+/// `process_into` there is a function that aborts, as garbage would, and
+/// `create` is version 1's, which has no channel count.
+static BIGGER: Grown<Descriptor> = Grown {
+    known: Descriptor {
+        size: std::mem::size_of::<Grown<Descriptor>>() as u32,
+        param_count: 2,
+        params: BIGGER_PARAMS.as_ptr().cast(),
+        // SAFETY: the loader calls a version 1 `create` as its own type;
+        // both are function pointers of the same size.
+        create: Some(unsafe {
+            std::mem::transmute::<
+                extern "C" fn(u32, u32, *mut *mut c_void) -> u32,
+                extern "C" fn(u32, u32, u32, *mut *mut c_void) -> u32,
+            >(create_v1)
+        }),
+        process_into: Some(must_not_be_read),
+        ..fixture(1, 2)
+    },
+    later: u64::MAX,
+};
+
+extern "C" fn must_not_be_read(
+    _: *mut c_void,
+    _: u32,
+    _: *const c_void,
+    _: *mut c_void,
+    _: u32,
+) -> u32 {
+    std::process::abort()
+}
+
+/// `create` of version 1.
+extern "C" fn create_v1(_: u32, _: u32, instance: *mut *mut c_void) -> u32 {
+    // SAFETY: the ABI passes a place for the instance.
+    unsafe { *instance = std::ptr::NonNull::<u8>::dangling().as_ptr().cast() };
+    CREATE_OK
+}
 
 /// Parameter entries that state a size of 8192 bytes, and one 4 bytes
 /// beyond version 1's, which is no multiple of their alignment. The loader
@@ -308,6 +367,9 @@ pub extern "C" fn aas_plugin() -> *const Descriptor {
     match std::env::var("AAS_FIXTURE").as_deref() {
         Ok("abi") => &ABI_99,
         Ok("mono") => &MONO,
+        Ok("nointo") => &NO_INTO,
+        Ok("zerocount") => &ZERO_COUNT,
+        Ok("toomany") => &TOO_MANY,
         Ok("null") => &NULL_CREATE,
         Ok("unsupported") => &UNSUPPORTED,
         Ok("noinstance") => &NO_INSTANCE,
@@ -324,7 +386,9 @@ pub extern "C" fn aas_plugin() -> *const Descriptor {
         Ok("nullname") => &NULL_NAME,
         Ok("chunks") => &CHUNKS,
         Ok("small") => &SMALL,
+        Ok("smallv2") => &SMALL_V2,
         Ok("bigger") => &BIGGER.known,
+        Ok("biggerv2") => &BIGGER_V2.known,
         Ok("stateful") => &STATEFUL,
         Ok("hugestride") => &HUGE,
         Ok("oddstride") => &ODD,
@@ -337,21 +401,21 @@ pub extern "C" fn aas_plugin() -> *const Descriptor {
 }
 
 /// An instance with no state: a pointer that is not null and never read.
-extern "C" fn create(_: u32, _: u32, instance: *mut *mut c_void) -> u32 {
+extern "C" fn create(_: u32, _: u32, _: u32, instance: *mut *mut c_void) -> u32 {
     // SAFETY: the ABI passes a place for the instance.
     unsafe { *instance = std::ptr::NonNull::<u8>::dangling().as_ptr().cast() };
     CREATE_OK
 }
 
-extern "C" fn create_failed(_: u32, _: u32, _: *mut *mut c_void) -> u32 {
+extern "C" fn create_failed(_: u32, _: u32, _: u32, _: *mut *mut c_void) -> u32 {
     CREATE_FAILED
 }
 
-extern "C" fn create_unsupported(_: u32, _: u32, _: *mut *mut c_void) -> u32 {
+extern "C" fn create_unsupported(_: u32, _: u32, _: u32, _: *mut *mut c_void) -> u32 {
     CREATE_UNSUPPORTED
 }
 
-extern "C" fn create_ok_without_instance(_: u32, _: u32, _: *mut *mut c_void) -> u32 {
+extern "C" fn create_ok_without_instance(_: u32, _: u32, _: u32, _: *mut *mut c_void) -> u32 {
     CREATE_OK
 }
 
@@ -384,7 +448,7 @@ extern "C" fn latency_max(_: *const c_void) -> u32 {
 
 /// An instance of `stateful`: the `process` calls since `create` or
 /// `reset`.
-extern "C" fn create_counter(_: u32, _: u32, instance: *mut *mut c_void) -> u32 {
+extern "C" fn create_counter(_: u32, _: u32, _: u32, instance: *mut *mut c_void) -> u32 {
     // SAFETY: the ABI passes a place for the instance.
     unsafe { *instance = Box::into_raw(Box::new(0u32)).cast() };
     CREATE_OK

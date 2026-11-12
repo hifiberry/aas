@@ -1,5 +1,6 @@
 //! The config file: one flat TOML file, all keys optional.
 
+use crate::matrix::{INPUT_NAMES, MAX_CHANNELS};
 use crate::rate::{MAX_RATE, MIN_RATE};
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -111,12 +112,25 @@ pub enum ParamValue {
     Text(String),
 }
 
+/// One `[[matrix]]` table: a gain from an input to an output channel.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Route {
+    /// The input, as an index into `matrix::INPUT_NAMES`.
+    pub from: usize,
+    /// The output channel, counted from 1.
+    pub to: usize,
+    /// From -100 to 0.
+    pub gain_db: f32,
+}
+
 /// The settings, after the defaults are filled in. The README lists the
 /// keys of the file.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     /// The card to play to, as its ALSA id or index. None finds one.
     pub card: Option<String>,
+    /// The channels the card is opened with, from 1 to `MAX_CHANNELS`.
+    pub channels: usize,
     /// The target for the latency of the card's buffer. None takes the
     /// default of the board.
     pub latency_ms: Option<f32>,
@@ -140,6 +154,10 @@ pub struct Config {
     pub analog: Analog,
     /// The plugins, in the order of the file.
     pub plugins: Vec<PluginConfig>,
+    /// The routes of the mixing matrix, in the order of the file. None without
+    /// a `[[matrix]]` table, and for an empty `matrix = []`: both give the
+    /// default matrix, never one with every route off.
+    pub matrix: Option<Vec<Route>>,
 }
 
 #[derive(Deserialize)]
@@ -153,6 +171,7 @@ struct RawAnalog {
 #[serde(deny_unknown_fields)]
 struct Raw {
     card: Option<String>,
+    channels: Option<usize>,
     latency_ms: Option<f32>,
     default_rate: Option<u32>,
     format: Option<Format>,
@@ -164,6 +183,56 @@ struct Raw {
     volume_mode: Option<VolumeMode>,
     analog: Option<RawAnalog>,
     plugin: Option<Vec<toml::Table>>,
+    matrix: Option<Vec<RawRoute>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRoute {
+    from: Option<toml::Value>,
+    to: Option<toml::Value>,
+    gain_db: Option<toml::Value>,
+}
+
+/// Checks one `[[matrix]]` table. `n` is its position in the file, from 1.
+fn route_from_table(n: usize, raw: RawRoute) -> Result<Route, String> {
+    let from = match raw.from {
+        None => return Err(format!("matrix {n}: from is missing")),
+        Some(toml::Value::String(name)) => INPUT_NAMES
+            .iter()
+            .position(|known| *known == name)
+            .ok_or_else(|| {
+                format!(
+                    "matrix {n}: from \"{name}\" must be one of {}",
+                    INPUT_NAMES.map(|known| format!("\"{known}\"")).join(", ")
+                )
+            })?,
+        Some(_) => return Err(format!("matrix {n}: from must be a string")),
+    };
+    let to = match raw.to {
+        None => return Err(format!("matrix {n}: to is missing")),
+        Some(toml::Value::Integer(v)) if (1..=MAX_CHANNELS as i64).contains(&v) => v as usize,
+        Some(toml::Value::Integer(_)) => {
+            return Err(format!(
+                "matrix {n}: to must be a channel from 1 to {MAX_CHANNELS}"
+            ));
+        }
+        Some(_) => return Err(format!("matrix {n}: to must be a whole number")),
+    };
+    let gain_db = match raw.gain_db {
+        None => 0.0,
+        Some(toml::Value::Integer(v)) => v as f64,
+        Some(toml::Value::Float(v)) => v,
+        Some(_) => return Err(format!("matrix {n}: gain_db must be a number")),
+    };
+    if !(-100.0..=0.0).contains(&gain_db) {
+        return Err(format!("matrix {n}: gain_db must be from -100 to 0"));
+    }
+    Ok(Route {
+        from,
+        to,
+        gain_db: gain_db as f32,
+    })
 }
 
 const BUILT_IN_PLUGINS: [&str; 2] = ["detect", "balance"];
@@ -242,6 +311,7 @@ impl Default for Config {
     fn default() -> Config {
         Config {
             card: None,
+            channels: 2,
             latency_ms: None,
             default_rate: 48000,
             format: Format::F32,
@@ -254,6 +324,7 @@ impl Default for Config {
             volume_mode: None,
             analog: Analog::default(),
             plugins: Vec::new(),
+            matrix: None,
         }
     }
 }
@@ -283,6 +354,15 @@ impl Config {
         {
             return Err(format!(
                 "{}: default_rate must be from {MIN_RATE} to {MAX_RATE}",
+                path.display()
+            ));
+        }
+        if raw
+            .channels
+            .is_some_and(|n| !(1..=MAX_CHANNELS).contains(&n))
+        {
+            return Err(format!(
+                "{}: channels must be from 1 to {MAX_CHANNELS}",
                 path.display()
             ));
         }
@@ -324,8 +404,23 @@ impl Config {
             }
             plugins.push(plugin);
         }
+        let matrix = match raw.matrix {
+            None => None,
+            Some(tables) if tables.is_empty() => None,
+            Some(tables) => {
+                let mut routes = Vec::new();
+                for (i, table) in tables.into_iter().enumerate() {
+                    routes.push(
+                        route_from_table(i + 1, table)
+                            .map_err(|e| format!("{}: {e}", path.display()))?,
+                    );
+                }
+                Some(routes)
+            }
+        };
         Ok(Config {
             card: raw.card,
+            channels: raw.channels.unwrap_or(d.channels),
             latency_ms: raw.latency_ms,
             default_rate: raw.default_rate.unwrap_or(d.default_rate),
             format: raw.format.unwrap_or(d.format),
@@ -336,6 +431,7 @@ impl Config {
             volume_mode: raw.volume_mode,
             analog,
             plugins,
+            matrix,
         })
     }
 }
@@ -364,6 +460,22 @@ mod tests {
         assert_eq!(c.latency_ms, None);
         assert_eq!(c.volume_control, None);
         assert_eq!(c.volume_mode, None);
+    }
+
+    #[test]
+    fn channels_defaults_to_two_and_takes_one_to_eight() {
+        assert_eq!(load_str("").unwrap().channels, 2);
+        for n in 1..=8 {
+            assert_eq!(load_str(&format!("channels = {n}\n")).unwrap().channels, n);
+        }
+    }
+
+    #[test]
+    fn nine_channels_are_an_error() {
+        for v in ["0", "9", "-1", "\"2\""] {
+            let e = load_str(&format!("channels = {v}\n")).unwrap_err();
+            assert!(e.contains("channels"), "{v}: {e}");
+        }
     }
 
     #[test]
@@ -435,6 +547,79 @@ mod tests {
 
     fn err(text: &str) -> String {
         load_str(text).unwrap_err()
+    }
+
+    #[test]
+    fn matrix_routes_are_read_in_file_order() {
+        let c = load_str(
+            "[[matrix]]\nfrom = \"players.right\"\nto = 1\n\
+             [[matrix]]\nfrom = \"analog.left\"\nto = 2\ngain_db = -6\n\
+             [[matrix]]\nfrom = \"players.left\"\nto = 8\ngain_db = -0.5\n",
+        )
+        .unwrap();
+        assert_eq!(
+            c.matrix.unwrap(),
+            [
+                Route {
+                    from: 1,
+                    to: 1,
+                    gain_db: 0.0
+                },
+                Route {
+                    from: 2,
+                    to: 2,
+                    gain_db: -6.0
+                },
+                Route {
+                    from: 0,
+                    to: 8,
+                    gain_db: -0.5
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_matrix_route_with_an_unknown_source_is_an_error() {
+        let e = err("[[matrix]]\nfrom = \"players.left\"\nto = 1\n\
+             [[matrix]]\nfrom = \"players\"\nto = 1\n");
+        assert!(
+            e.contains("matrix 2") && e.contains("from \"players\""),
+            "{e}"
+        );
+        assert!(e.contains("aas.toml"), "{e}");
+        let e = err("[[matrix]]\nfrom = \"players.left\"\nto = 1\nvia = 2\n");
+        assert!(e.contains("via"), "{e}");
+    }
+
+    #[test]
+    fn a_matrix_gain_above_0_db_is_an_error() {
+        for v in ["0.5", "1", "-101", "nan", "\"-3\""] {
+            let e = err(&format!(
+                "[[matrix]]\nfrom = \"players.left\"\nto = 1\ngain_db = {v}\n"
+            ));
+            assert!(e.contains("matrix 1") && e.contains("gain_db"), "{v}: {e}");
+        }
+        assert!(load_str("[[matrix]]\nfrom = \"players.left\"\nto = 1\ngain_db = -100\n").is_ok());
+    }
+
+    #[test]
+    fn a_matrix_route_without_to_is_an_error() {
+        let e = err("[[matrix]]\nfrom = \"players.left\"\n");
+        assert!(e.contains("matrix 1") && e.contains("to"), "{e}");
+        let e = err("[[matrix]]\nto = 1\n");
+        assert!(e.contains("matrix 1") && e.contains("from"), "{e}");
+        for v in ["0", "9", "1.5", "\"1\""] {
+            let e = err(&format!("[[matrix]]\nfrom = \"players.left\"\nto = {v}\n"));
+            assert!(e.contains("matrix 1") && e.contains("to"), "{v}: {e}");
+        }
+    }
+
+    #[test]
+    fn no_matrix_table_gives_none() {
+        assert_eq!(load_str("").unwrap().matrix, None);
+        assert_eq!(Config::default().matrix, None);
+        assert_eq!(load_str("matrix = []\n").unwrap().matrix, None);
     }
 
     #[test]

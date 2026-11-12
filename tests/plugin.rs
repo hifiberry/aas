@@ -1,10 +1,11 @@
-//! Plugins loaded from shared libraries: the example gain plugin and a
-//! fixture that breaks the ABI in the ways the loader refuses.
+//! Plugins loaded from shared libraries: the example gain plugin, a fixture
+//! that breaks the ABI in the ways the loader refuses, a library of ABI
+//! version 1 and one that widens.
 
 use aas::config::{Format, ParamValue, PluginConfig, PluginPlace};
 use aas::plugin::build::{Chains, Libraries as Loaded, build_chain};
 use aas::plugin::native::Library;
-use aas::plugin::{Block, Formats, ParamKind, Plugin, Status};
+use aas::plugin::{Block, Channels, Formats, ParamKind, Plugin, Samples, Status};
 use assert_no_alloc::assert_no_alloc;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -19,6 +20,8 @@ static ALLOCATOR: assert_no_alloc::AllocDisabler = assert_no_alloc::AllocDisable
 struct Libraries {
     gain: PathBuf,
     fixture: PathBuf,
+    v1: PathBuf,
+    wide: PathBuf,
 }
 
 /// Builds the libraries and takes their paths from cargo's own report, so
@@ -34,6 +37,10 @@ fn libraries() -> &'static Libraries {
             "aas-plugin-gain",
             "-p",
             "aas-plugin-fixture-bad",
+            "-p",
+            "aas-plugin-fixture-v1",
+            "-p",
+            "aas-plugin-fixture-wide",
         ]);
         if !cfg!(debug_assertions) {
             cmd.arg("--release");
@@ -64,6 +71,8 @@ fn libraries() -> &'static Libraries {
         Libraries {
             gain: find("libaas_gain.so"),
             fixture: find("libaas_fixture_bad.so"),
+            v1: find("libaas_fixture_v1.so"),
+            wide: find("libaas_fixture_wide.so"),
         }
     })
 }
@@ -75,7 +84,7 @@ fn gain_path() -> PathBuf {
 fn gain() -> Box<dyn Plugin> {
     Library::open(&gain_path())
         .unwrap()
-        .create(48000, 1024)
+        .create(48000, 1024, 2)
         .unwrap()
 }
 
@@ -115,7 +124,7 @@ fn with_fixture(test: &str, case: &str, body: impl FnOnce(&Path)) {
 fn refused_fixture(test: &str, case: &str, check: impl FnOnce(&str, &str)) {
     with_fixture(test, case, |path| {
         let created =
-            Library::open(path).and_then(|l| l.create(48000, 1024).map_err(|e| e.message));
+            Library::open(path).and_then(|l| l.create(48000, 1024, 2).map_err(|e| e.message));
         let msg = unwrap_err(created);
         check(&msg, path.to_str().unwrap());
     });
@@ -139,8 +148,14 @@ fn a_loaded_plugin_processes_audio() {
     let mut f = [[0.5f32, -1.0]; 64];
     let mut d = [[0.5f64, -1.0]; 64];
     let (sf, sd) = assert_no_alloc(|| {
-        let sf = p.process(Block::F32(&mut f));
-        let sd = p.process(Block::F64(&mut d));
+        let sf = p.process(Block {
+            channels: 2,
+            samples: Samples::F32(f.as_flattened_mut()),
+        });
+        let sd = p.process(Block {
+            channels: 2,
+            samples: Samples::F64(d.as_flattened_mut()),
+        });
         (sf, sd)
     });
     assert!(!sf.no_signal && !sd.no_signal);
@@ -159,12 +174,18 @@ fn a_loaded_plugin_processes_audio() {
     // Out of range values are clamped to the range, -60 dB here.
     p.set_param(0, -1000.0);
     let mut d = [[1.0f64, -1.0]];
-    p.process(Block::F64(&mut d));
+    p.process(Block {
+        channels: 2,
+        samples: Samples::F64(d.as_flattened_mut()),
+    });
     assert!((d[0][0] - 0.001).abs() < 1e-9, "{d:?}");
     // An index beyond the parameters is ignored.
     p.set_param(1, 0.0);
     let mut d = [[1.0f64, -1.0]];
-    p.process(Block::F64(&mut d));
+    p.process(Block {
+        channels: 2,
+        samples: Samples::F64(d.as_flattened_mut()),
+    });
     assert!((d[0][0] - 0.001).abs() < 1e-9, "{d:?}");
 }
 
@@ -187,7 +208,10 @@ fn it_is_neutral_at_its_default() {
     assert!(p.neutral());
     let mut d = [[0.1f64, -0.9], [1.0 / 3.0, f64::MAX]];
     let d0 = d;
-    p.process(Block::F64(&mut d));
+    p.process(Block {
+        channels: 2,
+        samples: Samples::F64(d.as_flattened_mut()),
+    });
     assert_eq!(
         d.map(|x| x.map(f64::to_bits)),
         d0.map(|x| x.map(f64::to_bits))
@@ -244,13 +268,61 @@ fn a_library_of_another_abi_version_is_refused() {
 }
 
 #[test]
-fn a_plugin_that_is_not_stereo_is_refused() {
+fn a_version_1_plugin_that_is_not_stereo_is_refused() {
     refused_fixture(
-        "a_plugin_that_is_not_stereo_is_refused",
+        "a_version_1_plugin_that_is_not_stereo_is_refused",
         "mono",
         |msg, path| {
             assert!(msg.contains(path), "{msg}");
-            assert!(msg.contains("stage 3b"), "{msg}");
+            assert!(msg.contains("version 1, which is stereo"), "{msg}");
+        },
+    );
+}
+
+#[test]
+fn a_version_2_library_with_differing_counts_and_no_process_into_is_refused() {
+    refused_fixture(
+        "a_version_2_library_with_differing_counts_and_no_process_into_is_refused",
+        "nointo",
+        |msg, path| {
+            assert!(msg.contains(path), "{msg}");
+            assert!(msg.contains("process_into"), "{msg}");
+        },
+    );
+}
+
+#[test]
+fn a_version_2_library_with_one_count_zero_is_refused() {
+    refused_fixture(
+        "a_version_2_library_with_one_count_zero_is_refused",
+        "zerocount",
+        |msg, path| {
+            assert!(msg.contains(path), "{msg}");
+            assert!(msg.contains("0 means any count"), "{msg}");
+        },
+    );
+}
+
+#[test]
+fn a_version_2_library_with_more_than_eight_channels_is_refused() {
+    refused_fixture(
+        "a_version_2_library_with_more_than_eight_channels_is_refused",
+        "toomany",
+        |msg, path| {
+            assert!(msg.contains(path), "{msg}");
+            assert!(msg.contains("more than the 8"), "{msg}");
+        },
+    );
+}
+
+#[test]
+fn a_version_2_descriptor_smaller_than_version_2_is_refused() {
+    refused_fixture(
+        "a_version_2_descriptor_smaller_than_version_2_is_refused",
+        "smallv2",
+        |msg, path| {
+            assert!(msg.contains(path), "{msg}");
+            assert!(msg.contains("bytes, not version 2's"), "{msg}");
         },
     );
 }
@@ -270,21 +342,30 @@ fn a_plugin_whose_create_returns_null_is_refused() {
 #[test]
 fn two_instances_do_not_share_state() {
     let lib = Library::open(&gain_path()).unwrap();
-    let mut a = lib.create(48000, 1024).unwrap();
-    let mut b = lib.create(48000, 1024).unwrap();
+    let mut a = lib.create(48000, 1024, 2).unwrap();
+    let mut b = lib.create(48000, 1024, 2).unwrap();
     a.set_param(0, -6.02);
     assert!(!a.neutral());
     assert!(b.neutral());
     let mut da = [[1.0f64, 1.0]];
     let mut db = [[1.0f64, 1.0]];
-    a.process(Block::F64(&mut da));
-    b.process(Block::F64(&mut db));
+    a.process(Block {
+        channels: 2,
+        samples: Samples::F64(da.as_flattened_mut()),
+    });
+    b.process(Block {
+        channels: 2,
+        samples: Samples::F64(db.as_flattened_mut()),
+    });
     assert!((da[0][0] - 0.5).abs() < 1e-4, "{da:?}");
     assert_eq!(db, [[1.0, 1.0]]);
     drop(a);
     // The other instance still works after the first is destroyed.
     b.set_param(0, 20.0);
-    b.process(Block::F64(&mut db));
+    b.process(Block {
+        channels: 2,
+        samples: Samples::F64(db.as_flattened_mut()),
+    });
     assert!((db[0][0] - 10.0).abs() < 1e-9, "{db:?}");
 }
 
@@ -295,7 +376,13 @@ fn a_block_in_a_format_the_plugin_lacks_is_left_alone() {
     let mut p = gain();
     p.set_param(0, -6.02);
     let mut i = [[1000, -1000]; 4];
-    assert_eq!(p.process(Block::I32(&mut i)), Status::default());
+    assert_eq!(
+        p.process(Block {
+            channels: 2,
+            samples: Samples::I32(i.as_flattened_mut())
+        }),
+        Status::default()
+    );
     assert_eq!(i, [[1000, -1000]; 4]);
 }
 
@@ -307,16 +394,27 @@ fn a_block_longer_than_max_frames_is_passed_in_parts() {
         "a_block_longer_than_max_frames_is_passed_in_parts",
         "chunks",
         |path| {
-            let mut p = Library::open(path).unwrap().create(48000, 4).unwrap();
+            let mut p = Library::open(path).unwrap().create(48000, 4, 2).unwrap();
             let mut f = [[0.0f32; 2]; 9];
-            let s = assert_no_alloc(|| p.process(Block::F32(&mut f)));
+            let s = assert_no_alloc(|| {
+                p.process(Block {
+                    channels: 2,
+                    samples: Samples::F32(f.as_flattened_mut()),
+                })
+            });
             let counts: Vec<f32> = f.iter().map(|x| x[0]).collect();
             assert_eq!(counts, [4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 1.0]);
             assert!(f.iter().all(|x| x[0] == x[1]));
             // Only the last part had an odd count; its bit is kept.
             assert!(s.no_signal);
             let mut f = [[0.0f32; 2]; 8];
-            assert!(!p.process(Block::F32(&mut f)).no_signal);
+            assert!(
+                !p.process(Block {
+                    channels: 2,
+                    samples: Samples::F32(f.as_flattened_mut())
+                })
+                .no_signal
+            );
             assert!(f.iter().all(|x| x[0] == 4.0));
         },
     );
@@ -349,7 +447,7 @@ fn a_parameter_whose_default_is_outside_its_range_is_refused() {
 #[test]
 fn typed_parameters_are_described() {
     with_fixture("typed_parameters_are_described", "typed", |path| {
-        let p = Library::open(path).unwrap().create(48000, 1024).unwrap();
+        let p = Library::open(path).unwrap().create(48000, 1024, 2).unwrap();
         let kinds: Vec<(&str, &ParamKind)> = p
             .params()
             .iter()
@@ -466,10 +564,52 @@ fn a_larger_descriptor_and_parameter_entries_of_version_1_are_read() {
         "a_larger_descriptor_and_parameter_entries_of_version_1_are_read",
         "bigger",
         |path| {
-            let p = Library::open(path).unwrap().create(48000, 1024).unwrap();
+            let lib = Library::open(path).unwrap();
+            assert_eq!(
+                lib.channels(),
+                Channels::Fixed {
+                    input: 2,
+                    output: 2
+                }
+            );
+            let mut p = lib.create(48000, 1024, 2).unwrap();
             let names: Vec<&str> = p.params().iter().map(|q| q.name.as_str()).collect();
             assert_eq!(names, ["level", "taps"]);
             assert_eq!(p.params()[1].kind, ParamKind::Integer);
+            // What lies where version 2 has `process_into` is not read.
+            let mut f = [0.0f32; 4];
+            p.process(Block {
+                channels: 2,
+                samples: Samples::F32(&mut f),
+            });
+            assert_eq!(f, [2.0; 4]);
+            // A copied field would be called here, and abort.
+            let mut i = [1.0f32; 4];
+            let mut o = [7.0f32; 4];
+            p.process_into(
+                Block {
+                    channels: 2,
+                    samples: Samples::F32(&mut i),
+                },
+                Block {
+                    channels: 2,
+                    samples: Samples::F32(&mut o),
+                },
+            );
+            assert_eq!(o, [0.0; 4]);
+        },
+    );
+}
+
+#[test]
+fn a_larger_descriptor_of_version_2_is_read() {
+    with_fixture(
+        "a_larger_descriptor_of_version_2_is_read",
+        "biggerv2",
+        |path| {
+            let p = Library::open(path).unwrap().create(48000, 1024, 2).unwrap();
+            let names: Vec<&str> = p.params().iter().map(|q| q.name.as_str()).collect();
+            assert_eq!(names, ["level", "taps"]);
         },
     );
 }
@@ -480,13 +620,22 @@ fn reset_clears_a_plugins_state_and_is_optional() {
         "reset_clears_a_plugins_state_and_is_optional",
         "stateful",
         |path| {
-            let mut p = Library::open(path).unwrap().create(48000, 64).unwrap();
+            let mut p = Library::open(path).unwrap().create(48000, 64, 2).unwrap();
             let mut d = [[0.0f32; 2]; 4];
-            p.process(Block::F32(&mut d));
-            p.process(Block::F32(&mut d));
+            p.process(Block {
+                channels: 2,
+                samples: Samples::F32(d.as_flattened_mut()),
+            });
+            p.process(Block {
+                channels: 2,
+                samples: Samples::F32(d.as_flattened_mut()),
+            });
             assert_eq!(d[0][0], 2.0);
             assert_no_alloc(|| p.reset());
-            p.process(Block::F32(&mut d));
+            p.process(Block {
+                channels: 2,
+                samples: Samples::F32(d.as_flattened_mut()),
+            });
             assert_eq!(d[0][0], 1.0);
         },
     );
@@ -502,7 +651,7 @@ fn create_tells_an_unsupported_rate_from_a_failure() {
     let created = |path: &Path| {
         Library::open(path)
             .unwrap()
-            .create(48000, 1024)
+            .create(48000, 1024, 2)
             .err()
             .unwrap()
     };
@@ -523,7 +672,7 @@ fn a_failed_create_or_one_without_an_instance_is_a_failure() {
     let created = |path: &Path| {
         Library::open(path)
             .unwrap()
-            .create(48000, 1024)
+            .create(48000, 1024, 2)
             .err()
             .unwrap()
     };
@@ -550,7 +699,7 @@ fn a_create_that_succeeds_without_an_instance_is_a_failure() {
         |path| {
             let e = Library::open(path)
                 .unwrap()
-                .create(48000, 1024)
+                .create(48000, 1024, 2)
                 .err()
                 .unwrap();
             assert_eq!(e.kind, Failure::Failed, "{e}");
@@ -576,7 +725,15 @@ fn library_at(path: &Path, params: &[(&str, ParamValue)]) -> Vec<PluginConfig> {
 fn build_with(path: &Path, params: &[(&str, ParamValue)]) -> Result<(), aas::plugin::BuildError> {
     let mut loaded = Loaded::default();
     let config = library_at(path, params);
-    build_chain(&config, PluginPlace::Mix, 48000, Format::F32, &mut loaded).map(|_| ())
+    build_chain(
+        &config,
+        PluginPlace::Mix,
+        48000,
+        Format::F32,
+        2,
+        &mut loaded,
+    )
+    .map(|_| ())
 }
 
 #[test]
@@ -586,7 +743,7 @@ fn a_text_parameter_is_set_while_the_chain_is_built_and_may_be_refused() {
         "a_text_parameter_is_set_while_the_chain_is_built_and_may_be_refused",
         "text",
         |path| {
-            let p = Library::open(path).unwrap().create(48000, 64).unwrap();
+            let p = Library::open(path).unwrap().create(48000, 64, 2).unwrap();
             assert_eq!(p.params()[1].kind, ParamKind::Text);
             let text = |t: &str| ParamValue::Text(t.into());
             assert!(build_with(path, &[("file", text("/etc/aas/room.wav"))]).is_ok());
@@ -618,7 +775,8 @@ fn a_text_parameter_is_set_while_the_chain_is_built_and_may_be_refused() {
             // At the start, the daemon does not start.
             let mut loaded = Loaded::default();
             let config = library_at(path, &[("file", text("missing.wav"))]);
-            let start = Chains::build_for_start(&config, 48000, &[44100], Format::F32, &mut loaded);
+            let start =
+                Chains::build_for_start(&config, 48000, &[44100], Format::F32, 2, &mut loaded);
             assert!(start.err().unwrap().contains("missing.wav"));
         },
     );
@@ -669,7 +827,7 @@ fn a_text_parameter_without_a_name_is_refused() {
 #[test]
 fn a_latency_beyond_10_s_is_capped() {
     with_fixture("a_latency_beyond_10_s_is_capped", "slow", |path| {
-        let p = Library::open(path).unwrap().create(48000, 64).unwrap();
+        let p = Library::open(path).unwrap().create(48000, 64, 2).unwrap();
         assert_eq!(p.latency_frames(), 480_000);
     });
 }
@@ -690,4 +848,189 @@ fn a_parameter_size_out_of_step_with_the_alignment_is_refused() {
         "oddstride",
         |msg, _| assert!(msg.contains("in steps of"), "{msg}"),
     );
+}
+
+/// The mix chain of the library at `path`, built for blocks of `channels`.
+fn chain_of(path: &Path, channels: usize) -> Result<aas::plugin::chain::Chain, String> {
+    let mut loaded = Loaded::default();
+    build_chain(
+        &library_at(path, &[]),
+        PluginPlace::Mix,
+        48000,
+        Format::F32,
+        channels,
+        &mut loaded,
+    )
+    .map_err(|e| e.message)
+}
+
+#[test]
+fn a_version_1_library_still_loads_and_is_stereo() {
+    let lib = Library::open(&libraries().v1).unwrap();
+    assert_eq!(
+        lib.channels(),
+        Channels::Fixed {
+            input: 2,
+            output: 2
+        }
+    );
+    let mut p = lib.create(48000, 1024, 2).unwrap();
+    assert_eq!(p.name(), "gain-v1");
+    assert_eq!(p.params()[0].name, "gain");
+    p.set_param(0, -6.02);
+    let mut d = [[0.5f64, -1.0]; 8];
+    assert_no_alloc(|| {
+        p.process(Block {
+            channels: 2,
+            samples: Samples::F64(d.as_flattened_mut()),
+        })
+    });
+    for x in d {
+        assert!(
+            (x[0] - 0.25).abs() < 1e-4 && (x[1] + 0.5).abs() < 1e-4,
+            "{x:?}"
+        );
+    }
+    assert!(chain_of(&libraries().v1, 2).is_ok());
+}
+
+#[test]
+fn a_version_1_library_is_refused_where_the_block_has_four_channels() {
+    let e = chain_of(&libraries().v1, 4).err().unwrap();
+    assert!(e.contains("plugin 1"), "{e}");
+    assert!(e.contains("gain-v1"), "{e}");
+    assert!(e.contains("takes 2 channels, but 4 reach it"), "{e}");
+}
+
+#[test]
+fn a_version_2_library_for_any_count_runs_on_six_channels() {
+    let lib = Library::open(&gain_path()).unwrap();
+    assert_eq!(lib.channels(), Channels::Any);
+    let mut p = lib.create(48000, 1024, 6).unwrap();
+    assert_eq!(p.channels(), Channels::Any);
+    p.set_param(0, -6.0206);
+    let mut d = [[0.5f32, -1.0, 0.25, 1.0, -0.5, 0.0]; 16];
+    assert_no_alloc(|| {
+        p.process(Block {
+            channels: 6,
+            samples: Samples::F32(d.as_flattened_mut()),
+        })
+    });
+    for x in d {
+        for (got, want) in x.iter().zip([0.25f32, -0.5, 0.125, 0.5, -0.25, 0.0]) {
+            assert!((got - want).abs() < 1e-4, "{x:?}");
+        }
+    }
+    // A block of another count never reaches the library.
+    let mut four = [1.0f32; 8];
+    p.process(Block {
+        channels: 4,
+        samples: Samples::F32(&mut four),
+    });
+    assert_eq!(four, [1.0; 8]);
+    assert!(chain_of(&gain_path(), 6).is_ok());
+    assert!(lib.create(48000, 1024, 9).is_err());
+}
+
+#[test]
+fn a_version_2_library_for_any_count_runs_on_one_and_eight_channels_in_every_format() {
+    for channels in [1, 8] {
+        for format in [Format::I32, Format::F32, Format::F64] {
+            let mut loaded = Loaded::default();
+            let params = [("gain", ParamValue::Number(-6.0206))];
+            let mut chain = build_chain(
+                &library_at(&gain_path(), &params),
+                PluginPlace::Mix,
+                48000,
+                format,
+                channels,
+                &mut loaded,
+            )
+            .unwrap();
+            assert_eq!(
+                (chain.channels_in(), chain.channels_out()),
+                (channels, channels)
+            );
+            let n = 4 * channels;
+            let (mut i, mut f, mut d) = (vec![1 << 20; n], vec![0.5f32; n], vec![0.5f64; n]);
+            let samples = match format {
+                Format::I32 => Samples::I32(&mut i),
+                Format::F32 => Samples::F32(&mut f),
+                Format::F64 => Samples::F64(&mut d),
+            };
+            let (block, _) = assert_no_alloc(|| chain.run(Block { channels, samples }));
+            assert_eq!(block.channels, channels);
+            match block.samples {
+                Samples::I32(o) => assert!(o.iter().all(|&x| (x - (1 << 19)).abs() < 300), "{o:?}"),
+                Samples::F32(o) => assert!(o.iter().all(|&x| (x - 0.25).abs() < 1e-4), "{o:?}"),
+                Samples::F64(o) => assert!(o.iter().all(|&x| (x - 0.25).abs() < 1e-4), "{o:?}"),
+            }
+        }
+    }
+}
+
+#[test]
+fn a_block_process_into_refuses_is_silence() {
+    let mut p = Library::open(&libraries().wide)
+        .unwrap()
+        .create(48000, 16, 2)
+        .unwrap();
+    let mut i = [1.0f32; 6];
+    let mut o = [7.0f32; 8];
+    // Three frames in, two out: the frame counts differ.
+    p.process_into(
+        Block {
+            channels: 2,
+            samples: Samples::F32(&mut i),
+        },
+        Block {
+            channels: 4,
+            samples: Samples::F32(&mut o),
+        },
+    );
+    assert_eq!(o, [0.0; 8]);
+}
+
+#[test]
+fn a_library_that_widens_runs_through_process_into() {
+    let lib = Library::open(&libraries().wide).unwrap();
+    assert_eq!(
+        lib.channels(),
+        Channels::Fixed {
+            input: 2,
+            output: 4
+        }
+    );
+    let mut chain = chain_of(&libraries().wide, 2).unwrap();
+    assert_eq!((chain.channels_in(), chain.channels_out()), (2, 4));
+    let mut d = [1.0f32, 2.0, 3.0, 4.0];
+    let (block, _) = assert_no_alloc(|| {
+        chain.run(Block {
+            channels: 2,
+            samples: Samples::F32(&mut d),
+        })
+    });
+    assert_eq!(block.channels, 4);
+    let Samples::F32(out) = block.samples else {
+        panic!("not f32")
+    };
+    assert_eq!(out, [1.0, 2.0, 1.0, 2.0, 3.0, 4.0, 3.0, 4.0]);
+    assert!(chain_of(&libraries().wide, 4).is_err());
+    // Blocks longer than `max_frames` go through in parts.
+    let mut p = lib.create(48000, 2, 2).unwrap();
+    assert!(!p.neutral());
+    let mut i = [1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let mut o = [0.0f64; 12];
+    p.process_into(
+        Block {
+            channels: 2,
+            samples: Samples::F64(&mut i),
+        },
+        Block {
+            channels: 4,
+            samples: Samples::F64(&mut o),
+        },
+    );
+    assert_eq!(o[8..], [5.0, 6.0, 5.0, 6.0]);
+    assert_eq!(o[..4], [1.0, 2.0, 1.0, 2.0]);
 }

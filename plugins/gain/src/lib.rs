@@ -1,11 +1,12 @@
 //! Example aas plugin: a gain in dB, from -60 to 20.
 //!
-//! It takes `f32` and `f64` blocks, has no latency and reports no status.
-//! At 0 dB it is neutral and leaves the audio alone.
+//! It takes `f32` and `f64` blocks of any channel count, from 1 to 8, and
+//! keeps the count. It has no latency and reports no status. At 0 dB it is
+//! neutral and leaves the audio alone.
 
 use aas_plugin::{
-    ABI, CREATE_OK, DESCRIPTOR_SIZE, Descriptor, FORMAT_F32, FORMAT_F64, PARAM_FLOAT,
-    PARAM_INFO_SIZE, ParamInfo,
+    ABI, CREATE_FAILED, CREATE_OK, DESCRIPTOR_SIZE, Descriptor, FORMAT_F32, FORMAT_F64,
+    PARAM_FLOAT, PARAM_INFO_SIZE, ParamInfo,
 };
 use std::ffi::c_void;
 
@@ -29,8 +30,9 @@ static DESCRIPTOR: Descriptor = Descriptor {
     abi: ABI,
     name: c"gain".as_ptr(),
     formats: FORMAT_F32 | FORMAT_F64,
-    channels_in: 2,
-    channels_out: 2,
+    // Any count, which `create` is told.
+    channels_in: 0,
+    channels_out: 0,
     param_count: PARAMS.len() as u32,
     params: PARAMS.as_ptr(),
     create: Some(create),
@@ -42,6 +44,7 @@ static DESCRIPTOR: Descriptor = Descriptor {
     // A gain keeps nothing from one block to the next.
     reset: None,
     set_param_text: None,
+    process_into: None,
 };
 
 /// The plugin's entry point.
@@ -51,6 +54,8 @@ pub extern "C" fn aas_plugin() -> *const Descriptor {
 }
 
 struct Gain {
+    /// The channels of the blocks the instance is given.
+    channels: usize,
     db: f64,
     /// The linear factor of `db`, worked out when it is set.
     factor: f64,
@@ -67,8 +72,17 @@ unsafe fn gain<'a>(p: *mut c_void) -> &'a mut Gain {
     unsafe { &mut *p.cast::<Gain>() }
 }
 
-extern "C" fn create(_rate: u32, _max_frames: u32, instance: *mut *mut c_void) -> u32 {
+extern "C" fn create(
+    _rate: u32,
+    _max_frames: u32,
+    channels: u32,
+    instance: *mut *mut c_void,
+) -> u32 {
+    if !(1..=8).contains(&channels) {
+        return CREATE_FAILED;
+    }
     let gain = Box::new(Gain {
+        channels: channels as usize,
         db: 0.0,
         factor: 1.0,
     });
@@ -109,11 +123,11 @@ extern "C" fn process(p: *mut c_void, format: u32, samples: *mut c_void, frames:
     if g.db == 0.0 {
         return 0;
     }
-    let n = 2 * frames as usize;
+    let n = g.channels * frames as usize;
     match format {
         FORMAT_F32 => {
-            // SAFETY: the ABI passes `2 * frames` samples in `format`, which
-            // nothing else touches during the call.
+            // SAFETY: the ABI passes `frames * channels` samples in `format`,
+            // which nothing else touches during the call.
             let s = unsafe { std::slice::from_raw_parts_mut(samples.cast::<f32>(), n) };
             let f = g.factor as f32;
             s.iter_mut().for_each(|x| *x *= f);

@@ -16,9 +16,14 @@ pub enum SinkError {
     Xrun,
     /// The device has gone away.
     Gone,
+    /// The device is there and refuses this configuration, such as a
+    /// channel count it does not take. Trying again changes nothing until
+    /// the configuration does.
+    Refused,
 }
 
-/// A device that takes S32 stereo frames. `wait_room` is the audio thread's
+/// A device that takes interleaved S32 frames of a fixed number of
+/// channels. `wait_room` is the audio thread's
 /// only wait. The engine calls it before it reads the clients, so that what
 /// it reads goes to the device at once and `write` finds room.
 pub trait Sink: Send {
@@ -28,7 +33,10 @@ pub trait Sink: Send {
     fn wait_room(&mut self) -> Result<(), SinkError> {
         Ok(())
     }
-    fn write(&mut self, frames: &[[i32; 2]]) -> Result<(), SinkError>;
+    /// Interleaved S32, `channels()` samples per frame.
+    fn write(&mut self, samples: &[i32]) -> Result<(), SinkError>;
+    /// Fixed for the life of the sink.
+    fn channels(&self) -> usize;
     fn close(&mut self);
     /// Frames between the sink's input and the listener.
     fn delay_frames(&self) -> u32;
@@ -53,8 +61,12 @@ impl Sink for Box<dyn Sink> {
         (**self).wait_room()
     }
 
-    fn write(&mut self, frames: &[[i32; 2]]) -> Result<(), SinkError> {
-        (**self).write(frames)
+    fn write(&mut self, samples: &[i32]) -> Result<(), SinkError> {
+        (**self).write(samples)
+    }
+
+    fn channels(&self) -> usize {
+        (**self).channels()
     }
 
     fn close(&mut self) {
@@ -118,9 +130,18 @@ impl Pacer {
 }
 
 /// Throws the audio away in real time.
-#[derive(Default)]
 pub struct NullSink {
     pacer: Pacer,
+    channels: usize,
+}
+
+impl NullSink {
+    pub fn new(channels: usize) -> NullSink {
+        NullSink {
+            pacer: Pacer::default(),
+            channels,
+        }
+    }
 }
 
 impl Sink for NullSink {
@@ -134,9 +155,13 @@ impl Sink for NullSink {
         Ok(())
     }
 
-    fn write(&mut self, frames: &[[i32; 2]]) -> Result<(), SinkError> {
-        self.pacer.write(frames.len());
+    fn write(&mut self, samples: &[i32]) -> Result<(), SinkError> {
+        self.pacer.write(samples.len() / self.channels);
         Ok(())
+    }
+
+    fn channels(&self) -> usize {
+        self.channels
     }
 
     fn close(&mut self) {}
@@ -152,7 +177,7 @@ impl Sink for NullSink {
 
 #[derive(Default)]
 struct Record {
-    frames: Vec<[i32; 2]>,
+    samples: Vec<i32>,
     opens: Vec<(u32, u32)>,
     closes: usize,
     failure: Option<SinkError>,
@@ -162,20 +187,35 @@ struct Record {
 
 /// Records what it is given, for tests. Its log stays readable after the sink
 /// has moved to the audio thread.
-#[derive(Default)]
 pub struct MemorySink {
     record: Arc<Mutex<Record>>,
     /// Keeps time like a card when set.
     pacer: Option<Pacer>,
+    channels: usize,
+}
+
+impl Default for MemorySink {
+    fn default() -> MemorySink {
+        MemorySink::with_channels(2)
+    }
 }
 
 impl MemorySink {
-    /// A sink that returns at once.
+    /// A stereo sink that returns at once.
     pub fn new() -> MemorySink {
         MemorySink::default()
     }
 
-    /// A sink that takes as long as a card would.
+    /// A sink of `channels` channels that returns at once.
+    pub fn with_channels(channels: usize) -> MemorySink {
+        MemorySink {
+            record: Arc::default(),
+            pacer: None,
+            channels,
+        }
+    }
+
+    /// A stereo sink that takes as long as a card would.
     pub fn paced() -> MemorySink {
         MemorySink {
             pacer: Some(Pacer::default()),
@@ -184,7 +224,10 @@ impl MemorySink {
     }
 
     pub fn log(&self) -> SinkLog {
-        SinkLog(self.record.clone())
+        SinkLog {
+            record: self.record.clone(),
+            channels: self.channels,
+        }
     }
 
     fn record(&self) -> MutexGuard<'_, Record> {
@@ -213,17 +256,28 @@ impl Sink for MemorySink {
         Ok(())
     }
 
-    fn write(&mut self, frames: &[[i32; 2]]) -> Result<(), SinkError> {
+    fn write(&mut self, samples: &[i32]) -> Result<(), SinkError> {
+        assert_eq!(
+            samples.len() % self.channels,
+            0,
+            "a write of {} samples is not whole frames of {} channels",
+            samples.len(),
+            self.channels
+        );
         let mut record = self.record();
         if let Some(e) = record.failure {
             return Err(e);
         }
-        record.frames.extend_from_slice(frames);
+        record.samples.extend_from_slice(samples);
         drop(record);
         if let Some(pacer) = &mut self.pacer {
-            pacer.write(frames.len());
+            pacer.write(samples.len() / self.channels);
         }
         Ok(())
+    }
+
+    fn channels(&self) -> usize {
+        self.channels
     }
 
     fn close(&mut self) {
@@ -241,15 +295,35 @@ impl Sink for MemorySink {
 
 /// A handle on what a `MemorySink` has seen, and on how it behaves.
 #[derive(Clone)]
-pub struct SinkLog(Arc<Mutex<Record>>);
+pub struct SinkLog {
+    record: Arc<Mutex<Record>>,
+    /// The channels of the sink, as many samples per frame.
+    channels: usize,
+}
 
 impl SinkLog {
     fn record(&self) -> MutexGuard<'_, Record> {
-        self.0.lock().unwrap()
+        self.record.lock().unwrap()
     }
 
+    /// What was written, as stereo frames. Panics for another channel
+    /// count.
     pub fn frames(&self) -> Vec<[i32; 2]> {
-        self.record().frames.clone()
+        assert_eq!(
+            self.channels, 2,
+            "frames() reads a stereo sink, this one has {}",
+            self.channels
+        );
+        self.record()
+            .samples
+            .chunks_exact(2)
+            .map(|f| [f[0], f[1]])
+            .collect()
+    }
+
+    /// What was written, interleaved.
+    pub fn samples(&self) -> Vec<i32> {
+        self.record().samples.clone()
     }
 
     /// Every successful `open`, as rate and period.
@@ -277,7 +351,8 @@ impl SinkLog {
     /// Makes room, so that recording does not allocate during a test of the
     /// audio thread.
     pub fn reserve(&self, frames: usize) {
-        self.record().frames.reserve(frames);
+        let samples = frames * self.channels;
+        self.record().samples.reserve(samples);
     }
 }
 
@@ -326,9 +401,16 @@ impl CardWatch {
 pub struct CardSearch {
     gone: Arc<AtomicBool>,
     retry: Arc<AtomicBool>,
+    refused: Arc<AtomicBool>,
 }
 
 impl CardSearch {
+    /// Whether the output is meant to play and the card refuses the
+    /// configuration. Trying again helps only once something has changed.
+    pub fn is_refused(&self) -> bool {
+        self.refused.load(Ordering::Acquire)
+    }
+
     /// Whether the output is meant to play and the real sink is gone.
     pub fn is_gone(&self) -> bool {
         self.gone.load(Ordering::Acquire)
@@ -382,6 +464,11 @@ pub struct FallbackSink {
     retry_now: Arc<AtomicBool>,
     /// A `CardSearch` was handed out, so retries come from there.
     searched: bool,
+    /// The last open was refused for good: only a reopen or an asked-for
+    /// retry tries again, never the clock.
+    refused: bool,
+    /// `refused`, for the control thread, while the output is open.
+    refusing: Arc<AtomicBool>,
     retry_at: Instant,
     retry: Duration,
 }
@@ -389,10 +476,10 @@ pub struct FallbackSink {
 impl FallbackSink {
     pub fn new(inner: Box<dyn Sink>) -> FallbackSink {
         FallbackSink {
+            null: NullSink::new(inner.channels()),
             rates: inner.supported_rates(),
             watch: None,
             inner,
-            null: NullSink::default(),
             format: (0, 0),
             live: false,
             switched: false,
@@ -402,6 +489,8 @@ impl FallbackSink {
             gone: Arc::default(),
             retry_now: Arc::default(),
             searched: false,
+            refused: false,
+            refusing: Arc::default(),
             retry_at: Instant::now(),
             retry: RETRY,
         }
@@ -430,12 +519,13 @@ impl FallbackSink {
         CardSearch {
             gone: self.gone.clone(),
             retry: self.retry_now.clone(),
+            refused: self.refusing.clone(),
         }
     }
 
     /// Whether to try the inner sink again now.
     fn retry_due(&mut self) -> bool {
-        if self.searched {
+        if self.searched || self.refused {
             self.retry_now.swap(false, Ordering::AcqRel)
         } else {
             Instant::now() >= self.retry_at
@@ -453,7 +543,9 @@ impl FallbackSink {
         // The control thread opened the mixer at the start, before any
         // open: a card gone at the very first open is a change too.
         let first = !std::mem::replace(&mut self.tried, true);
-        self.live = self.inner.open(rate, period).is_ok();
+        let opened = self.inner.open(rate, period);
+        self.live = opened.is_ok();
+        self.refused = opened == Err(SinkError::Refused);
         let changed = if self.live {
             !was_live
         } else {
@@ -462,7 +554,10 @@ impl FallbackSink {
         if changed {
             self.changes.fetch_add(1, Ordering::Release);
         }
-        self.gone.store(!self.live, Ordering::Release);
+        // A card that refuses is not gone, so nothing looks for it.
+        self.gone
+            .store(!self.live && !self.refused, Ordering::Release);
+        self.refusing.store(self.refused, Ordering::Release);
         self.retry_at = Instant::now() + self.retry;
         let rates = self.inner.supported_rates();
         if rates == self.rates {
@@ -513,18 +608,22 @@ impl Sink for FallbackSink {
         self.null.wait_room()
     }
 
-    fn write(&mut self, frames: &[[i32; 2]]) -> Result<(), SinkError> {
+    fn write(&mut self, samples: &[i32]) -> Result<(), SinkError> {
         if !self.live && self.retry_due() {
             self.try_inner();
             self.switched = self.live;
         }
         if self.live {
-            match self.inner.write(frames) {
+            match self.inner.write(samples) {
                 Err(SinkError::Gone) => self.lost(),
                 result => return result,
             }
         }
-        self.null.write(frames)
+        self.null.write(samples)
+    }
+
+    fn channels(&self) -> usize {
+        self.null.channels()
     }
 
     fn close(&mut self) {
@@ -534,6 +633,7 @@ impl Sink for FallbackSink {
             self.closed_live = true;
         }
         self.gone.store(false, Ordering::Release);
+        self.refusing.store(false, Ordering::Release);
     }
 
     fn delay_frames(&self) -> u32 {
@@ -562,7 +662,7 @@ mod tests {
         let mut sink = MemorySink::new();
         let log = sink.log();
         sink.open(48000, 2).unwrap();
-        sink.write(&[[1, 2], [3, 4]]).unwrap();
+        sink.write(&[1, 2, 3, 4]).unwrap();
         sink.close();
         assert_eq!(log.frames(), [[1, 2], [3, 4]]);
         assert_eq!(log.opens(), [(48000, 2)]);
@@ -575,12 +675,12 @@ mod tests {
         let log = sink.log();
         sink.open(48000, 2).unwrap();
         log.fail(Some(SinkError::Xrun));
-        assert_eq!(sink.write(&[[1, 2]]), Err(SinkError::Xrun));
+        assert_eq!(sink.write(&[1, 2]), Err(SinkError::Xrun));
         log.fail(Some(SinkError::Gone));
-        assert_eq!(sink.write(&[[1, 2]]), Err(SinkError::Gone));
+        assert_eq!(sink.write(&[1, 2]), Err(SinkError::Gone));
         assert_eq!(sink.open(48000, 2), Err(SinkError::Gone));
         log.fail(None);
-        sink.write(&[[5, 6]]).unwrap();
+        sink.write(&[5, 6]).unwrap();
         assert_eq!(log.frames(), [[5, 6]]);
     }
 
@@ -591,7 +691,7 @@ mod tests {
         let start = Instant::now();
         for _ in 0..cycles {
             sink.wait_room().unwrap();
-            sink.write(&frames).unwrap();
+            sink.write(frames.as_flattened()).unwrap();
         }
         start.elapsed()
     }
@@ -611,23 +711,23 @@ mod tests {
 
     #[test]
     fn null_sink_takes_one_period_per_cycle_once_full() {
-        let took = time_of_cycles(&mut NullSink::default(), 7);
+        let took = time_of_cycles(&mut NullSink::new(2), 7);
         assert!(took >= Duration::from_millis(50), "{took:?}");
     }
 
     #[test]
     fn null_sink_has_room_while_less_than_two_periods_are_queued() {
-        let took = time_of_cycles(&mut NullSink::default(), 2);
+        let took = time_of_cycles(&mut NullSink::new(2), 2);
         assert!(took < Duration::from_millis(10), "{took:?}");
     }
 
     #[test]
     fn null_sink_writes_do_not_wait() {
-        let mut sink = NullSink::default();
+        let mut sink = NullSink::new(2);
         sink.open(48000, 480).unwrap();
         let start = Instant::now();
         for _ in 0..5 {
-            sink.write(&[[0; 2]; 480]).unwrap();
+            sink.write([[0; 2]; 480].as_flattened()).unwrap();
         }
         assert!(start.elapsed() < Duration::from_millis(10));
     }
@@ -640,7 +740,7 @@ mod tests {
         log.set_delay(7);
         log.set_rates(vec![44100]);
         sink.open(44100, 1).unwrap();
-        sink.write(&[[9, 9]]).unwrap();
+        sink.write(&[9, 9]).unwrap();
         sink.close();
         assert_eq!(sink.delay_frames(), 7);
         assert_eq!(sink.supported_rates(), [44100]);
@@ -660,7 +760,7 @@ mod tests {
         let (mut sink, log) = fallback(RETRY);
         log.set_delay(11);
         sink.open(48000, 1).unwrap();
-        sink.write(&[[1, 1]]).unwrap();
+        sink.write(&[1, 1]).unwrap();
         assert_eq!(log.frames(), [[1, 1]]);
         assert_eq!(sink.delay_frames(), 11);
         sink.close();
@@ -672,7 +772,7 @@ mod tests {
         let (mut sink, log) = fallback(RETRY);
         sink.open(48000, 1).unwrap();
         log.fail(Some(SinkError::Xrun));
-        assert_eq!(sink.write(&[[1, 1]]), Err(SinkError::Xrun));
+        assert_eq!(sink.write(&[1, 1]), Err(SinkError::Xrun));
     }
 
     #[test]
@@ -680,11 +780,11 @@ mod tests {
         let (mut sink, log) = fallback(RETRY);
         sink.open(48000, 480).unwrap();
         log.fail(Some(SinkError::Gone));
-        assert_eq!(sink.write(&[[0; 2]; 480]), Ok(()));
+        assert_eq!(sink.write([[0; 2]; 480].as_flattened()), Ok(()));
         let start = Instant::now();
         for _ in 0..3 {
             assert_eq!(sink.wait_room(), Ok(()));
-            assert_eq!(sink.write(&[[0; 2]; 480]), Ok(()));
+            assert_eq!(sink.write([[0; 2]; 480].as_flattened()), Ok(()));
         }
         assert!(start.elapsed() >= Duration::from_millis(10));
         assert_eq!(sink.delay_frames(), 0);
@@ -695,7 +795,7 @@ mod tests {
         let (mut sink, log) = fallback(RETRY);
         log.fail(Some(SinkError::Gone));
         assert_eq!(sink.open(48000, 48), Ok(()));
-        assert_eq!(sink.write(&[[0; 2]; 48]), Ok(()));
+        assert_eq!(sink.write([[0; 2]; 48].as_flattened()), Ok(()));
     }
 
     #[test]
@@ -703,13 +803,13 @@ mod tests {
         let (mut sink, log) = fallback(RETRY);
         sink.open(48000, 48).unwrap();
         log.fail(Some(SinkError::Gone));
-        sink.write(&[[1; 2]; 48]).unwrap();
+        sink.write([[1; 2]; 48].as_flattened()).unwrap();
         log.fail(None);
         // Too early: the retry is not due, so this goes to the null sink.
-        sink.write(&[[2; 2]; 48]).unwrap();
+        sink.write([[2; 2]; 48].as_flattened()).unwrap();
         assert!(log.frames().is_empty());
         sink.retry_at = Instant::now();
-        sink.write(&[[3; 2]; 48]).unwrap();
+        sink.write([[3; 2]; 48].as_flattened()).unwrap();
         assert_eq!(log.frames(), [[3; 2]; 48]);
         assert_eq!(log.opens(), [(48000, 48), (48000, 48)]);
     }
@@ -721,14 +821,14 @@ mod tests {
         // Opened by the engine, not inside a write.
         assert!(!sink.switched());
         log.fail(Some(SinkError::Gone));
-        sink.write(&[[1; 2]; 48]).unwrap();
-        sink.write(&[[1; 2]; 48]).unwrap();
+        sink.write([[1; 2]; 48].as_flattened()).unwrap();
+        sink.write([[1; 2]; 48].as_flattened()).unwrap();
         assert!(!sink.switched());
         log.fail(None);
-        sink.write(&[[2; 2]; 48]).unwrap();
+        sink.write([[2; 2]; 48].as_flattened()).unwrap();
         assert!(sink.switched());
         assert!(!sink.switched());
-        sink.write(&[[2; 2]; 48]).unwrap();
+        sink.write([[2; 2]; 48].as_flattened()).unwrap();
         assert!(!sink.switched());
     }
 
@@ -744,26 +844,79 @@ mod tests {
         assert!(search.is_gone());
         log.fail(None);
         for _ in 0..3 {
-            sink.write(&[[1; 2]; 48]).unwrap();
+            sink.write([[1; 2]; 48].as_flattened()).unwrap();
         }
         assert!(log.opens().is_empty());
         search.retry();
-        sink.write(&[[2; 2]; 48]).unwrap();
+        sink.write([[2; 2]; 48].as_flattened()).unwrap();
         assert_eq!(log.frames(), [[2; 2]; 48]);
         assert!(!search.is_gone());
         // A retry that fails is asked for again, not repeated by itself.
         log.fail(Some(SinkError::Gone));
-        sink.write(&[[3; 2]; 48]).unwrap();
+        sink.write([[3; 2]; 48].as_flattened()).unwrap();
         assert!(search.is_gone());
         search.retry();
-        sink.write(&[[3; 2]; 48]).unwrap();
+        sink.write([[3; 2]; 48].as_flattened()).unwrap();
         log.fail(None);
-        sink.write(&[[3; 2]; 48]).unwrap();
+        sink.write([[3; 2]; 48].as_flattened()).unwrap();
         assert_eq!(log.opens().len(), 1);
         assert!(search.is_gone());
         // A closed output is not looked for.
         sink.close();
         assert!(!search.is_gone());
+    }
+
+    #[test]
+    fn a_refused_open_is_not_retried_by_the_clock() {
+        let (mut sink, log) = fallback(Duration::ZERO);
+        log.fail(Some(SinkError::Refused));
+        sink.open(48000, 48).unwrap();
+        log.fail(None);
+        for _ in 0..5 {
+            sink.write([[1; 2]; 48].as_flattened()).unwrap();
+        }
+        assert!(log.frames().is_empty());
+        assert_eq!(log.opens().len(), 0);
+        // A reopen tries again.
+        sink.open(44100, 48).unwrap();
+        sink.write([[2; 2]; 48].as_flattened()).unwrap();
+        assert_eq!(log.frames(), [[2; 2]; 48]);
+    }
+
+    #[test]
+    fn a_refused_open_is_not_looked_for_but_an_asked_retry_tries_again() {
+        let (mut sink, log) = fallback(Duration::ZERO);
+        let search = sink.card_search();
+        log.fail(Some(SinkError::Refused));
+        sink.open(48000, 48).unwrap();
+        // Not gone, but refusing: only a change makes a try worth it.
+        assert!(!search.is_gone());
+        assert!(search.is_refused());
+        log.fail(None);
+        for _ in 0..3 {
+            sink.write([[1; 2]; 48].as_flattened()).unwrap();
+        }
+        assert!(log.frames().is_empty());
+        search.retry();
+        sink.write([[2; 2]; 48].as_flattened()).unwrap();
+        assert_eq!(log.frames(), [[2; 2]; 48]);
+        assert!(!search.is_refused());
+        // A closed output is not looked after.
+        log.fail(Some(SinkError::Refused));
+        sink.open(48000, 48).unwrap();
+        assert!(search.is_refused());
+        sink.close();
+        assert!(!search.is_refused());
+    }
+
+    #[test]
+    fn an_ordinary_failed_open_is_retried_after_the_interval() {
+        let (mut sink, log) = fallback(Duration::ZERO);
+        log.fail(Some(SinkError::Gone));
+        sink.open(48000, 48).unwrap();
+        log.fail(None);
+        sink.write([[1; 2]; 48].as_flattened()).unwrap();
+        assert_eq!(log.frames(), [[1; 2]; 48]);
     }
 
     #[test]
@@ -773,14 +926,14 @@ mod tests {
         sink.open(48000, 48).unwrap();
         // The control thread saw the sink gone a moment ago and asks late.
         search.retry();
-        sink.write(&[[1; 2]; 48]).unwrap();
+        sink.write([[1; 2]; 48].as_flattened()).unwrap();
         log.fail(Some(SinkError::Gone));
-        sink.write(&[[1; 2]; 48]).unwrap();
+        sink.write([[1; 2]; 48].as_flattened()).unwrap();
         assert!(search.is_gone());
         // Nobody has seen the card since it went, so it is not tried, even
         // though it would open.
         log.fail(None);
-        sink.write(&[[2; 2]; 48]).unwrap();
+        sink.write([[2; 2]; 48].as_flattened()).unwrap();
         assert_eq!(log.opens().len(), 1);
         assert!(search.is_gone());
     }
@@ -798,7 +951,7 @@ mod tests {
         assert_no_alloc::assert_no_alloc(|| {
             for _ in 0..3 {
                 sink.wait_room().unwrap();
-                sink.write(&frames).unwrap();
+                sink.write(frames.as_flattened()).unwrap();
             }
         });
     }
@@ -812,7 +965,7 @@ mod tests {
         assert_eq!(watch.take(), None);
         log.set_rates(vec![44100, 48000]);
         log.fail(None);
-        sink.write(&[[0; 2]; 48]).unwrap();
+        sink.write([[0; 2]; 48].as_flattened()).unwrap();
         assert_eq!(watch.take(), Some(vec![44100, 48000]));
         // Unchanged rates are not published again.
         sink.close();
@@ -846,13 +999,13 @@ mod tests {
         assert!(!watch.changed());
         // Gone, so the control thread can let go of the old card.
         log.fail(Some(SinkError::Gone));
-        sink.write(&[[0; 2]; 48]).unwrap();
+        sink.write([[0; 2]; 48].as_flattened()).unwrap();
         assert!(watch.changed());
         // A failed retry is no change.
-        sink.write(&[[0; 2]; 48]).unwrap();
+        sink.write([[0; 2]; 48].as_flattened()).unwrap();
         assert!(!watch.changed());
         log.fail(None);
-        sink.write(&[[0; 2]; 48]).unwrap();
+        sink.write([[0; 2]; 48].as_flattened()).unwrap();
         assert!(watch.changed());
         // Closed while idle, then opened: the card may have changed meanwhile.
         sink.close();
@@ -871,10 +1024,10 @@ mod tests {
         // must hear that the card is gone to let go of it.
         assert!(watch.changed());
         // A failed retry after that is no change.
-        sink.write(&[[0; 2]; 48]).unwrap();
+        sink.write([[0; 2]; 48].as_flattened()).unwrap();
         assert!(!watch.changed());
         log.fail(None);
-        sink.write(&[[0; 2]; 48]).unwrap();
+        sink.write([[0; 2]; 48].as_flattened()).unwrap();
         assert!(watch.changed());
     }
 
@@ -893,12 +1046,12 @@ mod tests {
         sink.open(48000, 48).unwrap();
         assert!(watch.changed());
         // Further failed tries are no change.
-        sink.write(&[[0; 2]; 48]).unwrap();
+        sink.write([[0; 2]; 48].as_flattened()).unwrap();
         sink.close();
         sink.open(48000, 48).unwrap();
         assert!(!watch.changed());
         log.fail(None);
-        sink.write(&[[0; 2]; 48]).unwrap();
+        sink.write([[0; 2]; 48].as_flattened()).unwrap();
         assert!(watch.changed());
     }
 
@@ -918,12 +1071,102 @@ mod tests {
         let (mut sink, log) = fallback(Duration::ZERO);
         sink.open(48000, 48).unwrap();
         log.fail(Some(SinkError::Gone));
-        sink.write(&[[1; 2]; 48]).unwrap();
+        sink.write([[1; 2]; 48].as_flattened()).unwrap();
         sink.close();
         log.fail(None);
         sink.open(44100, 32).unwrap();
         assert_eq!(*log.opens().last().unwrap(), (44100, 32));
-        sink.write(&[[4; 2]; 32]).unwrap();
+        sink.write([[4; 2]; 32].as_flattened()).unwrap();
         assert_eq!(log.frames(), [[4; 2]; 32]);
+    }
+
+    #[test]
+    fn a_memory_sink_with_four_channels_records_interleaved_samples() {
+        let mut sink = MemorySink::with_channels(4);
+        let log = sink.log();
+        assert_eq!(sink.channels(), 4);
+        sink.open(48000, 2).unwrap();
+        sink.write(&[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+        sink.write(&[9, 10, 11, 12]).unwrap();
+        assert_eq!(log.samples(), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+    }
+
+    #[test]
+    #[should_panic(expected = "not whole frames")]
+    fn a_write_that_is_not_whole_frames_panics_in_the_memory_sink() {
+        let mut sink = MemorySink::with_channels(4);
+        sink.write(&[1, 2, 3, 4, 5, 6]).unwrap();
+    }
+
+    #[test]
+    #[should_panic(expected = "stereo")]
+    fn the_stereo_accessor_panics_for_another_channel_count() {
+        MemorySink::with_channels(4).log().frames();
+    }
+
+    /// A card that takes six channels, or says it does not.
+    struct SixChannels {
+        opens: Arc<AtomicU64>,
+        refuses: Arc<AtomicBool>,
+    }
+
+    impl Sink for SixChannels {
+        fn open(&mut self, _rate: u32, _period: u32) -> Result<(), SinkError> {
+            self.opens.fetch_add(1, Ordering::Relaxed);
+            match self.refuses.load(Ordering::Relaxed) {
+                true => Err(SinkError::Gone),
+                false => Ok(()),
+            }
+        }
+
+        fn write(&mut self, _samples: &[i32]) -> Result<(), SinkError> {
+            Ok(())
+        }
+
+        fn channels(&self) -> usize {
+            6
+        }
+
+        fn close(&mut self) {}
+
+        fn delay_frames(&self) -> u32 {
+            0
+        }
+
+        fn supported_rates(&self) -> Vec<u32> {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn a_card_that_refuses_the_channel_count_counts_as_missing() {
+        let opens = Arc::new(AtomicU64::new(0));
+        let refuses = Arc::new(AtomicBool::new(true));
+        let card = SixChannels {
+            opens: opens.clone(),
+            refuses: refuses.clone(),
+        };
+        let mut sink = FallbackSink::new(Box::new(card));
+        sink.retry = Duration::from_secs(3600);
+        assert_eq!(sink.channels(), 6);
+        assert_eq!(sink.open(48000, 480), Ok(()));
+        assert_eq!(opens.load(Ordering::Relaxed), 1);
+        let start = Instant::now();
+        for _ in 0..4 {
+            assert_eq!(sink.wait_room(), Ok(()));
+            assert_eq!(sink.write(&[0; 6 * 480]), Ok(()));
+        }
+        // The null sink keeps time for six channels: a period of 480
+        // frames takes 10 ms, two of them are queued before it waits.
+        assert!(start.elapsed() >= Duration::from_millis(10));
+        assert!(!sink.live);
+        // Not due yet, so it is not tried again.
+        assert_eq!(opens.load(Ordering::Relaxed), 1);
+        refuses.store(false, Ordering::Relaxed);
+        sink.retry_at = Instant::now();
+        sink.write(&[0; 6 * 480]).unwrap();
+        assert_eq!(opens.load(Ordering::Relaxed), 2);
+        assert!(sink.live);
+        assert!(sink.switched());
     }
 }

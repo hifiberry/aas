@@ -3,12 +3,13 @@
 
 use crate::board;
 use crate::cards;
-use crate::config::{Config, Format};
+use crate::config::{BitPerfect, Config, Format};
 use crate::control::{Answer, ConnId, Control, OpenCapture, eventfd};
 use crate::counters::Counters;
 use crate::engine::Engine;
 use crate::format::{F32, F64, I32, Processing};
-use crate::plugin::build::{Chains, Libraries};
+use crate::matrix::{INPUT_NAMES, Matrix};
+use crate::plugin::build::{Chains, Libraries, matrix_width, widths};
 use crate::rate::STANDARD_RATES;
 use crate::rt;
 use crate::sink::{CardSearch, CardWatch, FallbackSink, RETRY, RatesWatch, Sink};
@@ -47,9 +48,13 @@ fn check(rc: isize) -> io::Result<usize> {
     }
 }
 
-/// Says whether the card the sink plays to is present. Called on the
-/// control thread, once a second while the sink is gone.
-pub type CardProbe = Box<dyn FnMut() -> bool + Send>;
+/// Says whether the audio thread should try the sink again. Called on the
+/// control thread, once a second while the sink is gone, with `false`: is
+/// the card present. While the card refuses the configuration it is called
+/// with `true`: has the set of cards changed since last time, so that a
+/// card unplugged and plugged in again, or another one, is tried once, and
+/// the refusal is not retried every second.
+pub type CardProbe = Box<dyn FnMut(bool) -> bool + Send>;
 
 /// Runs the daemon as `run_probing` does, with no probe for the card: the
 /// audio thread then tries a sink that is gone every second by itself.
@@ -119,13 +124,17 @@ pub fn run_probing(
         &supported[..]
     };
     let mut libraries = Libraries::default();
+    let matrix = build_matrix(&config, &mut libraries)?;
     let chains = Chains::build_for_start(
         &config.plugins,
         config.default_rate,
         others,
         config.format,
+        config.channels,
         &mut libraries,
     )?;
+    check_forced(&config, &mut libraries)?;
+    eprintln!("aas: matrix: {}", describe(&matrix));
     let notify = eventfd().map_err(|e| format!("eventfd: {e}"))?;
     let listener = listen(socket).map_err(|e| format!("{}: {e}", socket.display()))?;
     let mut sink = FallbackSink::new(sink);
@@ -141,18 +150,36 @@ pub fn run_probing(
     let spawned = thread::Builder::new().name("aas-audio".into());
     let audio = match config.format {
         Format::I32 => {
-            let engine =
-                Engine::<I32, _>::new(sink, command_queue, event_queue, engine_counters, mode);
+            let engine = Engine::<I32, _>::new(
+                sink,
+                command_queue,
+                event_queue,
+                engine_counters,
+                mode,
+                matrix,
+            );
             spawned.spawn(move || audio_loop(engine, wake))
         }
         Format::F32 => {
-            let engine =
-                Engine::<F32, _>::new(sink, command_queue, event_queue, engine_counters, mode);
+            let engine = Engine::<F32, _>::new(
+                sink,
+                command_queue,
+                event_queue,
+                engine_counters,
+                mode,
+                matrix,
+            );
             spawned.spawn(move || audio_loop(engine, wake))
         }
         Format::F64 => {
-            let engine =
-                Engine::<F64, _>::new(sink, command_queue, event_queue, engine_counters, mode);
+            let engine = Engine::<F64, _>::new(
+                sink,
+                command_queue,
+                event_queue,
+                engine_counters,
+                mode,
+                matrix,
+            );
             spawned.spawn(move || audio_loop(engine, wake))
         }
     }
@@ -216,6 +243,55 @@ pub fn run_probing(
         Ok(()) if died => Err("the audio thread stopped".to_string()),
         Ok(()) => Ok(()),
     }
+}
+
+/// The matrix of the config, as wide as the plugins of the `mix` and
+/// `output` chains make it. Without `[[matrix]]` tables it is the default.
+/// A route to a channel above the width is an error.
+pub fn build_matrix(config: &Config, libraries: &mut Libraries) -> Result<Matrix, String> {
+    let width = matrix_width(&config.plugins, config.channels, libraries).map_err(|e| e.message)?;
+    match &config.matrix {
+        None => Ok(Matrix::default_for(width)),
+        Some(routes) => Matrix::from_routes(routes, width),
+    }
+}
+
+/// Forced bit-perfect bypasses the `mix` and `output` chains, so it cannot
+/// work with chains that change the channel count: the matrix would not
+/// reach the card's channels. A matrix narrower or wider than the card
+/// comes only from such chains, and is refused with them.
+pub fn check_forced(config: &Config, libraries: &mut Libraries) -> Result<(), String> {
+    if config.bit_perfect != BitPerfect::Forced {
+        return Ok(());
+    }
+    let w = widths(&config.plugins, config.channels, libraries).map_err(|(_, e)| e.message)?;
+    if w.changes || w.mix != config.channels {
+        return Err("bit_perfect = \"forced\" needs chains that keep the channel count".into());
+    }
+    Ok(())
+}
+
+/// The routes of `matrix` for the log, such as `players.left to 1`, with
+/// the gain where it is not 0 dB.
+pub fn describe(matrix: &Matrix) -> String {
+    let mut routes = Vec::new();
+    for (input, name) in INPUT_NAMES.iter().enumerate() {
+        for channel in 0..matrix.width() {
+            let gain = matrix.gain(input, channel);
+            if gain == 0.0 {
+                continue;
+            }
+            let mut route = format!("{name} to {}", channel + 1);
+            if gain != 1.0 {
+                route += &format!(" at {:.2} dB", 20.0 * gain.log10());
+            }
+            routes.push(route);
+        }
+    }
+    if routes.is_empty() {
+        return "no routes, every channel is silent".to_string();
+    }
+    routes.join(", ")
 }
 
 /// Logs a wake-up gap longer than the buffer soon after it happens, with
@@ -321,7 +397,8 @@ impl Server {
         // After the card change above: the mixer of a card that has just
         // gone is closed by now, so the card is no longer listed for that.
         if let Some((search, probe)) = &mut self.search {
-            if self.probe_wait.due(search.is_gone(), now) && probe() {
+            let refused = search.is_refused();
+            if self.probe_wait.due(search.is_gone() || refused, now) && probe(refused) {
                 search.retry();
             }
         }
@@ -554,6 +631,27 @@ impl ProbeWait {
     }
 }
 
+/// Notices a change in the list of cards between looks.
+#[derive(Default)]
+pub struct ListChange {
+    last: Option<Vec<String>>,
+}
+
+impl ListChange {
+    /// Whether `now` differs from the list at the last look. The first look
+    /// only takes the baseline.
+    pub fn changed(&mut self, now: Vec<String>) -> bool {
+        self.last
+            .replace(now.clone())
+            .is_some_and(|last| last != now)
+    }
+
+    /// Forgets the list, so that the next look is a baseline.
+    pub fn reset(&mut self) {
+        self.last = None;
+    }
+}
+
 /// Whether an accept failed for want of a descriptor or memory. The
 /// connection is still queued then, and trying again at once cannot help.
 fn accept_must_pause(e: &io::Error) -> bool {
@@ -695,6 +793,107 @@ mod tests {
     }
 
     #[test]
+    fn the_matrix_is_logged_route_by_route_with_gains_off_0_db() {
+        assert_eq!(
+            describe(&Matrix::default_for(2)),
+            "players.left to 1, players.right to 2, analog.left to 1, analog.right to 2"
+        );
+        let route = |from, to, gain_db| crate::config::Route { from, to, gain_db };
+        let m = Matrix::from_routes(&[route(1, 1, 0.0), route(0, 2, -6.0)], 2).unwrap();
+        assert_eq!(
+            describe(&m),
+            "players.left to 2 at -6.00 dB, players.right to 1"
+        );
+        let m = Matrix::from_routes(&[], 2).unwrap();
+        assert_eq!(describe(&m), "no routes, every channel is silent");
+    }
+
+    #[test]
+    fn a_route_above_the_width_of_the_matrix_is_an_error() {
+        let mut config = Config {
+            channels: 4,
+            ..Config::default()
+        };
+        let route = |from, to| crate::config::Route {
+            from,
+            to,
+            gain_db: 0.0,
+        };
+        config.matrix = Some(vec![route(0, 4)]);
+        let mut libraries = Libraries::default();
+        assert_eq!(build_matrix(&config, &mut libraries).unwrap().width(), 4);
+        // A balance on the mix takes two channels, so the matrix has two.
+        config.plugins = vec![crate::config::PluginConfig {
+            place: crate::config::PluginPlace::Mix,
+            kind: "balance".into(),
+            path: None,
+            params: Default::default(),
+        }];
+        let e = build_matrix(&config, &mut libraries).unwrap_err();
+        assert!(e.contains("channel 4") && e.contains("2 channels"), "{e}");
+        config.matrix = None;
+        assert_eq!(
+            build_matrix(&config, &mut libraries).unwrap(),
+            Matrix::default_for(2)
+        );
+    }
+
+    #[test]
+    fn forced_bit_perfect_with_chains_that_change_the_count_stops_the_start() {
+        let mix = |kind: &str| crate::config::PluginConfig {
+            place: crate::config::PluginPlace::Mix,
+            kind: kind.into(),
+            path: None,
+            params: Default::default(),
+        };
+        let output = |kind: &str| crate::config::PluginConfig {
+            place: crate::config::PluginPlace::Output,
+            ..mix(kind)
+        };
+        // Widened on the mix and narrowed on the output: in automatic mode
+        // the chains end at the card's two channels.
+        let config = Config {
+            bit_perfect: BitPerfect::Forced,
+            plugins: vec![mix("widen"), output("narrow")],
+            ..Config::default()
+        };
+        let mut libraries = Libraries::default();
+        let auto = Config {
+            bit_perfect: BitPerfect::Auto,
+            ..config.clone()
+        };
+        assert_eq!(check_forced(&auto, &mut libraries), Ok(()));
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("aas.sock");
+        let state = dir.path().join("state.toml");
+        let sink = crate::sink::MemorySink::paced();
+        let log = sink.log();
+        let shutdown = Arc::new(AtomicBool::new(true));
+        let result = run(
+            config,
+            Box::new(sink),
+            &socket,
+            &state,
+            None,
+            None,
+            shutdown,
+        );
+        assert_eq!(
+            result,
+            Err("bit_perfect = \"forced\" needs chains that keep the channel count".into())
+        );
+        assert!(log.opens().is_empty());
+        assert!(!socket.exists());
+        // Chains that keep the count are fine.
+        let kept = Config {
+            bit_perfect: BitPerfect::Forced,
+            plugins: vec![mix("balance")],
+            ..Config::default()
+        };
+        assert_eq!(check_forced(&kept, &mut libraries), Ok(()));
+    }
+
+    #[test]
     fn a_notice_is_sent_when_the_unread_bytes_cannot_be_told() {
         // The ioctl fails on a descriptor that is no socket.
         let file = OwnedFd::from(fs::File::open("/dev/null").unwrap());
@@ -719,6 +918,23 @@ mod tests {
         assert!(!wait.due(true, t + ms(4000)));
         assert!(!wait.due(true, t + ms(4900)));
         assert!(wait.due(true, t + ms(5000)));
+    }
+
+    #[test]
+    fn a_change_in_the_card_list_is_seen_once() {
+        let list = |ids: &[&str]| ids.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let mut change = ListChange::default();
+        // The first look is the baseline.
+        assert!(!change.changed(list(&["a"])));
+        assert!(!change.changed(list(&["a"])));
+        assert!(change.changed(list(&[])));
+        assert!(!change.changed(list(&[])));
+        assert!(change.changed(list(&["a"])));
+        assert!(change.changed(list(&["a", "b"])));
+        assert!(!change.changed(list(&["a", "b"])));
+        // Forgotten while not refused: the next look is a baseline again.
+        change.reset();
+        assert!(!change.changed(list(&["a"])));
     }
 
     #[test]

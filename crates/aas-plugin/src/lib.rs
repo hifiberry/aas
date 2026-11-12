@@ -1,4 +1,4 @@
-//! The C ABI of aas plugins, version 1.
+//! The C ABI of aas plugins, version 2.
 //!
 //! A plugin is a shared library that exports one function,
 //! `aas_plugin`, which returns a pointer to a [`Descriptor`]. The daemon
@@ -6,12 +6,23 @@
 //! strings and the parameter list it points to must live as long as the
 //! library and never change.
 //!
-//! A plugin processes stereo audio in place, in one of the formats it
-//! names. Stereo in place is fixed in version 1: `channels_in` and
-//! `channels_out` must both be 2. A plugin that changes the channel count
-//! needs a separate output buffer, which is ABI version 2. Float samples
-//! are scaled so that full scale is 1.0 and are not clipped. `process`
-//! may be called with `frames == 0`.
+//! A plugin processes audio in one of the formats it names, for 1 to 8
+//! channels. It takes a fixed count of channels and gives a fixed count
+//! (`channels_in` and `channels_out`, each 1 to 8), or takes any count and
+//! keeps it (both 0): `create` then tells it the count. A plugin whose
+//! counts are equal processes in place with `process`. One whose counts
+//! differ gives `process_into`, which reads one buffer and writes another;
+//! it gives `process` too, which is never called then.
+//! Float samples are scaled so that full scale is 1.0 and are not
+//! clipped. `process` and `process_into` may be called with
+//! `frames == 0`.
+//!
+//! Version 1 took stereo in place only, and its `create` had no channel
+//! count. The daemon still loads a version 1 library, as a plugin with two
+//! channels in and out. A version 1 descriptor is not this crate's
+//! [`Descriptor`]: it ends at `set_param_text`, and its `create` is
+//! `extern "C" fn(rate: u32, max_frames: u32, instance: *mut *mut c_void)
+//! -> u32`.
 //!
 //! # Threads
 //!
@@ -40,9 +51,10 @@
 //!
 //! [`Descriptor`] and [`ParamInfo`] start with their size, as the plugin
 //! was compiled. Within an ABI version fields are only ever appended: the
-//! layout of version 1 as first published is frozen, with
-//! [`DESCRIPTOR_SIZE_V1`] and [`PARAM_INFO_SIZE_V1`] its sizes. The daemon
-//! refuses a size smaller than those, larger than [`MAX_STRUCT_SIZE`] or
+//! layout of each version as first published is frozen, with
+//! [`DESCRIPTOR_SIZE_V1`], [`DESCRIPTOR_SIZE_V2`] and
+//! [`PARAM_INFO_SIZE_V1`] its sizes. The daemon refuses a size smaller than
+//! the version's, larger than [`MAX_STRUCT_SIZE`] or
 //! not a multiple of the struct's alignment, ignores trailing bytes it does
 //! not know, and steps through the parameter list by the size its entries
 //! state. A plugin sets them to [`DESCRIPTOR_SIZE`] and [`PARAM_INFO_SIZE`].
@@ -109,8 +121,8 @@
 //!     abi: ABI,
 //!     name: c"example".as_ptr(),
 //!     formats: FORMAT_F32,
-//!     channels_in: 2,
-//!     channels_out: 2,
+//!     channels_in: 0,
+//!     channels_out: 0,
 //!     param_count: PARAMS.len() as u32,
 //!     params: PARAMS.as_ptr(),
 //!     create: Some(create),
@@ -121,13 +133,14 @@
 //!     process: Some(process),
 //!     reset: None,
 //!     set_param_text: None,
+//!     process_into: None,
 //! };
 //!
 //! #[unsafe(no_mangle)]
 //! pub extern "C" fn aas_plugin() -> *const Descriptor {
 //!     &DESCRIPTOR
 //! }
-//! # extern "C" fn create(_: u32, _: u32, _: *mut *mut c_void) -> u32 { 2 }
+//! # extern "C" fn create(_: u32, _: u32, _: u32, _: *mut *mut c_void) -> u32 { 2 }
 //! # extern "C" fn destroy(_: *mut c_void) {}
 //! # extern "C" fn set_param(_: *mut c_void, _: u32, _: f64) {}
 //! # extern "C" fn neutral(_: *const c_void) -> u32 { 1 }
@@ -139,8 +152,8 @@
 
 use std::ffi::{c_char, c_void};
 
-/// The ABI version this crate describes. The daemon refuses any other.
-pub const ABI: u32 = 1;
+/// The ABI version this crate describes. The daemon also takes version 1.
+pub const ABI: u32 = 2;
 
 /// Signed 32 bit integer samples, full scale at 2^31.
 pub const FORMAT_I32: u32 = 1;
@@ -224,15 +237,18 @@ pub struct Descriptor {
     /// The size of this struct as the plugin was compiled,
     /// [`DESCRIPTOR_SIZE`].
     pub size: u32,
-    /// Must be [`ABI`].
+    /// Must be [`ABI`] for a descriptor of this crate, never 1: the daemon
+    /// would call `create` as version 1 has it, with one argument fewer,
+    /// which it cannot detect.
     pub abi: u32,
     /// A NUL terminated UTF-8 name. Must not be null.
     pub name: *const c_char,
     /// The formats `process` takes, a mask of the `FORMAT_` bits. Not 0.
     pub formats: u32,
-    /// 2 in version 1. Other channel counts come with the matrix.
+    /// 0 with `channels_out` 0: any count, which the plugin keeps. Else the
+    /// fixed input count, 1 to 8.
     pub channels_in: u32,
-    /// 2 in version 1.
+    /// 0 with `channels_in` 0, else the fixed output count, 1 to 8.
     pub channels_out: u32,
     /// The number of entries at `params`.
     pub param_count: u32,
@@ -241,11 +257,14 @@ pub struct Descriptor {
     pub params: *const ParamInfo,
     /// Builds an instance for `rate` Hz and blocks of up to `max_frames`
     /// frames, with every parameter at its default, and stores it at
-    /// `instance`. Returns [`CREATE_OK`], [`CREATE_UNSUPPORTED`] or
+    /// `instance`. `channels` is the count of the blocks the instance is
+    /// given: `channels_in` for a fixed plugin, else the count the plugin
+    /// is to keep, 1 to 8. Returns [`CREATE_OK`], [`CREATE_UNSUPPORTED`] or
     /// [`CREATE_FAILED`], and stores an instance, not null, only with
     /// `CREATE_OK`.
-    pub create:
-        Option<extern "C" fn(rate: u32, max_frames: u32, instance: *mut *mut c_void) -> u32>,
+    pub create: Option<
+        extern "C" fn(rate: u32, max_frames: u32, channels: u32, instance: *mut *mut c_void) -> u32,
+    >,
     /// Frees an instance `create` returned.
     pub destroy: Option<extern "C" fn(*mut c_void)>,
     /// Sets parameter `index` to `value`. The daemon passes only indices
@@ -257,10 +276,12 @@ pub struct Descriptor {
     pub neutral: Option<extern "C" fn(*const c_void) -> u32>,
     /// How many frames the instance delays the audio by.
     pub latency: Option<extern "C" fn(*const c_void) -> u32>,
-    /// Processes `frames` frames in place: `2 * frames` interleaved samples
-    /// in `format`, one of the `FORMAT_` bits in `formats`. `frames` is at
-    /// most the `max_frames` of `create`, and may be 0. Returns a mask of
-    /// the `STATUS_` bits.
+    /// Processes `frames` frames in place: `frames * channels` interleaved
+    /// samples in `format`, one of the `FORMAT_` bits in `formats`, where
+    /// `channels` is that of `create`. `frames` is at most the `max_frames`
+    /// of `create`, and may be 0. Returns a mask of the `STATUS_` bits. Every
+    /// plugin gives it, and the daemon refuses a descriptor without; for a
+    /// plugin whose counts differ it is never called, and may do nothing.
     pub process:
         Option<extern "C" fn(*mut c_void, format: u32, samples: *mut c_void, frames: u32) -> u32>,
     /// Clears what the instance keeps from earlier blocks, such as a
@@ -289,6 +310,20 @@ pub struct Descriptor {
     /// otherwise.
     pub set_param_text:
         Option<extern "C" fn(*mut c_void, index: u32, text: *const u8, len: u32) -> u32>,
+    /// Appended in version 2. Must be given if the counts differ, may be
+    /// `None` otherwise. Reads `frames * channels_in` samples in `format`
+    /// at `input` and writes `frames * channels_out` at `output`; the two
+    /// do not overlap. `frames` is at most the `max_frames` of `create`,
+    /// and may be 0. Returns a mask of the `STATUS_` bits.
+    pub process_into: Option<
+        extern "C" fn(
+            *mut c_void,
+            format: u32,
+            input: *const c_void,
+            output: *mut c_void,
+            frames: u32,
+        ) -> u32,
+    >,
 }
 
 /// The size of [`Descriptor`] as this crate has it, for its `size`. It grows
@@ -303,6 +338,12 @@ pub const PARAM_INFO_SIZE: u32 = std::mem::size_of::<ParamInfo>() as u32;
 pub const DESCRIPTOR_SIZE_V1: u32 = 104;
 #[cfg(target_pointer_width = "32")]
 pub const DESCRIPTOR_SIZE_V1: u32 = 64;
+/// The size of the first [`Descriptor`] of version 2, which ends with
+/// `process_into`. It never changes: the daemon refuses a smaller one.
+#[cfg(target_pointer_width = "64")]
+pub const DESCRIPTOR_SIZE_V2: u32 = 112;
+#[cfg(target_pointer_width = "32")]
+pub const DESCRIPTOR_SIZE_V2: u32 = 68;
 /// The size of the first [`ParamInfo`] of version 1. It never changes.
 #[cfg(target_pointer_width = "64")]
 pub const PARAM_INFO_SIZE_V1: u32 = 72;
@@ -314,14 +355,18 @@ pub const PARAM_INFO_SIZE_V1: u32 = 48;
 /// size is refused rather than read.
 pub const MAX_STRUCT_SIZE: u32 = 4096;
 
-// Version 1 is frozen: these offsets and sizes never change. Fields are
+// Versions 1 and 2 are frozen: these offsets and sizes never change. Fields are
 // only ever appended, after them.
 const _: () = {
     use std::mem::{offset_of, size_of};
     #[cfg(target_pointer_width = "64")]
-    const D: [usize; 16] = [0, 4, 8, 16, 20, 24, 28, 32, 40, 48, 56, 64, 72, 80, 88, 96];
+    const D: [usize; 17] = [
+        0, 4, 8, 16, 20, 24, 28, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104,
+    ];
     #[cfg(target_pointer_width = "32")]
-    const D: [usize; 16] = [0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52, 56, 60];
+    const D: [usize; 17] = [
+        0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52, 56, 60, 64,
+    ];
     assert!(offset_of!(Descriptor, size) == D[0]);
     assert!(offset_of!(Descriptor, abi) == D[1]);
     assert!(offset_of!(Descriptor, name) == D[2]);
@@ -338,7 +383,11 @@ const _: () = {
     assert!(offset_of!(Descriptor, process) == D[13]);
     assert!(offset_of!(Descriptor, reset) == D[14]);
     assert!(offset_of!(Descriptor, set_param_text) == D[15]);
-    assert!(size_of::<Descriptor>() == DESCRIPTOR_SIZE_V1 as usize);
+    assert!(offset_of!(Descriptor, process_into) == D[16]);
+    assert!(
+        offset_of!(Descriptor, set_param_text) + size_of::<usize>() == DESCRIPTOR_SIZE_V1 as usize
+    );
+    assert!(size_of::<Descriptor>() == DESCRIPTOR_SIZE_V2 as usize);
     #[cfg(target_pointer_width = "64")]
     const P: [usize; 9] = [0, 8, 16, 24, 32, 40, 48, 56, 64];
     #[cfg(target_pointer_width = "32")]

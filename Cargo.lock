@@ -46,6 +46,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "aas-plugin-fixture-v1"
+version = "0.1.0"
+
+[[package]]
+name = "aas-plugin-fixture-wide"
+version = "0.1.0"
+dependencies = [
+ "aas-plugin",
+]
+
+[[package]]
 name = "aas-plugin-gain"
 version = "0.1.0"
 dependencies = [
