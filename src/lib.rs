@@ -15,6 +15,7 @@ pub mod format;
 pub mod further;
 pub mod latency;
 pub mod matrix;
+pub mod output_mix;
 pub mod plugin;
 pub mod rate;
 pub mod resample;
