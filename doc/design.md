@@ -210,7 +210,8 @@ part 2 of stage 3b. What is decided for the one *(call)*:
 - A matrix change fades. The engine takes a new matrix as a command and moves
   each gain to its new value over 10 ms, at once when nothing is audible or
   while a DoP stream is held. A DoP stream that starts during a fade waits for
-  it, at most 10 ms. Only the config sends one in this stage.
+  it, at most 10 ms. In this stage the matrix is set once, at startup; the
+  ramp is for the API in stage 4.
 - Buffers are sized for the configured channels, not for eight. A wide chain
   costs about 0.25 MiB per channel.
 - Mixing takes a direct path when the matrix is the default one at 0 dB and no
