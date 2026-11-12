@@ -1041,25 +1041,11 @@ pub enum Command {
     /// An empty tap table with more capacity. It replaces the current one.
     #[allow(clippy::vec_box)] // Moving a boxed tap moves only a pointer.
     GrowTaps(Vec<Box<Tap>>),
-    /// Replaces the matrix. Answered by `Event::OldMatrix` with the one it
-    /// replaced. One of another width than the matrix in place is sent
-    /// back as the `OldMatrix`, and the one in place stays: the buffers
-    /// and the chains are built for its width.
-    ///
-    /// Each gain moves in a straight line from where it is to its new
-    /// value over 10 ms of frames, also when a change arrives while
-    /// another still ramps. In forced bit-perfect the new gains are taken
-    /// as `bus_gains` takes them, so a change only turns routes on or off.
-    /// While the gains move the copy path is not used, and no DoP stream
-    /// takes the output; both follow the new matrix once the ramp is over.
-    /// The change applies at once when nothing is audible, as the output
-    /// gain's does, when the output is closed, and while a DoP stream has
-    /// a claim on the output: DoP is never faded, and a stream whose
-    /// routing changes is cut anyway, as by a reopen. It then plays on,
-    /// unaltered, through the new routing, or, if that would alter it,
-    /// goes silent and gives up its claim. A close or reopen of the output
-    /// ends a ramp still running: the output has faded to silence, and the
-    /// new gains apply from its first frame after it.
+    /// Replaces the matrix, each gain moving to its new value over 10 ms.
+    /// Answered by `Event::OldMatrix` with the one it replaced. One of
+    /// another width than the matrix in place is sent back as the
+    /// `OldMatrix`, and the one in place stays: the buffers and the chains
+    /// are built for its width.
     SetMatrix(Box<Matrix>),
     Shutdown,
 }
@@ -1606,6 +1592,23 @@ impl<P: Processing, S: Sink> Engine<P, S> {
     }
 
     /// Replaces the matrix, as `Command::SetMatrix` says.
+    ///
+    /// Each gain moves in a straight line from where it is to its new
+    /// value over 10 ms of frames, also when a change arrives while
+    /// another still ramps. In forced bit-perfect the new gains are taken
+    /// as `bus_gains` takes them, so a change only turns routes on or off.
+    /// While the gains move the copy path is not used, and no DoP stream
+    /// takes the output; both follow the new matrix once the ramp is over.
+    ///
+    /// The change applies at once when nothing is heard, as the output
+    /// gain's does, when no gain moves, when the output is closed, and
+    /// while a DoP stream has a claim on the output: DoP is never faded,
+    /// and a stream whose routing changes is cut anyway, as by a reopen.
+    /// It then plays on, unaltered, through the new routing, or, if that
+    /// would alter it, goes silent and gives up its claim. A ramp also
+    /// ends in a cycle where nothing is heard any more, so that a DoP
+    /// stream that starts then plays at once, and at a close or reopen of
+    /// the output, which has faded to silence by then.
     fn set_matrix(&mut self, mut matrix: Box<Matrix>) {
         if matrix.width() == self.matrix.width() {
             let forced = self.mode == BitPerfect::Forced;
@@ -1696,6 +1699,11 @@ impl<P: Processing, S: Sink> Engine<P, S> {
             .read(self.period, self.rate, &self.counters, store, plugins);
         self.taps.deliver(&self.analog, self.period);
         self.scan();
+        // A ramp with nothing left to hear has nothing to fade.
+        if self.ramp_left > 0 && !self.heard() {
+            self.finish_ramp();
+            self.dop_routing = self.routing_for_dop();
+        }
         self.order_claims();
         let (rate, routed) = (self.rate, self.dop_routing.is_some());
         let holders = self.table.iter().enumerate();
@@ -8699,9 +8707,45 @@ mod tests {
     #[test]
     fn a_dop_stream_waits_for_the_end_of_a_matrix_ramp() {
         // While the gains move, the matrix in effect is neither the old
-        // one nor the new one: a DoP stream that starts then is silent and
-        // takes no claim until the ramp is over, then plays unaltered
+        // one nor the new one: a DoP stream that starts then, while a PCM
+        // client is still heard, is silent and takes no claim until the
+        // ramp is over. From the first period after it, it plays unaltered
         // through the new routing.
+        let (mut rig, mut a) = swapped_and_playing::<F32>(BitPerfect::Auto);
+        rig.send(Command::SetMatrix(Box::new(stereo())));
+        let mut out = play_level(&mut rig, &mut a, 1);
+        let mut dop = client(2);
+        rig.add(&mut dop);
+        let marked = dop_frames(PERIOD);
+        let ramp_periods = RAMP.div_ceil(PERIOD);
+        for _ in 1..ramp_periods {
+            dop.ring.write(&marked);
+            out.extend(play_level(&mut rig, &mut a, 1));
+            assert_eq!(dop.ring.available(), 0);
+        }
+        // Only the client, along the ramp.
+        let level = f64::from(RAMP_LEVEL);
+        let want = |i| {
+            let share = along(i, 0, 0.0, 1.0);
+            [level * share, level * (1.0 - share)]
+        };
+        check_ramp(&out, want, "f32");
+        assert_eq!(dop_events(&rig.events()), 0);
+        dop.ring.write(&marked);
+        a.ring.write(&[[RAMP_LEVEL, 0]; PERIOD]);
+        rig.cycle();
+        assert_eq!(rig.last_periods(1), marked);
+        assert!(matches!(rig.events()[..], [Event::DopStarted(2, _)]));
+        dop.ring.write(&marked);
+        rig.cycle();
+        assert_eq!(rig.last_periods(1), marked);
+    }
+
+    #[test]
+    fn a_matrix_ramp_ends_when_nothing_is_heard() {
+        // The client stops during the ramp: with nothing to fade, the new
+        // matrix applies, and a DoP stream that starts in the next cycle
+        // plays from its first period.
         let (mut rig, mut a) = swapped_and_playing::<F32>(BitPerfect::Auto);
         rig.send(Command::SetMatrix(Box::new(stereo())));
         play_level(&mut rig, &mut a, 1);
@@ -8709,20 +8753,88 @@ mod tests {
         let mut dop = client(2);
         rig.add(&mut dop);
         let marked = dop_frames(PERIOD);
-        let ramp_periods = RAMP.div_ceil(PERIOD);
-        for k in 1..ramp_periods {
-            dop.ring.write(&marked);
-            rig.cycle();
-            assert_eq!(rig.last_periods(1), frames(0, PERIOD), "period {k}");
-            assert_eq!(dop.ring.available(), 0);
-        }
-        assert_eq!(dop_events(&rig.events()), 0);
-        dop.ring.write(&marked);
-        rig.cycle();
         dop.ring.write(&marked);
         rig.cycle();
         assert_eq!(rig.last_periods(1), marked);
-        assert!(matches!(rig.events()[..], [Event::DopStarted(2, _)]));
+        let events = rig.events();
+        assert_eq!(dop_events(&events), 1);
+        assert_eq!(count(&events, |e| matches!(e, Event::DopStarted(2, _))), 1);
+        assert_eq!(rig.engine.ramp_left, 0);
+    }
+
+    #[test]
+    fn a_matrix_ramp_moves_the_analog_bus_too() {
+        // The analog input alone, swapped, then the default: its channels
+        // cross over 10 ms as a client's do.
+        let swapped = matrix(
+            &[
+                route(0, 1, 0.0),
+                route(1, 2, 0.0),
+                route(2, 2, 0.0),
+                route(3, 1, 0.0),
+            ],
+            2,
+        );
+        let (mut rig, feed) = wide_with_capture::<F64>(BitPerfect::Auto, swapped, 2);
+        let play = |rig: &mut Rig<F64>, n: usize| {
+            let mut out = Vec::new();
+            for _ in 0..n {
+                feed.push(&[[RAMP_LEVEL, 0]; PERIOD]);
+                rig.cycle();
+                out.extend(rig.last_periods(1));
+            }
+            out
+        };
+        // Past the detector's fade in.
+        play(&mut rig, 20);
+        assert_eq!(rig.last_periods(1), vec![[0, RAMP_LEVEL]; PERIOD]);
+        rig.events();
+        rig.send(Command::SetMatrix(Box::new(stereo())));
+        let out = play(&mut rig, 10);
+        let level = f64::from(RAMP_LEVEL);
+        let want = |i| {
+            let share = along(i, 0, 0.0, 1.0);
+            [level * share, level * (1.0 - share)]
+        };
+        check_ramp(&out, want, "analog");
+        assert!(out[RAMP..].iter().all(|f| *f == [RAMP_LEVEL, 0]));
+    }
+
+    #[test]
+    fn a_period_longer_than_the_ramp_holds_the_new_gains_after_it() {
+        fn check<P: Processing>() {
+            let what = format!("{:?}", format_of::<P>());
+            let long = 1024;
+            let mut rig = Rig::<P>::closed_with(BitPerfect::Auto, 1024, swap_at(0.0), 2);
+            rig.send(Command::Reconfigure {
+                rate: RATE,
+                period: long as u32,
+            });
+            let mut a = client(1);
+            rig.add(&mut a);
+            let play = |rig: &mut Rig<P>| {
+                a.ring.write(&vec![[RAMP_LEVEL, 0]; long]);
+                rig.cycle();
+                let frames = rig.log.frames();
+                frames[frames.len() - long..].to_vec()
+            };
+            play(&mut rig);
+            assert_eq!(play(&mut rig), vec![[0, RAMP_LEVEL]; long], "{what}");
+            rig.send(Command::SetMatrix(Box::new(stereo())));
+            let out = play(&mut rig);
+            let level = f64::from(RAMP_LEVEL);
+            let want = |i| {
+                let share = along(i, 0, 0.0, 1.0);
+                [level * share, level * (1.0 - share)]
+            };
+            check_ramp(&out, want, &what);
+            let after = &out[RAMP..];
+            assert!(after.iter().all(|f| *f == [RAMP_LEVEL, 0]), "{what}");
+            assert_eq!(play(&mut rig), vec![[RAMP_LEVEL, 0]; long], "{what}");
+        }
+        check::<I32>();
+        check::<F32>();
+        check::<F64>();
     }
 
     #[test]
