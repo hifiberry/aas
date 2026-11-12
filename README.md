@@ -246,7 +246,8 @@ and `channels_out`, each 1 to 8. A plugin that takes any count and keeps it, as
 counts are equal processes in place with `process`, `frames * channels`
 interleaved samples. One whose counts differ gives `process_into`, which reads
 `frames * channels_in` samples at `input` and writes `frames * channels_out` at
-`output`, two buffers that do not overlap; it may be left out otherwise. The
+`output`, two buffers that do not overlap; it may be left out otherwise. Every
+plugin still gives `process`, which is never called when the counts differ. The
 daemon refuses a library with one count 0 and the other not, a count above 8,
 or counts that differ and no `process_into`, and refuses a chain in which a
 plugin does not get the count it takes. A plugin whose counts differ is never

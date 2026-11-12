@@ -583,6 +583,20 @@ fn a_larger_descriptor_and_parameter_entries_of_version_1_are_read() {
                 samples: Samples::F32(&mut f),
             });
             assert_eq!(f, [2.0; 4]);
+            // A copied field would be called here, and abort.
+            let mut i = [1.0f32; 4];
+            let mut o = [7.0f32; 4];
+            p.process_into(
+                Block {
+                    channels: 2,
+                    samples: Samples::F32(&mut i),
+                },
+                Block {
+                    channels: 2,
+                    samples: Samples::F32(&mut o),
+                },
+            );
+            assert_eq!(o, [0.0; 4]);
         },
     );
 }

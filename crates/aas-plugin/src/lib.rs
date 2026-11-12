@@ -11,7 +11,8 @@
 //! (`channels_in` and `channels_out`, each 1 to 8), or takes any count and
 //! keeps it (both 0): `create` then tells it the count. A plugin whose
 //! counts are equal processes in place with `process`. One whose counts
-//! differ gives `process_into`, which reads one buffer and writes another.
+//! differ gives `process_into`, which reads one buffer and writes another;
+//! it gives `process` too, which is never called then.
 //! Float samples are scaled so that full scale is 1.0 and are not
 //! clipped. `process` and `process_into` may be called with
 //! `frames == 0`.
