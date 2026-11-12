@@ -13,7 +13,9 @@
 //! # The measurement
 //!
 //! The delay is read at one instant, the writer's read time `t` just after
-//! its wait, as the sum of three parts in frames at the master's rate:
+//! its wait, as the sum of three parts in frames at the master's rate. The
+//! card is read after the commands, and what it played between `t` and the
+//! moment its reading returned is added back.
 //!
 //! - the feed: the frames pushed less the frames taken, plus the master
 //!   frames made since the last push, at most that push's length. The
@@ -40,20 +42,31 @@
 //! writer waking 20 to 300 µs late, the ratio moves 4 to 8 ppm peak to peak
 //! once settled, at 44.1 to 192 kHz and 64 to 1024 frames.
 //!
+//! A reading taken after the master's next push was due is short by the
+//! frames not pushed yet, which says nothing about the clocks: the drift
+//! does not see it, and the ratio holds.
+//!
 //! # Priming
 //!
-//! After an open, a reconfiguration, an xrun, a starve, an overflow or a
-//! card lost or back, the writer forgets the drift and empties its
-//! resampler, and primes: it writes zero periods to the card while the
-//! path holds less than its target, and drops the oldest frames of the feed
+//! The writer primes: it writes zero periods to the card while the path
+//! holds less than its target, and drops the oldest frames of the feed
 //! while it holds more. When less than a card period is missing, the
 //! missing frames go out as zeros in front of the first resampled frames,
-//! so that the path starts on its target to the frame.
+//! so that the path starts on its target to the frame, and the drift's
+//! first reading is that of the path with the zeros in.
 //!
-//! A starve plays a period of zeros, drops what is left in the feed and
-//! primes again: old audio is never played twice, nor late. A full feed refuses the new period and counts an overflow,
-//! which the writer sees at its next cycle and primes, dropping what is too
-//! much.
+//! After an open, a reconfiguration or a card lost or back, the clocks
+//! under the path are new: the drift starts over, and the resampler
+//! empties. After a starve, an overflow, a stall or an xrun they are the
+//! same: the resampler empties and the drift only starts its reading
+//! afresh, keeping its integral, its lock and its estimate, so the ratio
+//! stays where the card needs it and the lock is not lost.
+//!
+//! A starve plays a period of zeros and drops what is left in the feed. A
+//! full feed refuses the new period and counts an overflow; the writer sees
+//! it at its next cycle and drops the whole feed, as it does after a stall
+//! longer than the feed lasts: all of it is from before the gap. Old audio
+//! is never played twice, nor late.
 //!
 //! # A card that goes
 //!
@@ -99,6 +112,10 @@ const PARK: Duration = Duration::from_millis(100);
 /// Seconds over which the line through the pushes follows them. The jitter
 /// of the pushes averages out over that time.
 const LINE: f64 = 2.0;
+/// How far beyond a push length a push may come off the line before the
+/// line starts again from it: the wake-up jitter of a loaded board, which
+/// at short periods is more than a period.
+const LINE_SLACK_NS: f64 = 2e6;
 /// How far the master's clock may run from CLOCK_MONOTONIC.
 const CLOCKS: f64 = 0.005;
 
@@ -251,20 +268,21 @@ impl Line {
         }
     }
 
-    /// The line moved by a push. A push a period off the line, or with a
-    /// count from before, starts it again.
-    fn follow(self, push: Push, rate: f64) -> Line {
+    /// The line moved by a push, or `None` for a push off the line by more
+    /// than its length and [`LINE_SLACK_NS`], or with a count from before,
+    /// from which the line starts again.
+    fn follow(self, push: Push, rate: f64) -> Option<Line> {
         if push.frames == self.frames {
-            return self;
+            return Some(self);
         }
         if push.frames < self.frames {
-            return Line::start(push, rate);
+            return None;
         }
         let span = (push.frames - self.frames) as f64;
         let expected = self.at + span * self.frame_ns;
         let late = push.at_ns as f64 - expected;
-        if late.abs() >= push.last as f64 * self.frame_ns {
-            return Line::start(push, rate);
+        if late.abs() >= push.last as f64 * self.frame_ns + LINE_SLACK_NS {
+            return None;
         }
         // A critically damped loop on the phase and the rate, with gains
         // for the time since the last push seen.
@@ -272,11 +290,11 @@ impl Line {
         let nominal = 1e9 / rate;
         let frame_ns = (self.frame_ns + follow * follow / 4.0 * late / span)
             .clamp(nominal * (1.0 - CLOCKS), nominal * (1.0 + CLOCKS));
-        Line {
+        Some(Line {
             frames: push.frames,
             at: expected + follow * late,
             frame_ns,
-        }
+        })
     }
 }
 
@@ -363,8 +381,14 @@ pub struct Writer {
     clamped: bool,
     /// Overflows seen.
     overflows: u64,
-    /// The ratio last set.
+    /// The ratio the drift last gave, kept over a re-prime.
     ratio: f64,
+    /// The ratio the resampler last ran at: 1 after its reset.
+    applied: f64,
+    /// The last reading came after the master's next push was due: frames
+    /// it has not pushed are missing from it, which says nothing about the
+    /// clocks, so the drift does not see it.
+    overdue: bool,
 }
 
 impl Writer {
@@ -391,7 +415,12 @@ impl Writer {
         if let Err(e) = waited {
             self.failed(e);
         }
-        self.count_wake(now);
+        if self.count_wake(now) > self.feed_ns() {
+            // The writer stalled longer than the feed lasts: what it holds
+            // is from before the gap.
+            self.discard();
+            self.reprime();
+        }
         self.watch_card();
         self.watch_overflows();
         let played = self.play(now);
@@ -460,7 +489,7 @@ impl Writer {
         self.shared.open.store(true, Release);
         self.playing = true;
         self.last_wake = None;
-        self.prime_again();
+        self.restart();
     }
 
     fn halt(&mut self) {
@@ -471,7 +500,7 @@ impl Writer {
         self.shared.open.store(false, Release);
         self.discard();
         self.last_wake = None;
-        self.prime_again();
+        self.restart();
     }
 
     /// Takes everything in the feed and throws it away.
@@ -495,14 +524,25 @@ impl Writer {
         }
     }
 
-    /// Starts over: the drift and the resampler forget, and the writer
-    /// primes.
-    fn prime_again(&mut self) {
-        self.running = false;
+    /// Starts over on another card, clock or configuration: the drift
+    /// forgets all, the resampler empties, and the writer primes.
+    fn restart(&mut self) {
+        self.reprime();
         self.ratio = 1.0;
-        self.held = 0.0;
         if let Some(path) = &mut self.path {
             path.drift.reset();
+        }
+    }
+
+    /// Primes again after a starve, an overflow, a stall or an xrun, with
+    /// the clocks as they were: the resampler empties, the drift starts its
+    /// reading afresh and keeps its integral, its lock and its estimate.
+    fn reprime(&mut self) {
+        self.running = false;
+        self.held = 0.0;
+        self.applied = 1.0;
+        if let Some(path) = &mut self.path {
+            path.drift.reprime();
             path.resampler.reset();
         }
     }
@@ -517,15 +557,14 @@ impl Writer {
         if error == SinkError::Xrun {
             self.counters.xruns.fetch_add(1, Relaxed);
         }
-        self.prime_again();
+        self.reprime();
     }
 
-    fn count_wake(&mut self, now: u64) {
-        let Some(path) = &self.path else {
-            return;
-        };
-        if let Some(last) = self.last_wake {
-            let gap = now.saturating_sub(last);
+    /// Counts a late wake-up and returns the time since the last, ns.
+    fn count_wake(&mut self, now: u64) -> u64 {
+        let mut gap = 0;
+        if let (Some(path), Some(last)) = (&self.path, self.last_wake) {
+            gap = now.saturating_sub(last);
             self.counters.worst_gap_ns.fetch_max(gap, Relaxed);
             let buffer = u64::from(BUFFERED * path.period) * 1_000_000_000;
             if gap > buffer / u64::from(path.card_rate) {
@@ -533,10 +572,19 @@ impl Writer {
             }
         }
         self.last_wake = Some(now);
+        gap
     }
 
-    /// The card gone or back changes the path under the drift: the writer
-    /// primes again, and the control thread hears of it once.
+    /// How long a full feed lasts, ns.
+    fn feed_ns(&self) -> u64 {
+        let frames = (self.ring.buffer().capacity() / self.channels) as u64;
+        let rate = self.path.as_ref().map_or(1, |p| p.master_rate);
+        frames * 1_000_000_000 / u64::from(rate)
+    }
+
+    /// The card gone or back puts another clock under the path, the null
+    /// sink's or the card's opened anew: the writer starts over, and the
+    /// control thread hears of it once.
     fn watch_card(&mut self) {
         if !self.watch.changed() {
             return;
@@ -550,7 +598,7 @@ impl Writer {
                 FurtherEvent::Back
             });
         }
-        self.prime_again();
+        self.restart();
     }
 
     fn watch_overflows(&mut self) {
@@ -558,7 +606,10 @@ impl Writer {
         if overflows != self.overflows {
             self.overflows = overflows;
             self.emit(FurtherEvent::Overflowed);
-            self.prime_again();
+            // The writer fell behind: all the feed holds is from before
+            // the gap.
+            self.discard();
+            self.reprime();
         }
     }
 
@@ -570,6 +621,12 @@ impl Writer {
                 return Err(e);
             }
         };
+        // The card is read as of the moment `delay_now` returned, after the
+        // commands and the card's own call; at `now` it held what it has
+        // played since, too.
+        let read_ns = self.clock.now().saturating_sub(now);
+        let rate = self.path.as_ref().map_or(0, |p| p.card_rate);
+        let card = f64::from(card) + read_ns as f64 * f64::from(rate) / 1e9;
         let delay = self.measure(now, card);
         if self.running {
             self.run(delay, 0)
@@ -580,28 +637,31 @@ impl Writer {
 
     /// The path's delay at `now` in master frames, with `card` frames
     /// queued in the card.
-    fn measure(&mut self, now: u64, card: u32) -> f64 {
+    fn measure(&mut self, now: u64, card: f64) -> f64 {
         let push = self.shared.read();
         let since = self.since_push(push, now);
         let path = self.path.as_ref().expect("playing has a path");
         let feed = push.frames as f64 - self.taken as f64 + self.held + since;
-        feed + (path.resampler.delay_frames() + f64::from(card)) * path.scale()
+        feed + (path.resampler.delay_frames() + card) * path.scale()
     }
 
     /// Master frames made since the last push, from the line through the
     /// pushes, at most that push's length: a master that has stopped
     /// pushing has stopped making frames for this output.
     fn since_push(&mut self, push: Push, now: u64) -> f64 {
+        self.overdue = false;
         if push.frames == 0 {
             return 0.0;
         }
         let rate = f64::from(self.path.as_ref().map_or(1, |p| p.master_rate));
-        let line = match self.line {
-            Some(line) => line.follow(push, rate),
-            None => Line::start(push, rate),
-        };
+        let line = self
+            .line
+            .and_then(|line| line.follow(push, rate))
+            .unwrap_or_else(|| Line::start(push, rate));
         self.line = Some(line);
-        ((now as f64 - line.at) / line.frame_ns).clamp(0.0, push.last as f64)
+        let since = (now as f64 - line.at) / line.frame_ns;
+        self.overdue = since > push.last as f64;
+        since.clamp(0.0, push.last as f64)
     }
 
     /// Zeros until the path holds its target, dropping the oldest frames
@@ -621,7 +681,9 @@ impl Writer {
             return self.write(true);
         }
         self.running = true;
-        self.run(delay, missing.round().max(0.0) as usize)
+        // The drift reads the delay the card holds once the zeros are in.
+        let zeros = missing.round().max(0.0) as usize;
+        self.run(delay + zeros as f64 * scale, zeros)
     }
 
     /// A period of the feed through the resampler, after `zeros` frames of
@@ -630,8 +692,9 @@ impl Writer {
         let channels = self.channels;
         let path = self.path.as_deref_mut().expect("playing has a path");
         let period = path.period as usize;
-        let before = self.ratio;
-        self.ratio = path.drift.update(delay);
+        if !self.overdue {
+            self.ratio = path.drift.update(delay);
+        }
         path.resampler.set_ratio(self.ratio);
         let out = period - zeros;
         let need =
@@ -656,8 +719,9 @@ impl Writer {
         self.taken += consumed as u64;
         // The ratio ramps from the last one to this one over the call, so
         // the position moves by the output over their mean.
-        let mean = 0.5 * (before + self.ratio) / path.scale();
+        let mean = 0.5 * (self.applied + self.ratio) / path.scale();
         self.held += consumed as f64 - produced as f64 / mean;
+        self.applied = self.ratio;
         self.write(false)
     }
 
@@ -668,7 +732,7 @@ impl Writer {
         self.discard();
         self.counters.starves.fetch_add(1, Relaxed);
         self.emit(FurtherEvent::Starved);
-        self.prime_again();
+        self.reprime();
         self.write(true)
     }
 
@@ -856,12 +920,15 @@ impl Drop for FurtherHandle {
             return;
         };
         let commands = self.commands.get_mut().unwrap();
-        while commands.push(Command::Stop).is_err() {
+        // A writer that has died reads nothing more.
+        while commands.push(Command::Stop).is_err() && !thread.is_finished() {
             thread.thread().unpark();
             thread::sleep(Duration::from_millis(1));
         }
         thread.thread().unpark();
-        let _ = thread.join();
+        if thread.join().is_err() {
+            eprintln!("aas: output {}: the writer thread panicked", self.index + 1);
+        }
         self.collect();
     }
 }
@@ -910,6 +977,8 @@ fn parts(
         clamped: false,
         overflows: counters.overflows.load(Relaxed),
         ratio: 1.0,
+        applied: 1.0,
+        overdue: false,
     };
     let feed = Feed {
         ring: feed_in,
@@ -1032,6 +1101,8 @@ mod tests {
         wake_late_us: (f64, f64),
         /// Keep what the card plays.
         record: bool,
+        /// How long reading the card's delay takes, µs.
+        read_cost_us: f64,
         /// Master frames added to the plan's target, which holds exactly
         /// a card period in the feed when the writer wakes, and starves at
         /// a frame of rounding.
@@ -1051,6 +1122,7 @@ mod tests {
                 push_late_us: (20.0, 150.0),
                 wake_late_us: (20.0, 300.0),
                 record: false,
+                read_cost_us: 0.0,
                 margin: master_period as f64 / 2.0,
             }
         }
@@ -1067,6 +1139,10 @@ mod tests {
         push_at: u64,
         /// Pushes the feed refused.
         refused: u64,
+        /// Master periods to leave out from now on, as if lost.
+        skip: u32,
+        /// Frames the master made and never pushed, refused or left out.
+        lost: u64,
         period: Vec<i32>,
         push_jitter: Lcg,
         /// The card's period, as opened.
@@ -1093,6 +1169,8 @@ mod tests {
                 periods: 0,
                 push_at: 0,
                 refused: 0,
+                skip: 0,
+                lost: 0,
                 period: vec![0; sim.master_period * sim.channels],
                 push_jitter: Lcg(0x5eed),
                 card_period: sim.card_period as usize,
@@ -1129,7 +1207,8 @@ mod tests {
                 self.periods as f64 * self.sim.master_period as f64 * 1e9 / self.master_rate();
             let range = self.sim.push_late_us;
             let late = self.push_jitter.between(range) * 1e3;
-            self.push_at = (nominal + late) as u64;
+            // A late push delays the next: they never overtake each other.
+            self.push_at = ((nominal + late) as u64).max(self.push_at);
         }
 
         /// Runs the master up to `t`.
@@ -1138,8 +1217,12 @@ mod tests {
                 self.set_now(self.push_at);
                 if let Source::Dc(value) = self.source {
                     self.period.fill(value);
-                    if !self.feed.as_mut().unwrap().push(&self.period) {
+                    if self.skip > 0 {
+                        self.skip -= 1;
+                        self.lost += self.sim.master_period as u64;
+                    } else if !self.feed.as_mut().unwrap().push(&self.period) {
                         self.refused += 1;
+                        self.lost += self.sim.master_period as u64;
                     }
                 }
                 self.periods += 1;
@@ -1241,11 +1324,15 @@ mod tests {
             Ok(())
         }
 
+        /// Takes `read_cost_us` and tells the queue at its end, as
+        /// `AlsaSink` moves its reading on to the moment it returns.
         fn delay_now(&mut self) -> Result<u32, SinkError> {
             let mut w = self.world();
             if w.gone {
                 return Err(SinkError::Gone);
             }
+            let done = w.now() + (w.sim.read_cost_us * 1e3) as u64;
+            w.advance_to(done);
             w.drain();
             Ok(w.queued.floor() as u32)
         }
@@ -1367,7 +1454,7 @@ mod tests {
             // at each push; the first push is at 0.
             let made = w.now() as f64 * w.master_rate() / 1e9 + self.sim.master_period as f64;
             let feed = w.feed.as_ref().unwrap();
-            let in_feed = feed.queued() as f64 + made - feed.pushed() as f64;
+            let in_feed = feed.queued() as f64 + made - (feed.pushed() + w.lost) as f64;
             let scale = rate / f64::from(self.sim.card_rate);
             in_feed + self.writer.resampler_delay() + w.queued * scale
         }
@@ -1444,7 +1531,9 @@ mod tests {
             assert!(rig.seconds() < 30.0, "never locked");
         }
         // Lock comes when the delay has held for 5 s, while the integral
-        // still moves the ratio to the card's offset over its 20 s.
+        // still moves the ratio to the card's offset over its 20 s: right
+        // after lock the ratio swings some 60 ppm as the integral settles,
+        // slowly, which is not jitter. The ten minutes start after that.
         while rig.seconds() < 60.0 {
             rig.cycle();
         }
@@ -1535,9 +1624,206 @@ mod tests {
         assert_eq!(rig.writer.feed_ends(), Some((1, 4)));
         rig.cycle();
         assert!(rig.events().contains(&FurtherEvent::Overflowed));
-        // Back to the target, the oldest frames first.
-        assert!(rig.world().feed.as_ref().unwrap().queued() < 4 * 256);
-        assert_eq!(rig.writer.feed_ends().map(|(_, last)| last), Some(4));
+        // A full feed means the writer fell behind: all of it is from before
+        // the gap, and goes.
+        assert_eq!(rig.world().feed.as_ref().unwrap().queued(), 0);
+    }
+
+    /// Plays `before` for a second, holds the writer for 100 ms while the
+    /// master plays `during`, then plays a negative value for a second, and
+    /// returns what the card played after the hold.
+    fn after_a_stall(during: Source) -> (Rig, Vec<i32>) {
+        let mut sim = Sim::new(48_000, 256, 48_000, 256);
+        sim.record = true;
+        let mut rig = Rig::new(sim);
+        rig.world().source = Source::Dc(1 << 28);
+        rig.run_until(1.0);
+        {
+            let mut w = rig.world();
+            w.source = during;
+            let until = w.now() + 100_000_000;
+            w.advance_to(until);
+            w.source = Source::Dc(-(1 << 28));
+        }
+        let mark = rig.world().written().len();
+        let until = rig.seconds() + 1.0;
+        rig.run_until(until);
+        let after = rig.world().written()[mark..].to_vec();
+        assert!(after.iter().any(|&s| s < -(1 << 27)));
+        (rig, after)
+    }
+
+    #[test]
+    fn a_writer_stalled_longer_than_its_feed_plays_nothing_from_before() {
+        // The master pushes on and the feed overflows.
+        let (rig, after) = after_a_stall(Source::Dc(1 << 28));
+        assert!(rig.world().refused > 0);
+        assert!(
+            after.iter().all(|&s| s < 1 << 26),
+            "audio from before the stall"
+        );
+        // The master is quiet meanwhile: what the feed held is as old.
+        let (rig, after) = after_a_stall(Source::Off);
+        assert_eq!(rig.world().refused, 0);
+        assert!(
+            after.iter().all(|&s| s < 1 << 26),
+            "audio from before the stall"
+        );
+    }
+
+    #[test]
+    fn a_starve_after_lock_keeps_the_ratio_and_the_lock() {
+        let mut sim = Sim::new(44_100, 256, 48_000, 256);
+        sim.ppm = 100.0;
+        let mut rig = Rig::new(sim);
+        rig.world().source = Source::Dc(1 << 20);
+        rig.run_until(40.0);
+        assert!(rig.counters.locked.load(Relaxed));
+        let before = rig.writer.ratio();
+        let quarter = rig.period / 4.0;
+        let _ = rig.events();
+        // Two master periods lost on the way: the feed runs short once.
+        rig.world().skip = 2;
+        let start = rig.seconds();
+        let mut moved = 0.0f64;
+        while rig.seconds() < start + 10.0 {
+            rig.cycle();
+            moved = moved.max((rig.writer.ratio() - before).abs() * 1e6);
+            let at = rig.seconds() - start;
+            assert!(
+                rig.counters.locked.load(Relaxed),
+                "lost lock {at:.2} s after"
+            );
+            let ratio = rig.writer.ratio();
+            assert!(
+                (ratio - before).abs() < 20e-6,
+                "ratio {:+.1} ppm {at:.2} s after, {:+.1} before",
+                (ratio - 1.0) * 1e6,
+                (before - 1.0) * 1e6
+            );
+            if at > 2.0 {
+                let error = rig.true_delay() - rig.target;
+                assert!(error.abs() < quarter, "error {error:.1} {at:.2} s after");
+            }
+        }
+        eprintln!("the ratio moved {moved:.2} ppm over the starve");
+        assert_eq!(rig.count(&rig.counters.starves), 1);
+        let events = rig.events();
+        assert!(events.contains(&FurtherEvent::Starved), "{events:?}");
+        assert!(!events.contains(&FurtherEvent::Unlocked), "{events:?}");
+    }
+
+    #[test]
+    fn the_card_is_read_at_the_instant_of_the_feed() {
+        // Reading the card takes a millisecond, 48 frames.
+        let mut sim = Sim::new(48_000, 256, 48_000, 256);
+        sim.ppm = 100.0;
+        sim.read_cost_us = 1_000.0;
+        let mut rig = Rig::new(sim);
+        rig.world().source = Source::Dc(1 << 20);
+        rig.run_until(20.0);
+        assert!(rig.counters.locked.load(Relaxed));
+        let mut worst = 0.0f64;
+        while rig.seconds() < 30.0 {
+            rig.cycle();
+            worst = worst.max((rig.true_delay() - rig.target).abs());
+        }
+        assert!(worst < 8.0, "error up to {worst:.1} frames");
+    }
+
+    #[test]
+    fn the_line_rides_out_wake_jitter_at_short_periods() {
+        // 64 frames at 48 kHz, a push every 1.3 ms, each 20 µs to 4 ms
+        // late, and never before the one before it.
+        let rate = 48_000.0;
+        let last = 64;
+        let mut jitter = Lcg(7);
+        let mut line: Option<Line> = None;
+        let mut restarts = 0;
+        let mut at = 0;
+        let (mut low, mut high) = (f64::MAX, f64::MIN);
+        for k in 1..=20_000u64 {
+            let nominal = (k * last) as f64 * 1e9 / rate;
+            let late = jitter.between((20.0, 4_000.0)) * 1e3;
+            at = ((nominal + late) as u64).max(at);
+            let push = Push {
+                frames: k * last,
+                at_ns: at,
+                last,
+            };
+            let next = match line {
+                None => Line::start(push, rate),
+                Some(line) => line.follow(push, rate).unwrap_or_else(|| {
+                    restarts += 1;
+                    Line::start(push, rate)
+                }),
+            };
+            line = Some(next);
+            // Past the line's settling, about 5 s.
+            if k > 4_000 {
+                low = low.min(next.at - nominal);
+                high = high.max(next.at - nominal);
+            }
+        }
+        assert_eq!(restarts, 0);
+        let swing = (high - low) / 1e3;
+        assert!(swing < 200.0, "the line moves {swing:.0} µs");
+    }
+
+    /// A card whose driver panics at the open, which takes the writer
+    /// thread with it.
+    struct Doomed;
+
+    impl Sink for Doomed {
+        fn open(&mut self, _rate: u32, _period: u32) -> Result<(), SinkError> {
+            panic!("the card's driver fails");
+        }
+
+        fn write(&mut self, _samples: &[i32]) -> Result<(), SinkError> {
+            Ok(())
+        }
+
+        fn channels(&self) -> usize {
+            2
+        }
+
+        fn close(&mut self) {}
+
+        fn delay_frames(&self) -> u32 {
+            0
+        }
+
+        fn supported_rates(&self) -> Vec<u32> {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn dropping_the_handle_of_a_dead_writer_returns() {
+        let sink = FallbackSink::new(Box::new(Doomed));
+        let (_feed, handle) = spawn(1, sink, 1024, 2, Arc::default());
+        let resampler = Box::new(Adaptive::new(
+            48_000,
+            48_000,
+            2,
+            256,
+            Quality::Medium,
+            Format::F32,
+        ));
+        handle.reconfigure(48_000, 48_000, 256, resampler, 1_000.0);
+        // The writer dies at the open; the commands after it pile up.
+        for _ in 0..2 * COMMANDS {
+            handle.set_open(true);
+        }
+        let (done, dropped) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(handle);
+            done.send(()).unwrap();
+        });
+        assert!(
+            dropped.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "dropping the handle hangs"
+        );
     }
 
     #[test]

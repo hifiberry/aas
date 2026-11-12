@@ -271,6 +271,18 @@ impl Drift {
         self.skipped
     }
 
+    /// The path was primed onto its target again after a starve, an
+    /// overflow or an xrun, with the clocks as they were: forgets the
+    /// smoothed error, whose next reading starts it afresh, and the run of
+    /// readings not believed. Keeps the integral, so the ratio stays where
+    /// the card needs it, and the lock, the clamp and the estimate, which
+    /// pauses for its settling time and then goes on averaging.
+    pub fn reprime(&mut self) {
+        self.error = None;
+        self.lost = 0;
+        self.settled = 0;
+    }
+
     /// Forgets the estimate, the error and the lock: back to ratio 1.
     pub fn reset(&mut self) {
         self.error = None;
@@ -598,6 +610,32 @@ mod tests {
         assert!(!drift.clamped());
         assert_eq!(drift.ppm(), 0.0);
         assert_eq!(drift.update(TARGET), 1.0);
+    }
+
+    #[test]
+    fn a_reprime_keeps_the_integral_the_lock_and_the_estimate() {
+        let mut path = Path::new(RATE, PERIOD, 100.0, TARGET);
+        let mut drift = Drift::new(TARGET, RATE, PERIOD);
+        for _ in 0..path.periods(180.0) {
+            path.step(&mut drift);
+        }
+        assert!(drift.locked());
+        let (ratio, ppm, integral) = (path.ratio, drift.ppm(), drift.integral);
+        // The path was primed again onto its target after a starve.
+        drift.reprime();
+        assert!(drift.locked());
+        assert_eq!(drift.ppm(), ppm);
+        assert_eq!(drift.integral, integral);
+        // The first reading seeds the smoothed error afresh: a reading on
+        // target gives the ratio the card needs, not 1.
+        let next = drift.update(TARGET);
+        assert!((next - ratio).abs() < 20e-6, "{next} after {ratio}");
+        assert!((next - 1.0 - 100e-6).abs() < 20e-6, "{next}");
+        // And it holds on from there.
+        for _ in 0..path.periods(60.0) {
+            path.step(&mut drift);
+            assert!(drift.locked());
+        }
     }
 
     /// Runs two controllers on the same path, one of them also given
