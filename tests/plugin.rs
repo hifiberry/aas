@@ -626,7 +626,15 @@ fn library_at(path: &Path, params: &[(&str, ParamValue)]) -> Vec<PluginConfig> {
 fn build_with(path: &Path, params: &[(&str, ParamValue)]) -> Result<(), aas::plugin::BuildError> {
     let mut loaded = Loaded::default();
     let config = library_at(path, params);
-    build_chain(&config, PluginPlace::Mix, 48000, Format::F32, &mut loaded).map(|_| ())
+    build_chain(
+        &config,
+        PluginPlace::Mix,
+        48000,
+        Format::F32,
+        2,
+        &mut loaded,
+    )
+    .map(|_| ())
 }
 
 #[test]

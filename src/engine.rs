@@ -5061,7 +5061,7 @@ mod tests {
             .into_iter()
             .map(|p| Box::new(p) as Box<dyn Plugin>)
             .collect();
-        Box::new(Chain::new(plugins, format_of::<P>(), max_frames))
+        Box::new(Chain::new(plugins, format_of::<P>(), max_frames, 2).unwrap())
     }
 
     /// Takes only floats, so an engine in another format converts around it.
@@ -5122,7 +5122,7 @@ mod tests {
     fn a_chain_that_resumes_after_dop_does_not_play_an_old_tail() {
         let mut rig = Rig::<F64>::new(BitPerfect::Auto);
         let plugins: Vec<Box<dyn Plugin>> = vec![Box::new(Delay { kept: [0.0; 2] })];
-        let chain = Chain::new(plugins, Format::F64, MAX_PERIOD as usize);
+        let chain = Chain::new(plugins, Format::F64, MAX_PERIOD as usize, 2).unwrap();
         rig.send(Command::SetChain(Place::Mix, Box::new(chain)));
         let mut a = client(1);
         rig.add(&mut a);
@@ -5815,7 +5815,7 @@ mod tests {
         let mut detect = Detect::new(RATE);
         detect.set_param(1, hold_s);
         let plugins: Vec<Box<dyn Plugin>> = vec![Box::new(detect)];
-        Box::new(Chain::new(plugins, format_of::<P>(), MAX_PERIOD as usize))
+        Box::new(Chain::new(plugins, format_of::<P>(), MAX_PERIOD as usize, 2).unwrap())
     }
 
     #[test]
@@ -5953,7 +5953,7 @@ mod tests {
             let mut detect = Detect::new(RATE);
             detect.set_param(1, 0.0);
             let plugins: Vec<Box<dyn Plugin>> = vec![Box::new(times(4.0)), Box::new(detect)];
-            let chain = Chain::new(plugins, format_of::<P>(), MAX_PERIOD as usize);
+            let chain = Chain::new(plugins, format_of::<P>(), MAX_PERIOD as usize, 2).unwrap();
             rig.send(Command::SetChain(Place::Analog, Box::new(chain)));
             let recorder = add_tap(&mut rig, 5);
             // A loud ramp, with the low bits set, for two windows of 50 ms.
@@ -6049,7 +6049,7 @@ mod tests {
         // does it.
         let (capture, feed) = MemoryCapture::new();
         rig.send(Command::SetCapture(Some(Box::new(capture))));
-        let chain = Chain::new(analog, format_of::<P>(), MAX_PERIOD as usize);
+        let chain = Chain::new(analog, format_of::<P>(), MAX_PERIOD as usize, 2).unwrap();
         rig.send(Command::SetChain(Place::Analog, Box::new(chain)));
         let mut a = client.then(|| client_at(1, rate));
         if let Some(a) = a.as_mut() {
@@ -6131,7 +6131,7 @@ mod tests {
     fn the_copy_path_is_bit_exact_again_once_the_fade_is_over() {
         fn check<P: Processing>() {
             let (mut rig, feed) = with_capture::<P>(BitPerfect::Auto);
-            let chain = Chain::new(gate(None), format_of::<P>(), MAX_PERIOD as usize);
+            let chain = Chain::new(gate(None), format_of::<P>(), MAX_PERIOD as usize, 2).unwrap();
             rig.send(Command::SetChain(Place::Analog, Box::new(chain)));
             // Loud, with the low bits set, through the open and its fade.
             let loud: Vec<[i32; 2]> = (0..75 * PERIOD as i32)
@@ -6449,7 +6449,7 @@ mod tests {
         detect.set_param(1, 0.0);
         let plugins: Vec<Box<dyn Plugin>> =
             vec![Box::new(times(1.0).only(other)), Box::new(detect)];
-        let chain = Chain::new(plugins, format_of::<P>(), MAX_PERIOD as usize);
+        let chain = Chain::new(plugins, format_of::<P>(), MAX_PERIOD as usize, 2).unwrap();
         rig.send(Command::SetChain(Place::Analog, Box::new(chain)));
         rig.cycle();
         rig.events();

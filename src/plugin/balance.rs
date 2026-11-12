@@ -73,6 +73,7 @@ impl Plugin for Balance {
     }
 
     fn process(&mut self, block: Block<'_>) -> Status {
+        debug_assert_eq!(block.channels, 2);
         if self.neutral() {
             return Status::default();
         }

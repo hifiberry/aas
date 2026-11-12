@@ -138,6 +138,7 @@ impl Processing for I32 {
     }
 
     fn to_block<'s>(acc: &mut [i64], channels: usize, scratch: &'s mut BlockStore) -> Block<'s> {
+        debug_assert_eq!(acc.len() % channels, 0, "a whole number of frames");
         let samples = &mut scratch.i32[..acc.len()];
         for (b, a) in samples.iter_mut().zip(acc.iter()) {
             *b = Self::finish(*a);
@@ -184,6 +185,7 @@ impl Processing for F32 {
 
     /// The accumulator already has full scale at 1.0, so this is a copy.
     fn to_block<'s>(acc: &mut [f32], channels: usize, scratch: &'s mut BlockStore) -> Block<'s> {
+        debug_assert_eq!(acc.len() % channels, 0, "a whole number of frames");
         let samples = &mut scratch.f32[..acc.len()];
         samples.copy_from_slice(acc);
         Block {
@@ -226,6 +228,7 @@ impl Processing for F64 {
 
     /// The accumulator already has full scale at 1.0, so this is a copy.
     fn to_block<'s>(acc: &mut [f64], channels: usize, scratch: &'s mut BlockStore) -> Block<'s> {
+        debug_assert_eq!(acc.len() % channels, 0, "a whole number of frames");
         let samples = &mut scratch.f64[..acc.len()];
         samples.copy_from_slice(acc);
         Block {

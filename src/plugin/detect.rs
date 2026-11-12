@@ -198,6 +198,7 @@ impl Plugin for Detect {
     }
 
     fn process(&mut self, block: Block<'_>) -> Status {
+        debug_assert_eq!(block.channels, 2);
         match block.samples {
             Samples::I32(d) => self.run(
                 d,

@@ -1244,8 +1244,15 @@ impl Control {
             }
             let chain = match &mut ready {
                 Some(ready) => ready.take(place),
-                None => build_chain(&self.plugins, place, rate, self.format, &mut self.libraries)
-                    .map_err(|e| (place, e))?,
+                None => build_chain(
+                    &self.plugins,
+                    place,
+                    rate,
+                    self.format,
+                    2,
+                    &mut self.libraries,
+                )
+                .map_err(|e| (place, e))?,
             };
             chains.push((place, chain));
         }

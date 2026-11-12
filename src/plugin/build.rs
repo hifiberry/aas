@@ -1,7 +1,7 @@
 //! Chains built from the config, on the control thread.
 
 use super::builtin;
-use super::chain::Chain;
+use super::chain::{self, Chain};
 use super::native::Library;
 use super::{BuildError, Failure, Param, ParamKind, Plugin};
 use crate::config::{Format, ParamValue, PluginConfig, PluginPlace};
@@ -43,17 +43,22 @@ pub fn engine_place(place: PluginPlace) -> Place {
 /// place without plugins gives an empty chain, except `Analog`: it always
 /// has a detector, last if the config lists none.
 ///
+/// `channels` is the count of the blocks the chain is given. A plugin that
+/// does not fit the count that reaches it is a config error.
+///
 /// Errors name the plugin by its position in the config, from 1.
 pub fn build_chain(
     config: &[PluginConfig],
     place: PluginPlace,
     rate: u32,
     format: Format,
+    channels: usize,
     libraries: &mut Libraries,
 ) -> Result<Chain, BuildError> {
     let config_error = |m: String| BuildError::new(Failure::Config, m);
     let max_frames = MAX_PERIOD as usize;
     let mut plugins = Vec::new();
+    let mut positions = Vec::new();
     let listed = config.iter().enumerate().filter(|(_, p)| p.place == place);
     for (i, p) in listed {
         let n = i + 1;
@@ -72,7 +77,7 @@ pub fn build_chain(
                     "{prefix}type \"library\" needs a path"
                 )));
             }
-            (kind, _) => match builtin::create(kind, rate) {
+            (kind, _) => match builtin::create(kind, rate, channels) {
                 Some(Ok(plugin)) => plugin,
                 Some(Err(failure)) => {
                     let what = match failure {
@@ -116,18 +121,27 @@ pub fn build_chain(
             }
         }
         plugins.push(plugin);
+        positions.push(n);
     }
     let has_detect = config
         .iter()
         .any(|p| p.place == place && p.kind == "detect");
     if place == PluginPlace::Analog && !has_detect {
-        let detect = builtin::create("detect", rate).and_then(Result::ok);
+        let detect = builtin::create("detect", rate, channels).and_then(Result::ok);
         plugins.push(detect.expect("detect is built in and takes every rate"));
     }
     if plugins.is_empty() {
         return Ok(Chain::empty());
     }
-    Ok(Chain::new(plugins, format, max_frames).for_rate(rate))
+    if let Err((at, message)) = chain::fit(&plugins, channels) {
+        let m = match at.and_then(|i| positions.get(i)) {
+            Some(n) => format!("plugin {n}: {message}"),
+            None => message,
+        };
+        return Err(config_error(m));
+    }
+    let chain = Chain::new(plugins, format, max_frames, channels).map_err(config_error)?;
+    Ok(chain.for_rate(rate))
 }
 
 /// Whether `value` fits the type of `param`: text for a text parameter, and
@@ -185,7 +199,7 @@ impl Chains {
         format: Format,
         libraries: &mut Libraries,
     ) -> Result<Chains, BuildError> {
-        let mut build = |place| build_chain(config, place, rate, format, libraries);
+        let mut build = |place| build_chain(config, place, rate, format, 2, libraries);
         Ok(Chains {
             rate,
             analog: build(PluginPlace::Analog)?,
@@ -258,7 +272,7 @@ mod tests {
 
     fn build(config: &[PluginConfig], place: PluginPlace) -> Result<Chain, String> {
         let mut libraries = Libraries::default();
-        build_chain(config, place, 48000, Format::F32, &mut libraries).map_err(|e| e.message)
+        build_chain(config, place, 48000, Format::F32, 2, &mut libraries).map_err(|e| e.message)
     }
 
     #[test]
@@ -387,6 +401,7 @@ mod tests {
             PluginPlace::Analog,
             48000,
             Format::F32,
+            2,
             &mut libraries,
         );
         let e = e.err().unwrap();
@@ -404,5 +419,26 @@ mod tests {
         assert!(chains.take(PluginPlace::Mix).is_empty());
         assert_eq!(names(&chains.take(PluginPlace::Output)), ["balance"]);
         assert!(chains.take(PluginPlace::Output).is_empty());
+    }
+
+    #[test]
+    fn a_plugin_that_does_not_fit_the_channel_count_names_its_position() {
+        let config = [
+            plugin(PluginPlace::Mix, "balance", &[]),
+            plugin(PluginPlace::Output, "balance", &[]),
+        ];
+        let mut libraries = Libraries::default();
+        let e = build_chain(
+            &config,
+            PluginPlace::Output,
+            48000,
+            Format::F32,
+            4,
+            &mut libraries,
+        );
+        let e = e.err().unwrap();
+        assert_eq!(e.kind, Failure::Config);
+        assert!(e.message.starts_with("plugin 2: balance"), "{e}");
+        assert!(e.message.contains('2') && e.message.contains('4'), "{e}");
     }
 }

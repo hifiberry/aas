@@ -167,9 +167,26 @@ pub struct Status {
     pub changed: bool,
 }
 
+/// The channel counts a plugin takes and gives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Channels {
+    /// Any count, which it keeps. It is told the count when it is created.
+    Any,
+    /// `input` channels in, `output` channels out.
+    Fixed { input: usize, output: usize },
+}
+
 /// A processing stage.
 pub trait Plugin: Send {
     fn name(&self) -> &str;
+    /// The channel counts the plugin takes and gives. Two in and two out
+    /// unless it says otherwise.
+    fn channels(&self) -> Channels {
+        Channels::Fixed {
+            input: 2,
+            output: 2,
+        }
+    }
     /// The formats `process` takes. A chain converts the others.
     fn formats(&self) -> Formats;
     fn params(&self) -> &[Param];
@@ -182,6 +199,13 @@ pub trait Plugin: Send {
     fn latency_frames(&self) -> u32;
     /// Processes one block in place. Runs on the audio thread.
     fn process(&mut self, block: Block<'_>) -> Status;
+    /// Processes one block of a plugin whose channel counts differ: reads
+    /// `input`, writes `output`, the same number of frames. Runs on the audio
+    /// thread. Never called for a plugin whose counts are equal, which
+    /// needs not implement it.
+    fn process_into(&mut self, _input: Block<'_>, _output: Block<'_>) -> Status {
+        unreachable!("a plugin whose channel counts are equal is processed in place")
+    }
     /// Sets text parameter `index`, on the control thread while the chain
     /// is built, never later. Fails with `Failure::Config` and why, for a
     /// value the plugin refuses, or `Failure::Unsupported` for one it cannot
