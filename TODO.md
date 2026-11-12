@@ -173,16 +173,13 @@ board with such a card, for example a multichannel USB DAC or a HiFiBerry card
 with more than two outputs. First step: run `bit-check --channels 8 --expect`
 against it, then the hour runs of Stage 3b with `channels` set to its count.
 
-## Pi 3: the stereo cost of the matrix, and the 96 kHz input padding
+## Pi 3: the 96 kHz input padding
 
-Stage 3b part 1 measured the mean CPU time of the audio thread per cycle on the
-Pi 3 test board 16% (`f32`) and 18% (`f64`) above `main` with the default
-matrix. The default stereo config now takes a direct mixing path as `main` does.
-Missing: the Pi 3 measurement of it with the same method, 3 runs of 10 minutes
-at 48 kHz against `main` at 2ce4e21. The figure is `schedstat` time per cycle,
-so it includes the card write and the wake-ups. Also not looked into: at 96 kHz
-with the analog input on, the Pi 3 padded 256 frames in the hour run against 768
-in stage 3a. First step: run the ignored test `tests/cycle_cost.rs` on the board.
+At 96 kHz with the analog input on, the Pi 3 test board padded 256 frames in
+the stage 3b part 1 hour run against 768 in stage 3a. Not looked into; it may
+be chance. Missing: a look at when the padding happens. First step: repeat the
+hour run of `doc/measurements.md`, Stage 3b part 1, at 96 kHz and log the time
+of each padding.
 
 ## Matrix changes through the API
 
