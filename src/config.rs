@@ -155,7 +155,8 @@ pub struct Config {
     /// The plugins, in the order of the file.
     pub plugins: Vec<PluginConfig>,
     /// The routes of the mixing matrix, in the order of the file. None without
-    /// a `[[matrix]]` table.
+    /// a `[[matrix]]` table, and for an empty `matrix = []`: both give the
+    /// default matrix, never one with every route off.
     pub matrix: Option<Vec<Route>>,
 }
 
@@ -405,6 +406,7 @@ impl Config {
         }
         let matrix = match raw.matrix {
             None => None,
+            Some(tables) if tables.is_empty() => None,
             Some(tables) => {
                 let mut routes = Vec::new();
                 for (i, table) in tables.into_iter().enumerate() {
@@ -617,6 +619,7 @@ mod tests {
     fn no_matrix_table_gives_none() {
         assert_eq!(load_str("").unwrap().matrix, None);
         assert_eq!(Config::default().matrix, None);
+        assert_eq!(load_str("matrix = []\n").unwrap().matrix, None);
     }
 
     #[test]

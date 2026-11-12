@@ -165,9 +165,10 @@ mod tests {
 
     #[test]
     fn a_route_above_the_width_is_refused_with_the_channel_and_the_width() {
-        let e = Matrix::from_routes(&[route(0, 1, 0.0), route(1, 3, 0.0)], 2).unwrap_err();
+        let routes = [route(0, 1, 0.0), route(1, 2, 0.0), route(2, 7, 0.0)];
+        let e = Matrix::from_routes(&routes, 4).unwrap_err();
         assert!(
-            e.contains("matrix 2") && e.contains('3') && e.contains('2'),
+            e.contains("matrix 3") && e.contains("channel 7") && e.contains("4 channels"),
             "{e}"
         );
         let e = Matrix::from_routes(&[route(0, 0, 0.0)], 2).unwrap_err();
@@ -225,5 +226,44 @@ mod tests {
     fn minus_6_db_is_a_gain_of_about_a_half() {
         let m = Matrix::from_routes(&[route(0, 1, -6.0)], 2).unwrap();
         assert!((m.gain(0, 0) - 0.5012).abs() < 1e-3);
+    }
+
+    #[test]
+    fn swapping_the_analog_bus_leaves_the_players_bus_alone() {
+        let m = Matrix::from_routes(
+            &[
+                route(0, 1, 0.0),
+                route(1, 2, 0.0),
+                route(2, 2, 0.0),
+                route(3, 1, 0.0),
+            ],
+            2,
+        )
+        .unwrap();
+        let analog = m.routing(Bus::Analog, false).unwrap();
+        assert_eq!(&analog[..3], &[Some(1), Some(0), None]);
+        let players = m.routing(Bus::Players, false).unwrap();
+        assert_eq!(&players[..3], &[Some(0), Some(1), None]);
+    }
+
+    #[test]
+    fn forced_takes_a_minus_100_db_route_as_pure() {
+        let m = Matrix::from_routes(&[route(0, 1, -100.0), route(1, 2, 0.0)], 2).unwrap();
+        assert!(m.gain(0, 0) > 0.0);
+        assert_eq!(m.routing(Bus::Players, false), None);
+        assert_eq!(
+            m.routing(Bus::Players, true),
+            Some([Some(0), Some(1), None, None, None, None, None, None])
+        );
+    }
+
+    #[test]
+    fn a_matrix_of_width_8_takes_routes_on_channels_7_and_8() {
+        let m = Matrix::from_routes(&[route(0, 7, 0.0), route(1, 8, 0.0)], 8).unwrap();
+        assert_eq!(m.width(), 8);
+        assert_eq!(
+            m.routing(Bus::Players, false),
+            Some([None, None, None, None, None, None, Some(0), Some(1)])
+        );
     }
 }

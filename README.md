@@ -141,6 +141,14 @@ gain_db = 0               # -100 to 0, default 0
 [[matrix]]
 from = "players.right"
 to = 1
+
+[[matrix]]
+from = "analog.left"
+to = 2
+
+[[matrix]]
+from = "analog.right"
+to = 1
 ```
 
 `[analog]` turns on the card's analog input (`enabled`, default `false`) and sets
@@ -178,20 +186,32 @@ default, from the input `from` to the output channel `to`, counted from 1. The
 inputs are `players.left` and `players.right`, the sum of all clients after their
 volumes, and `analog.left` and `analog.right`. What no route names is off. Without
 any `[[matrix]]` table, left goes to channel 1 and right to channel 2 for both
-sources, and further channels are silent. The two routes above swap left and right.
-A sum to mono is two routes to the same channel, which should lower each by 6 dB to
-keep full-scale input from clipping:
+sources, and further channels are silent. With any `[[matrix]]` table only the
+routes listed exist, the analog input included, so a matrix that names only
+`players` leaves the analog input silent. The four routes above swap left and right
+for both sources. A sum to mono is two routes to the same channel, lowered by 6.03 dB
+each (a gain of 0.4995) so that full-scale input on both channels does not clip:
 
 ```toml
 [[matrix]]
 from = "players.left"
 to = 1
-gain_db = -6
+gain_db = -6.03
 
 [[matrix]]
 from = "players.right"
 to = 1
-gain_db = -6
+gain_db = -6.03
+
+[[matrix]]
+from = "analog.left"
+to = 1
+gain_db = -6.03
+
+[[matrix]]
+from = "analog.right"
+to = 1
+gain_db = -6.03
 ```
 
 The same `from` and `to` may not appear twice, and `to` may not be above the
