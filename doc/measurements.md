@@ -1,8 +1,9 @@
 # Measurements
 
 Stage 1 measured what the hardware can do, before the daemon was written.
-[Stage 2](#stage-2) measured the daemon itself, and [Stage 3a](#stage-3a) its
-analog input and plugins. The probes are in `tools/measure`.
+[Stage 2](#stage-2) measured the daemon itself, [Stage 3a](#stage-3a) its
+analog input and plugins, and [Stage 3b, part 1](#stage-3b-part-1) the mixing
+matrix and the output's channel count. The probes are in `tools/measure`.
 The Pi 4 is still to be measured.
 
 ## Boards
@@ -1275,3 +1276,266 @@ the capture shows.
 - The analog path was measured at 48 kHz only.
 - The detection times rest on the stage 2 latency figure for the player's side.
 - Each card was tested on one board only.
+
+## Stage 3b, part 1
+
+The mixing matrix, the output's channel count (`channels`) and plugins for any
+channel count, measured on the CM5 test board and on the Pi 3 test board. Both
+carry stereo cards, so more than two channels were run against `snd-aloop`.
+Each figure names its board.
+
+The daemon was built from a5e9a5a with the `alsa-output` feature and ran as
+root with real-time rights, a fresh daemon for each run. `bit-check` was built
+with its `--channels` and `--expect` options as committed in 94715aa, and
+`dist/test-plugin.sh` ran as committed in cef9447. Players reached the daemon
+through the plugin as ALSA's `default` device. The `main` daemon in the cost
+comparison was built from 2ce4e21. `/etc/sysctl.d/90-aas.conf` was installed
+on both boards.
+
+### Summary
+
+| Criterion | Pi 3 result | CM5 result | Verdict |
+|---|---|---|---|
+| Bit-exact through `snd-aloop`: the default matrix, a swap, and eight channels with players on 1, 2 and 7, 8 | Not run | 36 of 36 cases: `differing 0, breaks 0`, and no frame off the routing | Pass on the CM5 |
+| Stereo with the default matrix costs what `main` costs, 10 minutes at 48 kHz, 3 runs each | Worst cycle within `main`'s spread in `f32` and `f64`. **The mean CPU time of the audio thread per cycle is 16% higher in `f32` and 18% in `f64`**, 12 to 15 µs, against a spread of under 1 µs | Not run | **Fail** on the mean, by a margin far outside the spread. Pass on the worst cycle |
+| Eight channels to `snd-aloop`, `gain` on all eight, 10 minutes at 48 kHz | 1.9% of a period on the mean in `f32`, 2.7% in `f64`; worst cycle 2.9% and 3.7% | Not run | Measured |
+| One hour at 44.1 kHz, full load, real card, swap matrix, analog input on | 0 xruns, 0 wake-up gaps, worst gap 6.89 ms against 11.61 ms | 0 xruns, 0 wake-up gaps, worst gap 1.56 ms against 2.90 ms | Pass on both |
+| One hour at 96 kHz, the same | 0 xruns, 0 wake-up gaps, worst gap 6.43 ms against 10.67 ms | 0 xruns, 0 wake-up gaps, worst gap 1.45 ms against 2.67 ms | Pass on both |
+| A swap moves a left-only tone to the right output, through the cable | Not run | -20.1 dBFS on the left without the swap, -20.0 dBFS on the right with it; the other channel 110 dB or more below | Pass on the CM5 |
+| `dist/test-plugin.sh` with the capture and `ANALOG=1` | Not run | 32 of 33. The failure is the `mpd` case: `mpd` is not installed | Pass, except the case that needs `mpd` |
+| `channels = 8` on the stereo card | The card refuses 8 channels when probed. The null sink plays and the reason is logged once | **The card says it takes 8 channels when probed, then refuses them when opened. The null sink plays, but each retry costs the audio thread about 3.4 ms, which counts as a wake-up gap every second** | As designed on the Pi 3. A finding on the CM5, below |
+
+### Bit-exactness through `snd-aloop`
+
+The method of [stage 2](#bit-exactness): `bit-check` plays a seeded
+pseudo-random stream at full scale through `default`, captures the other end
+of `snd-aloop` and compares the two frame by frame. The stream is stereo. With
+`--channels` the capture takes as many channels as the daemon opened, and
+`--expect` names the channels that should carry the stream's left and right:
+the first channel of each side is compared with the stream, every other channel
+named must be a copy of it, and every channel not named must be zero. A frame
+that breaks this counts as off the routing and fails the case.
+
+The CM5 ran with `card = "Loopback"`, `latency_ms = 48`, the daemon's default
+volume of 0 dB, and four configs, each in `i32`, `f32` and `f64`:
+
+| Config | `channels` | Routes | Checked as |
+|---|---|---|---|
+| Default | 2 | none, so left to 1 and right to 2 | `1=L,2=R` |
+| Swap | 2 | `players.left` to 2, `players.right` to 1 | `1=R,2=L` |
+| Eight, default | 8 | none, so left to 1, right to 2, the rest silent | `1=L,2=R` |
+| Eight | 8 | `players.left` to 1 and 7, `players.right` to 2 and 8 | `1=L,2=R,7=L,8=R` |
+
+Each config and format ran S16 at 44.1 kHz, S24 at 96 kHz and S32 at 192 kHz,
+10 seconds each. All 36 cases gave `differing 0, breaks 0` and 0 frames off
+the routing, and each of the 12 daemons counted 0 xruns and 0 wake-up gaps,
+with a worst gap of 28.0 to 31.7 ms against buffers of 42.7 to 46.4 ms. The
+daemon chose 1024 frames per period on `snd-aloop` at 44.1 and 48 kHz, as in
+stage 2, 2048 at 96 kHz and 4096 at 192 kHz. With one client at 0 dB and pure routes the
+output is bit-perfect, so the samples are copied, swapped or duplicated as
+they are, and the processing format made no difference.
+
+Two negative checks, in `f32`: the swap checked as `1=L,2=R` reported every
+one of its 144000 frames as differing, with left and right exchanged; and the
+eight channels checked as stereo, `1=L,2=R` with channels 3 to 8 to be silent,
+reported every frame off the routing, the first one showing channels 7 and 8
+equal to 1 and 2.
+
+The Pi 3 was not run: bit-exactness does not depend on the board, and stage 2
+found `snd-aloop` there needs 48 ms as on the CM5.
+
+### Processing cost on the Pi 3
+
+The daemon on the DAC+ ADC with its defaults, so 256 frames at 48 kHz and
+2 periods buffered, and `bit_perfect = "off"`, so that every cycle mixes in
+the processing format instead of copying. One `aplay` played music at 48 kHz,
+the 44.1 kHz recording of the hour runs resampled to 48 kHz beforehand and kept
+in RAM, for 10 minutes per run. The board was otherwise idle and sat at 54 to
+67 °C, at 600 MHz in most readings and 1.2 GHz in 33 of 282, as the `ondemand`
+governor chose; its throttle flags showed only past events. The runs of `main`
+at 2ce4e21 and of this stage alternated, three of each per format, f32 first.
+
+The worst cycle is the daemon's own figure: from the end of the wait for room
+to the end of the cycle, without the write to the card. The mean is the CPU
+time of the audio thread from `/proc/<pid>/task/<tid>/schedstat`, read just
+before the daemon stopped, divided by the cycles it counted. So the mean also
+holds the write to the card, the wait's system calls and the wake-up, which the
+worst cycle does not.
+
+| Daemon | Format | Mean per cycle, three runs | Share of a period | Worst cycle, three runs |
+|---|---|---|---|---|
+| `main` | `f32` | 75.7, 76.1, 76.1 µs | 1.4% | 0.244, 0.176, 0.153 ms |
+| this stage | `f32` | 89.4, 87.8, 88.1 µs | 1.7% | 0.182, 0.190, 0.183 ms |
+| `main` | `f64` | 81.5, 81.7, 82.2 µs | 1.5% | 0.136, 0.164, 0.210 ms |
+| this stage | `f64` | 96.0, 96.5, 97.1 µs | 1.8% | 0.206, 0.261, 0.194 ms |
+
+Every run counted 0 xruns and 0 wake-up gaps, with a worst gap of 5.45 to
+5.67 ms against a 10.67 ms buffer.
+
+**The stereo figures are not within the run-to-run spread of `main` on the
+mean.** This stage takes 12.5 µs more per cycle in `f32`, 16%, and 14.7 µs more
+in `f64`, 18%, where the three runs of `main` lie within 0.4 and 0.7 µs of each
+other. Every run of this stage is above every run of `main`, and the clock
+readings do not explain it: the first `main` run, with no reading at 1.2 GHz,
+gave the same mean as the third, with five. The worst cycles are within
+`main`'s spread in both formats. Where the extra time goes was not measured.
+It is 0.2 to 0.3% of a period.
+
+Eight channels, the same player, to `snd-aloop` with `channels = 8`,
+`latency_ms = 48`, so 1024 frames per period, `bit_perfect = "off"`, a route
+from `players.left` to 1, 3, 5 and 7 and from `players.right` to 2, 4, 6 and 8,
+and the `gain` library at `place = "output"` with `gain = -3`, so that it
+works on all eight channels. One run per format:
+
+| Format | Mean per cycle | Share of a period | Per frame | Worst cycle | Xruns, gaps |
+|---|---|---|---|---|---|
+| `f32` | 395.7 µs | 1.9% | 0.39 µs | 0.608 ms, 2.9% | 0, 0 |
+| `f64` | 576.9 µs | 2.7% | 0.56 µs | 0.785 ms, 3.7% | 0, 0 |
+
+Per frame, eight channels with a plugin cost about as much as stereo without
+one in `f32`, 0.39 against 0.35 µs, and half again as much in `f64`, 0.56
+against 0.38 µs. `latency_ms = 48` was used because a first try at 24 ms,
+512 frames, gave 1 xrun and a 32 ms wake-up gap in 20 seconds, against a
+21 ms buffer, which stage 2 traced to `snd-aloop`'s timer on this kernel.
+
+### Hour runs with a swap matrix
+
+The runs of [stage 3a](#hour-runs-with-the-analog-input), made the same way
+but with every route swapped: a fresh daemon per run on the real card with its
+defaults, the stage 1 full load, and the same music from RAM looped into
+`aplay -t raw` for an hour. The config:
+
+```toml
+[analog]
+enabled = true
+volume_db = -20
+
+[[matrix]]
+from = "players.left"
+to = 2
+
+[[matrix]]
+from = "players.right"
+to = 1
+
+[[matrix]]
+from = "analog.left"
+to = 2
+
+[[matrix]]
+from = "analog.right"
+to = 1
+```
+
+The music played through the cable into the ADC, so the input opened a second
+after each start and stayed open, and came back swapped once more at -20 dB.
+The CM5 runs and the Pi 3 runs were made one after the other on each board,
+the CM5's while the Pi 3 measured its cost. On the CM5 the logs were kept in
+RAM and copied off every two minutes, and the kernel log was streamed off the
+board.
+
+On the CM5, 64 frames at 44.1 kHz and 128 at 96 kHz, with the heatsink. It sat
+at 82 to 87 °C and ran between 1.5 and 2.4 GHz.
+
+| Run | Daemon xruns | Wake-up gaps over the buffer | Worst gap / buffer | Worst cycle | Padded, dropped | `aplay` underruns |
+|---|---|---|---|---|---|---|
+| 44.1 kHz | 0 | 0 | 1.56 / 2.90 ms | 0.07 ms | 128, 0 | 0 |
+| 96 kHz | 0 | 0 | 1.45 / 2.67 ms | 0.08 ms | 192, 0 | 0 |
+
+Both pass, with the same figures as stage 3a without the matrix. The board did
+not hang, and the kernel log has nothing from the runs. The kernel migrated
+no pages in either hour.
+
+On the Pi 3, 256 frames at 44.1 kHz and 512 at 96 kHz, without a heatsink. It
+sat at 86 to 87 °C and 442 to 603 MHz, throttled, as in stage 3a.
+
+| Run | Daemon xruns | Wake-up gaps over the buffer | Worst gap / buffer | Worst cycle | Padded, dropped | `aplay` underruns |
+|---|---|---|---|---|---|---|
+| 44.1 kHz | 0 | 0 | 6.89 / 11.61 ms | 0.65 ms | 512, 0 | 0 |
+| 96 kHz | 0 | 0 | 6.43 / 10.67 ms | 0.76 ms | 256, 0 | 0 |
+
+Both pass. The kernel migrated 17748 pages during the 44.1 kHz hour and 5552
+during the 96 kHz hour, with `vm.compact_unevictable_allowed = 0` from the
+installed file. Faults of the audio thread were not counted. The worst gaps are close
+to stage 2's hours without the analog input, 7.44 and 6.60 ms, and far from
+stage 3a's 96 kHz hour, 10.16 ms, made before the setting. The worst cycles,
+0.65 and 0.76 ms, are a little above the 0.43 to 0.60 ms of the hours with the
+setting in stage 3a, at an eighth of a period. In the 96 kHz run the capture
+padded 256 frames, one period at 48 kHz at the start, and nothing when the rate
+changed, where stage 3a padded one more period each time; why was not looked
+into.
+
+### A swap through the cable
+
+The CM5 with its defaults on the DAC+ ADC Pro, the analog input off, and
+`arecord` reading the card's ADC directly at 48 kHz while a player sent 3 s
+of a 1 kHz tone at -20 dBFS peak on the left channel only, with silence on the
+right, through `aas` at 48 kHz. Level at 1 kHz over the loudest second, per
+channel:
+
+| Config | Channel 1 | Channel 2 |
+|---|---|---|
+| No matrix | -20.1 dBFS | -134.7 dBFS |
+| The swap of the hour runs | -131.2 dBFS | -20.0 dBFS |
+| No matrix, again | -20.1 dBFS | -131.8 dBFS |
+
+So the swap moved the tone to the right output, at the same level, and left
+nothing of it on the left that the ADC can show. There was no ear at the
+board, so it was not listened to.
+
+`dist/test-plugin.sh` now has the same check as a case,
+`matrix_swaps_the_channels`, run when `AAS_TEST_CAPTURE` names the capture
+device. On the CM5, with the daemon installed as its unit for the run and
+removed after, `AAS_TEST_CAPTURE=plughw:sndrpihifiberry ANALOG=1` passed 32 of
+33 cases. The one failure is `mpd_mixer_works`, because `mpd` is not installed.
+The matrix case read the tone at -20.1 dBFS on the left before and -20.0 dBFS
+on the right with the swap, the other channel at -72 dBFS by the case's own
+measure, which takes the loudest tenth of a second of the noise at 1 kHz.
+
+### Eight channels on a stereo card
+
+The plan treats a card that does not take the configured channel count as
+missing: the null sink plays, the reason is logged once, and the open is tried
+again every second. Both boards were run with only `channels = 8` in the config,
+while a player played for 3 s.
+
+On the Pi 3 that is what happens. The daemon logged
+`hw:sndrpihifiberry: does not take 8 channels` once at the start, played to the
+null sink, counted 0 xruns and 0 wake-up gaps, and the kernel logged nothing.
+Nothing reached the ADC.
+
+On the CM5 the card answers the probe differently from the open. The probe
+logged `card hw:sndrpihifiberry takes 8 channels`: the card's configuration
+space allows 8 channels. Opening the card then fails in `snd_pcm_hw_params` with `Invalid argument`, and the kernel logs
+`designware-i2s ... ASoC error (-22): at snd_soc_dai_hw_params()`. So the daemon
+played to the null sink and nothing reached the ADC, as it should. But:
+
+- The reason it logged is the failure of the call, `apply: ... Invalid argument
+  (22)`, not that the card does not take 8 channels.
+- Each retry, once a second, opens the card and fails in the kernel on the
+  audio thread, and took 3.4 to 4.1 ms. With the null sink at the CM5's period
+  of 64 frames, a 2.67 ms buffer, the daemon counted that as a wake-up gap
+  every second: 7 in 7.5 s, the worst 4.11 ms.
+- The kernel logged two lines per retry, so two a second for as long as the
+  config stays.
+
+Nothing played wrongly. Whether the retry should run off the audio thread, or
+the daemon should treat a failure to apply the hardware parameters at the
+configured channel count as the card not taking the count, is left open.
+
+### What these figures do not show
+
+- No board has a card with more than two channels, so more than two channels
+  were checked only through `snd-aloop`, which proves the samples, not timing
+  on a real card.
+- The cost comparison is on the Pi 3 only, at 48 kHz and 256 frames, idle,
+  with the mixing forced by `bit_perfect = "off"`. Bit-perfect stereo, the
+  usual case, was not timed. The mean includes the audio thread's system calls,
+  so the extra time may be in the cycle's work or around it.
+- The eight-channel cost ran at 1024 frames, not at the stereo runs' 256, so the
+  two compare per frame only.
+- The swap through the cable was checked on the CM5 only, at 48 kHz, with the
+  analog input off. The hour runs had it on, but a swap of the analog input was
+  checked only in that the hour passed.
+- A matrix change at run time was not measured on a board: only the config sets
+  a matrix in this stage, and the daemon reads it at its start.
