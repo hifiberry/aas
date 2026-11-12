@@ -18,6 +18,10 @@
 # with the input enabled at -20 dB, so that the loop through the cable
 # stays quiet, and put the config back after. Without ANALOG=1 they are
 # not run and not counted.
+#
+# With AAS_TEST_CAPTURE set the matrix case runs too: it restarts the
+# daemon with a matrix that swaps left and right, and checks that a tone
+# played on the left comes back on the right. Without it, it is skipped.
 set -u
 # alsactl is in sbin.
 PATH=$PATH:/usr/sbin
@@ -25,13 +29,13 @@ PATH=$PATH:/usr/sbin
 rate=48000
 work=$(mktemp -d)
 conf=/etc/aas/aas.toml
-# What analog_on did to the config, for analog_off to undo: "kept" with
-# the old file in $work, "added" where there was none.
-analog_conf=""
-analog_dir=""
+# What config_with did to the config, for config_back to undo: "kept"
+# with the old file in $work, "added" where there was none.
+changed_conf=""
+changed_dir=""
 # Full volume again at the end, however the run ends, for whatever plays
 # next, and the config the daemon had.
-trap 'kill $(jobs -p) 2>/dev/null; analog_off; amixer -q -D default sset Master 100% 2>/dev/null; rm -rf "$work"' EXIT
+trap 'kill $(jobs -p) 2>/dev/null; config_back; amixer -q -D default sset Master 100% 2>/dev/null; rm -rf "$work"' EXIT
 trap 'exit 130' INT TERM HUP
 failed=0
 
@@ -64,46 +68,55 @@ wait_daemon() {
 	return 1
 }
 
-# Restarts the daemon with the analog input enabled at -20 dB, on top of
-# the config it has. A config with an [analog] table of its own is left
-# alone and the case fails.
-analog_on() {
+# Restarts the daemon with the TOML in $2 added to the config it has. A
+# config that already has a table matching the pattern $1 is left alone
+# and the case fails.
+config_with() {
 	if [ -e $conf ]; then
-		grep -q '^[[:space:]]*\[analog\]' $conf && return 1
+		grep -q "$1" $conf && return 1
 		cp $conf "$work/aas.toml.before"
-		analog_conf=kept
+		changed_conf=kept
 	else
-		[ -d /etc/aas ] || analog_dir=made
+		[ -d /etc/aas ] || changed_dir=made
 		: >"$work/aas.toml.before"
-		analog_conf=added
+		changed_conf=added
 	fi
 	{
 		cat "$work/aas.toml.before"
-		printf '\n[analog]\nenabled = true\nvolume_db = -20\n'
-	} >"$work/analog.toml"
-	sudo install -D -m 0644 "$work/analog.toml" $conf || return 1
+		printf '\n%s\n' "$2"
+	} >"$work/changed.toml"
+	sudo install -D -m 0644 "$work/changed.toml" $conf || return 1
 	# Each case starts the daemon twice. More than five starts in ten
 	# seconds would reach systemd's limit.
 	sudo systemctl reset-failed aas
 	sudo systemctl restart aas
-	wait_daemon || return 1
+	wait_daemon
+}
+
+# Restarts the daemon with the analog input enabled at -20 dB, on top of
+# the config it has. A config with an [analog] table of its own is left
+# alone and the case fails.
+analog_on() {
+	config_with '^[[:space:]]*\[analog\]' '[analog]
+enabled = true
+volume_db = -20' || return 1
 	# The capture reads zeros for its first second, while the ADC settles.
 	sleep 1.5
 }
 
-# Puts the config back as analog_on found it and restarts the daemon. Does
-# nothing if analog_on changed nothing.
-analog_off() {
-	case $analog_conf in
+# Puts the config back as config_with found it and restarts the daemon.
+# Does nothing if config_with changed nothing.
+config_back() {
+	case $changed_conf in
 	kept) sudo install -m 0644 "$work/aas.toml.before" $conf ;;
 	added)
 		sudo rm -f $conf
-		[ "$analog_dir" = made ] && sudo rmdir /etc/aas
+		[ "$changed_dir" = made ] && sudo rmdir /etc/aas
 		;;
 	*) return 0 ;;
 	esac
-	analog_conf=""
-	analog_dir=""
+	changed_conf=""
+	changed_dir=""
 	sudo systemctl reset-failed aas
 	sudo systemctl restart aas
 	wait_daemon
@@ -810,7 +823,7 @@ fi
 
 # A helper for the tone the format case plays and hears. `gen` writes one
 # second of a 1 kHz sine at -20 dBFS, at 48 kHz, in the format and channel
-# count given. `hear` reads a recording, S32_LE stereo at 48 kHz or at the
+# count given, and with `left` after them on the first channel only. `hear` reads a recording, S32_LE stereo at 48 kHz or at the
 # rate given, and prints for each channel the tone's level in dBFS, the
 # share of the signal's power that is the tone, and for how many tenths of
 # a second the tone was there. `freq` reads the same and prints for each
@@ -843,11 +856,11 @@ static double median(double *v, int n)
 	return v[n / 2];
 }
 
-static int gen(const char *format, int channels)
+static int gen(const char *format, int channels, int left_only)
 {
 	for (int i = 0; i < RATE; i++) {
-		double x = 0.1 * sin(2 * M_PI * FREQ * i / RATE);
 		for (int c = 0; c < channels; c++) {
+			double x = c > 0 && left_only ? 0 : 0.1 * sin(2 * M_PI * FREQ * i / RATE);
 			if (!strcmp(format, "S16_LE")) {
 				int16_t v = lrint(x * 32767);
 				fwrite(&v, 2, 1, stdout);
@@ -982,7 +995,9 @@ int main(int argc, char **argv)
 	if ((argc == 2 || argc == 3) && !strcmp(argv[1], "freq"))
 		return freq();
 	if (argc == 4 && !strcmp(argv[1], "gen"))
-		return gen(argv[2], atoi(argv[3]));
+		return gen(argv[2], atoi(argv[3]), 0);
+	if (argc == 5 && !strcmp(argv[1], "gen") && !strcmp(argv[4], "left"))
+		return gen(argv[2], atoi(argv[3]), 1);
 	if ((argc == 2 || argc == 3) && !strcmp(argv[1], "hear"))
 		return hear();
 	if (argc == 2 && !strcmp(argv[1], "widen"))
@@ -1646,7 +1661,7 @@ case_analog_input_opens_on_signal() {
 	name=analog_input_opens_on_signal
 	if ! analog_on; then
 		fail $name "the daemon did not start with the analog input"
-		analog_off
+		config_back
 		return
 	fi
 	daemon=$(main_pid)
@@ -1655,7 +1670,7 @@ case_analog_input_opens_on_signal() {
 	if ! capture_running; then
 		fail $name "the daemon holds no running capture: $(daemon_log $daemon | grep analog | tr '\n' ' ')"
 		amixer -q -D default sset Master "$volume%"
-		analog_off
+		config_back
 		return
 	fi
 	"$work/tone" gen S16_LE 2 >"$work/tone.raw"
@@ -1667,7 +1682,7 @@ case_analog_input_opens_on_signal() {
 	opened=$(log_wait $daemon "analog input: signal" 1000)
 	closed=$(log_wait $daemon "analog input: quiet" 6000)
 	amixer -q -D default sset Master "$volume%"
-	analog_off
+	config_back
 	took=$((end - start))
 	end=$((start + 2000))
 	if [ $status -ne 0 ]; then
@@ -1693,7 +1708,7 @@ case_analog_input_stays_closed_on_silence() {
 	name=analog_input_stays_closed_on_silence
 	if ! analog_on; then
 		fail $name "the daemon did not start with the analog input"
-		analog_off
+		config_back
 		return
 	fi
 	daemon=$(main_pid)
@@ -1702,7 +1717,7 @@ case_analog_input_stays_closed_on_silence() {
 	capture_running && running=yes
 	opens=$(daemon_log $daemon | grep -c -F "analog input: signal")
 	log=$(daemon_log $daemon | grep analog | tr '\n' ' ')
-	analog_off
+	config_back
 	if [ $running = yes ] && [ "$opens" -eq 0 ]; then
 		pass $name "capture running, no open in 10 s"
 	else
@@ -1717,7 +1732,7 @@ case_rate_change_with_capture_open() {
 	name=rate_change_with_capture_open
 	if ! analog_on; then
 		fail $name "the daemon did not start with the analog input"
-		analog_off
+		config_back
 		return
 	fi
 	daemon=$(main_pid)
@@ -1728,7 +1743,7 @@ case_rate_change_with_capture_open() {
 	sleep 0.5
 	running=no
 	capture_running && running=yes
-	analog_off
+	config_back
 	log_wait $daemon "aas: stopped:" 2000 >/dev/null
 	log=$(daemon_log $daemon)
 	counters=$(echo "$log" | grep -F "aas: stopped:" | head -n1 | cut -d' ' -f2-)
@@ -1755,7 +1770,7 @@ case_capture_hears_the_analog_input() {
 	name=capture_hears_the_analog_input
 	if ! analog_on; then
 		fail $name "the daemon did not start with the analog input"
-		analog_off
+		config_back
 		return
 	fi
 	volume=$(master)
@@ -1804,12 +1819,74 @@ case_capture_hears_the_analog_input() {
 		fi
 	done
 	amixer -q -D default sset Master "$volume%"
-	analog_off
+	config_back
 	if [ -z "$bad" ]; then
 		report="${report# }"
 		pass $name "${report%;}"
 	else
 		fail $name "failed:$bad"
+	fi
+}
+
+# Records what the cable brings back of a tone played on the left only,
+# and prints the level, share and tenths per channel as `hear` gives them.
+heard_left_tone() {
+	"$work/tone" gen S16_LE 2 left >"$work/left.raw"
+	arecord -q -D "$AAS_TEST_CAPTURE" -t raw -f S32_LE -c 2 -r $rate -s $((rate * 16 / 10)) \
+		"$work/heard.raw" 2>"$work/caperr" &
+	recorder=$!
+	sleep 0.3
+	aplay -q -D default -t raw -f S16_LE -c 2 -r $rate "$work/left.raw" 2>"$work/err" || return 1
+	wait $recorder || return 1
+	"$work/tone" hear <"$work/heard.raw"
+}
+
+# A matrix that swaps left and right moves a tone played on the left to
+# the right output, through the cable. Played once with the config as it
+# is, which must route left to the left, and once with the swap added:
+# the tone must come back on the other channel within 1 dB of its level
+# before, nine tenths of the power in the tone, and the channel without
+# it at least 40 dB lower.
+case_matrix_swaps_the_channels() {
+	name=matrix_swaps_the_channels
+	volume=$(master)
+	amixer -q -D default sset Master 100%
+	before=$(heard_left_tone) || before=""
+	if ! config_with '^[[:space:]]*\[\[matrix\]\]' '[[matrix]]
+from = "players.left"
+to = 2
+
+[[matrix]]
+from = "players.right"
+to = 1
+
+[[matrix]]
+from = "analog.left"
+to = 2
+
+[[matrix]]
+from = "analog.right"
+to = 1'; then
+		fail $name "the daemon did not start with the swap, or the config has a matrix"
+		amixer -q -D default sset Master "$volume%"
+		config_back
+		return
+	fi
+	amixer -q -D default sset Master 100%
+	after=$(heard_left_tone) || after=""
+	amixer -q -D default sset Master "$volume%"
+	config_back
+	if [ -z "$before" ] || [ -z "$after" ]; then
+		fail $name "a player or the recording failed: $(head -n1 "$work/err") $(head -n1 "$work/caperr")"
+	elif echo "$before $after" | awk '{
+		# Left then right, as level, share and tenths; before, then after.
+		if ($2 < 0.9 || $3 < 9 || $3 > 11 || $4 > $1 - 40) exit 1
+		if ($11 < 0.9 || $12 < 9 || $12 > 11 || $7 > $10 - 40) exit 1
+		if ($10 < $1 - 1 || $10 > $1 + 1) exit 1
+	}'; then
+		pass $name "left only, per channel as level, share and tenths: before $before, swapped $after"
+	else
+		fail $name "left only, per channel as level, share and tenths: before $before, swapped $after"
 	fi
 }
 
@@ -1824,7 +1901,8 @@ amixer_fails_without_the_daemon watcher_hears_the_daemon_go
 monitor_sleeps_when_the_daemon_is_gone arecord_records_each_format
 capture_is_silent_without_signal capture_never_hears_a_player
 capture_ends_on_a_rate_change recorder_killed_keeps_daemon_up
-capture_overrun_returns_epipe capture_polls_and_survives_a_reset"
+capture_overrun_returns_epipe capture_polls_and_survives_a_reset
+matrix_swaps_the_channels"
 analog_cases="analog_input_opens_on_signal analog_input_stays_closed_on_silence
 rate_change_with_capture_open capture_hears_the_analog_input"
 [ "${ANALOG:-}" = 1 ] && cases="$cases $analog_cases"
@@ -1832,6 +1910,10 @@ rate_change_with_capture_open capture_hears_the_analog_input"
 for name in $cases; do
 	if [ "${ANALOG:-}" != 1 ] && echo "$analog_cases" | grep -qw -- "$name"; then
 		echo "SKIP $name: needs ANALOG=1"
+		continue
+	fi
+	if [ -z "${AAS_TEST_CAPTURE:-}" ] && [ "$name" = matrix_swaps_the_channels ]; then
+		echo "SKIP $name: needs AAS_TEST_CAPTURE"
 		continue
 	fi
 	if ! command -v "case_$name" >/dev/null; then
