@@ -114,7 +114,7 @@ is kept in `/var/lib/aas/state.toml`.
 | `volume_control` | a mixer control name | the first of `Digital`, `Master`, `PCM` | The card's control that carries the volume. |
 | `default_rate` | 8000 to 384000 | 48000 | The rate the output opens at before the first client plays. |
 
-Two tables set up the analog input and the audio plugins.
+Three tables set up the analog input, the audio plugins and the mixing matrix.
 
 ```toml
 [analog]
@@ -132,6 +132,15 @@ place = "output"
 type = "library"
 path = "/usr/lib/aas/libaas_gain.so"
 gain = -3
+
+[[matrix]]
+from = "players.left"     # players.left, players.right, analog.left or analog.right
+to = 2                    # the output channel, counted from 1
+gain_db = 0               # -100 to 0, default 0
+
+[[matrix]]
+from = "players.right"
+to = 1
 ```
 
 `[analog]` turns on the card's analog input (`enabled`, default `false`) and sets
@@ -163,6 +172,32 @@ values for an enumeration. `detect` takes `threshold` in dBFS and
 `hold` in seconds. Without a `detect` table it runs last at `analog` with its
 defaults. `balance` takes `balance`, from -1 (left) to 1 (right). A plugin that
 cannot be loaded stops the daemon with an error.
+
+Each `[[matrix]]` table adds one route: a gain, `gain_db` from -100 to 0 and 0 by
+default, from the input `from` to the output channel `to`, counted from 1. The
+inputs are `players.left` and `players.right`, the sum of all clients after their
+volumes, and `analog.left` and `analog.right`. What no route names is off. Without
+any `[[matrix]]` table, left goes to channel 1 and right to channel 2 for both
+sources, and further channels are silent. The two routes above swap left and right.
+A sum to mono is two routes to the same channel, which should lower each by 6 dB to
+keep full-scale input from clipping:
+
+```toml
+[[matrix]]
+from = "players.left"
+to = 1
+gain_db = -6
+
+[[matrix]]
+from = "players.right"
+to = 1
+gain_db = -6
+```
+
+The same `from` and `to` may not appear twice, and `to` may not be above the
+number of channels. An unknown key, a `from` that is not one of the four names, a
+`to` that is not a whole number from 1 to 8 and a `gain_db` outside -100 to 0 stop
+the daemon with an error naming the table by its position in the file.
 
 ### Recording
 
