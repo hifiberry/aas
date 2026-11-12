@@ -311,7 +311,8 @@ plugin still gives `process`, which is never called when the counts differ. The
 daemon refuses a library with one count 0 and the other not, a count above 8,
 or counts that differ and no `process_into`, and refuses a chain in which a
 plugin does not get the count it takes. A plugin whose counts differ is never
-neutral.
+neutral, and runs only at `mix` or `output`: the analog input keeps two channels
+throughout, and such a plugin there stops the daemon with an error.
 
 Libraries of ABI version 1, which are stereo and in place and whose `create` has
 no `channels` argument, still load, as plugins with two channels in and out.

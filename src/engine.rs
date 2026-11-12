@@ -1040,7 +1040,7 @@ pub enum Command {
     /// built for `MAX_PERIOD` frames, so that no period change can outgrow
     /// it. A shorter one is refused: it comes back as the `OldChain` and the
     /// chain in place stays. So is one built for other channel counts: an
-    /// analog chain takes and gives two, a `mix` chain takes as many as the
+    /// analog chain keeps two throughout, a `mix` chain takes as many as the
     /// matrix is wide, an `output` chain takes what the `mix` chain gives,
     /// and with both in place they end at the sink's count. An empty chain
     /// fits any count. An empty `output` chain in place does not hold back
@@ -1475,7 +1475,13 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         let takes = |n: usize, count: usize| n == 0 || n == count;
         let width = self.matrix.width();
         match place {
-            Place::Analog => takes(chain.channels_in(), 2) && takes(chain.channels_out(), 2),
+            // The analog input runs its chain in place, which a chain that
+            // changes the count anywhere inside it cannot do.
+            Place::Analog => {
+                takes(chain.channels_in(), 2)
+                    && takes(chain.channels_out(), 2)
+                    && !chain.changes_channels()
+            }
             Place::Mix => {
                 let between = gives(chain, width);
                 let output = &self.output;
@@ -7889,6 +7895,32 @@ mod tests {
         check::<I32>();
         check::<F32>();
         check::<F64>();
+    }
+
+    #[test]
+    fn an_analog_chain_that_changes_the_count_inside_it_is_sent_back() {
+        // Two in and two out, but four between: the analog input runs its
+        // chain in place, so such a chain must never reach it.
+        let (mut rig, feed) = with_capture::<F32>(BitPerfect::Off);
+        feed.push(&frames(1000, PERIOD));
+        rig.cycle();
+        rig.events();
+        let narrow = crate::plugin::builtin::create("narrow", RATE, 4);
+        let mut plugins = vec![widen(), narrow.unwrap().unwrap()];
+        plugins.push(Box::new(Detect::new(RATE)));
+        let chain = chain_at::<F32>(plugins, 2);
+        assert!(chain.changes_channels());
+        assert_eq!((chain.channels_in(), chain.channels_out()), (2, 2));
+        rig.send(Command::SetChain(Place::Analog, chain));
+        feed.push(&frames(1000, PERIOD));
+        rig.cycle();
+        let back = rig.events().into_iter().find_map(|e| match e {
+            Event::OldChain(c) => Some(c),
+            _ => None,
+        });
+        assert!(back.is_some_and(|c| c.changes_channels()));
+        // The chain in place keeps playing.
+        assert_eq!(rig.last_periods(1), frames(1000, PERIOD));
     }
 
     /// In f32 only: which chain is refused depends on its counts, not on

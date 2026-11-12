@@ -768,7 +768,9 @@ Details *(call)*:
   whose counts differ is never neutral, and cannot work in place, so it needs
   ABI version 2. A chain checks its plugins' counts when it is built, on the
   control thread, and refuses a pair that does not fit. An empty chain keeps
-  any count.
+  any count. Only `mix` and `output` take a plugin whose counts differ: the
+  analog input keeps two channels throughout and runs its chain in place, so
+  such a plugin there is a config error.
 - `mix` and `output` both belong to the output and run after the matrix, `mix`
   first *(call)*. They differ only in order, as before. In part 2 of stage 3b a
   plugin names its card.

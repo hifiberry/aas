@@ -122,7 +122,16 @@ pub fn build_chain(
                 }
             }
         }
-        if let Channels::Fixed { output, .. } = plugin.channels() {
+        if let Channels::Fixed { input, output } = plugin.channels() {
+            // The analog input runs its chain in place, at two channels
+            // throughout.
+            if place == PluginPlace::Analog && input != output {
+                return Err(config_error(format!(
+                    "{prefix}{} takes {input} channels and gives {output}, but \
+                     place = \"analog\" takes only plugins that keep two channels",
+                    plugin.name()
+                )));
+            }
             width = output;
         }
         plugins.push(plugin);
@@ -636,5 +645,37 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[test]
+    fn the_analog_input_takes_no_plugin_that_changes_the_count() {
+        let refused = |config: &[PluginConfig], n: usize, kind: &str| {
+            let e = build(config, PluginPlace::Analog).err().unwrap();
+            assert!(e.starts_with(&format!("plugin {n}: {kind}")), "{e}");
+            assert!(e.contains("place = \"analog\""), "{e}");
+            assert!(e.contains("keep two channels"), "{e}");
+            let mut libraries = Libraries::default();
+            let start = Chains::build_for_start(config, 48000, &[], Format::F32, 2, &mut libraries);
+            assert_eq!(start.err(), Some(e));
+        };
+        // Two in and two out, with four between.
+        let config = [
+            plugin(PluginPlace::Analog, "widen", &[]),
+            plugin(PluginPlace::Analog, "narrow", &[]),
+            plugin(PluginPlace::Analog, "detect", &[]),
+        ];
+        refused(&config, 1, "widen");
+        // Four out after the detector.
+        let config = [
+            plugin(PluginPlace::Analog, "detect", &[]),
+            plugin(PluginPlace::Analog, "widen", &[]),
+        ];
+        refused(&config, 2, "widen");
+        // The same plugins elsewhere are fine.
+        let config = [
+            plugin(PluginPlace::Mix, "widen", &[]),
+            plugin(PluginPlace::Output, "narrow", &[]),
+        ];
+        assert!(build(&config, PluginPlace::Analog).is_ok());
     }
 }
