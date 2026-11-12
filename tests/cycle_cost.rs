@@ -8,7 +8,8 @@
 //! Each line gives the fastest, middle and slowest of seven runs of 20,000
 //! cycles, in nanoseconds per cycle. The sink takes the period and does
 //! nothing with it, so the figure is the cycle's own work. Pin the process
-//! to one CPU (`taskset -c 2`) for figures that compare between builds.
+//! to one CPU of your choice, the same for every build, with `taskset -c`
+//! for figures that compare between builds.
 
 use aas::capture::MemoryCapture;
 use aas::config::{BitPerfect, Format};
