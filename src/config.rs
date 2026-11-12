@@ -123,6 +123,26 @@ pub struct Route {
     pub gain_db: f32,
 }
 
+/// The most outputs there can be, the master included.
+pub const MAX_OUTPUTS: usize = 4;
+
+/// One `[[output]]` table: a further card to play to.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OutputConfig {
+    /// The card, as its ALSA id or index.
+    pub card: String,
+    /// The channels the card is opened with, from 1 to `MAX_CHANNELS`.
+    pub channels: usize,
+    /// What the output does when nothing plays.
+    pub idle: Idle,
+    /// The output's offset to the `Master` volume in dB, from -60 to 0.
+    pub volume_db: f32,
+    /// The plugins of this output, in the order of the file.
+    pub plugins: Vec<PluginConfig>,
+    /// The routes of this output's matrix. None gives the default matrix.
+    pub matrix: Option<Vec<Route>>,
+}
+
 /// The settings, after the defaults are filled in. The README lists the
 /// keys of the file.
 #[derive(Debug, Clone, PartialEq)]
@@ -158,6 +178,21 @@ pub struct Config {
     /// a `[[matrix]]` table, and for an empty `matrix = []`: both give the
     /// default matrix, never one with every route off.
     pub matrix: Option<Vec<Route>>,
+    /// The further outputs, in the order of the file. The flat keys are the
+    /// master, output 1.
+    pub outputs: Vec<OutputConfig>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawOutput {
+    card: Option<String>,
+    channels: Option<usize>,
+    idle: Option<IdleKind>,
+    idle_delay_s: Option<u32>,
+    volume_db: Option<toml::Value>,
+    plugin: Option<Vec<toml::Table>>,
+    matrix: Option<Vec<RawRoute>>,
 }
 
 #[derive(Deserialize)]
@@ -184,6 +219,7 @@ struct Raw {
     analog: Option<RawAnalog>,
     plugin: Option<Vec<toml::Table>>,
     matrix: Option<Vec<RawRoute>>,
+    output: Option<Vec<RawOutput>>,
 }
 
 #[derive(Deserialize)]
@@ -325,8 +361,90 @@ impl Default for Config {
             analog: Analog::default(),
             plugins: Vec::new(),
             matrix: None,
+            outputs: Vec::new(),
         }
     }
+}
+
+fn idle_from(kind: Option<IdleKind>, delay: Option<u32>) -> Result<Idle, String> {
+    match (kind, delay) {
+        (Some(IdleKind::Zeros), Some(_)) => Err("idle_delay_s needs idle = \"off\"".to_string()),
+        (Some(IdleKind::Zeros), None) => Ok(Idle::Zeros),
+        (_, delay) => Ok(Idle::Off {
+            delay_s: delay.unwrap_or(DEFAULT_IDLE_DELAY_S),
+        }),
+    }
+}
+
+/// Checks the `[[plugin]]` tables of one output. The master takes the analog
+/// place and `detect`; a further output does not.
+fn plugins_from(tables: Vec<toml::Table>, master: bool) -> Result<Vec<PluginConfig>, String> {
+    let mut plugins = Vec::new();
+    for (i, table) in tables.into_iter().enumerate() {
+        let plugin = plugin_from_table(i + 1, table)?;
+        if !master && plugin.place == PluginPlace::Analog {
+            return Err(format!(
+                "plugin {}: place \"analog\" is only for the master output",
+                i + 1
+            ));
+        }
+        if !master && plugin.kind == "detect" {
+            return Err(format!(
+                "plugin {}: detect is only for the master output",
+                i + 1
+            ));
+        }
+        if plugin.kind == "detect" && plugins.iter().any(|p: &PluginConfig| p.kind == "detect") {
+            return Err(format!(
+                "plugin {}: only one detect plugin is allowed",
+                i + 1
+            ));
+        }
+        plugins.push(plugin);
+    }
+    Ok(plugins)
+}
+
+fn matrix_from(tables: Option<Vec<RawRoute>>) -> Result<Option<Vec<Route>>, String> {
+    match tables {
+        None => Ok(None),
+        Some(tables) if tables.is_empty() => Ok(None),
+        Some(tables) => tables
+            .into_iter()
+            .enumerate()
+            .map(|(i, table)| route_from_table(i + 1, table))
+            .collect::<Result<Vec<_>, _>>()
+            .map(Some),
+    }
+}
+
+/// Checks one `[[output]]` table. `n` is its output number, from 2.
+fn output_from_table(n: usize, raw: RawOutput) -> Result<OutputConfig, String> {
+    let at = |e: String| format!("output {n}: {e}");
+    let card = raw.card.ok_or_else(|| at("card is missing".to_string()))?;
+    if raw
+        .channels
+        .is_some_and(|c| !(1..=MAX_CHANNELS).contains(&c))
+    {
+        return Err(at(format!("channels must be from 1 to {MAX_CHANNELS}")));
+    }
+    let volume_db = match raw.volume_db {
+        None => 0.0,
+        Some(toml::Value::Integer(v)) => v as f64,
+        Some(toml::Value::Float(v)) => v,
+        Some(_) => return Err(at("volume_db must be a number".to_string())),
+    };
+    if !(-60.0..=0.0).contains(&volume_db) {
+        return Err(at("volume_db must be from -60 to 0".to_string()));
+    }
+    Ok(OutputConfig {
+        card,
+        channels: raw.channels.unwrap_or(2),
+        idle: idle_from(raw.idle, raw.idle_delay_s).map_err(at)?,
+        volume_db: volume_db as f32,
+        plugins: plugins_from(raw.plugin.unwrap_or_default(), false).map_err(at)?,
+        matrix: matrix_from(raw.matrix).map_err(at)?,
+    })
 }
 
 impl Config {
@@ -367,18 +485,8 @@ impl Config {
             ));
         }
         let d = Config::default();
-        let idle = match (raw.idle, raw.idle_delay_s) {
-            (Some(IdleKind::Zeros), Some(_)) => {
-                return Err(format!(
-                    "{}: idle_delay_s needs idle = \"off\"",
-                    path.display()
-                ));
-            }
-            (Some(IdleKind::Zeros), None) => Idle::Zeros,
-            (_, delay) => Idle::Off {
-                delay_s: delay.unwrap_or(DEFAULT_IDLE_DELAY_S),
-            },
-        };
+        let idle = idle_from(raw.idle, raw.idle_delay_s)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
         let mut analog = d.analog;
         if let Some(a) = raw.analog {
             analog.enabled = a.enabled.unwrap_or(analog.enabled);
@@ -390,34 +498,43 @@ impl Config {
                 path.display()
             ));
         }
-        let mut plugins = Vec::new();
-        for (i, table) in raw.plugin.unwrap_or_default().into_iter().enumerate() {
-            let plugin =
-                plugin_from_table(i + 1, table).map_err(|e| format!("{}: {e}", path.display()))?;
-            if plugin.kind == "detect" && plugins.iter().any(|p: &PluginConfig| p.kind == "detect")
-            {
+        let plugins = plugins_from(raw.plugin.unwrap_or_default(), true)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        let matrix = matrix_from(raw.matrix).map_err(|e| format!("{}: {e}", path.display()))?;
+        let raw_outputs = raw.output.unwrap_or_default();
+        if raw_outputs.len() >= MAX_OUTPUTS {
+            return Err(format!(
+                "{}: at most {} [[output]] tables, so {MAX_OUTPUTS} outputs with the master",
+                path.display(),
+                MAX_OUTPUTS - 1
+            ));
+        }
+        if !raw_outputs.is_empty() && raw.card.is_none() {
+            return Err(format!(
+                "{}: card is needed to name the master's card when there are [[output]] tables",
+                path.display()
+            ));
+        }
+        let mut outputs: Vec<OutputConfig> = Vec::new();
+        for (i, table) in raw_outputs.into_iter().enumerate() {
+            let n = i + 2;
+            let out =
+                output_from_table(n, table).map_err(|e| format!("{}: {e}", path.display()))?;
+            let earlier = raw
+                .card
+                .iter()
+                .map(|c| (1, c))
+                .chain(outputs.iter().enumerate().map(|(j, o)| (j + 2, &o.card)))
+                .find(|(_, c)| **c == out.card);
+            if let Some((first, _)) = earlier {
                 return Err(format!(
-                    "{}: plugin {}: only one detect plugin is allowed",
+                    "{}: card \"{}\" is used by output {first} and output {n}",
                     path.display(),
-                    i + 1
+                    out.card
                 ));
             }
-            plugins.push(plugin);
+            outputs.push(out);
         }
-        let matrix = match raw.matrix {
-            None => None,
-            Some(tables) if tables.is_empty() => None,
-            Some(tables) => {
-                let mut routes = Vec::new();
-                for (i, table) in tables.into_iter().enumerate() {
-                    routes.push(
-                        route_from_table(i + 1, table)
-                            .map_err(|e| format!("{}: {e}", path.display()))?,
-                    );
-                }
-                Some(routes)
-            }
-        };
         Ok(Config {
             card: raw.card,
             channels: raw.channels.unwrap_or(d.channels),
@@ -432,6 +549,7 @@ impl Config {
             analog,
             plugins,
             matrix,
+            outputs,
         })
     }
 }
@@ -788,5 +906,160 @@ mod tests {
             ));
             assert!(e.contains("plugin 1") && e.contains("gain"), "{v}: {e}");
         }
+    }
+
+    #[test]
+    fn no_output_table_leaves_outputs_empty() {
+        assert!(load_str("card = \"a\"\n").unwrap().outputs.is_empty());
+        assert!(load_str("").unwrap().outputs.is_empty());
+    }
+
+    #[test]
+    fn an_output_table_takes_its_own_matrix_and_plugins() {
+        let c = load_str(
+            r#"
+card = "a"
+[[output]]
+card = "b"
+[[output.matrix]]
+from = "players.left"
+to = 2
+gain_db = -6
+[[output.plugin]]
+place = "output"
+type = "balance"
+[[output]]
+card = "c"
+channels = 4
+[[output.matrix]]
+from = "players.right"
+to = 3
+[[output.plugin]]
+place = "mix"
+type = "balance"
+[[output.plugin]]
+place = "output"
+type = "balance"
+"#,
+        )
+        .unwrap();
+        assert_eq!(c.outputs.len(), 2);
+        assert_eq!(c.outputs[0].card, "b");
+        assert_eq!(c.outputs[0].plugins.len(), 1);
+        assert_eq!(c.outputs[0].plugins[0].place, PluginPlace::Output);
+        let m = c.outputs[0].matrix.as_ref().unwrap();
+        assert_eq!(m.len(), 1);
+        assert_eq!((m[0].to, m[0].gain_db), (2, -6.0));
+        assert_eq!(c.outputs[1].card, "c");
+        assert_eq!(c.outputs[1].channels, 4);
+        assert_eq!(c.outputs[1].plugins.len(), 2);
+        assert_eq!(c.outputs[1].matrix.as_ref().unwrap()[0].to, 3);
+        assert!(c.matrix.is_none() && c.plugins.is_empty());
+    }
+
+    #[test]
+    fn an_output_without_a_card_is_refused() {
+        let e = load_str("card = \"a\"\n[[output]]\nchannels = 2\n").unwrap_err();
+        assert!(e.contains("output 2") && e.contains("card"), "{e}");
+    }
+
+    #[test]
+    fn two_outputs_on_one_card_are_refused() {
+        let e = load_str("card = \"a\"\n[[output]]\ncard = \"b\"\n[[output]]\ncard = \"b\"\n")
+            .unwrap_err();
+        assert!(
+            e.contains("\"b\"") && e.contains("output 2") && e.contains("output 3"),
+            "{e}"
+        );
+        let e = load_str("card = \"a\"\n[[output]]\ncard = \"a\"\n").unwrap_err();
+        assert!(
+            e.contains("\"a\"") && e.contains("output 1") && e.contains("output 2"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn outputs_need_the_master_card_named() {
+        let e = load_str("[[output]]\ncard = \"b\"\n").unwrap_err();
+        assert!(e.contains("card") && e.contains("output"), "{e}");
+    }
+
+    #[test]
+    fn a_fifth_output_is_refused() {
+        let tables = |n: usize| {
+            let mut t = String::from("card = \"m\"\n");
+            for i in 0..n {
+                t += &format!("[[output]]\ncard = \"c{i}\"\n");
+            }
+            t
+        };
+        assert_eq!(load_str(&tables(MAX_OUTPUTS - 1)).unwrap().outputs.len(), 3);
+        let e = load_str(&tables(MAX_OUTPUTS)).unwrap_err();
+        assert!(e.contains("at most") && e.contains('4'), "{e}");
+    }
+
+    #[test]
+    fn analog_plugins_and_detect_are_refused_in_an_output() {
+        for plugin in [
+            "place = \"analog\"\ntype = \"balance\"",
+            "place = \"analog\"\ntype = \"detect\"",
+            "place = \"mix\"\ntype = \"detect\"",
+        ] {
+            let e = load_str(&format!(
+                "card = \"a\"\n[[output]]\ncard = \"b\"\n[[output.plugin]]\n{plugin}\n"
+            ))
+            .unwrap_err();
+            assert!(e.contains("output 2") && e.contains("plugin 1"), "{e}");
+        }
+    }
+
+    #[test]
+    fn output_volume_db_is_minus_60_to_0_and_0_by_default() {
+        let one = |v: &str| load_str(&format!("card = \"a\"\n[[output]]\ncard = \"b\"\n{v}\n"));
+        assert_eq!(one("").unwrap().outputs[0].volume_db, 0.0);
+        assert_eq!(one("volume_db = -60").unwrap().outputs[0].volume_db, -60.0);
+        assert_eq!(
+            one("volume_db = -12.5").unwrap().outputs[0].volume_db,
+            -12.5
+        );
+        for v in ["-60.5", "0.5", "\"x\"", "nan"] {
+            let e = one(&format!("volume_db = {v}")).unwrap_err();
+            assert!(
+                e.contains("output 2") && e.contains("volume_db"),
+                "{v}: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_output_takes_idle_and_channels_by_the_flat_rules() {
+        let c = load_str(
+            "card = \"a\"\n[[output]]\ncard = \"b\"\n[[output]]\ncard = \"c\"\nidle = \"zeros\"\n\
+             [[output]]\ncard = \"d\"\nidle_delay_s = 5\nchannels = 8\n",
+        )
+        .unwrap();
+        assert_eq!(c.outputs[0].idle, Idle::Off { delay_s: 60 });
+        assert_eq!(c.outputs[0].channels, 2);
+        assert_eq!(c.outputs[1].idle, Idle::Zeros);
+        assert_eq!(c.outputs[2].idle, Idle::Off { delay_s: 5 });
+        assert_eq!(c.outputs[2].channels, 8);
+        let e = load_str(
+            "card = \"a\"\n[[output]]\ncard = \"b\"\nidle = \"zeros\"\nidle_delay_s = 5\n",
+        )
+        .unwrap_err();
+        assert!(e.contains("output 2") && e.contains("idle_delay_s"), "{e}");
+        for v in ["0", "9"] {
+            let e = load_str(&format!(
+                "card = \"a\"\n[[output]]\ncard = \"b\"\nchannels = {v}\n"
+            ))
+            .unwrap_err();
+            assert!(e.contains("output 2") && e.contains("channels"), "{v}: {e}");
+        }
+        let e = load_str(
+            "card = \"a\"\n[[output]]\ncard = \"b\"\n[[output.matrix]]\nfrom = \"players.left\"\nto = 9\n",
+        )
+        .unwrap_err();
+        assert!(e.contains("output 2") && e.contains("matrix 1"), "{e}");
+        assert!(load_str("card = \"a\"\n[[output]]\ncard = \"b\"\nbogus = 1\n").is_err());
     }
 }
