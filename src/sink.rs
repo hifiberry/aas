@@ -220,7 +220,10 @@ impl MemorySink {
     }
 
     pub fn log(&self) -> SinkLog {
-        SinkLog(self.record.clone(), self.channels)
+        SinkLog {
+            record: self.record.clone(),
+            channels: self.channels,
+        }
     }
 
     fn record(&self) -> MutexGuard<'_, Record> {
@@ -288,20 +291,24 @@ impl Sink for MemorySink {
 
 /// A handle on what a `MemorySink` has seen, and on how it behaves.
 #[derive(Clone)]
-pub struct SinkLog(Arc<Mutex<Record>>, usize);
+pub struct SinkLog {
+    record: Arc<Mutex<Record>>,
+    /// The channels of the sink, as many samples per frame.
+    channels: usize,
+}
 
 impl SinkLog {
     fn record(&self) -> MutexGuard<'_, Record> {
-        self.0.lock().unwrap()
+        self.record.lock().unwrap()
     }
 
     /// What was written, as stereo frames. Panics for another channel
     /// count.
     pub fn frames(&self) -> Vec<[i32; 2]> {
         assert_eq!(
-            self.1, 2,
+            self.channels, 2,
             "frames() reads a stereo sink, this one has {}",
-            self.1
+            self.channels
         );
         self.record()
             .samples
@@ -340,7 +347,7 @@ impl SinkLog {
     /// Makes room, so that recording does not allocate during a test of the
     /// audio thread.
     pub fn reserve(&self, frames: usize) {
-        let samples = frames * self.1;
+        let samples = frames * self.channels;
         self.record().samples.reserve(samples);
     }
 }

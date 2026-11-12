@@ -26,6 +26,8 @@ pub struct Chain {
     wide: [BlockStore; 2],
     /// For each plugin, the channels it takes and the channels it gives.
     counts: Vec<(usize, usize)>,
+    /// A plugin's counts differ.
+    changes: bool,
     /// The channels of the blocks the chain takes, and of the ones it gives.
     /// Both 0 for a chain that takes any count, which is `Chain::empty()`.
     channels_in: usize,
@@ -41,6 +43,9 @@ impl Chain {
     /// panics. The engine takes only chains built for
     /// `crate::latency::MAX_PERIOD`, so that one never depends on the
     /// period.
+    ///
+    /// A chain built here with no plugins reports `channels` as both its
+    /// counts, unlike `Chain::empty()`.
     ///
     /// Fails with a message that names the plugin and gives both counts when
     /// a plugin does not fit the count that reaches it, or when a count is 0
@@ -78,6 +83,7 @@ impl Chain {
             channels_in: channels,
             channels_out: counts.last().map_or(channels, |&(_, o)| o),
             counts,
+            changes: changes > 0,
             max_frames,
             rate: None,
         })
@@ -108,6 +114,7 @@ impl Chain {
             store_out: BlockStore::new(0, 1),
             wide: [BlockStore::new(0, 1), BlockStore::new(0, 1)],
             counts: Vec::new(),
+            changes: false,
             channels_in: 0,
             channels_out: 0,
             max_frames: 0,
@@ -129,7 +136,7 @@ impl Chain {
 
     /// True if a plugin's channel counts differ.
     pub fn changes_channels(&self) -> bool {
-        self.counts.iter().any(|(i, o)| i != o)
+        self.changes
     }
 
     /// Runs the plugins in order on `block`, which must be in the chain's
@@ -1140,6 +1147,135 @@ mod tests {
             panic!("not f32")
         };
         assert_eq!(out, [0.25, -0.5, 0.25, -0.5]);
+    }
+
+    /// Fixed 2 to 4 as `Wide`, with a latency, a status of its own and a
+    /// count of its resets.
+    struct Reporting {
+        resets: Arc<Mutex<u32>>,
+        status: Status,
+    }
+
+    impl Plugin for Reporting {
+        fn name(&self) -> &str {
+            "reporting"
+        }
+
+        fn formats(&self) -> Formats {
+            ALL
+        }
+
+        fn channels(&self) -> Channels {
+            Channels::Fixed {
+                input: 2,
+                output: 4,
+            }
+        }
+
+        fn params(&self) -> &[Param] {
+            &[]
+        }
+
+        fn set_param(&mut self, _: usize, _: f64) {}
+
+        fn neutral(&self) -> bool {
+            true
+        }
+
+        fn latency_frames(&self) -> u32 {
+            5
+        }
+
+        fn process(&mut self, _: Block<'_>) -> Status {
+            unreachable!()
+        }
+
+        fn process_into(&mut self, input: Block<'_>, output: Block<'_>) -> Status {
+            Wide { formats: ALL }.process_into(input, output);
+            self.status
+        }
+
+        fn reset(&mut self) {
+            *self.resets.lock().unwrap() += 1;
+        }
+    }
+
+    #[test]
+    fn a_chain_that_changes_the_count_reports_status_latency_and_resets() {
+        let resets = Arc::new(Mutex::new(0));
+        let reporting = Reporting {
+            resets: resets.clone(),
+            status: Status {
+                no_signal: true,
+                changed: true,
+            },
+        };
+        let mut late = add(0.0);
+        late.latency = 3;
+        let plugins: Vec<Box<dyn Plugin>> = vec![late.boxed(), Box::new(reporting)];
+        let mut c = Chain::new(plugins, Format::F64, 16, 2).unwrap();
+        assert_eq!(c.latency_frames(), 8);
+        let mut d = [0.5f64, 0.25];
+        let (block, status) = c.run(Block {
+            channels: 2,
+            samples: Samples::F64(&mut d),
+        });
+        assert_eq!(block.channels, 4);
+        assert_eq!(
+            status,
+            Status {
+                no_signal: true,
+                changed: true
+            }
+        );
+        c.reset();
+        assert_eq!(*resets.lock().unwrap(), 1);
+        // A plugin before it with its own status counts too.
+        let reporting = Reporting {
+            resets,
+            status: Status::default(),
+        };
+        let mut quiet = add(0.0);
+        quiet.no_signal = true;
+        let plugins: Vec<Box<dyn Plugin>> = vec![quiet.boxed(), Box::new(reporting)];
+        let mut c = Chain::new(plugins, Format::F64, 16, 2).unwrap();
+        let (_, status) = c.run(Block {
+            channels: 2,
+            samples: Samples::F64(&mut d),
+        });
+        assert!(status.no_signal && !status.changed);
+    }
+
+    #[test]
+    fn an_i32_chain_converts_for_a_plugin_that_widens() {
+        let plugin = Box::new(Wide {
+            formats: formats(false, false, true),
+        });
+        let mut c = Chain::new(vec![plugin], Format::I32, 16, 2).unwrap();
+        let mut d = [i32::MAX, i32::MIN, 1 << 30, -(1 << 30)];
+        let (block, _) = assert_no_alloc(|| {
+            c.run(Block {
+                channels: 2,
+                samples: Samples::I32(&mut d),
+            })
+        });
+        assert_eq!(block.channels, 4);
+        let Samples::I32(out) = block.samples else {
+            panic!("not i32")
+        };
+        assert_eq!(
+            out,
+            [
+                i32::MAX,
+                i32::MIN,
+                i32::MAX,
+                i32::MIN,
+                1 << 30,
+                -(1 << 30),
+                1 << 30,
+                -(1 << 30)
+            ]
+        );
     }
 
     #[test]

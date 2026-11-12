@@ -2,6 +2,7 @@
 //!
 //! The format is chosen once at startup. `mix` never allocates.
 
+use crate::matrix::MAX_CHANNELS;
 use crate::plugin::{Block, Samples};
 
 /// A per-block gain that moves linearly from `from` to `to`.
@@ -316,6 +317,53 @@ pub fn mix_finish<P: Processing>(acc: &[[P::Acc; 2]], out: &mut [[i32; 2]]) {
     }
 }
 
+/// Adds `bus * gain` for both bus channels into the interleaved `acc`, `width` wide.
+/// `gains[c]` is the ramp from bus channel c to each output channel; off is skipped.
+///
+/// A ramp spans all the frames of `bus`, and `acc` holds as many frames. A
+/// gain of exactly 1.0 adds a value unchanged in every format, so a bus
+/// that reaches one channel at 0 dB arrives there as it was.
+pub fn matrix_add<P: Processing>(
+    bus: &[[P::Acc; 2]],
+    gains: &[[Ramp; MAX_CHANNELS]; 2],
+    width: usize,
+    acc: &mut [P::Acc],
+) {
+    debug_assert_eq!(
+        acc.len(),
+        bus.len() * width,
+        "a frame of `acc` per bus frame"
+    );
+    let n = bus.len();
+    for (side, row) in gains.iter().enumerate() {
+        for (channel, &ramp) in row.iter().enumerate().take(width) {
+            if ramp.from == 0.0 && ramp.to == 0.0 {
+                continue;
+            }
+            let frames = acc.chunks_exact_mut(width).zip(bus.iter());
+            if ramp.from == ramp.to {
+                let g = P::gain(ramp.from);
+                for (a, b) in frames {
+                    P::accumulate_acc(&mut a[channel], b[side], g);
+                }
+            } else {
+                for (i, (a, b)) in frames.enumerate() {
+                    let g = P::gain(ramp.at(i, n));
+                    P::accumulate_acc(&mut a[channel], b[side], g);
+                }
+            }
+        }
+    }
+}
+
+/// Ends a mix of any width by converting to S32, saturating once, here.
+pub fn mix_finish_wide<P: Processing>(acc: &[P::Acc], out: &mut [i32]) {
+    debug_assert_eq!(acc.len(), out.len());
+    for (o, a) in out.iter_mut().zip(acc.iter()) {
+        *o = P::finish(*a);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -603,6 +651,74 @@ mod tests {
         mix_add_acc::<F64>(&[[2.0, -3.0]], Ramp::flat(0.25), &mut acc);
         mix_finish::<F64>(&acc, &mut out);
         assert_eq!(out, [[1 << 30, -(3 << 29)]]);
+    }
+
+    /// Gains that send left to channel `l` and right to channel `r` at 0 dB.
+    fn route(l: usize, r: usize) -> [[Ramp; MAX_CHANNELS]; 2] {
+        let mut gains = [[Ramp::flat(0.0); MAX_CHANNELS]; 2];
+        gains[0][l] = Ramp::flat(1.0);
+        gains[1][r] = Ramp::flat(1.0);
+        gains
+    }
+
+    /// Mixes `frames` into a bus at unity, through `gains` into `width`
+    /// channels, and finishes.
+    fn through_matrix<P: Processing>(
+        frames: &[[i32; 2]],
+        gains: &[[Ramp; MAX_CHANNELS]; 2],
+        width: usize,
+    ) -> Vec<i32> {
+        let mut bus = vec![[P::zero(); 2]; frames.len()];
+        mix_add::<P>(frames, Ramp::flat(1.0), &mut bus);
+        let mut acc = vec![P::zero(); frames.len() * width];
+        matrix_add::<P>(&bus, gains, width, &mut acc);
+        let mut out = vec![0; acc.len()];
+        mix_finish_wide::<P>(&acc, &mut out);
+        out
+    }
+
+    #[test]
+    fn a_route_at_0_db_passes_every_s32_value_unchanged() {
+        let mut v = EDGES.to_vec();
+        v.extend([0x1234_5679, -0x1234_5679, 0x7FFF_FF01]);
+        let frames: Vec<[i32; 2]> = v.iter().map(|&s| [s, !s]).collect();
+        let want: Vec<i32> = frames.iter().flat_map(|f| [f[1], 0, f[0]]).collect();
+        assert_eq!(through_matrix::<I32>(&frames, &route(2, 0), 3), want);
+        assert_eq!(through_matrix::<F64>(&frames, &route(2, 0), 3), want);
+        let s24: Vec<[i32; 2]> = (-4..4).map(|k| [k << 28, (k << 8) - 256]).collect();
+        let want: Vec<i32> = s24.iter().flat_map(|f| [f[1], 0, f[0]]).collect();
+        assert_eq!(through_matrix::<F32>(&s24, &route(2, 0), 3), want);
+    }
+
+    #[test]
+    fn a_wide_i32_mix_saturates_once_at_the_end() {
+        // Both channels of the bus onto channel 1: MAX + MAX, and then the
+        // other bus adds MIN + MIN, which leaves -2, not a clipped sum.
+        let mut both = [[Ramp::flat(0.0); MAX_CHANNELS]; 2];
+        both[0][0] = Ramp::flat(1.0);
+        both[1][0] = Ramp::flat(1.0);
+        let hi = [[i64::from(i32::MAX); 2]];
+        let lo = [[i64::from(i32::MIN); 2]];
+        let mut acc = [0i64; 1];
+        matrix_add::<I32>(&hi, &both, 1, &mut acc);
+        matrix_add::<I32>(&lo, &both, 1, &mut acc);
+        let mut out = [0; 1];
+        mix_finish_wide::<I32>(&acc, &mut out);
+        assert_eq!(out, [-2]);
+        let mut acc = [0i64; 1];
+        matrix_add::<I32>(&hi, &both, 1, &mut acc);
+        mix_finish_wide::<I32>(&acc, &mut out);
+        assert_eq!(out, [i32::MAX]);
+    }
+
+    #[test]
+    fn a_matrix_ramp_moves_over_the_block() {
+        let mut gains = [[Ramp::flat(0.0); MAX_CHANNELS]; 2];
+        gains[0][1] = Ramp { from: 0.0, to: 1.0 };
+        let bus = [[1i64 << 20, 7]; 4];
+        let mut acc = [0i64; 8];
+        matrix_add::<I32>(&bus, &gains, 2, &mut acc);
+        assert_eq!(acc, [0, 0, 0, 1 << 18, 0, 1 << 19, 0, 3 << 18]);
     }
 
     #[test]
