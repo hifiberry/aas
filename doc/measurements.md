@@ -1387,6 +1387,11 @@ gave the same mean as the third, with five. The worst cycles are within
 `main`'s spread in both formats. Where the extra time goes was not measured.
 It is 0.2 to 0.3% of a period.
 
+`i32`, which is not the default processing format, was not run on the board.
+An x86 figure, not one of the Pi 3: timed with `tests/cycle_cost.rs` after the
+direct mixing path, an `i32` cycle costs 1 to 3% more than `main`'s, and the
+difference is in reading the analog input through its chain, not in the mix.
+
 Eight channels, the same player, to `snd-aloop` with `channels = 8`,
 `latency_ms = 48`, so 1024 frames per period, `bit_perfect = "off"`, a route
 from `players.left` to 1, 3, 5 and 7 and from `players.right` to 2, 4, 6 and 8,
