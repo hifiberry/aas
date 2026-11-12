@@ -9,6 +9,7 @@ pub mod config;
 pub mod control;
 pub mod counters;
 pub mod dop;
+pub mod drift;
 pub mod engine;
 pub mod format;
 pub mod latency;
