@@ -237,7 +237,9 @@ pub struct Descriptor {
     /// The size of this struct as the plugin was compiled,
     /// [`DESCRIPTOR_SIZE`].
     pub size: u32,
-    /// Must be [`ABI`] for a descriptor of this crate.
+    /// Must be [`ABI`] for a descriptor of this crate, never 1: the daemon
+    /// would call `create` as version 1 has it, with one argument fewer,
+    /// which it cannot detect.
     pub abi: u32,
     /// A NUL terminated UTF-8 name. Must not be null.
     pub name: *const c_char,
