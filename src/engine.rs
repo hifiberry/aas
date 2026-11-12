@@ -903,6 +903,43 @@ fn bus_gains(matrix: &Matrix, bus: Bus, forced: bool) -> [[Ramp; MAX_CHANNELS]; 
 /// The gains of both buses, as `bus_gains` gives them, by bus.
 type Gains = [[[Ramp; MAX_CHANNELS]; 2]; 2];
 
+/// Whether `gains`, of a matrix `width` wide, take each bus to channels 1
+/// and 2 unchanged: left to 1 and right to 2 at exactly 0 dB, nothing
+/// else. Adding a bus through them then adds it as it is, in every format.
+fn passes_through(gains: &Gains, width: usize) -> bool {
+    let (one, off) = (Ramp::flat(1.0), Ramp::flat(0.0));
+    width == 2
+        && gains
+            .iter()
+            .all(|bus| bus[0][0] == one && bus[0][1] == off && bus[1][0] == off && bus[1][1] == one)
+}
+
+/// What each cycle asks of the matrix in place, worked out once when the
+/// matrix is set: it changes only with `Command::SetMatrix`, and the mode
+/// and the sink's channels not at all.
+#[derive(Clone, Copy)]
+struct Routes {
+    /// How the copy path places each bus, by bus, as `copy_routing` says.
+    copy: [Option<Routing>; 2],
+    /// The `players` routing for a DoP stream, if it keeps the sink's pairs
+    /// whole, as `routing_for_dop` says before its checks of the ramp and
+    /// the chains.
+    dop: Option<Routing>,
+    /// The gains pass both buses through, as `passes_through` says.
+    passes: bool,
+}
+
+impl Routes {
+    fn of(matrix: &Matrix, gains: &Gains, forced: bool, channels: usize) -> Routes {
+        let dop = matrix.routing(Bus::Players, false);
+        Routes {
+            copy: [Bus::Players, Bus::Analog].map(|bus| matrix.routing(bus, forced)),
+            dop: dop.filter(|routing| keeps_pairs(routing, channels)),
+            passes: passes_through(gains, matrix.width()),
+        }
+    }
+}
+
 /// Where each of `gains` ends.
 fn levels(gains: &Gains) -> [[[f32; MAX_CHANNELS]; 2]; 2] {
     gains.map(|bus| bus.map(|side| side.map(|ramp| ramp.to)))
@@ -1117,6 +1154,9 @@ pub struct Engine<P: Processing, S: Sink> {
     ramp_from: [[[f32; MAX_CHANNELS]; 2]; 2],
     /// Frames until the gains reach `gains`. No ramp runs at 0.
     ramp_left: usize,
+    /// What the matrix gives the copy path and DoP, and whether it passes
+    /// the buses through.
+    routes: Routes,
     /// How a DoP stream reaches the sink this cycle, or `None` while the
     /// matrix or the chains would alter it. Worked out at the start of each
     /// period from the matrix and chains in place.
@@ -1196,6 +1236,7 @@ impl<P: Processing, S: Sink> Engine<P, S> {
             channels,
             ramp_from: levels(&gains),
             ramp_left: 0,
+            routes: Routes::of(&matrix, &gains, forced, channels),
             gains,
             dop_routing: None,
             matrix,
@@ -1622,6 +1663,7 @@ impl<P: Processing, S: Sink> Engine<P, S> {
                 levels(&self.gains)
             };
             std::mem::swap(&mut self.matrix, &mut matrix);
+            self.routes = Routes::of(&self.matrix, &gains, forced, self.channels);
             self.gains = gains;
             let dop = self.table.iter().any(|s| s.dop_claim != 0);
             let moves = from != levels(&self.gains);
@@ -1839,8 +1881,10 @@ impl<P: Processing, S: Sink> Engine<P, S> {
     /// matrix routes it purely. In forced bit-perfect every route that is
     /// not off counts as 0 dB.
     fn copy_routing(&self) -> Option<Routing> {
-        let forced = self.mode == BitPerfect::Forced;
-        self.matrix.routing(self.copy_bus(), forced)
+        match self.copy_bus() {
+            Bus::Players => self.routes.copy[0],
+            Bus::Analog => self.routes.copy[1],
+        }
     }
 
     /// How a DoP stream reaches the sink, if it can unaltered: through the
@@ -1854,8 +1898,7 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         if self.ramp_left > 0 || !self.copy_allowed() {
             return None;
         }
-        let routing = self.matrix.routing(Bus::Players, false)?;
-        keeps_pairs(&routing, self.channels).then_some(routing)
+        self.routes.dop
     }
 
     /// What the bit-perfect rules need to know about this cycle.
@@ -1906,7 +1949,12 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         let copy = copy_routing.is_some();
         let routed = self.dop_routing.is_some();
         let (next_gain, fade_frames) = self.next_fade_step();
-        let (step, ramp_frames) = self.next_matrix_step();
+        let ramp_frames = self.ramp_left.min(period);
+        // A matrix that passes both buses to channels 1 and 2 as they are
+        // adds nothing to what the buses hold: the analog input is mixed
+        // straight into the players' bus, which is then the mix itself.
+        let direct = ramp_frames == 0 && self.routes.passes;
+        let step = (!direct).then(|| self.next_matrix_step().0);
         let (from, to) = if volumes {
             (self.gain, next_gain)
         } else {
@@ -1948,8 +1996,12 @@ impl<P: Processing, S: Sink> Engine<P, S> {
                 out.copy_from_slice(&self.analog.buf[..period]);
             } else {
                 let level = if volumes { self.analog.gain } else { 1.0 };
-                mix_clear::<P>(analog_bus);
-                self.analog.mix(fade, level, analog_bus);
+                if direct {
+                    self.analog.mix(fade, level, players);
+                } else {
+                    mix_clear::<P>(analog_bus);
+                    self.analog.mix(fade, level, analog_bus);
+                }
             }
         }
         if let Some(routing) = copy_routing {
@@ -1959,18 +2011,31 @@ impl<P: Processing, S: Sink> Engine<P, S> {
             return false;
         }
         let width = self.matrix.width();
-        let wide = &mut self.wide[..period * width];
-        wide.fill(P::zero());
-        let gains = &self.gains;
-        matrix_add_ramped::<P>(players, &step[0], ramp_frames, &gains[0], width, wide);
-        if self.analog.audible {
-            matrix_add_ramped::<P>(analog_bus, &step[1], ramp_frames, &gains[1], width, wide);
-        }
-        // The ramp moves on, whether this period is heard or not.
-        if ramp_frames > 0 {
-            self.ramp_left -= ramp_frames;
-            self.ramp_from = levels(&step);
-        }
+        let mixed: &mut [P::Acc] = match &step {
+            None => players.as_flattened_mut(),
+            Some(step) => {
+                let wide = &mut self.wide[..period * width];
+                wide.fill(P::zero());
+                let gains = &self.gains;
+                matrix_add_ramped::<P>(players, &step[0], ramp_frames, &gains[0], width, wide);
+                if self.analog.audible {
+                    matrix_add_ramped::<P>(
+                        analog_bus,
+                        &step[1],
+                        ramp_frames,
+                        &gains[1],
+                        width,
+                        wide,
+                    );
+                }
+                // The ramp moves on, whether this period is heard or not.
+                if ramp_frames > 0 {
+                    self.ramp_left -= ramp_frames;
+                    self.ramp_from = levels(step);
+                }
+                wide
+            }
+        };
         let samples = &mut self.samples[..period * channels];
         let has_plugins = !self.mix.is_empty() || !self.output.is_empty();
         let chains_ran = plugins_apply(self.mode) && has_plugins;
@@ -1997,20 +2062,24 @@ impl<P: Processing, S: Sink> Engine<P, S> {
             return false;
         }
         // Without plugins the mix is not copied for them at all.
-        if chains_ran {
+        let finished: &[P::Acc] = if chains_ran {
             // After periods that did not pass them, so that a filter or a
             // delay does not play an old tail.
             if std::mem::take(&mut self.chains_idle) {
                 self.mix.reset();
                 self.output.reset();
             }
-            let block = P::to_block(wide, width, &mut self.store);
+            let block = P::to_block(mixed, width, &mut self.store);
             let (block, _) = self.mix.run(block);
             let (block, _) = self.output.run(block);
             debug_assert_eq!(block.channels, channels);
-            P::from_block(block, &mut self.wide[..period * channels]);
-        }
-        mix_finish_wide::<P>(&self.wide[..period * channels], samples);
+            let wide = &mut self.wide[..period * channels];
+            P::from_block(block, wide);
+            wide
+        } else {
+            mixed
+        };
+        mix_finish_wide::<P>(finished, samples);
         if self.unmute_left > 0 {
             let fade = (rate * FADE_MS / 1000) as usize;
             unmute(samples, channels, &mut self.unmute_left, fade);
@@ -8935,5 +9004,49 @@ mod tests {
         matrix_changes_without_allocating::<I32>();
         matrix_changes_without_allocating::<F32>();
         matrix_changes_without_allocating::<F64>();
+    }
+
+    /// The default matrix passes both buses through, so the analog input is
+    /// mixed straight into the players' bus. That gives the same samples as
+    /// adding both buses through the matrix, in every format: with two
+    /// clients at gains, sums that clip, an output fade and the analog input
+    /// at a gain, as captured and through a chain that alters it.
+    #[test]
+    fn passing_the_buses_through_gives_what_the_matrix_gives() {
+        fn run<P: Processing>(through: bool, neutral: bool) -> Vec<[i32; 2]> {
+            let (mut rig, feed) = with_capture::<P>(BitPerfect::Off);
+            if !neutral {
+                set_chain(&mut rig, Place::Analog, vec![times(0.8)]);
+            }
+            assert!(rig.engine.routes.passes);
+            rig.engine.routes.passes = through;
+            let mut a = client(1);
+            a.source.as_mut().unwrap().gain = 0.3;
+            rig.add(&mut a);
+            let mut b = client(2);
+            b.source.as_mut().unwrap().gain = db_to_gain(-1.5);
+            rig.add(&mut b);
+            rig.send(Command::SetAnalogGain(0.6));
+            for cycle in 0..12 {
+                if cycle == 4 {
+                    rig.send(Command::SetGain(0.5));
+                }
+                a.ring.write(&ramp(PERIOD));
+                b.ring.write(&frames(i32::MAX - 5, PERIOD));
+                feed.push(&ramp(PERIOD));
+                rig.cycle();
+            }
+            rig.log.frames()
+        }
+        fn check<P: Processing>() {
+            for neutral in [true, false] {
+                let through = run::<P>(true, neutral);
+                assert_eq!(through, run::<P>(false, neutral), "{:?}", format_of::<P>());
+                assert!(through.iter().any(|f| f[0] != 0));
+            }
+        }
+        check::<I32>();
+        check::<F32>();
+        check::<F64>();
     }
 }
