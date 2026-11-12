@@ -669,6 +669,7 @@ fn a_lost_further_card_is_looked_for_every_second() {
     let output = OutputConfig {
         card: "Loopback".into(),
         channels: 2,
+        latency_ms: None,
         idle: Idle::Zeros,
         volume_db: 0.0,
         plugins: Vec::new(),

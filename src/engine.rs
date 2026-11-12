@@ -51,9 +51,6 @@ const DOP_GRACE_MS: u32 = 100;
 /// scan looks that far ahead so that it can judge everything about to be read.
 const MAX_DOWNSAMPLING: usize = 8;
 
-/// The longest delay line the master can have, in frames.
-pub const MAX_DELAY: u32 = 8192;
-
 /// The outputs there can be besides the master.
 const FURTHER: usize = MAX_OUTPUTS - 1;
 
@@ -1114,8 +1111,8 @@ impl DelayLine {
         self.ring.len() / self.channels
     }
 
-    /// Whether anything audible is still in the line. Reads all of it, up to
-    /// `MAX_DELAY` frames, only for a `SetDelay` or a queued close.
+    /// Whether anything audible is still in the line. Reads all of it, as
+    /// long as the delay is, only for a `SetDelay` or a queued close.
     fn holds_sound(&self) -> bool {
         self.ring[..self.frames * self.channels]
             .iter()

@@ -10,9 +10,7 @@ use crate::capture::{Capture, OpenError};
 use crate::config::{Config, Format, Idle, OutputConfig, PluginConfig, PluginPlace, Quality};
 use crate::dop;
 use crate::drift::SANE;
-use crate::engine::{
-    Command, Event, INITIAL_SOURCES, INITIAL_TAPS, MAX_DELAY, Source, Tap, Target,
-};
+use crate::engine::{Command, Event, INITIAL_SOURCES, INITIAL_TAPS, Source, Tap, Target};
 use crate::format::{F32, F64, I32, Processing, db_to_gain};
 use crate::further::{BUFFERED, FEED_PERIODS, Feed, FurtherEvent, FurtherHandle};
 use crate::latency::{MAX_PERIOD, PERIODS, period_frames};
@@ -157,25 +155,129 @@ fn feed_frames(master_rate: u32, master_period: u32, target: u32, part: (u32, u3
     fed.max(FEED_PERIODS * master_period as usize).max(least)
 }
 
+/// The delay a fresh resampler from `master` to `card` Hz brings, in card
+/// frames, as `Adaptive::delay_frames` gives it at its nominal ratio.
+fn resampler_delay(quality: Quality, master: u32, card: u32) -> f64 {
+    taps(quality) as f64 * f64::from(card) / f64::from(master) / 2.0 - 1.0
+}
+
+/// A further card's part of the path with the master at `master` Hz and the
+/// card at `card` Hz: its rate, its period by the latency rule for
+/// `latency_ms`, and its resampler's delay, as `align_frames` takes it.
+fn part_at(master: u32, card: u32, latency_ms: f32, quality: Quality) -> (u32, u32, f64) {
+    let period = period_frames(card, latency_ms);
+    (card, period, resampler_delay(quality, master, card))
+}
+
+/// The writer's period in master frames.
+fn writer_frames(master_rate: u32, (rate, period, _): (u32, u32, f64)) -> f64 {
+    f64::from(period) * f64::from(master_rate) / f64::from(rate)
+}
+
+/// The fullest feed the drift believes at `target`: a full feed has to read
+/// as a delay it takes in, or a path that overflows starts over every
+/// second.
+fn believed(master_rate: u32, target: u32, part: (u32, u32, f64)) -> f64 {
+    f64::from(target) + SANE * writer_frames(master_rate, part)
+}
+
+/// The feed of a further output at a configuration, as `feed_frames` says,
+/// within what it was made with and what the drift believes; true if it
+/// had to be cut short for the drift.
+fn feed_within(
+    master_rate: u32,
+    master_period: u32,
+    target: u32,
+    part: (u32, u32, f64),
+    capacity: usize,
+) -> (usize, bool) {
+    let feed = feed_frames(master_rate, master_period, target, part).min(capacity);
+    let most = believed(master_rate, target, part).ceil() as usize - 1;
+    (feed.min(most), feed > most)
+}
+
+/// The rates the start checks a further output's latency at: those of the
+/// cards aas is for. Below them a feed that the drift would not believe is
+/// cut short at run time, and logged.
+fn checked_rates() -> impl Iterator<Item = u32> {
+    STANDARD_RATES.into_iter().filter(|&r| r >= 44100)
+}
+
+/// Refuses an output latency the drift cannot follow beside the master's:
+/// one so much shorter that the master hands over more at a time than the
+/// feed may hold for the drift to believe it. Checked with the master and
+/// the card each at every rate from 44.1 kHz. `number` names the output.
+pub fn check_alignment(
+    master_latency_ms: f32,
+    number: usize,
+    latency_ms: f32,
+    quality: Quality,
+) -> Result<(), String> {
+    for master in checked_rates() {
+        let period = period_frames(master, master_latency_ms);
+        for card in checked_rates() {
+            let part = part_at(master, card, latency_ms, quality);
+            let target = align_frames(master, period, &[part]);
+            let feed = feed_frames(master, period, target, part);
+            if feed as f64 >= believed(master, target, part) {
+                return Err(format!(
+                    "output {number}: latency_ms = {latency_ms} is too short beside the \
+                     master's {master_latency_ms}: with the master at {master} Hz and the card \
+                     at {card} Hz the master hands over {period} frames at a time, more than \
+                     periods of {} frames can follow",
+                    part.1
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Every further card's part at every rate, for the master at `master` Hz.
+fn all_parts(master: u32, latencies: &[f32], quality: Quality) -> Vec<(u32, u32, f64)> {
+    let cards = STANDARD_RATES.iter();
+    let each = |&card: &u32| latencies.iter().map(move |&l| (card, l));
+    cards
+        .flat_map(each)
+        .map(|(card, l)| part_at(master, card, l, quality))
+        .collect()
+}
+
 /// The frames a further output's feed is made with: the most it holds at
-/// any rate the master and its card may run at, with a master period to
-/// spare for a rate between the standard ones.
-pub fn feed_capacity(latency_ms: f32, quality: Quality) -> usize {
-    let half = taps(quality) as f64 / 2.0;
+/// any rate the master and the cards may run at, the further outputs'
+/// latencies being `latencies`, with a master period to spare for a rate
+/// between the standard ones.
+pub fn feed_capacity(master_latency_ms: f32, latencies: &[f32], quality: Quality) -> usize {
     STANDARD_RATES
         .iter()
         .map(|&master| {
-            let period = period_frames(master, latency_ms);
-            let parts: Vec<(u32, u32, f64)> = STANDARD_RATES
-                .iter()
-                .map(|&rate| {
-                    let delay = half * f64::from(rate) / f64::from(master);
-                    (rate, card_period(master, period, rate), delay)
-                })
-                .collect();
-            let target = align_frames(master, period, &parts) as usize;
-            let most = (target + 2 * period as usize).max(FEED_PERIODS * period as usize);
-            most + period as usize
+            let period = period_frames(master, master_latency_ms) as usize;
+            let target = align_frames(
+                master,
+                period as u32,
+                &all_parts(master, latencies, quality),
+            );
+            (target as usize + 2 * period).max(FEED_PERIODS * period) + period
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// The longest delay line the master needs, in frames: the most the
+/// alignment target can be beyond its two periods at any rate the master
+/// and the cards may run at, with a master period to spare. 0 without
+/// further outputs. The engine's line is made this long, so no valid config
+/// needs a cap.
+pub fn delay_capacity(master_latency_ms: f32, latencies: &[f32], quality: Quality) -> u32 {
+    if latencies.is_empty() {
+        return 0;
+    }
+    STANDARD_RATES
+        .iter()
+        .map(|&master| {
+            let period = period_frames(master, master_latency_ms);
+            let target = align_frames(master, period, &all_parts(master, latencies, quality));
+            target.saturating_sub(PERIODS * period) + period
         })
         .max()
         .unwrap_or(0)
@@ -189,21 +291,6 @@ pub fn card_rate(rates: &[u32], master_rate: u32) -> u32 {
     }
     let nearest = rates.iter().min_by_key(|&&r| (r.abs_diff(master_rate), r));
     nearest.copied().unwrap_or(master_rate)
-}
-
-/// A further card's period: as long as the master's, to the nearest power
-/// of two in frames, the lower of two as near, within the periods a card
-/// is opened with.
-pub fn card_period(master_rate: u32, master_period: u32, rate: u32) -> u32 {
-    let exact = f64::from(master_period) * f64::from(rate) / f64::from(master_rate);
-    let low = 1u32 << (exact.max(1.0).log2().floor() as u32);
-    let high = low * 2;
-    let nearest = if f64::from(high) - exact < exact - f64::from(low) {
-        high
-    } else {
-        low
-    };
-    nearest.clamp(MIN_PERIOD, MAX_PERIOD)
 }
 
 /// The line logged for an event of further output `number`, if any.
@@ -306,6 +393,10 @@ struct Pending {
 struct FurtherOutput {
     index: usize,
     channels: usize,
+    /// Its own latency target, or the master's.
+    latency_ms: f32,
+    /// Its card's part of the path as its writer was last given it.
+    current: Option<(u32, u32, f64)>,
     idle: Idle,
     volume_db: f32,
     plugins: Vec<PluginConfig>,
@@ -606,6 +697,12 @@ pub struct Control {
     quiet_since: Option<Instant>,
     /// The master's delay line as last sent.
     delay: Option<u32>,
+    /// The delay every output is held at, as last planned.
+    target: Option<u32>,
+    /// The longest delay line the engine has, from the outputs' latencies.
+    delay_capacity: u32,
+    /// The delay line was found too short, and that has been logged.
+    delay_warned: bool,
 }
 
 impl Control {
@@ -664,6 +761,9 @@ impl Control {
             further: Vec::new(),
             quiet_since: None,
             delay: None,
+            target: None,
+            delay_capacity: 0,
+            delay_warned: false,
         }
     }
 
@@ -671,9 +771,12 @@ impl Control {
     /// order of the config.
     pub fn add_output(&mut self, setup: FurtherSetup) {
         let config = setup.config;
+        let latency_ms = config.latency_ms.unwrap_or(self.latency_ms);
         self.further.push(FurtherOutput {
             index: setup.index,
             channels: config.channels,
+            latency_ms,
+            current: None,
             idle: config.idle,
             volume_db: config.volume_db,
             plugins: config.plugins,
@@ -687,6 +790,8 @@ impl Control {
             configured: false,
             open: false,
         });
+        let latencies: Vec<f32> = self.further.iter().map(|o| o.latency_ms).collect();
+        self.delay_capacity = delay_capacity(self.latency_ms, &latencies, self.quality);
     }
 
     /// The gain of a further output: the master's volume in software and
@@ -1729,88 +1834,105 @@ impl Control {
                 output.writer.set_open(false);
             }
         }
-        self.plan_further(rate, period, batch);
+        self.plan_further(rate, period, batch, None);
         batch.push(Command::Reconfigure { rate, period });
     }
 
-    /// Prepares every further output for the master at `rate` and
-    /// `period`: its chains, its card's rate and period, a fresh resampler,
-    /// and the delay every output is held at, which the master's delay line
+    /// Prepares the further outputs for the master at `rate` and `period`:
+    /// their chains, their cards' rates and periods, fresh resamplers, and
+    /// the delay every output is held at, which the master's delay line
     /// makes up. A chain that does not build at the rate silences its output
-    /// alone. The writers get it all once the master is open.
-    fn plan_further(&mut self, rate: u32, period: u32, batch: &mut Vec<Command>) {
+    /// alone. The writers get it once the master is open.
+    ///
+    /// With `only`, the master stays as it is and the rates of that output's
+    /// card have changed: it alone is given a new configuration, unless the
+    /// delay all are held at changes, which every output then follows.
+    fn plan_further(
+        &mut self,
+        rate: u32,
+        period: u32,
+        batch: &mut Vec<Command>,
+        only: Option<usize>,
+    ) {
         if self.further.is_empty() {
             return;
         }
         let (quality, format) = (self.quality, self.format);
-        let mut parts = Vec::new();
-        let mut resamplers = Vec::new();
-        for i in 0..self.further.len() {
-            let output = &mut self.further[i];
-            let built = further_chains(output, rate, format, &mut self.libraries, batch);
-            let silenced = match built {
-                Ok(()) => false,
-                Err(e) => {
-                    let number = output.number();
-                    eprintln!("aas: output {number}: {e}; it is silent at {rate} Hz");
-                    true
+        if only.is_none() {
+            for i in 0..self.further.len() {
+                let output = &mut self.further[i];
+                let built = further_chains(output, rate, format, &mut self.libraries, batch);
+                let silenced = match built {
+                    Ok(()) => false,
+                    Err(e) => {
+                        let number = output.number();
+                        eprintln!("aas: output {number}: {e}; it is silent at {rate} Hz");
+                        true
+                    }
+                };
+                if silenced != output.silenced {
+                    output.silenced = silenced;
+                    let gain = self.further_gain(&self.further[i]);
+                    batch.push(Command::SetGain(self.further[i].index, gain));
                 }
-            };
-            if silenced != output.silenced {
-                output.silenced = silenced;
-                let gain = self.further_gain(&self.further[i]);
-                batch.push(Command::SetGain(self.further[i].index, gain));
             }
-            let output = &self.further[i];
-            let card = card_rate(&output.rates, rate);
-            let card_period = card_period(rate, period, card);
-            let resampler =
-                Adaptive::new(rate, card, output.channels, card_period, quality, format);
-            parts.push((card, card_period, resampler.delay_frames()));
-            resamplers.push(resampler);
         }
+        let parts: Vec<(u32, u32, f64)> = self
+            .further
+            .iter()
+            .map(|o| part_at(rate, card_rate(&o.rates, rate), o.latency_ms, quality))
+            .collect();
         let target = align_frames(rate, period, &parts);
+        let moved = self.target != Some(target);
+        let given: Vec<bool> = self
+            .further
+            .iter()
+            .zip(&parts)
+            .map(|(o, &part)| match only {
+                None => true,
+                Some(index) => moved || (o.index == index && o.current != Some(part)),
+            })
+            .collect();
+        if !given.contains(&true) {
+            return;
+        }
+        self.target = Some(target);
         let mut delay = target.saturating_sub(PERIODS * period);
-        if delay > MAX_DELAY {
-            eprintln!(
-                "aas: warning: the master can be held back by {MAX_DELAY} frames, not {delay}: \
-                 it plays {} frames ahead of the other outputs",
-                delay - MAX_DELAY
-            );
-            delay = MAX_DELAY;
+        if delay > self.delay_capacity {
+            // Only a rate between the standard ones can get here.
+            if !std::mem::replace(&mut self.delay_warned, true) {
+                eprintln!(
+                    "aas: warning: the master can be held back by {} frames, not {delay}: \
+                     it plays ahead of the other outputs",
+                    self.delay_capacity
+                );
+            }
+            delay = self.delay_capacity;
         }
         if self.delay != Some(delay) {
             self.delay = Some(delay);
             batch.push(Command::SetDelay(delay));
         }
-        let margin = margin_frames(rate, period);
-        let parts = parts.into_iter().zip(resamplers);
-        for (output, (part, resampler)) in self.further.iter_mut().zip(parts) {
+        let outputs = self.further.iter_mut().zip(parts).zip(given);
+        for (output, part) in outputs.filter(|(_, given)| *given).map(|(o, _)| o) {
             let (card, card_period, _) = part;
-            let feed = feed_frames(rate, period, target, part);
-            let writer_period = f64::from(card_period) * f64::from(rate) / f64::from(card);
-            // The drift believes a full feed, so an overflow does not make
-            // it start over; the feed holds two card periods and the margin
-            // whatever the phase of the two clocks; and the feed was made
-            // for it.
             let number = output.number();
-            assert!(
-                (feed as f64) < f64::from(target) + SANE * writer_period,
-                "output {number}: a feed of {feed} frames at a target of {target}"
-            );
-            assert!(
-                feed as f64 >= 2.0 * writer_period + margin,
-                "output {number}: a feed of {feed} frames for periods of {writer_period}"
-            );
-            assert!(
-                feed <= output.capacity,
-                "output {number}: a feed of {feed} frames, made for {}",
-                output.capacity
-            );
+            // The start refuses latencies that need more; a rate between
+            // the standard ones, or below 44.1 kHz, may still.
+            let (feed, cut) = feed_within(rate, period, target, part, output.capacity);
+            if cut {
+                eprintln!(
+                    "aas: warning: output {number}: its feed holds only {feed} frames, \
+                     for the drift to follow at {rate} Hz"
+                );
+            }
+            let resampler =
+                Adaptive::new(rate, card, output.channels, card_period, quality, format);
             eprintln!(
                 "aas: output {number} at {card} Hz, {card_period} frames per period, \
                  {target} frames behind the mix like every output"
             );
+            output.current = Some(part);
             output.pending = Some(Pending {
                 card_rate: card,
                 period: card_period,
@@ -1888,7 +2010,7 @@ impl Control {
             return;
         };
         let mut batch = Vec::new();
-        self.plan_further(rate, period, &mut batch);
+        self.plan_further(rate, period, &mut batch, Some(index));
         self.send(batch);
         self.hand_over(now);
     }
@@ -4068,6 +4190,7 @@ mod tests {
         let config = OutputConfig {
             card: "Loopback".into(),
             channels: 2,
+            latency_ms: None,
             idle: Idle::Zeros,
             volume_db: 0.0,
             plugins: Vec::new(),
@@ -4086,7 +4209,11 @@ mod tests {
         let (engine_events, events) = rtrb::RingBuffer::new(256);
         let audio = std::thread::current();
         let mut control = Control::new(config, 12.0, Vec::new(), commands, events, audio);
-        let capacity = feed_capacity(12.0, config.resampling);
+        let latencies: Vec<f32> = outputs
+            .iter()
+            .map(|(o, _)| o.latency_ms.unwrap_or(12.0))
+            .collect();
+        let capacity = feed_capacity(12.0, &latencies, config.resampling);
         let mut logs = Vec::new();
         for (i, (output, rates)) in outputs.into_iter().enumerate() {
             let log = WriterLog::default();
@@ -4129,27 +4256,86 @@ mod tests {
         assert_eq!(align_frames(48000, 64, &[]), 0);
     }
 
+    /// The latencies the sweeps cover, in ms.
+    const LATENCIES: [f32; 9] = [1.0, 2.0, 4.0, 6.5, 12.0, 20.0, 48.0, 64.0, 100.0];
+
     #[test]
     fn a_feed_holds_what_its_card_and_the_drift_need_at_any_rate() {
         let quality = Quality::High;
-        for latency_ms in [4.0, 12.0, 100.0] {
-            let capacity = feed_capacity(latency_ms, quality);
-            for master in STANDARD_RATES {
-                let period = period_frames(master, latency_ms);
-                let margin = margin_frames(master, period);
-                for card in STANDARD_RATES {
-                    let card_period = card_period(master, period, card);
-                    let delay = resampler_delay(master, card, card_period);
-                    let part = (card, card_period, delay);
-                    let target = align_frames(master, period, &[part]);
-                    let feed = feed_frames(master, period, target, part);
-                    let writer = f64::from(card_period) * f64::from(master) / f64::from(card);
-                    let what = format!("{master} to {card} at {latency_ms} ms: {feed}");
-                    assert!((feed as f64) < f64::from(target) + SANE * writer, "{what}");
-                    assert!(feed as f64 >= 2.0 * writer + margin, "{what}");
-                    assert!(feed <= capacity, "{what} > {capacity}");
+        let rates: Vec<u32> = checked_rates().collect();
+        let mut refused = 0;
+        for master_latency in LATENCIES {
+            for latency in LATENCIES {
+                let ok = check_alignment(master_latency, 2, latency, quality).is_ok();
+                // An output as long as the master's, or longer, always works.
+                if latency >= master_latency {
+                    assert!(ok, "{latency} ms beside {master_latency} ms");
+                }
+                if !ok {
+                    refused += 1;
+                    continue;
+                }
+                let capacity = feed_capacity(master_latency, &[latency], quality);
+                let line = delay_capacity(master_latency, &[latency], quality);
+                for &master in &rates {
+                    let period = period_frames(master, master_latency);
+                    let margin = margin_frames(master, period);
+                    for &card in &rates {
+                        let part = part_at(master, card, latency, quality);
+                        let target = align_frames(master, period, &[part]);
+                        let what = format!("{master} to {card}, {master_latency} and {latency} ms");
+                        let wanted = feed_frames(master, period, target, part);
+                        assert!(wanted <= capacity, "{what}: {wanted} > {capacity}");
+                        let (feed, cut) = feed_within(master, period, target, part, capacity);
+                        assert!(!cut, "{what}: cut to {feed}");
+                        let writer = writer_frames(master, part);
+                        assert!((feed as f64) < believed(master, target, part), "{what}");
+                        assert!(feed as f64 >= 2.0 * writer + margin, "{what}: {feed}");
+                        let delay = target.saturating_sub(PERIODS * period);
+                        assert!(delay <= line, "{what}: delay {delay} > {line}");
+                    }
                 }
             }
+        }
+        // A latency far below the master's is refused, not cut short.
+        assert!(refused > 0);
+        let e = check_alignment(100.0, 3, 1.0, quality).unwrap_err();
+        assert!(
+            e.contains("output 3") && e.contains("latency_ms = 1"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn a_further_output_on_its_own_latency_plans_without_panicking() {
+        // An output on its own latency, the master moved through rates
+        // its card takes and does not.
+        for latency in LATENCIES {
+            let (mut output, rates) = further(&[44100, 48000, 96000, 192000]);
+            output.latency_ms = Some(latency);
+            let config = Config {
+                latency_ms: Some(4.0),
+                ..Config::default()
+            };
+            if check_alignment(12.0, 2, latency, config.resampling).is_err() {
+                continue;
+            }
+            let (mut control, mut engine, logs, now) = started_with(&config, vec![(output, rates)]);
+            engine.take(true);
+            control.handle_events(now);
+            for (conn, rate) in [44100, 88200, 176400, 352800, 384000]
+                .into_iter()
+                .enumerate()
+            {
+                let conn = conn as u64 + 1;
+                play(&mut control, conn, rate, now);
+                engine.take(true);
+                control.handle_events(now);
+                let stop = control.request(conn, Some(Request::Stop), now);
+                assert_eq!(stop.reply, Some(Reply::Ok));
+            }
+            let (target, feed, _) = logs[0].last_path();
+            assert!(target > 0.0 && feed > 0, "{latency}");
         }
     }
 
@@ -4159,10 +4345,12 @@ mod tests {
         assert_eq!(card_rate(&[44100, 48000, 96000], 96000), 96000);
         assert_eq!(card_rate(&[44100, 48000], 96000), 48000);
         assert_eq!(card_rate(&[32000, 64000], 48000), 32000);
-        // Its period lasts as long as the master's, to a power of two.
-        assert_eq!(card_period(48000, 256, 44100), 256);
-        assert_eq!(card_period(96000, 512, 48000), 256);
-        assert_eq!(card_period(48000, 64, 8000), 32);
+        // Its period follows from its latency by the master's rule.
+        let period = |card, latency_ms| part_at(48000, card, latency_ms, Quality::High).1;
+        assert_eq!(period(44100, 12.0), 256);
+        assert_eq!(period(48000, 4.0), 64);
+        assert_eq!(period(48000, 48.0), 1024);
+        assert_eq!(period(8000, 4.0), 32);
     }
 
     #[test]
@@ -4213,6 +4401,39 @@ mod tests {
         assert_eq!(logs[0].take(), ["reconfigure 48000 44100 256"]);
         let seen = engine.take(true);
         assert!(!has(&seen, "Reconfigure"), "{seen:?}");
+    }
+
+    #[test]
+    fn a_change_of_one_cards_rates_reconfigures_that_output_alone() {
+        // The first output's 48 ms sets the target for all.
+        let (mut slow, rates) = further(&[]);
+        slow.latency_ms = Some(48.0);
+        let outputs = vec![(slow, rates), further(&[])];
+        let (mut control, mut engine, logs, now) = started_with(&Config::default(), outputs);
+        engine.take(true);
+        control.handle_events(now);
+        for log in &logs {
+            log.take();
+        }
+        // Rates that leave the card where it is change nothing.
+        control.set_output_rates(2, vec![48000, 96000], now);
+        assert!(logs.iter().all(|log| log.take().is_empty()));
+        assert!(engine.take(true).is_empty());
+        // The second card now takes 44.1 kHz only: it alone moves, and
+        // the target, the first output's, stays, so the master's delay too.
+        let (target, _, _) = logs[1].last_path();
+        control.set_output_rates(2, vec![44100], now);
+        assert!(logs[0].take().is_empty());
+        assert_eq!(logs[1].take(), ["reconfigure 48000 44100 256"]);
+        assert_eq!(logs[1].last_path().0, target);
+        let seen = engine.take(true);
+        assert!(!has(&seen, "SetDelay"), "{seen:?}");
+        // The first card moving changes the target: every output follows,
+        // and the master's delay with them.
+        control.set_output_rates(1, vec![44100], now);
+        assert_eq!(logs[0].take(), ["reconfigure 48000 44100 1024"]);
+        assert_eq!(logs[1].take(), ["reconfigure 48000 44100 256"]);
+        assert!(has(&engine.take(true), "SetDelay"));
     }
 
     #[test]

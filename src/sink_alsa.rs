@@ -172,6 +172,22 @@ pub fn card_is_present(card: Option<&str>) -> bool {
     wanted_card_is_among(card, &card_ids())
 }
 
+/// Whether a card's error, `errno`, means its device is gone, rather than
+/// an xrun that a restart cures. `disconnected` is the stream's state;
+/// `recovering` says the error came from the restart after an xrun. Only
+/// a device that has gone (ENODEV, or EBADFD on a disconnected stream), or
+/// a card still stuck after a restart, is gone: an underrun or a suspend,
+/// also one during the restart, stays an xrun, which is counted and
+/// recovered in place.
+pub fn card_is_gone(errno: i32, disconnected: bool, recovering: bool) -> bool {
+    match errno {
+        libc::ENODEV => true,
+        libc::EBADFD => disconnected,
+        libc::ETIMEDOUT => recovering,
+        _ => false,
+    }
+}
+
 /// The sample format the card is opened with, best first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CardFormat {
@@ -413,7 +429,7 @@ mod mixer {
 
 #[cfg(feature = "alsa-output")]
 mod card {
-    use super::{CardFormat, card_device, encode};
+    use super::{CardFormat, card_device, card_is_gone, encode};
     use crate::counters::monotonic_ns;
     use crate::latency::PERIODS;
     use crate::sink::{Sink, SinkError};
@@ -581,6 +597,18 @@ mod card {
         fn recover(&self) -> alsa::Result<()> {
             self.pcm.prepare()?;
             self.write_all(&self.zeros)
+        }
+
+        /// Whether the stream's device has been disconnected.
+        fn disconnected(&self) -> bool {
+            self.pcm.state() == State::Disconnected
+        }
+
+        /// Waits a period, after a restart that failed, so that a card that
+        /// fails at every period cannot spin the thread that plays to it.
+        fn rest(&self) {
+            let ns = self.period as u64 * 1_000_000_000 / u64::from(self.rate);
+            std::thread::sleep(std::time::Duration::from_nanos(ns));
         }
     }
 
@@ -779,6 +807,35 @@ mod card {
         }
     }
 
+    impl AlsaSink {
+        /// What a failed wait or write comes to: a device that is gone, as
+        /// `card_is_gone` says, is let go of, so that its module can be
+        /// unloaded; anything else is an xrun, recovered here in place. A
+        /// restart that fails, other than for a device gone, is an xrun too,
+        /// and waits a period. alsa::Error holds the positive errno.
+        fn io_failed(&mut self, error: alsa::Error) -> SinkError {
+            let Some(open) = &self.open else {
+                return SinkError::Gone;
+            };
+            let result = if card_is_gone(error.errno(), open.disconnected(), false) {
+                SinkError::Gone
+            } else {
+                match open.recover() {
+                    Ok(()) => SinkError::Xrun,
+                    Err(e) if card_is_gone(e.errno(), open.disconnected(), true) => SinkError::Gone,
+                    Err(_) => {
+                        open.rest();
+                        SinkError::Xrun
+                    }
+                }
+            };
+            if result == SinkError::Gone {
+                self.open = None;
+            }
+            result
+        }
+    }
+
     impl Sink for AlsaSink {
         fn open(&mut self, rate: u32, period: u32) -> Result<(), SinkError> {
             // The card takes one opener at a time.
@@ -804,40 +861,22 @@ mod card {
             let Some(open) = &mut self.open else {
                 return Err(SinkError::Gone);
             };
-            let result = match open.wait_room() {
+            match open.wait_room() {
                 Ok(()) => Ok(()),
-                Err(e) if e.errno() == libc::ENODEV => Err(SinkError::Gone),
-                // The restart fills the buffer, so wait for room again.
-                Err(_) => match open.recover().and_then(|()| open.wait_room()) {
-                    Ok(()) => Err(SinkError::Xrun),
-                    Err(_) => Err(SinkError::Gone),
-                },
-            };
-            if result == Err(SinkError::Gone) {
-                self.open = None;
+                // The restart fills the buffer; the write that follows
+                // waits for room itself.
+                Err(e) => Err(self.io_failed(e)),
             }
-            result
         }
 
         fn write(&mut self, samples: &[i32]) -> Result<(), SinkError> {
             let Some(open) = &mut self.open else {
                 return Err(SinkError::Gone);
             };
-            // alsa::Error holds the positive errno.
-            let result = match open.play(samples) {
+            match open.play(samples) {
                 Ok(()) => Ok(()),
-                Err(e) if e.errno() == libc::ENODEV => Err(SinkError::Gone),
-                // An underrun, a suspend, or anything else a restart may cure.
-                Err(_) => match open.recover() {
-                    Ok(()) => Err(SinkError::Xrun),
-                    Err(_) => Err(SinkError::Gone),
-                },
-            };
-            if result == Err(SinkError::Gone) {
-                // Lets the driver go, so that the module can be unloaded.
-                self.open = None;
+                Err(e) => Err(self.io_failed(e)),
             }
-            result
         }
 
         fn channels(&self) -> usize {
@@ -1178,6 +1217,26 @@ mod tests {
         " 1 [sndrpihifiberry]: HifiberryDacpAd - snd_rpi_hifiberry_dacplusadc\n",
         "                      snd_rpi_hifiberry_dacplusadc\n",
     );
+
+    #[test]
+    fn only_a_device_that_is_gone_counts_as_gone() {
+        // An underrun or a suspend stays an xrun, also during or after the
+        // restart that follows one.
+        for recovering in [false, true] {
+            for errno in [libc::EPIPE, libc::ESTRPIPE, libc::EINTR, libc::EIO] {
+                assert!(!card_is_gone(errno, false, recovering), "{errno}");
+            }
+            assert!(card_is_gone(libc::ENODEV, false, recovering));
+            // A stream left in a bad state is prepared again, unless its
+            // device was disconnected.
+            assert!(!card_is_gone(libc::EBADFD, false, recovering));
+            assert!(card_is_gone(libc::EBADFD, true, recovering));
+        }
+        // A card that gives no room for half a second is stuck once a
+        // restart has not helped.
+        assert!(!card_is_gone(libc::ETIMEDOUT, false, false));
+        assert!(card_is_gone(libc::ETIMEDOUT, false, true));
+    }
 
     #[test]
     fn a_card_is_known_by_its_index_whatever_it_is_named_by() {

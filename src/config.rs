@@ -133,6 +133,9 @@ pub struct OutputConfig {
     pub card: String,
     /// The channels the card is opened with, from 1 to `MAX_CHANNELS`.
     pub channels: usize,
+    /// The target for the latency of the card's buffer, as the flat key's.
+    /// None takes the master's.
+    pub latency_ms: Option<f32>,
     /// What the output does when nothing plays.
     pub idle: Idle,
     /// The output's offset to the `Master` volume in dB, from -60 to 0.
@@ -188,6 +191,7 @@ pub struct Config {
 struct RawOutput {
     card: Option<String>,
     channels: Option<usize>,
+    latency_ms: Option<f32>,
     idle: Option<IdleKind>,
     idle_delay_s: Option<u32>,
     volume_db: Option<toml::Value>,
@@ -428,6 +432,12 @@ fn output_from_table(n: usize, raw: RawOutput) -> Result<OutputConfig, String> {
     {
         return Err(at(format!("channels must be from 1 to {MAX_CHANNELS}")));
     }
+    if raw
+        .latency_ms
+        .is_some_and(|ms| !(ms.is_finite() && ms > 0.0))
+    {
+        return Err(at("latency_ms must be a positive number".to_string()));
+    }
     let volume_db = match raw.volume_db {
         None => 0.0,
         Some(toml::Value::Integer(v)) => v as f64,
@@ -440,6 +450,7 @@ fn output_from_table(n: usize, raw: RawOutput) -> Result<OutputConfig, String> {
     Ok(OutputConfig {
         card,
         channels: raw.channels.unwrap_or(2),
+        latency_ms: raw.latency_ms,
         idle: idle_from(raw.idle, raw.idle_delay_s).map_err(at)?,
         volume_db: volume_db as f32,
         plugins: plugins_from(raw.plugin.unwrap_or_default(), false).map_err(at)?,
@@ -1011,6 +1022,30 @@ type = "balance"
             .unwrap_err();
             assert!(e.contains("output 2") && e.contains("plugin 1"), "{e}");
         }
+    }
+
+    #[test]
+    fn an_output_takes_its_own_latency_by_the_flat_rule() {
+        let one = |v: &str| load_str(&format!("card = \"a\"\n[[output]]\ncard = \"b\"\n{v}\n"));
+        // None follows the master's target.
+        assert_eq!(one("").unwrap().outputs[0].latency_ms, None);
+        assert_eq!(
+            one("latency_ms = 48").unwrap().outputs[0].latency_ms,
+            Some(48.0)
+        );
+        assert_eq!(
+            one("latency_ms = 6.5").unwrap().outputs[0].latency_ms,
+            Some(6.5)
+        );
+        for v in ["0", "-1", "nan", "inf", "\"x\""] {
+            let e = one(&format!("latency_ms = {v}")).unwrap_err();
+            assert!(
+                e.contains("output 2") || e.contains("latency_ms"),
+                "{v}: {e}"
+            );
+        }
+        let e = one("latency_ms = 0").unwrap_err();
+        assert!(e.contains("output 2") && e.contains("latency_ms"), "{e}");
     }
 
     #[test]

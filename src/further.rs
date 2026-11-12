@@ -982,6 +982,13 @@ impl FurtherHandle {
         );
         let scale = f64::from(master_rate) / f64::from(card_rate);
         let writer_period = f64::from(period) * scale;
+        // The feed holds two card periods and a margin of at least 2 ms,
+        // whatever the phase of the two clocks.
+        debug_assert!(
+            feed_frames as f64 >= 2.0 * writer_period + f64::from(master_rate) / 500.0,
+            "output {}: a feed of {feed_frames} frames for periods of {writer_period:.0}",
+            self.index + 1,
+        );
         // A full feed has to read as a delay the drift believes, or a path
         // that overflows starts over every second.
         let believed = target + SANE * writer_period;
@@ -1791,9 +1798,9 @@ mod tests {
             Quality::Medium,
             Format::F32,
         ));
-        // Made for four periods, holding two at this configuration.
+        // Made for four periods, holding two and a half at this one.
         rig.handle
-            .reconfigure_holding(48_000, 48_000, 256, resampler, rig.target, 512);
+            .reconfigure_holding(48_000, 48_000, 256, resampler, rig.target, 640);
         rig.cycle();
         {
             let mut w = rig.world();
@@ -1804,6 +1811,24 @@ mod tests {
             assert_eq!(feed.queued(), 512);
         }
         assert_eq!(rig.count(&rig.counters.overflows), 1);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "periods of 256")]
+    fn a_feed_shorter_than_two_card_periods_and_the_margin_is_refused() {
+        let rig = Rig::new(Sim::new(48_000, 256, 48_000, 256));
+        let resampler = Box::new(Adaptive::new(
+            48_000,
+            48_000,
+            rig.sim.channels,
+            256,
+            Quality::Medium,
+            Format::F32,
+        ));
+        // Two periods, but no margin.
+        rig.handle
+            .reconfigure_holding(48_000, 48_000, 256, resampler, rig.target, 512);
     }
 
     #[test]

@@ -4,9 +4,12 @@
 use crate::board;
 use crate::cards;
 use crate::config::{BitPerfect, Config, Format, PluginPlace};
-use crate::control::{Answer, ConnId, Control, FurtherSetup, OpenCapture, eventfd, feed_capacity};
+use crate::control::{
+    Answer, ConnId, Control, FurtherSetup, OpenCapture, check_alignment, delay_capacity, eventfd,
+    feed_capacity,
+};
 use crate::counters::{Counters, OutputCounters};
-use crate::engine::{Engine, MAX_DELAY};
+use crate::engine::Engine;
 use crate::format::{F32, F64, I32, Processing};
 use crate::further;
 use crate::matrix::{INPUT_NAMES, Matrix};
@@ -184,6 +187,15 @@ pub fn run_outputs(
     )?;
     check_forced(&config, &mut libraries)?;
     let matrices = check_outputs(&config, &further, &mut libraries)?;
+    // Each further output's latency, its own or the master's.
+    let latencies: Vec<f32> = config
+        .outputs
+        .iter()
+        .map(|o| o.latency_ms.unwrap_or(latency_ms))
+        .collect();
+    for (i, &latency) in latencies.iter().enumerate() {
+        check_alignment(latency_ms, i + 2, latency, config.resampling)?;
+    }
     eprintln!("aas: matrix: {}", describe(&matrix));
     for (i, matrix) in matrices.iter().enumerate() {
         eprintln!("aas: output {} matrix: {}", i + 2, describe(matrix));
@@ -195,7 +207,7 @@ pub fn run_outputs(
     let card = sink.card_watch();
     let search = probe.map(|probe| (sink.card_search(), probe));
     // The writers start before the audio thread, which feeds them.
-    let capacity = feed_capacity(latency_ms, config.resampling);
+    let capacity = feed_capacity(latency_ms, &latencies, config.resampling);
     let mut setups = Vec::new();
     let mut searches = Vec::new();
     let mut watches = Vec::new();
@@ -232,12 +244,9 @@ pub fn run_outputs(
     let mode = config.bit_perfect;
     let wake = notify.as_raw_fd();
     let spawned = thread::Builder::new().name("aas-audio".into());
-    // The master's delay line keeps it in time with further outputs.
-    let delay = if config.outputs.is_empty() {
-        0
-    } else {
-        MAX_DELAY as usize
-    };
+    // The master's delay line keeps it in time with further outputs: as
+    // long as the longest target their latencies can make.
+    let delay = delay_capacity(latency_ms, &latencies, config.resampling) as usize;
     let audio = match config.format {
         Format::I32 => {
             let engine = Engine::<I32, _>::new(
