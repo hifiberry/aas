@@ -6,7 +6,7 @@ use crate::cards;
 use crate::config::{BitPerfect, Config, Format};
 use crate::control::{Answer, ConnId, Control, OpenCapture, eventfd};
 use crate::counters::Counters;
-use crate::engine::Engine;
+use crate::engine::{Engine, MAX_DELAY};
 use crate::format::{F32, F64, I32, Processing};
 use crate::matrix::{INPUT_NAMES, Matrix};
 use crate::plugin::build::{Chains, Libraries, matrix_width, widths};
@@ -148,6 +148,12 @@ pub fn run_probing(
     let mode = config.bit_perfect;
     let wake = notify.as_raw_fd();
     let spawned = thread::Builder::new().name("aas-audio".into());
+    // The master's delay line keeps it in time with further outputs.
+    let delay = if config.outputs.is_empty() {
+        0
+    } else {
+        MAX_DELAY as usize
+    };
     let audio = match config.format {
         Format::I32 => {
             let engine = Engine::<I32, _>::new(
@@ -157,6 +163,7 @@ pub fn run_probing(
                 engine_counters,
                 mode,
                 matrix,
+                delay,
             );
             spawned.spawn(move || audio_loop(engine, wake))
         }
@@ -168,6 +175,7 @@ pub fn run_probing(
                 engine_counters,
                 mode,
                 matrix,
+                delay,
             );
             spawned.spawn(move || audio_loop(engine, wake))
         }
@@ -179,6 +187,7 @@ pub fn run_probing(
                 engine_counters,
                 mode,
                 matrix,
+                delay,
             );
             spawned.spawn(move || audio_loop(engine, wake))
         }

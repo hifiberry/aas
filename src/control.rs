@@ -8,7 +8,7 @@
 use crate::capture::{Capture, OpenError};
 use crate::config::{Config, Format, Idle, PluginConfig, PluginPlace, Quality};
 use crate::dop;
-use crate::engine::{Command, Event, INITIAL_SOURCES, INITIAL_TAPS, Source, Tap};
+use crate::engine::{Command, Event, INITIAL_SOURCES, INITIAL_TAPS, Source, Tap, Target};
 use crate::format::db_to_gain;
 use crate::latency::{PERIODS, period_frames};
 use crate::plugin::build::{Chains, Libraries, build_chain, engine_place, widths};
@@ -441,7 +441,7 @@ impl Control {
             self.volume.percent(),
             self.volume_mode()
         );
-        self.send(vec![Command::SetGain(self.volume.gain())]);
+        self.send(vec![Command::SetGain(0, self.volume.gain())]);
     }
 
     fn volume_mode(&self) -> &'static str {
@@ -456,7 +456,7 @@ impl Control {
     /// zeros, and the idle rule applies from now, unless the analog input
     /// is on.
     pub fn start(&mut self, now: Instant) {
-        let mut batch = vec![Command::SetGain(self.volume.gain())];
+        let mut batch = vec![Command::SetGain(0, self.volume.gain())];
         if self.analog.is_some() {
             batch.push(Command::SetAnalogGain(self.analog_gain));
         }
@@ -637,7 +637,7 @@ impl Control {
         if !changed {
             return;
         }
-        self.send(vec![Command::SetGain(self.volume.gain())]);
+        self.send(vec![Command::SetGain(0, self.volume.gain())]);
         let subscribers = self.conns.iter().filter(|(_, c)| c.subscribed);
         let notice = Reply::VolumeChanged { percent };
         self.notices
@@ -1373,7 +1373,10 @@ impl Control {
         for (place, chain) in spare.chains {
             // A stand-in is built for another rate than the spare's.
             self.built[slot(place)] = Some(chain.rate().unwrap_or(spare.rate));
-            batch.push(Command::SetChain(engine_place(place), Box::new(chain)));
+            batch.push(Command::SetChain(
+                Target::master(engine_place(place)),
+                Box::new(chain),
+            ));
         }
     }
 
@@ -1546,9 +1549,10 @@ impl Control {
                 Event::Dropped(_)
                 | Event::Replaced(_)
                 | Event::OldTable(_)
-                | Event::OldChain(_)
+                | Event::OldChain(..)
                 | Event::OldTaps(_)
-                | Event::OldMatrix(_) => {}
+                | Event::OldMatrix(..)
+                | Event::OldOutput(..) => {}
                 // The audio thread writes it no more, so a client that
                 // reads it empty after this has all of it. A client that
                 // gave the stream up meanwhile is told nothing it minds.
@@ -2046,14 +2050,14 @@ mod tests {
             let mut gains = Vec::new();
             while gains.len() < 11 {
                 match engine_commands.pop() {
-                    Ok(Command::SetGain(gain)) => gains.push(gain),
+                    Ok(Command::SetGain(0, gain)) => gains.push(gain),
                     Ok(_) => panic!("another command"),
                     Err(_) => std::thread::sleep(Duration::from_millis(2)),
                 }
             }
             gains
         });
-        control.send((0..11).map(|i| Command::SetGain(i as f32)).collect());
+        control.send((0..11).map(|i| Command::SetGain(0, i as f32)).collect());
         let expect: Vec<f32> = (0..11).map(|i| i as f32).collect();
         assert_eq!(reader.join().unwrap(), expect);
     }
@@ -2206,12 +2210,13 @@ mod tests {
                         opened.then_some(Event::Reconfigured),
                     ),
                     Command::CloseOutput => ("CloseOutput".into(), None),
-                    Command::SetGain(_) => ("SetGain".into(), None),
+                    Command::SetGain(..) => ("SetGain".into(), None),
                     Command::Grow(t) => ("Grow".into(), Some(Event::OldTable(t))),
-                    Command::SetChain(place, chain) => {
+                    Command::SetChain(target, chain) => {
                         let names: Vec<&str> = chain.names().collect();
+                        let place = target.place;
                         let name = format!("SetChain {place:?} {}", names.join(","));
-                        (name, Some(Event::OldChain(chain)))
+                        (name, Some(Event::OldChain(target.output, chain)))
                     }
                     Command::SetParam { .. } => ("SetParam".into(), None),
                     Command::SetCapture(c) => {
@@ -2223,7 +2228,15 @@ mod tests {
                     Command::AddTap(t) => (format!("AddTap {}", t.id), None),
                     Command::RemoveTap(id) => (format!("RemoveTap {id}"), None),
                     Command::GrowTaps(t) => ("GrowTaps".into(), Some(Event::OldTaps(t))),
-                    Command::SetMatrix(m) => ("SetMatrix".into(), Some(Event::OldMatrix(m))),
+                    Command::SetMatrix(output, m) => {
+                        ("SetMatrix".into(), Some(Event::OldMatrix(output, m)))
+                    }
+                    Command::AddOutput(index, mix, feed) => (
+                        format!("AddOutput {index}"),
+                        Some(Event::OldOutput(index, mix, feed)),
+                    ),
+                    Command::RemoveOutput(index) => (format!("RemoveOutput {index}"), None),
+                    Command::SetDelay(frames) => (format!("SetDelay {frames}"), None),
                     Command::Shutdown => ("Shutdown".into(), None),
                 };
                 seen.push(name);

@@ -14,7 +14,7 @@
 use aas::capture::MemoryCapture;
 use aas::config::{BitPerfect, Format};
 use aas::counters::Counters;
-use aas::engine::{Command, Engine, Place, Source};
+use aas::engine::{Command, Engine, Place, Source, Target};
 use aas::format::{F32, F64, I32, Processing};
 use aas::latency::MAX_PERIOD;
 use aas::matrix::Matrix;
@@ -91,7 +91,7 @@ fn run<P: Processing>(format: Format, analog: Analog, cycles: usize) -> f64 {
     let counters = Arc::new(Counters::default());
     let matrix = Matrix::default_for(2);
     let mode = BitPerfect::Off;
-    let mut engine = Engine::<P, _>::new(NullSink, consumer, producer, counters, mode, matrix);
+    let mut engine = Engine::<P, _>::new(NullSink, consumer, producer, counters, mode, matrix, 0);
     let mut send = |command| assert!(commands.push(command).is_ok());
     send(Command::Reconfigure {
         rate: RATE,
@@ -106,7 +106,10 @@ fn run<P: Processing>(format: Format, analog: Analog, cycles: usize) -> f64 {
             let plugins: Vec<Box<dyn Plugin>> = vec![Box::new(Detect::new(RATE))];
             let chain = Chain::new(plugins, format, MAX_PERIOD as usize, 2).unwrap();
             send(Command::SetCapture(Some(Box::new(capture))));
-            send(Command::SetChain(Place::Analog, Box::new(chain)));
+            send(Command::SetChain(
+                Target::master(Place::Analog),
+                Box::new(chain),
+            ));
             Some(feed)
         }
     };

@@ -14,7 +14,7 @@
 use aas::capture::{CaptureFeed, MemoryCapture};
 use aas::config::{BitPerfect, Format, Route};
 use aas::counters::Counters;
-use aas::engine::{Command, Engine, Event, Place, Source};
+use aas::engine::{Command, Engine, Event, Place, Source, Target};
 use aas::format::{F32, F64, I32, Processing, db_to_gain};
 use aas::latency::MAX_PERIOD;
 use aas::matrix::Matrix;
@@ -267,7 +267,7 @@ impl<P: Processing> Run<P> {
         let (commands, consumer) = rtrb::RingBuffer::new(256);
         let (producer, events) = rtrb::RingBuffer::new(256);
         let counters = Arc::new(Counters::default());
-        let engine = Engine::new(sink, consumer, producer, counters, mode, matrix);
+        let engine = Engine::new(sink, consumer, producer, counters, mode, matrix, 0);
         Run {
             engine,
             commands,
@@ -306,7 +306,10 @@ impl<P: Processing> Run<P> {
     fn capture(&mut self, format: Format) -> CaptureFeed {
         let (capture, feed) = MemoryCapture::new();
         self.send(Command::SetCapture(Some(Box::new(capture))));
-        self.send(Command::SetChain(Place::Analog, detector(format)));
+        self.send(Command::SetChain(
+            Target::master(Place::Analog),
+            detector(format),
+        ));
         feed
     }
 
@@ -340,7 +343,7 @@ fn stereo<P: Processing>(mode: BitPerfect) -> String {
     let mut feed = None;
     for cycle in 0..CYCLES {
         match cycle {
-            3 => run.send(Command::SetGain(db_to_gain(-6.0))),
+            3 => run.send(Command::SetGain(0, db_to_gain(-6.0))),
             6 => feed = Some(run.capture(format)),
             12 => {
                 // A swap of the players, the analog input on both sides.
@@ -350,7 +353,7 @@ fn stereo<P: Processing>(mode: BitPerfect) -> String {
                     route(2, 1, -3.0),
                     route(3, 2, -3.0),
                 ];
-                run.send(Command::SetMatrix(matrix(&routes, 2)));
+                run.send(Command::SetMatrix(0, matrix(&routes, 2)));
             }
             // During that ramp.
             15 => {
@@ -360,29 +363,41 @@ fn stereo<P: Processing>(mode: BitPerfect) -> String {
                     route(2, 2, -6.0),
                     route(3, 1, -6.0),
                 ];
-                run.send(Command::SetMatrix(matrix(&routes, 2)));
+                run.send(Command::SetMatrix(0, matrix(&routes, 2)));
             }
-            22 => run.send(Command::SetChain(Place::Mix, balance(format, 0.4, RATE))),
+            22 => run.send(Command::SetChain(
+                Target::master(Place::Mix),
+                balance(format, 0.4, RATE),
+            )),
             // Built for another rate: silence, then a fade in.
-            26 => run.send(Command::SetChain(Place::Mix, balance(format, 0.4, 44100))),
-            28 => run.send(Command::SetChain(Place::Mix, balance(format, -0.3, RATE))),
-            30 => run.send(Command::SetGain(1.0)),
+            26 => run.send(Command::SetChain(
+                Target::master(Place::Mix),
+                balance(format, 0.4, 44100),
+            )),
+            28 => run.send(Command::SetChain(
+                Target::master(Place::Mix),
+                balance(format, -0.3, RATE),
+            )),
+            30 => run.send(Command::SetGain(0, 1.0)),
             33 => {
                 run.send(Command::SetCapture(None));
                 feed = None;
-                run.send(Command::SetChain(Place::Mix, Box::new(Chain::empty())));
-                run.send(Command::SetMatrix(Box::new(Matrix::default_for(2))));
+                run.send(Command::SetChain(
+                    Target::master(Place::Mix),
+                    Box::new(Chain::empty()),
+                ));
+                run.send(Command::SetMatrix(0, Box::new(Matrix::default_for(2))));
             }
             36 => {
                 let routes = [route(0, 2, 0.0), route(1, 1, 0.0)];
-                run.send(Command::SetMatrix(matrix(&routes, 2)));
+                run.send(Command::SetMatrix(0, matrix(&routes, 2)));
             }
             53 => run.send(Command::SetRunning(2, false)),
             54 => run.send(Command::SetChain(
-                Place::Output,
+                Target::master(Place::Output),
                 balance(format, -0.5, RATE),
             )),
-            56 => run.send(Command::SetMatrix(Box::new(Matrix::default_for(2)))),
+            56 => run.send(Command::SetMatrix(0, Box::new(Matrix::default_for(2)))),
             58 => run.send(Command::Reconfigure {
                 rate: RATE,
                 period: PERIOD as u32,
@@ -428,7 +443,7 @@ fn wide<P: Processing>(mode: BitPerfect) -> String {
     for cycle in 0..CYCLES {
         match cycle {
             4 => feed = Some(run.capture(format)),
-            10 => run.send(Command::SetGain(db_to_gain(-10.0))),
+            10 => run.send(Command::SetGain(0, db_to_gain(-10.0))),
             20 => {
                 let routes = [
                     route(1, 1, 0.0),
@@ -436,23 +451,26 @@ fn wide<P: Processing>(mode: BitPerfect) -> String {
                     route(2, 4, -1.0),
                     route(3, 3, 0.0),
                 ];
-                run.send(Command::SetMatrix(matrix(&routes, 4)));
+                run.send(Command::SetMatrix(0, matrix(&routes, 4)));
             }
             34 => {
                 let plugins: Vec<Box<dyn Plugin>> = Vec::new();
                 let chain = Chain::new(plugins, format, MAX_PERIOD as usize, 4).unwrap();
                 run.send(Command::SetChain(
-                    Place::Mix,
+                    Target::master(Place::Mix),
                     Box::new(chain.for_rate(44100)),
                 ));
             }
-            38 => run.send(Command::SetChain(Place::Mix, Box::new(Chain::empty()))),
+            38 => run.send(Command::SetChain(
+                Target::master(Place::Mix),
+                Box::new(Chain::empty()),
+            )),
             44 => {
                 run.send(Command::SetCapture(None));
                 feed = None;
-                run.send(Command::SetGain(1.0));
+                run.send(Command::SetGain(0, 1.0));
                 let routes = [route(0, 1, 0.0), route(1, 2, 0.0)];
-                run.send(Command::SetMatrix(matrix(&routes, 4)));
+                run.send(Command::SetMatrix(0, matrix(&routes, 4)));
             }
             _ => {}
         }

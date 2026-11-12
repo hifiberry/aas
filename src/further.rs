@@ -210,22 +210,44 @@ impl Feed {
         self.channels
     }
 
-    /// Hands a master period of interleaved frames to the writer. A full
-    /// feed takes none of it, counts an overflow and returns false. While
-    /// the output is closed the period is thrown away and this returns
-    /// true. Wait-free; does not allocate.
+    /// The time on the feed's clock, in ns: what a cycle's pushes are
+    /// stamped with, read once when the master's wait returns.
+    pub fn now(&self) -> u64 {
+        self.clock.now()
+    }
+
+    /// Hands a master period of interleaved frames to the writer, stamped
+    /// now. A full feed takes none of it, counts an overflow and returns
+    /// false. While the output is closed the period is thrown away and
+    /// this returns true. Wait-free; does not allocate.
     pub fn push(&mut self, samples: &[i32]) -> bool {
+        let now = self.now();
+        self.push_at(samples, now)
+    }
+
+    /// `push`, stamped `at_ns` on the feed's clock. The engine stamps each
+    /// push with the time its cycle woke, when the master's wait returned:
+    /// the time of the push itself is later by the work of the cycle up to
+    /// it, which would shift the writer's line through the pushes by a
+    /// constant.
+    pub fn push_at(&mut self, samples: &[i32], at_ns: u64) -> bool {
         debug_assert_eq!(samples.len() % self.channels, 0);
-        self.put(samples.len(), samples.iter().copied())
+        self.put(samples.len(), samples.iter().copied(), at_ns)
     }
 
     /// `push` for a period of `frames` zeros.
     pub fn silence(&mut self, frames: u32) -> bool {
-        let samples = frames as usize * self.channels;
-        self.put(samples, std::iter::repeat_n(0, samples))
+        let now = self.now();
+        self.silence_at(frames, now)
     }
 
-    fn put(&mut self, samples: usize, from: impl Iterator<Item = i32>) -> bool {
+    /// `push_at` for a period of `frames` zeros.
+    pub fn silence_at(&mut self, frames: u32, at_ns: u64) -> bool {
+        let samples = frames as usize * self.channels;
+        self.put(samples, std::iter::repeat_n(0, samples), at_ns)
+    }
+
+    fn put(&mut self, samples: usize, from: impl Iterator<Item = i32>, at_ns: u64) -> bool {
         if samples == 0 || !self.shared.open.load(Acquire) {
             return true;
         }
@@ -238,7 +260,7 @@ impl Feed {
         self.pushed += frames;
         self.shared.publish(Push {
             frames: self.pushed,
-            at_ns: self.clock.now(),
+            at_ns,
             last: frames,
         });
         true
@@ -776,6 +798,66 @@ impl Writer {
             self.emit(FurtherEvent::Clamped);
         }
         self.clamped = clamped;
+    }
+}
+
+/// The writer's side of a feed, for the engine's tests: what was pushed,
+/// and when.
+#[cfg(test)]
+pub(crate) struct FeedProbe {
+    ring: Consumer<i32>,
+    shared: Arc<Shared>,
+    counters: Arc<OutputCounters>,
+}
+
+#[cfg(test)]
+impl FeedProbe {
+    /// An open feed of `channels` channels that holds `frames` frames, on
+    /// the system's clock, and its probe. One of 0 frames refuses every
+    /// push.
+    pub(crate) fn new(channels: usize, frames: usize) -> (Feed, FeedProbe) {
+        let (ring, consumer) = RingBuffer::new(frames * channels);
+        let shared = Arc::new(Shared::default());
+        shared.open.store(true, Release);
+        let counters = Arc::new(OutputCounters::default());
+        let feed = Feed {
+            ring,
+            channels,
+            shared: shared.clone(),
+            counters: counters.clone(),
+            clock: Clock::Monotonic,
+            pushed: 0,
+        };
+        let probe = FeedProbe {
+            ring: consumer,
+            shared,
+            counters,
+        };
+        (feed, probe)
+    }
+
+    /// Everything pushed since the last call, interleaved.
+    pub(crate) fn take(&mut self) -> Vec<i32> {
+        let slots = self.ring.slots();
+        let chunk = self.ring.read_chunk(slots).unwrap();
+        chunk.into_iter().collect()
+    }
+
+    /// Empties the ring without allocating.
+    pub(crate) fn discard(&mut self) {
+        let slots = self.ring.slots();
+        self.ring.read_chunk(slots).unwrap().commit_all();
+    }
+
+    /// Frames pushed since the feed was made, and the stamp of the last
+    /// push.
+    pub(crate) fn last_push(&self) -> (u64, u64) {
+        let push = self.shared.read();
+        (push.frames, push.at_ns)
+    }
+
+    pub(crate) fn overflows(&self) -> u64 {
+        self.counters.overflows.load(Relaxed)
     }
 }
 
@@ -1601,6 +1683,21 @@ mod tests {
         let after = &w.written()[back..];
         assert!(after.iter().all(|&s| s < old / 4), "old audio again");
         assert!(after.iter().any(|&s| s < new / 2));
+    }
+
+    #[test]
+    fn a_push_carries_the_stamp_it_is_given() {
+        let (mut feed, probe) = FeedProbe::new(2, 256);
+        assert!(feed.push_at(&[1; 128], 1_000));
+        assert_eq!(probe.last_push(), (64, 1_000));
+        assert!(feed.silence_at(32, 2_000));
+        assert_eq!(probe.last_push(), (96, 2_000));
+        // Unstamped, a push takes the time it is made.
+        let before = feed.now();
+        assert!(feed.push(&[1; 2]));
+        let (frames, at) = probe.last_push();
+        assert_eq!(frames, 97);
+        assert!(at >= before && at <= feed.now());
     }
 
     #[test]
