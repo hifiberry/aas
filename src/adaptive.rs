@@ -171,6 +171,12 @@ impl Adaptive {
         (next as f64 + shift).ceil().max(0.0) as u32
     }
 
+    /// The most input frames a `process` call can take, at any ratio
+    /// within the clamp: what a caller's input buffer has to hold.
+    pub fn input_frames_max(&self) -> usize {
+        stage!(&self.precision, s => s.inner.input_frames_max())
+    }
+
     /// Resamples interleaved S32 frames from `input` into `output`. Yields
     /// as many frames as `output` holds, at most `max_out`, and takes
     /// `input_needed` of that from the front of `input`. Returns the frames
@@ -440,6 +446,7 @@ mod tests {
             // scaled down, plus a frame.
             let half = a.input_needed(PERIOD as u32 / 2) as usize;
             assert!(half <= need, "{half} {need}");
+            assert!(need <= a.input_frames_max(), "{need}");
             let (c, p) = a.process(&input[at..], &mut out);
             assert_eq!((c, p), (need, PERIOD), "call {i}");
             at += c * 2;

@@ -40,6 +40,12 @@ pub trait Sink: Send {
     fn close(&mut self);
     /// Frames between the sink's input and the listener.
     fn delay_frames(&self) -> u32;
+    /// The frames queued in the device at the moment of the call, as
+    /// precisely as the device tells: a further output measures its path's
+    /// delay with it. Does not allocate.
+    fn delay_now(&mut self) -> Result<u32, SinkError> {
+        Ok(self.delay_frames())
+    }
     /// Rates the device takes. Empty means any.
     fn supported_rates(&self) -> Vec<u32>;
     /// True once after a `write` that moved to another device, such as
@@ -75,6 +81,10 @@ impl Sink for Box<dyn Sink> {
 
     fn delay_frames(&self) -> u32 {
         (**self).delay_frames()
+    }
+
+    fn delay_now(&mut self) -> Result<u32, SinkError> {
+        (**self).delay_now()
     }
 
     fn supported_rates(&self) -> Vec<u32> {
@@ -116,6 +126,15 @@ impl Pacer {
         if let Some(due) = next.checked_sub(queue).filter(|&due| due > now) {
             std::thread::sleep(due - now);
         }
+    }
+
+    /// The frames written that have not played yet.
+    fn queued(&self) -> u32 {
+        let Some(next) = self.next else {
+            return 0;
+        };
+        let left = next.saturating_duration_since(Instant::now());
+        (left.as_nanos() * u128::from(self.rate) / 1_000_000_000) as u32
     }
 
     fn write(&mut self, frames: usize) {
@@ -168,6 +187,10 @@ impl Sink for NullSink {
 
     fn delay_frames(&self) -> u32 {
         0
+    }
+
+    fn delay_now(&mut self) -> Result<u32, SinkError> {
+        Ok(self.pacer.queued())
     }
 
     fn supported_rates(&self) -> Vec<u32> {
@@ -288,6 +311,17 @@ impl Sink for MemorySink {
         self.record().delay
     }
 
+    /// What a paced sink has queued, else the delay set.
+    fn delay_now(&mut self) -> Result<u32, SinkError> {
+        let record = self.record();
+        if let Some(e) = record.failure {
+            return Err(e);
+        }
+        let delay = record.delay;
+        drop(record);
+        Ok(self.pacer.as_ref().map_or(delay, Pacer::queued))
+    }
+
     fn supported_rates(&self) -> Vec<u32> {
         self.record().rates.clone()
     }
@@ -398,6 +432,7 @@ impl CardWatch {
 /// control thread looks for the card, which reads a file and allocates,
 /// and tells the audio thread to try the sink once it is there. The audio
 /// thread only reads a flag meanwhile.
+#[derive(Clone)]
 pub struct CardSearch {
     gone: Arc<AtomicBool>,
     retry: Arc<AtomicBool>,
@@ -644,6 +679,16 @@ impl Sink for FallbackSink {
         }
     }
 
+    fn delay_now(&mut self) -> Result<u32, SinkError> {
+        if self.live {
+            match self.inner.delay_now() {
+                Err(SinkError::Gone) => self.lost(),
+                result => return result,
+            }
+        }
+        self.null.delay_now()
+    }
+
     fn supported_rates(&self) -> Vec<u32> {
         self.inner.supported_rates()
     }
@@ -730,6 +775,44 @@ mod tests {
             sink.write([[0; 2]; 480].as_flattened()).unwrap();
         }
         assert!(start.elapsed() < Duration::from_millis(10));
+    }
+
+    #[test]
+    fn a_sink_reports_its_delay_now_as_its_delay_by_default() {
+        let sink = MemorySink::new();
+        let log = sink.log();
+        let mut sink: Box<dyn Sink> = Box::new(sink);
+        log.set_delay(123);
+        assert_eq!(sink.delay_now(), Ok(123));
+        log.fail(Some(SinkError::Gone));
+        assert_eq!(sink.delay_now(), Err(SinkError::Gone));
+    }
+
+    #[test]
+    fn the_null_sink_reports_what_it_has_queued_now() {
+        let mut sink = NullSink::new(2);
+        sink.open(48000, 480).unwrap();
+        assert_eq!(sink.delay_now(), Ok(0));
+        sink.write([[0; 2]; 480].as_flattened()).unwrap();
+        let queued = sink.delay_now().unwrap();
+        assert!((400..=480).contains(&queued), "{queued}");
+        std::thread::sleep(Duration::from_millis(5));
+        let later = sink.delay_now().unwrap();
+        assert!(later <= queued - 240, "{queued} then {later}");
+    }
+
+    #[test]
+    fn fallback_reads_the_delay_now_of_the_inner_sink_and_hides_its_loss() {
+        let (mut sink, log) = fallback(RETRY);
+        let search = sink.card_search();
+        log.set_delay(77);
+        sink.open(48000, 480).unwrap();
+        assert_eq!(sink.delay_now(), Ok(77));
+        log.fail(Some(SinkError::Gone));
+        // The null sink takes over, with nothing queued yet.
+        assert_eq!(sink.delay_now(), Ok(0));
+        assert!(search.is_gone());
+        assert!(search.clone().is_gone());
     }
 
     #[test]

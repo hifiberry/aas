@@ -371,9 +371,10 @@ mod mixer {
 #[cfg(feature = "alsa-output")]
 mod card {
     use super::{CardFormat, card_device, encode};
+    use crate::counters::monotonic_ns;
     use crate::latency::PERIODS;
     use crate::sink::{Sink, SinkError};
-    use alsa::pcm::{Access, Format, Frames, HwParams, PCM};
+    use alsa::pcm::{Access, Format, Frames, HwParams, PCM, State, TstampType};
     use alsa::{Direction, ValueOr};
 
     /// How long a write waits for room before the card counts as stuck.
@@ -422,6 +423,7 @@ mod card {
         pcm: PCM,
         format: CardFormat,
         channels: usize,
+        rate: u32,
         /// Frames in the card's buffer.
         buffer: u32,
         /// Frames in the card's period.
@@ -503,6 +505,32 @@ mod card {
                 self.write_all(&self.bytes[..len])?;
             }
             Ok(())
+        }
+
+        /// The frames queued in the card now. The status gives the delay
+        /// as of its timestamp, the time of the card's last position
+        /// update; while the card runs, the frames played since then are
+        /// taken off, so the delay is read at the moment of the call and
+        /// not at the card's last interrupt. A timestamp that is not on
+        /// CLOCK_MONOTONIC, or older than a period, is not used.
+        fn delay_now(&self) -> alsa::Result<u32> {
+            let status = self.pcm.status()?;
+            let delay = status.get_delay().max(0) as f64;
+            let stamp = status.get_htstamp();
+            // 32 bits on 32-bit ARM, 64 on 64-bit.
+            #[allow(clippy::unnecessary_cast)]
+            let stamp_ns = stamp.tv_sec as i64 * 1_000_000_000 + stamp.tv_nsec as i64;
+            let since_ns = monotonic_ns() as i64 - stamp_ns;
+            let period_ns = self.period as i64 * 1_000_000_000 / i64::from(self.rate);
+            let delay = if status.get_state() == State::Running
+                && stamp_ns > 0
+                && (0..=period_ns).contains(&since_ns)
+            {
+                delay - since_ns as f64 * f64::from(self.rate) / 1e9
+            } else {
+                delay
+            };
+            Ok(delay.max(0.0) as u32)
         }
 
         /// Restarts the card after an xrun: prepare, then two periods of
@@ -664,6 +692,15 @@ mod card {
                 // `wait_room` return at once until the difference had played.
                 sw.set_avail_min(Frames::from(period).min(buffer))
                     .map_err(|x| e("avail min", x))?;
+                // Timestamps on CLOCK_MONOTONIC for `delay_now`. A card
+                // without them still plays, its delay read as of its last
+                // position update.
+                if let Err(x) = sw
+                    .set_tstamp_mode(true)
+                    .and_then(|()| sw.set_tstamp_type(TstampType::Monotonic))
+                {
+                    eprintln!("aas: {device}: no monotonic timestamps: {x}");
+                }
                 pcm.sw_params(&sw).map_err(|x| e("apply sw", x))?;
             }
             if card_period != Frames::from(period) {
@@ -681,6 +718,7 @@ mod card {
                 pcm,
                 format,
                 channels: self.channels,
+                rate,
                 buffer: buffer as u32,
                 period: card_period as usize,
                 bytes: vec![0; period as usize * frame_bytes],
@@ -760,6 +798,22 @@ mod card {
 
         fn delay_frames(&self) -> u32 {
             self.open.as_ref().map_or(0, |open| open.buffer)
+        }
+
+        fn delay_now(&mut self) -> Result<u32, SinkError> {
+            let Some(open) = &self.open else {
+                return Err(SinkError::Gone);
+            };
+            match open.delay_now() {
+                Ok(frames) => Ok(frames),
+                Err(e) if e.errno() == libc::ENODEV => {
+                    // Lets the driver go, as a failed write does.
+                    self.open = None;
+                    Err(SinkError::Gone)
+                }
+                // The next write finds what is wrong and recovers.
+                Err(_) => Err(SinkError::Xrun),
+            }
         }
 
         fn supported_rates(&self) -> Vec<u32> {
