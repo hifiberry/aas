@@ -775,7 +775,8 @@ fn a_text_parameter_is_set_while_the_chain_is_built_and_may_be_refused() {
             // At the start, the daemon does not start.
             let mut loaded = Loaded::default();
             let config = library_at(path, &[("file", text("missing.wav"))]);
-            let start = Chains::build_for_start(&config, 48000, &[44100], Format::F32, &mut loaded);
+            let start =
+                Chains::build_for_start(&config, 48000, &[44100], Format::F32, 2, &mut loaded);
             assert!(start.err().unwrap().contains("missing.wav"));
         },
     );

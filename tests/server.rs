@@ -1320,22 +1320,23 @@ fn a_plugin_that_cannot_be_loaded_stops_the_start() {
 }
 
 #[test]
-fn a_channel_count_other_than_two_needs_the_matrix() {
+fn a_matrix_route_above_the_cards_channels_stops_the_start() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("aas.sock");
     let state = dir.path().join("state.toml");
     let config = Config {
-        channels: 4,
+        matrix: Some(vec![aas::config::Route {
+            from: 0,
+            to: 3,
+            gain_db: 0.0,
+        }]),
         ..default_config()
     };
     let (sink, log) = memory_sink();
     let shutdown = Arc::new(AtomicBool::new(true));
     let result = server::run(config, sink, &path, &state, None, None, shutdown);
     let e = result.expect_err("the daemon started");
-    assert!(
-        e.contains("channels") && e.contains("needs the matrix"),
-        "{e}"
-    );
+    assert!(e.contains("matrix 1") && e.contains("channel 3"), "{e}");
     assert!(log.opens().is_empty());
     assert!(!path.exists());
 }

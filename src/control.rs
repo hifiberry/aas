@@ -11,7 +11,7 @@ use crate::dop;
 use crate::engine::{Command, Event, INITIAL_SOURCES, INITIAL_TAPS, Source, Tap};
 use crate::format::db_to_gain;
 use crate::latency::{PERIODS, period_frames};
-use crate::plugin::build::{Chains, Libraries, build_chain, engine_place};
+use crate::plugin::build::{Chains, Libraries, build_chain, engine_place, widths};
 use crate::plugin::chain::Chain;
 use crate::plugin::{BuildError, Failure};
 use crate::rate::{ClientId, MAX_RATE, MIN_RATE, RatePolicy, SETTLE, STANDARD_RATES};
@@ -303,6 +303,8 @@ pub struct Control {
     notices: Vec<(ConnId, Reply)>,
     /// The plugins of the config, to build chains from at each rate.
     plugins: Vec<PluginConfig>,
+    /// The card's channels, from the config, which the chains end at.
+    channels: usize,
     libraries: Libraries,
     /// Chains built ahead, sent at the first open if it is at their rate.
     ready: Option<Chains>,
@@ -373,6 +375,7 @@ impl Control {
             save_at: None,
             notices: Vec::new(),
             plugins: config.plugins.clone(),
+            channels: config.channels,
             libraries: Libraries::default(),
             ready: None,
             built: [None; 3],
@@ -1229,14 +1232,18 @@ impl Control {
 
     /// Builds the chains `rate` needs that are not on the audio thread
     /// already: for a DoP stream the analog chain only, since DoP bypasses
-    /// the others and they keep their state. Fails with the place whose
-    /// chain could not be built.
+    /// the others and they keep their state. Each is built for the channels
+    /// that reach it: two at the analog input, the matrix width at `mix`
+    /// and what `mix` gives at `output`. Fails with the place whose chain
+    /// could not be built.
     fn chains_for(
         &mut self,
         rate: u32,
         dop: bool,
     ) -> Result<Vec<(PluginPlace, Chain)>, (PluginPlace, BuildError)> {
         let mut ready = self.ready.take().filter(|c| c.rate == rate);
+        let widths = widths(&self.plugins, self.channels, &mut self.libraries)
+            .map_err(|e| (PluginPlace::Mix, e))?;
         let mut chains = Vec::new();
         for place in self.chain_places() {
             if (dop && place != PluginPlace::Analog) || self.built[slot(place)] == Some(rate) {
@@ -1249,7 +1256,11 @@ impl Control {
                     place,
                     rate,
                     self.format,
-                    2,
+                    match place {
+                        PluginPlace::Analog => 2,
+                        PluginPlace::Mix => widths.mix,
+                        PluginPlace::Output => widths.output,
+                    },
                     &mut self.libraries,
                 )
                 .map_err(|e| (place, e))?,
@@ -3343,7 +3354,7 @@ mod tests {
         let mut control = Control::new(&config, 12.0, Vec::new(), commands, events, audio);
         let mut libraries = Libraries::default();
         let mut chains =
-            Chains::build(&config.plugins, 48000, Format::F32, &mut libraries).unwrap();
+            Chains::build(&config.plugins, 48000, Format::F32, 2, &mut libraries).unwrap();
         // A chain built ahead stands out by what it holds.
         chains.mix = Chain::empty();
         control.set_plugins(libraries, Some(chains));

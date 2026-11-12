@@ -8,7 +8,8 @@ use crate::control::{Answer, ConnId, Control, OpenCapture, eventfd};
 use crate::counters::Counters;
 use crate::engine::Engine;
 use crate::format::{F32, F64, I32, Processing};
-use crate::plugin::build::{Chains, Libraries};
+use crate::matrix::{INPUT_NAMES, Matrix};
+use crate::plugin::build::{Chains, Libraries, matrix_width};
 use crate::rate::STANDARD_RATES;
 use crate::rt;
 use crate::sink::{CardSearch, CardWatch, FallbackSink, RETRY, RatesWatch, Sink};
@@ -107,12 +108,6 @@ pub fn run_probing(
     capture: Option<OpenCapture>,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), String> {
-    if config.channels != 2 {
-        return Err(format!(
-            "channels = {} needs the matrix, which this build does not have yet",
-            config.channels
-        ));
-    }
     raise_file_limit();
     let latency_ms = config
         .latency_ms
@@ -125,13 +120,16 @@ pub fn run_probing(
         &supported[..]
     };
     let mut libraries = Libraries::default();
+    let matrix = build_matrix(&config, &mut libraries)?;
     let chains = Chains::build_for_start(
         &config.plugins,
         config.default_rate,
         others,
         config.format,
+        config.channels,
         &mut libraries,
     )?;
+    eprintln!("aas: matrix: {}", describe(&matrix));
     let notify = eventfd().map_err(|e| format!("eventfd: {e}"))?;
     let listener = listen(socket).map_err(|e| format!("{}: {e}", socket.display()))?;
     let mut sink = FallbackSink::new(sink);
@@ -147,18 +145,36 @@ pub fn run_probing(
     let spawned = thread::Builder::new().name("aas-audio".into());
     let audio = match config.format {
         Format::I32 => {
-            let engine =
-                Engine::<I32, _>::new(sink, command_queue, event_queue, engine_counters, mode);
+            let engine = Engine::<I32, _>::new(
+                sink,
+                command_queue,
+                event_queue,
+                engine_counters,
+                mode,
+                matrix,
+            );
             spawned.spawn(move || audio_loop(engine, wake))
         }
         Format::F32 => {
-            let engine =
-                Engine::<F32, _>::new(sink, command_queue, event_queue, engine_counters, mode);
+            let engine = Engine::<F32, _>::new(
+                sink,
+                command_queue,
+                event_queue,
+                engine_counters,
+                mode,
+                matrix,
+            );
             spawned.spawn(move || audio_loop(engine, wake))
         }
         Format::F64 => {
-            let engine =
-                Engine::<F64, _>::new(sink, command_queue, event_queue, engine_counters, mode);
+            let engine = Engine::<F64, _>::new(
+                sink,
+                command_queue,
+                event_queue,
+                engine_counters,
+                mode,
+                matrix,
+            );
             spawned.spawn(move || audio_loop(engine, wake))
         }
     }
@@ -222,6 +238,40 @@ pub fn run_probing(
         Ok(()) if died => Err("the audio thread stopped".to_string()),
         Ok(()) => Ok(()),
     }
+}
+
+/// The matrix of the config, as wide as the plugins of the `mix` and
+/// `output` chains make it. Without `[[matrix]]` tables it is the default.
+/// A route to a channel above the width is an error.
+pub fn build_matrix(config: &Config, libraries: &mut Libraries) -> Result<Matrix, String> {
+    let width = matrix_width(&config.plugins, config.channels, libraries).map_err(|e| e.message)?;
+    match &config.matrix {
+        None => Ok(Matrix::default_for(width)),
+        Some(routes) => Matrix::from_routes(routes, width),
+    }
+}
+
+/// The routes of `matrix` for the log, such as `players.left to 1`, with
+/// the gain where it is not 0 dB.
+pub fn describe(matrix: &Matrix) -> String {
+    let mut routes = Vec::new();
+    for (input, name) in INPUT_NAMES.iter().enumerate() {
+        for channel in 0..matrix.width() {
+            let gain = matrix.gain(input, channel);
+            if gain == 0.0 {
+                continue;
+            }
+            let mut route = format!("{name} to {}", channel + 1);
+            if gain != 1.0 {
+                route += &format!(" at {:.2} dB", 20.0 * gain.log10());
+            }
+            routes.push(route);
+        }
+    }
+    if routes.is_empty() {
+        return "no routes, every channel is silent".to_string();
+    }
+    routes.join(", ")
 }
 
 /// Logs a wake-up gap longer than the buffer soon after it happens, with
@@ -698,6 +748,52 @@ mod tests {
         let n = unsafe { libc::recv(theirs.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0) };
         assert!(n > 0);
         assert!(notice_is_due(&ours));
+    }
+
+    #[test]
+    fn the_matrix_is_logged_route_by_route_with_gains_off_0_db() {
+        assert_eq!(
+            describe(&Matrix::default_for(2)),
+            "players.left to 1, players.right to 2, analog.left to 1, analog.right to 2"
+        );
+        let route = |from, to, gain_db| crate::config::Route { from, to, gain_db };
+        let m = Matrix::from_routes(&[route(1, 1, 0.0), route(0, 2, -6.0)], 2).unwrap();
+        assert_eq!(
+            describe(&m),
+            "players.left to 2 at -6.00 dB, players.right to 1"
+        );
+        let m = Matrix::from_routes(&[], 2).unwrap();
+        assert_eq!(describe(&m), "no routes, every channel is silent");
+    }
+
+    #[test]
+    fn a_route_above_the_width_of_the_matrix_is_an_error() {
+        let mut config = Config {
+            channels: 4,
+            ..Config::default()
+        };
+        let route = |from, to| crate::config::Route {
+            from,
+            to,
+            gain_db: 0.0,
+        };
+        config.matrix = Some(vec![route(0, 4)]);
+        let mut libraries = Libraries::default();
+        assert_eq!(build_matrix(&config, &mut libraries).unwrap().width(), 4);
+        // A balance on the mix takes two channels, so the matrix has two.
+        config.plugins = vec![crate::config::PluginConfig {
+            place: crate::config::PluginPlace::Mix,
+            kind: "balance".into(),
+            path: None,
+            params: Default::default(),
+        }];
+        let e = build_matrix(&config, &mut libraries).unwrap_err();
+        assert!(e.contains("channel 4") && e.contains("2 channels"), "{e}");
+        config.matrix = None;
+        assert_eq!(
+            build_matrix(&config, &mut libraries).unwrap(),
+            Matrix::default_for(2)
+        );
     }
 
     #[test]
