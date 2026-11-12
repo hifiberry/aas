@@ -1236,6 +1236,12 @@ impl Control {
     /// that reach it: two at the analog input, the matrix width at `mix`
     /// and what `mix` gives at `output`. Fails with the place whose chain
     /// could not be built.
+    ///
+    /// A DoP stream that opens the output before any `mix` or `output`
+    /// chain was sent gets those too, so that PCM at its rate never plays
+    /// without them. One that cannot be built at the rate does not refuse
+    /// DoP there: a chain built for another rate stands in, which the audio
+    /// thread does not run at this one, so such PCM is silent.
     fn chains_for(
         &mut self,
         rate: u32,
@@ -1245,28 +1251,61 @@ impl Control {
         let widths = widths(&self.plugins, self.channels, &mut self.libraries)?;
         let mut chains = Vec::new();
         for place in self.chain_places() {
-            if (dop && place != PluginPlace::Analog) || self.built[slot(place)] == Some(rate) {
+            let built = self.built[slot(place)];
+            let bypassed = dop && place != PluginPlace::Analog;
+            if (bypassed && built.is_some()) || built == Some(rate) {
                 continue;
             }
+            let channels = match place {
+                PluginPlace::Analog => 2,
+                PluginPlace::Mix => widths.mix,
+                PluginPlace::Output => widths.output,
+            };
             let chain = match &mut ready {
                 Some(ready) => ready.take(place),
-                None => build_chain(
-                    &self.plugins,
-                    place,
-                    rate,
-                    self.format,
-                    match place {
-                        PluginPlace::Analog => 2,
-                        PluginPlace::Mix => widths.mix,
-                        PluginPlace::Output => widths.output,
-                    },
-                    &mut self.libraries,
-                )
-                .map_err(|e| (place, e))?,
+                None => match self.build(place, rate, channels) {
+                    Ok(chain) => chain,
+                    Err(e) if bypassed => {
+                        let stand_in = self.stand_in(place, rate, channels);
+                        let Some(chain) = stand_in else {
+                            return Err((place, e));
+                        };
+                        eprintln!(
+                            "aas: {e}; the output carries only DoP at {rate} Hz, PCM there is silent"
+                        );
+                        chain
+                    }
+                    Err(e) => return Err((place, e)),
+                },
             };
             chains.push((place, chain));
         }
         Ok(chains)
+    }
+
+    /// The chain at `place` for `channels` channels at `rate`.
+    fn build(
+        &mut self,
+        place: PluginPlace,
+        rate: u32,
+        channels: usize,
+    ) -> Result<Chain, BuildError> {
+        let (plugins, format) = (&self.plugins, self.format);
+        build_chain(plugins, place, rate, format, channels, &mut self.libraries)
+    }
+
+    /// The chain at `place` built for the standard rate nearest `rate` at
+    /// which it builds, if any.
+    fn stand_in(&mut self, place: PluginPlace, rate: u32, channels: usize) -> Option<Chain> {
+        let mut rates: Vec<u32> = STANDARD_RATES
+            .iter()
+            .copied()
+            .filter(|&r| r != rate)
+            .collect();
+        rates.sort_by_key(|&r| (r.abs_diff(rate), r));
+        rates
+            .into_iter()
+            .find_map(|r| self.build(place, r, channels).ok())
     }
 
     /// A change of clients or of the card: a chain that failed is tried
@@ -1332,7 +1371,8 @@ impl Control {
             return;
         };
         for (place, chain) in spare.chains {
-            self.built[slot(place)] = Some(spare.rate);
+            // A stand-in is built for another rate than the spare's.
+            self.built[slot(place)] = Some(chain.rate().unwrap_or(spare.rate));
             batch.push(Command::SetChain(engine_place(place), Box::new(chain)));
         }
     }
@@ -3297,6 +3337,58 @@ mod tests {
         control.handle_events(now);
         let seen = sent(&mut engine);
         assert!(has(&seen, "Reconfigure 176400"), "{seen:?}");
+        assert!(!has(&seen, "SetChain Mix"), "{seen:?}");
+    }
+
+    #[test]
+    fn a_first_open_for_dop_sends_the_mix_and_output_chains_too() {
+        // The card takes only 176.4 kHz, where the output chain refuses PCM,
+        // so the output has never opened when the DoP stream claims it.
+        let config = Config {
+            plugins: vec![
+                entry(config::PluginPlace::Mix, "balance"),
+                entry(config::PluginPlace::Output, "only-up-to-48k"),
+            ],
+            ..Config::default()
+        };
+        let (commands, engine_commands) = rtrb::RingBuffer::new(256);
+        let (engine_events, events) = rtrb::RingBuffer::new(256);
+        let audio = std::thread::current();
+        let mut control = Control::new(&config, 12.0, Vec::new(), commands, events, audio);
+        let now = Instant::now();
+        control.set_supported(vec![176400], now);
+        control.start(now);
+        let mut engine = FakeEngine {
+            commands: engine_commands,
+            events: engine_events,
+            capture: None,
+        };
+        play(&mut control, 1, 176400, now);
+        let seen = sent(&mut engine);
+        assert!(!has(&seen, "Reconfigure"), "{seen:?}");
+        engine.send(Event::DopStarted(1, 1));
+        control.handle_events(now);
+        let seen = sent(&mut engine);
+        // The chains go before the open, so that PCM at that rate never
+        // plays without them: the mix chain built for it, and in place of
+        // the output chain, which refuses it, one built for another rate,
+        // which the audio thread does not run at this one. It plays
+        // silence there instead of a bypass.
+        let open = seen
+            .iter()
+            .position(|s| s.starts_with("Reconfigure 176400"));
+        let mix = seen.iter().position(|s| s == "SetChain Mix balance");
+        let output = seen.iter().position(|s| s == "SetChain Output balance");
+        assert!(open.is_some() && mix < open && output < open, "{seen:?}");
+        let built = |place| control.built[slot(place)];
+        assert_eq!(built(config::PluginPlace::Mix), Some(176400));
+        assert_eq!(built(config::PluginPlace::Output), Some(48000));
+        // When the stream turns to PCM, the mix chain is not built again.
+        control.handle_events(now);
+        engine.take(true);
+        engine.send(Event::DopStopped(1));
+        control.handle_events(now);
+        let seen = sent(&mut engine);
         assert!(!has(&seen, "SetChain Mix"), "{seen:?}");
     }
 

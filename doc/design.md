@@ -774,10 +774,10 @@ Details *(call)*:
 - `mix` and `output` both belong to the output and run after the matrix, `mix`
   first *(call)*. They differ only in order, as before. In part 2 of stage 3b a
   plugin names its card.
-- When the first open is for a DoP stream only the analog chain is sent, as the
-  `mix` and `output` chains are bypassed. A PCM stream at that rate then plays
-  without plugins until its chains arrive, as the old engine did. On a config
-  whose width differs from the card the output is silent, and fades in.
+- A DoP stream bypasses the `mix` and `output` chains, but when it opens the
+  output before they were ever sent they are sent with it, so PCM at that rate
+  never plays without them. One that cannot be built at that rate is sent as
+  built for another, which the audio thread does not run: such PCM is silent.
 - A plugin can report "no signal" for its block.
 - Plugins run in-process on the audio thread, so a slow plugin causes dropouts.
 - Neutral is a property of a plugin's parameters, not of the audio. A plugin is

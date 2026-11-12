@@ -96,6 +96,11 @@ impl Chain {
         self
     }
 
+    /// The rate the chain was built for, None if it names none.
+    pub fn rate(&self) -> Option<u32> {
+        self.rate
+    }
+
     /// Whether the chain may run at `rate`: its own, or any for a chain
     /// that names none, such as one without plugins.
     pub fn fits(&self, rate: u32) -> bool {
