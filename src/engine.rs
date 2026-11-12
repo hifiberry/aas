@@ -1034,6 +1034,7 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         counters: Arc<Counters>,
         mode: BitPerfect,
     ) -> Self {
+        debug_assert_eq!(sink.channels(), 2, "the engine renders stereo");
         let frames = MAX_PERIOD as usize;
         Engine {
             sink,
@@ -1452,7 +1453,7 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         // The mix and output chains missed this period's audio.
         self.chains_idle |= !chains_ran;
         let before_write = Instant::now();
-        let result = self.sink.write(&self.out[..self.period]);
+        let result = self.sink.write(self.out[..self.period].as_flattened());
         let after_write = Instant::now();
         if result == Err(SinkError::Xrun) {
             self.counters.xruns.fetch_add(1, Ordering::Relaxed);
@@ -3220,12 +3221,16 @@ mod tests {
             Ok(())
         }
 
-        fn write(&mut self, _frames: &[[i32; 2]]) -> Result<(), SinkError> {
+        fn write(&mut self, _samples: &[i32]) -> Result<(), SinkError> {
             if std::mem::take(&mut self.switch_next) {
                 std::thread::sleep(self.took);
                 self.switched = self.reports;
             }
             Ok(())
+        }
+
+        fn channels(&self) -> usize {
+            2
         }
 
         fn close(&mut self) {}
@@ -3427,9 +3432,16 @@ mod tests {
             Ok(())
         }
 
-        fn write(&mut self, frames: &[[i32; 2]]) -> Result<(), SinkError> {
-            self.played.lock().unwrap().extend_from_slice(frames);
+        fn write(&mut self, samples: &[i32]) -> Result<(), SinkError> {
+            self.played
+                .lock()
+                .unwrap()
+                .extend(samples.chunks_exact(2).map(|f| [f[0], f[1]]));
             Ok(())
+        }
+
+        fn channels(&self) -> usize {
+            2
         }
 
         fn close(&mut self) {}
@@ -3507,9 +3519,16 @@ mod tests {
             Ok(())
         }
 
-        fn write(&mut self, frames: &[[i32; 2]]) -> Result<(), SinkError> {
-            self.played.lock().unwrap().extend_from_slice(frames);
+        fn write(&mut self, samples: &[i32]) -> Result<(), SinkError> {
+            self.played
+                .lock()
+                .unwrap()
+                .extend(samples.chunks_exact(2).map(|f| [f[0], f[1]]));
             Ok(())
+        }
+
+        fn channels(&self) -> usize {
+            2
         }
 
         fn close(&mut self) {}
@@ -3573,8 +3592,12 @@ mod tests {
             Ok(())
         }
 
-        fn write(&mut self, _frames: &[[i32; 2]]) -> Result<(), SinkError> {
+        fn write(&mut self, _samples: &[i32]) -> Result<(), SinkError> {
             Ok(())
+        }
+
+        fn channels(&self) -> usize {
+            2
         }
 
         fn close(&mut self) {}
@@ -6255,8 +6278,12 @@ mod tests {
             Ok(())
         }
 
-        fn write(&mut self, _frames: &[[i32; 2]]) -> Result<(), SinkError> {
+        fn write(&mut self, _samples: &[i32]) -> Result<(), SinkError> {
             Ok(())
+        }
+
+        fn channels(&self) -> usize {
+            2
         }
 
         fn close(&mut self) {}

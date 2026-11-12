@@ -74,13 +74,16 @@ fn handle_signals(shutdown: Arc<AtomicBool>) {
 
 #[cfg(feature = "alsa-output")]
 fn output(config: &Config) -> Box<dyn Sink> {
-    Box::new(aas::sink_alsa::AlsaSink::new(config.card.clone()))
+    Box::new(aas::sink_alsa::AlsaSink::new(
+        config.card.clone(),
+        config.channels,
+    ))
 }
 
 #[cfg(not(feature = "alsa-output"))]
-fn output(_config: &Config) -> Box<dyn Sink> {
+fn output(config: &Config) -> Box<dyn Sink> {
     eprintln!("aas: warning: built without ALSA, the output goes nowhere");
-    Box::new(aas::sink::NullSink::default())
+    Box::new(aas::sink::NullSink::new(config.channels))
 }
 
 /// Opens the card's volume control, unless the config asks for software

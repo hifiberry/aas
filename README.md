@@ -104,6 +104,7 @@ is kept in `/var/lib/aas/state.toml`.
 |---|---|---|---|
 | `latency_ms` | a number above 0 | 4 on a Pi 5 or CM5, 12 elsewhere | Target for the latency of the card's buffer. The period is the largest power of two that keeps two periods within it. |
 | `card` | an ALSA card id or index | the first card that is not `Loopback`, `Headphones` or HDMI | The card to play to. |
+| `channels` | 1 to 8 | 2 | The number of channels the card is opened with. Only 2 is accepted until the channel matrix is in; a card that does not take the count is treated as missing. |
 | `format` | `"f32"`, `"f64"`, `"i32"` | `"f32"` | The arithmetic used to mix and to apply volume. |
 | `resampling` | `"high"`, `"medium"` | `"high"` | Quality of the resampler for a client at another rate than the output. |
 | `bit_perfect` | `"auto"`, `"forced"`, `"off"` | `"auto"` | `auto` copies the samples untouched while one client plays at the output rate with no software volume. `forced` also ignores the software volume and bypasses plugins, except input detection. `off` always mixes. |

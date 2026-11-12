@@ -107,6 +107,12 @@ pub fn run_probing(
     capture: Option<OpenCapture>,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), String> {
+    if config.channels != 2 {
+        return Err(format!(
+            "channels = {} needs the matrix, which this build does not have yet",
+            config.channels
+        ));
+    }
     raise_file_limit();
     let latency_ms = config
         .latency_ms

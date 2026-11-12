@@ -158,10 +158,10 @@ impl CardFormat {
     }
 }
 
-/// Writes S32 frames into `out` as `format`, little endian, keeping the top
-/// bits. `out` holds exactly the frames.
-pub fn encode(format: CardFormat, frames: &[[i32; 2]], out: &mut [u8]) {
-    let samples = frames.iter().flatten();
+/// Writes interleaved S32 samples into `out` as `format`, little endian,
+/// keeping the top bits. `out` holds exactly the samples.
+pub fn encode(format: CardFormat, samples: &[i32], out: &mut [u8]) {
+    let samples = samples.iter();
     match format {
         CardFormat::S32 => {
             for (s, o) in samples.zip(out.chunks_exact_mut(4)) {
@@ -376,8 +376,6 @@ mod card {
     use alsa::pcm::{Access, Format, Frames, HwParams, PCM};
     use alsa::{Direction, ValueOr};
 
-    const CHANNELS: usize = 2;
-
     /// How long a write waits for room before the card counts as stuck.
     const WAIT_MS: u32 = 500;
 
@@ -403,9 +401,10 @@ mod card {
         PCM::new(device, Direction::Playback, true)
     }
 
-    /// The best format the card takes, and its rates in that format.
-    fn choose(hw: &HwParams) -> alsa::Result<(CardFormat, Vec<u32>)> {
-        hw.set_channels(CHANNELS as u32)?;
+    /// The best format the card takes with `channels` channels, and its
+    /// rates in that format.
+    fn choose(hw: &HwParams, channels: usize) -> alsa::Result<(CardFormat, Vec<u32>)> {
+        hw.set_channels(channels as u32)?;
         hw.set_access(Access::RWInterleaved)?;
         let format = CardFormat::PREFERRED
             .into_iter()
@@ -422,6 +421,7 @@ mod card {
     struct Open {
         pcm: PCM,
         format: CardFormat,
+        channels: usize,
         /// Frames in the card's buffer.
         buffer: u32,
         /// Frames in the card's period.
@@ -434,7 +434,7 @@ mod card {
 
     impl Open {
         fn frame_bytes(&self) -> usize {
-            self.format.bytes() * CHANNELS
+            self.format.bytes() * self.channels
         }
 
         /// Writes all of `bytes`. The PCM is non-blocking, so this waits in
@@ -486,19 +486,19 @@ mod card {
         }
 
         /// Converts and writes the frames, a buffer's worth at a time.
-        fn play(&mut self, frames: &[[i32; 2]]) -> alsa::Result<()> {
+        fn play(&mut self, samples: &[i32]) -> alsa::Result<()> {
             if self.format == CardFormat::S32 && cfg!(target_endian = "little") {
-                // The frames are the card's bytes already.
-                // SAFETY: a frame is 8 bytes with no padding, and bytes
+                // The samples are the card's bytes already.
+                // SAFETY: a sample is 4 bytes with no padding, and bytes
                 // have no alignment to keep.
                 let bytes = unsafe {
-                    std::slice::from_raw_parts(frames.as_ptr().cast::<u8>(), size_of_val(frames))
+                    std::slice::from_raw_parts(samples.as_ptr().cast::<u8>(), size_of_val(samples))
                 };
                 return self.write_all(bytes);
             }
-            let per_chunk = (self.bytes.len() / self.frame_bytes()).max(1);
-            for chunk in frames.chunks(per_chunk) {
-                let len = chunk.len() * self.frame_bytes();
+            let per_chunk = (self.bytes.len() / self.frame_bytes()).max(1) * self.channels;
+            for chunk in samples.chunks(per_chunk) {
+                let len = chunk.len() * self.format.bytes();
                 encode(self.format, chunk, &mut self.bytes[..len]);
                 self.write_all(&self.bytes[..len])?;
             }
@@ -513,12 +513,13 @@ mod card {
         }
     }
 
-    /// Plays to `hw:<card>`, as S32 if the card takes it, else S24 in 32
-    /// bits, else S16. Two periods are buffered and the card starts once
-    /// both are written.
+    /// Plays to `hw:<card>` with a fixed number of channels, as S32 if the
+    /// card takes it, else S24 in 32 bits, else S16. Two periods are
+    /// buffered and the card starts once both are written.
     pub struct AlsaSink {
         /// The card the config names. None finds one at each open.
         card: Option<String>,
+        channels: usize,
         open: Option<Open>,
         rates: Vec<u32>,
         /// The last failure logged, so that a retry every second does not
@@ -529,9 +530,10 @@ mod card {
     impl AlsaSink {
         /// Looks at the card once for its rates. A card that is missing now
         /// is looked for again at each open.
-        pub fn new(card: Option<String>) -> AlsaSink {
+        pub fn new(card: Option<String>, channels: usize) -> AlsaSink {
             let mut sink = AlsaSink {
                 card,
+                channels,
                 open: None,
                 rates: Vec::new(),
                 last_failure: None,
@@ -548,9 +550,25 @@ mod card {
             let e = |err: alsa::Error| format!("{device}: {err}");
             let pcm = open_pcm(&device).map_err(e)?;
             let hw = HwParams::any(&pcm).map_err(e)?;
-            let (format, rates) = choose(&hw).map_err(e)?;
-            eprintln!("aas: card {device} takes {}, {rates:?}", format.name());
+            let (format, rates) = self.choose(&device, &hw)?;
+            eprintln!(
+                "aas: card {device} takes {} channels, {}, {rates:?}",
+                self.channels,
+                format.name()
+            );
             Ok(rates)
+        }
+
+        /// `choose` for this sink's channel count, with the failure for a
+        /// card that does not take it.
+        fn choose(&self, device: &str, hw: &HwParams) -> Result<(CardFormat, Vec<u32>), String> {
+            if hw.test_channels(self.channels as u32).is_err() {
+                return Err(format!(
+                    "{device}: does not take {} channels",
+                    self.channels
+                ));
+            }
+            choose(hw, self.channels).map_err(|err| format!("{device}: format: {err}"))
         }
 
         /// The device to open. A named card is looked for first, so that a
@@ -572,7 +590,7 @@ mod card {
             let pcm = open_pcm(&device).map_err(|x| e("open", x))?;
             let (format, buffer, card_period) = {
                 let hw = HwParams::any(&pcm).map_err(|x| e("hw params", x))?;
-                let (format, rates) = choose(&hw).map_err(|x| e("format", x))?;
+                let (format, rates) = self.choose(&device, &hw)?;
                 self.rates = rates;
                 if !self.rates.contains(&rate) {
                     return Err(format!("{device}: does not take {rate} Hz"));
@@ -614,10 +632,11 @@ mod card {
                  {buffer} frames buffered",
                 format.name(),
             );
-            let frame_bytes = format.bytes() * CHANNELS;
+            let frame_bytes = format.bytes() * self.channels;
             Ok(Open {
                 pcm,
                 format,
+                channels: self.channels,
                 buffer: buffer as u32,
                 period: card_period as usize,
                 bytes: vec![0; period as usize * frame_bytes],
@@ -662,12 +681,12 @@ mod card {
             result
         }
 
-        fn write(&mut self, frames: &[[i32; 2]]) -> Result<(), SinkError> {
+        fn write(&mut self, samples: &[i32]) -> Result<(), SinkError> {
             let Some(open) = &mut self.open else {
                 return Err(SinkError::Gone);
             };
             // alsa::Error holds the positive errno.
-            let result = match open.play(frames) {
+            let result = match open.play(samples) {
                 Ok(()) => Ok(()),
                 Err(e) if e.errno() == libc::ENODEV => Err(SinkError::Gone),
                 // An underrun, a suspend, or anything else a restart may cure.
@@ -681,6 +700,10 @@ mod card {
                 self.open = None;
             }
             result
+        }
+
+        fn channels(&self) -> usize {
+            self.channels
         }
 
         fn close(&mut self) {
@@ -984,14 +1007,14 @@ mod tests {
     #[test]
     fn s32_is_written_as_it_is() {
         let mut out = [0u8; 8];
-        encode(CardFormat::S32, &[[0x1234_5678, -2]], &mut out);
+        encode(CardFormat::S32, &[0x1234_5678, -2], &mut out);
         assert_eq!(out, [0x78, 0x56, 0x34, 0x12, 0xfe, 0xff, 0xff, 0xff]);
     }
 
     #[test]
     fn s24_keeps_the_top_24_bits_in_the_low_three_bytes() {
         let mut out = [0u8; 8];
-        encode(CardFormat::S24, &[[0x1234_5678, i32::MIN]], &mut out);
+        encode(CardFormat::S24, &[0x1234_5678, i32::MIN], &mut out);
         assert_eq!(out, [0x56, 0x34, 0x12, 0x00, 0x00, 0x00, 0x80, 0xff]);
     }
 
@@ -1136,7 +1159,7 @@ mod tests {
         let frames = [[0x1234_5678, -0x0765_4321], [i32::MAX, i32::MIN]];
         for format in CardFormat::PREFERRED {
             let mut bytes = vec![0u8; frames.len() * 2 * format.bytes()];
-            encode(format, &frames, &mut bytes);
+            encode(format, frames.as_flattened(), &mut bytes);
             let mut back = [[0; 2]; 2];
             decode(format, &bytes, &mut back);
             let bits = 8 * format.bytes() as u32 - if format == CardFormat::S24 { 8 } else { 0 };
@@ -1148,9 +1171,22 @@ mod tests {
     }
 
     #[test]
+    fn samples_are_encoded_in_the_order_given_whatever_the_channel_count() {
+        let samples = [1 << 16, 2 << 16, 3 << 16, 4 << 16, 5 << 16, 6 << 16];
+        let mut out = [0u8; 12];
+        encode(CardFormat::S16, &samples, &mut out);
+        assert_eq!(out, [1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0]);
+        let mut out = [0u8; 24];
+        encode(CardFormat::S32, &samples, &mut out);
+        for (i, o) in out.chunks_exact(4).enumerate() {
+            assert_eq!(i32::from_le_bytes(o.try_into().unwrap()), samples[i]);
+        }
+    }
+
+    #[test]
     fn s16_keeps_the_top_16_bits() {
         let mut out = [0u8; 4];
-        encode(CardFormat::S16, &[[0x1234_5678, -65536]], &mut out);
+        encode(CardFormat::S16, &[0x1234_5678, -65536], &mut out);
         assert_eq!(out, [0x34, 0x12, 0xff, 0xff]);
     }
 }

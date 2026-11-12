@@ -398,8 +398,12 @@ impl Sink for GatedSink {
         self.inner.wait_room()
     }
 
-    fn write(&mut self, frames: &[[i32; 2]]) -> Result<(), SinkError> {
-        self.inner.write(frames)
+    fn write(&mut self, samples: &[i32]) -> Result<(), SinkError> {
+        self.inner.write(samples)
+    }
+
+    fn channels(&self) -> usize {
+        self.inner.channels()
     }
 
     fn close(&mut self) {
@@ -980,8 +984,12 @@ impl Sink for PanickingSink {
         Ok(())
     }
 
-    fn write(&mut self, _frames: &[[i32; 2]]) -> Result<(), SinkError> {
+    fn write(&mut self, _samples: &[i32]) -> Result<(), SinkError> {
         panic!("a test sink that panics on write");
+    }
+
+    fn channels(&self) -> usize {
+        2
     }
 
     fn close(&mut self) {}
@@ -1307,6 +1315,27 @@ fn a_plugin_that_cannot_be_loaded_stops_the_start() {
     let result = server::run(config, sink, &path, &state, None, None, shutdown);
     let e = result.expect_err("the daemon started");
     assert!(e.contains(missing), "{e}");
+    assert!(log.opens().is_empty());
+    assert!(!path.exists());
+}
+
+#[test]
+fn a_channel_count_other_than_two_needs_the_matrix() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("aas.sock");
+    let state = dir.path().join("state.toml");
+    let config = Config {
+        channels: 4,
+        ..default_config()
+    };
+    let (sink, log) = memory_sink();
+    let shutdown = Arc::new(AtomicBool::new(true));
+    let result = server::run(config, sink, &path, &state, None, None, shutdown);
+    let e = result.expect_err("the daemon started");
+    assert!(
+        e.contains("channels") && e.contains("needs the matrix"),
+        "{e}"
+    );
     assert!(log.opens().is_empty());
     assert!(!path.exists());
 }

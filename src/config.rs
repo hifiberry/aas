@@ -1,5 +1,6 @@
 //! The config file: one flat TOML file, all keys optional.
 
+use crate::matrix::MAX_CHANNELS;
 use crate::rate::{MAX_RATE, MIN_RATE};
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -117,6 +118,8 @@ pub enum ParamValue {
 pub struct Config {
     /// The card to play to, as its ALSA id or index. None finds one.
     pub card: Option<String>,
+    /// The channels the card is opened with, from 1 to `MAX_CHANNELS`.
+    pub channels: usize,
     /// The target for the latency of the card's buffer. None takes the
     /// default of the board.
     pub latency_ms: Option<f32>,
@@ -153,6 +156,7 @@ struct RawAnalog {
 #[serde(deny_unknown_fields)]
 struct Raw {
     card: Option<String>,
+    channels: Option<usize>,
     latency_ms: Option<f32>,
     default_rate: Option<u32>,
     format: Option<Format>,
@@ -242,6 +246,7 @@ impl Default for Config {
     fn default() -> Config {
         Config {
             card: None,
+            channels: 2,
             latency_ms: None,
             default_rate: 48000,
             format: Format::F32,
@@ -286,6 +291,15 @@ impl Config {
                 path.display()
             ));
         }
+        if raw
+            .channels
+            .is_some_and(|n| !(1..=MAX_CHANNELS).contains(&n))
+        {
+            return Err(format!(
+                "{}: channels must be from 1 to {MAX_CHANNELS}",
+                path.display()
+            ));
+        }
         let d = Config::default();
         let idle = match (raw.idle, raw.idle_delay_s) {
             (Some(IdleKind::Zeros), Some(_)) => {
@@ -326,6 +340,7 @@ impl Config {
         }
         Ok(Config {
             card: raw.card,
+            channels: raw.channels.unwrap_or(d.channels),
             latency_ms: raw.latency_ms,
             default_rate: raw.default_rate.unwrap_or(d.default_rate),
             format: raw.format.unwrap_or(d.format),
@@ -364,6 +379,22 @@ mod tests {
         assert_eq!(c.latency_ms, None);
         assert_eq!(c.volume_control, None);
         assert_eq!(c.volume_mode, None);
+    }
+
+    #[test]
+    fn channels_defaults_to_two_and_takes_one_to_eight() {
+        assert_eq!(load_str("").unwrap().channels, 2);
+        for n in 1..=8 {
+            assert_eq!(load_str(&format!("channels = {n}\n")).unwrap().channels, n);
+        }
+    }
+
+    #[test]
+    fn nine_channels_are_an_error() {
+        for v in ["0", "9", "-1", "\"2\""] {
+            let e = load_str(&format!("channels = {v}\n")).unwrap_err();
+            assert!(e.contains("channels"), "{v}: {e}");
+        }
     }
 
     #[test]
