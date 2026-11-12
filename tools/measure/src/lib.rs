@@ -5,6 +5,7 @@ pub mod handoff;
 #[cfg(feature = "alsa-probes")]
 pub mod hw;
 pub mod pattern;
+pub mod routing;
 pub mod rt;
 pub mod sample;
 pub mod stats;
