@@ -196,6 +196,9 @@ pub struct Widths {
     pub output: usize,
     /// What reaches the card.
     pub end: usize,
+    /// A plugin of the `mix` or `output` chain gives another count than
+    /// it takes.
+    pub changes: bool,
 }
 
 /// The width of the matrix: walking the `mix` and then the `output` chain,
@@ -261,10 +264,15 @@ pub fn widths(
         })
     };
     let at_output = after(width, &mix);
+    let changes = mix.iter().chain(&output).any(|c| match *c {
+        Channels::Fixed { input, output } => input != output,
+        Channels::Any => false,
+    });
     Ok(Widths {
         mix: width,
         output: at_output,
         end: after(at_output, &output),
+        changes,
     })
 }
 
@@ -564,6 +572,9 @@ mod tests {
         assert_eq!(matrix_width(&config, 2, &mut libraries).unwrap(), 4);
         let w = widths(&config, 2, &mut libraries).unwrap();
         assert_eq!((w.mix, w.output, w.end), (4, 2, 2));
+        assert!(w.changes);
+        let kept = [plugin(PluginPlace::Mix, "balance", &[])];
+        assert!(!widths(&kept, 2, &mut libraries).unwrap().changes);
         let start = Chains::build_for_start(&config, 48000, &[], Format::F32, 2, &mut libraries);
         let chains = start.unwrap().unwrap();
         assert_eq!(chains.mix.channels_in(), 4);

@@ -3,13 +3,13 @@
 
 use crate::board;
 use crate::cards;
-use crate::config::{Config, Format};
+use crate::config::{BitPerfect, Config, Format};
 use crate::control::{Answer, ConnId, Control, OpenCapture, eventfd};
 use crate::counters::Counters;
 use crate::engine::Engine;
 use crate::format::{F32, F64, I32, Processing};
 use crate::matrix::{INPUT_NAMES, Matrix};
-use crate::plugin::build::{Chains, Libraries, matrix_width};
+use crate::plugin::build::{Chains, Libraries, matrix_width, widths};
 use crate::rate::STANDARD_RATES;
 use crate::rt;
 use crate::sink::{CardSearch, CardWatch, FallbackSink, RETRY, RatesWatch, Sink};
@@ -129,6 +129,7 @@ pub fn run_probing(
         config.channels,
         &mut libraries,
     )?;
+    check_forced(&config, &mut libraries)?;
     eprintln!("aas: matrix: {}", describe(&matrix));
     let notify = eventfd().map_err(|e| format!("eventfd: {e}"))?;
     let listener = listen(socket).map_err(|e| format!("{}: {e}", socket.display()))?;
@@ -249,6 +250,21 @@ pub fn build_matrix(config: &Config, libraries: &mut Libraries) -> Result<Matrix
         None => Ok(Matrix::default_for(width)),
         Some(routes) => Matrix::from_routes(routes, width),
     }
+}
+
+/// Forced bit-perfect bypasses the `mix` and `output` chains, so it cannot
+/// work with chains that change the channel count: the matrix would not
+/// reach the card's channels. A matrix narrower or wider than the card
+/// comes only from such chains, and is refused with them.
+pub fn check_forced(config: &Config, libraries: &mut Libraries) -> Result<(), String> {
+    if config.bit_perfect != BitPerfect::Forced {
+        return Ok(());
+    }
+    let w = widths(&config.plugins, config.channels, libraries).map_err(|(_, e)| e.message)?;
+    if w.changes || w.mix != config.channels {
+        return Err("bit_perfect = \"forced\" needs chains that keep the channel count".into());
+    }
+    Ok(())
 }
 
 /// The routes of `matrix` for the log, such as `players.left to 1`, with
@@ -794,6 +810,61 @@ mod tests {
             build_matrix(&config, &mut libraries).unwrap(),
             Matrix::default_for(2)
         );
+    }
+
+    #[test]
+    fn forced_bit_perfect_with_chains_that_change_the_count_stops_the_start() {
+        let mix = |kind: &str| crate::config::PluginConfig {
+            place: crate::config::PluginPlace::Mix,
+            kind: kind.into(),
+            path: None,
+            params: Default::default(),
+        };
+        let output = |kind: &str| crate::config::PluginConfig {
+            place: crate::config::PluginPlace::Output,
+            ..mix(kind)
+        };
+        // Widened on the mix and narrowed on the output: in automatic mode
+        // the chains end at the card's two channels.
+        let config = Config {
+            bit_perfect: BitPerfect::Forced,
+            plugins: vec![mix("widen"), output("narrow")],
+            ..Config::default()
+        };
+        let mut libraries = Libraries::default();
+        let auto = Config {
+            bit_perfect: BitPerfect::Auto,
+            ..config.clone()
+        };
+        assert_eq!(check_forced(&auto, &mut libraries), Ok(()));
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("aas.sock");
+        let state = dir.path().join("state.toml");
+        let sink = crate::sink::MemorySink::paced();
+        let log = sink.log();
+        let shutdown = Arc::new(AtomicBool::new(true));
+        let result = run(
+            config,
+            Box::new(sink),
+            &socket,
+            &state,
+            None,
+            None,
+            shutdown,
+        );
+        assert_eq!(
+            result,
+            Err("bit_perfect = \"forced\" needs chains that keep the channel count".into())
+        );
+        assert!(log.opens().is_empty());
+        assert!(!socket.exists());
+        // Chains that keep the count are fine.
+        let kept = Config {
+            bit_perfect: BitPerfect::Forced,
+            plugins: vec![mix("balance")],
+            ..Config::default()
+        };
+        assert_eq!(check_forced(&kept, &mut libraries), Ok(()));
     }
 
     #[test]

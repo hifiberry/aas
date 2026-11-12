@@ -186,9 +186,11 @@ impl Source {
     }
 
     /// A DoP stream cannot be resampled, so it stays silent until the output
-    /// runs at its rate.
-    fn muted(&self, output_rate: u32) -> bool {
-        self.stream == Stream::Dop && self.rate != output_rate
+    /// runs at its rate. Nor can it be scaled or summed: while `routed` is
+    /// false, because the matrix or the chains would alter it, it is silent
+    /// the same way.
+    fn muted(&self, output_rate: u32, routed: bool) -> bool {
+        self.stream == Stream::Dop && (self.rate != output_rate || !routed)
     }
 
     /// Input frames one period takes.
@@ -310,12 +312,14 @@ impl Source {
     }
 
     /// Whether this DoP stream holds the output this cycle. One that has run
-    /// dry keeps it for the grace time, unless it has ended.
-    fn holds_output(&self, output_rate: u32) -> bool {
+    /// dry keeps it for the grace time, unless it has ended. One that is
+    /// not `routed` never holds it.
+    fn holds_output(&self, output_rate: u32, routed: bool) -> bool {
         let dry_for_now = !self.stalled && !self.draining();
         self.running
             && self.stream == Stream::Dop
             && self.rate == output_rate
+            && routed
             && (self.ready > 0 || dry_for_now)
     }
 
@@ -835,14 +839,22 @@ fn unmute(out: &mut [i32], channels: usize, left: &mut usize, fade: usize) {
     }
 }
 
-/// Writes stereo `frames` to channels 1 and 2 of `out`, interleaved frames
-/// of `channels` samples, unaltered, and zeros to the other channels. A
-/// card of one channel gets the left one.
-fn place_stereo(frames: &[[i32; 2]], channels: usize, out: &mut [i32]) {
+/// For each output channel, which channel of a stereo bus it copies, 0
+/// left and 1 right, or `None` for silence: a pure routing, as
+/// `Matrix::routing` gives it.
+type Routing = [Option<u8>; MAX_CHANNELS];
+
+/// Writes stereo `frames` to `out`, interleaved frames of `channels`
+/// samples, unaltered: each output channel gets the channel `routing`
+/// names, and zeros where it names none.
+fn place_routed(frames: &[[i32; 2]], routing: &Routing, channels: usize, out: &mut [i32]) {
     for (o, f) in out.chunks_exact_mut(channels).zip(frames) {
-        let sides = channels.min(2);
-        o[..sides].copy_from_slice(&f[..sides]);
-        o[sides..].fill(0);
+        for (v, side) in o
+            .iter_mut()
+            .zip(routing.iter().chain(std::iter::repeat(&None)))
+        {
+            *v = side.map_or(0, |side| f.get(usize::from(side)).copied().unwrap_or(0));
+        }
     }
 }
 
@@ -856,12 +868,16 @@ fn gives(chain: &Chain, count: usize) -> usize {
 }
 
 /// The gains of `matrix` from each channel of `bus` to each output
-/// channel, as constant ramps.
-fn bus_gains(matrix: &Matrix, bus: Bus) -> [[Ramp; MAX_CHANNELS]; 2] {
+/// channel, as constant ramps. `forced` takes every route that is not off
+/// as 0 dB, as forced bit-perfect does: there a routing that sums two
+/// channels into one, which cannot be copied, is mixed at unit gains, as
+/// overlapping sources are.
+fn bus_gains(matrix: &Matrix, bus: Bus, forced: bool) -> [[Ramp; MAX_CHANNELS]; 2] {
     let mut gains = [[Ramp::flat(0.0); MAX_CHANNELS]; 2];
     for (row, input) in gains.iter_mut().zip(bus.inputs()) {
         for (channel, gain) in row.iter_mut().enumerate().take(matrix.width()) {
-            *gain = Ramp::flat(matrix.gain(input, channel));
+            let g = matrix.gain(input, channel);
+            *gain = Ramp::flat(if forced && g != 0.0 { 1.0 } else { g });
         }
     }
     gains
@@ -1040,10 +1056,13 @@ pub struct Engine<P: Processing, S: Sink> {
     channels: usize,
     /// The gains from the buses to the channels of the output.
     matrix: Matrix,
-    /// The same, by bus: `players` and then `analog`.
+    /// The same, by bus: `players` and then `analog`. In forced bit-perfect
+    /// every route that is not off is at 0 dB.
     gains: [[[Ramp; MAX_CHANNELS]; 2]; 2],
-    /// The matrix is the default one, two channels wide, on a stereo sink.
-    stereo: bool,
+    /// How a DoP stream reaches the sink this cycle, or `None` while the
+    /// matrix or the chains would alter it. Worked out at the start of each
+    /// period from the matrix and chains in place.
+    dop_routing: Option<Routing>,
     /// A period of stereo frames that play unaltered: the one source the
     /// copy path copies, or a DoP stream.
     out: Vec<[i32; 2]>,
@@ -1103,6 +1122,7 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         let frames = MAX_PERIOD as usize;
         let channels = sink.channels();
         let widest = matrix.width().max(channels);
+        let forced = mode == BitPerfect::Forced;
         Engine {
             sink,
             commands,
@@ -1113,10 +1133,10 @@ impl<P: Processing, S: Sink> Engine<P, S> {
             backlog: VecDeque::with_capacity(BACKLOG),
             channels,
             gains: [
-                bus_gains(&matrix, Bus::Players),
-                bus_gains(&matrix, Bus::Analog),
+                bus_gains(&matrix, Bus::Players, forced),
+                bus_gains(&matrix, Bus::Analog, forced),
             ],
-            stereo: channels == 2 && matrix == Matrix::default_for(2),
+            dop_routing: None,
             matrix,
             out: vec![[0; 2]; frames],
             samples: vec![0; frames * channels],
@@ -1505,9 +1525,9 @@ impl<P: Processing, S: Sink> Engine<P, S> {
 
     /// Running sources that are heard this cycle.
     fn audible(&self) -> impl Iterator<Item = &Source> {
-        let rate = self.rate;
+        let (rate, routed) = (self.rate, self.dop_routing.is_some());
         let sources = self.table.iter().map(|s| &**s);
-        sources.filter(move |s| s.running && !s.muted(rate) && s.plays)
+        sources.filter(move |s| s.running && !s.muted(rate, routed) && s.plays)
     }
 
     fn finish_fade(&mut self) {
@@ -1533,6 +1553,7 @@ impl<P: Processing, S: Sink> Engine<P, S> {
     /// behind no more than the card's buffer. The cycle is timed from
     /// `start`, the end of that wait.
     fn render(&mut self, fade_out: bool, start: Instant) -> Result<(), SinkError> {
+        self.dop_routing = self.routing_for_dop();
         let store = &mut self.store;
         let plugins = plugins_apply(self.mode);
         self.analog
@@ -1540,9 +1561,9 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         self.taps.deliver(&self.analog, self.period);
         self.scan();
         self.order_claims();
-        let rate = self.rate;
+        let (rate, routed) = (self.rate, self.dop_routing.is_some());
         let holders = self.table.iter().enumerate();
-        let holders = holders.filter(|(_, s)| s.holds_output(rate));
+        let holders = holders.filter(|(_, s)| s.holds_output(rate, routed));
         let owner = holders.min_by_key(|(_, s)| s.dop_claim).map(|(i, _)| i);
         let chains_ran = match owner {
             Some(owner) => {
@@ -1595,12 +1616,13 @@ impl<P: Processing, S: Sink> Engine<P, S> {
 
     /// Gives each stream newly seen as DoP the next claim, in table order
     /// within a cycle, as `report` sends `DopStarted`. A stream that is no
-    /// longer DoP, or has stalled, gives its claim up.
+    /// longer DoP, or has stalled, gives its claim up, and so does every
+    /// one while DoP cannot reach the sink unaltered.
     fn order_claims(&mut self) {
-        let rate = self.rate;
+        let (rate, routed) = (self.rate, self.dop_routing.is_some());
         for source in self.table.iter_mut() {
             source.note_stall(rate);
-            if source.stream != Stream::Dop || source.stalled {
+            if source.stream != Stream::Dop || source.stalled || !routed {
                 source.dop_claim = 0;
             } else if source.dop_claim == 0 {
                 self.claims += 1;
@@ -1624,7 +1646,8 @@ impl<P: Processing, S: Sink> Engine<P, S> {
     }
 
     /// DoP has the output to itself and nothing touches its samples. The
-    /// analog input has been read and measured, and is not played.
+    /// analog input has been read and measured, and is not played. Only a
+    /// stream the `players` routing takes unaltered holds the output.
     fn play_dop(&mut self, owner: usize) {
         self.finish_fade();
         let (rate, period) = (self.rate, self.period);
@@ -1635,23 +1658,55 @@ impl<P: Processing, S: Sink> Engine<P, S> {
                 source.discard(period, rate);
             }
         }
-        self.place_unaltered();
+        let routing = self.dop_routing.unwrap_or([None; MAX_CHANNELS]);
+        self.place_unaltered(&routing);
     }
 
     /// Writes the period in `out`, from the one source the copy path copies
-    /// or from a DoP stream, to the sink's buffer unaltered: on channels 1
-    /// and 2, with zeros on the others.
-    fn place_unaltered(&mut self) {
+    /// or from a DoP stream, to the sink's buffer unaltered: to the channels
+    /// `routing` names, with zeros on the others.
+    fn place_unaltered(&mut self, routing: &Routing) {
         let period = self.period;
         let samples = &mut self.samples[..period * self.channels];
-        place_stereo(&self.out[..period], self.channels, samples);
+        place_routed(&self.out[..period], routing, self.channels, samples);
     }
 
-    /// Whether the copy path may play, when the bit-perfect rules allow it:
-    /// with the default matrix on a stereo sink and chains that keep the
-    /// channel count.
+    /// Whether the copy path, or a DoP stream, may play, when the routing
+    /// and the bit-perfect rules allow it: with a matrix as wide as the
+    /// sink and chains that keep the channel count.
     fn copy_allowed(&self) -> bool {
-        self.stereo && !self.mix.changes_channels() && !self.output.changes_channels()
+        self.matrix.width() == self.channels
+            && !self.mix.changes_channels()
+            && !self.output.changes_channels()
+    }
+
+    /// The bus of the one source the copy path would copy: the analog
+    /// input's while it is audible, else the players'.
+    fn copy_bus(&self) -> Bus {
+        if self.analog.audible {
+            Bus::Analog
+        } else {
+            Bus::Players
+        }
+    }
+
+    /// How the copy path places the bus of the one active source, if the
+    /// matrix routes it purely. In forced bit-perfect every route that is
+    /// not off counts as 0 dB.
+    fn copy_routing(&self) -> Option<Routing> {
+        let forced = self.mode == BitPerfect::Forced;
+        self.matrix.routing(self.copy_bus(), forced)
+    }
+
+    /// How a DoP stream reaches the sink, if it can unaltered: through the
+    /// `players` routing, pure with its gains as they are, also in forced
+    /// bit-perfect, since a DoP stream is never scaled, and only where the
+    /// copy path could play.
+    fn routing_for_dop(&self) -> Option<Routing> {
+        if !self.copy_allowed() {
+            return None;
+        }
+        self.matrix.routing(Bus::Players, false)
     }
 
     /// What the bit-perfect rules need to know about this cycle.
@@ -1659,9 +1714,10 @@ impl<P: Processing, S: Sink> Engine<P, S> {
     fn situation(&self) -> Situation {
         let audible = || self.audible();
         let analog = self.analog.audible;
+        let active = audible().count() + usize::from(analog);
         Situation {
             mode: self.mode,
-            active: audible().count() + usize::from(analog),
+            active,
             software_volume_at_0db: self.gain == 1.0
                 && self.target_gain == 1.0
                 && audible().all(|s| s.gain == 1.0)
@@ -1670,6 +1726,7 @@ impl<P: Processing, S: Sink> Engine<P, S> {
             plugins_neutral: self.mix.neutral()
                 && self.output.neutral()
                 && (!analog || self.analog.chain.neutral()),
+            routing_pure: active == 0 || self.copy_routing().is_some(),
         }
     }
 
@@ -1686,11 +1743,18 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         let fading = self.analog.audible && self.analog.plays != Plays::Captured;
         // Nor is a fade in after a mute for a chain at another rate over.
         let unmuting = self.unmute_left > 0;
-        let copy = !fade_out
+        let copy_routing = if !fade_out
             && !fading
             && !unmuting
             && self.copy_allowed()
-            && decide(&self.situation()).is_ok();
+            && decide(&self.situation()).is_ok()
+        {
+            self.copy_routing()
+        } else {
+            None
+        };
+        let copy = copy_routing.is_some();
+        let routed = self.dop_routing.is_some();
         let (next_gain, fade_frames) = self.next_fade_step();
         let (from, to) = if volumes {
             (self.gain, next_gain)
@@ -1714,7 +1778,7 @@ impl<P: Processing, S: Sink> Engine<P, S> {
                 let held = &self.counters.held_frames;
                 held.fetch_add(source.held as u64, Ordering::Relaxed);
             }
-            if source.muted(rate) {
+            if source.muted(rate, routed) {
                 source.discard(period, rate);
             } else if !source.plays {
                 source.note_shortfall(0, 1);
@@ -1737,8 +1801,8 @@ impl<P: Processing, S: Sink> Engine<P, S> {
                 self.analog.mix(fade, level, analog_bus);
             }
         }
-        if copy {
-            self.place_unaltered();
+        if let Some(routing) = copy_routing {
+            self.place_unaltered(&routing);
             self.gain = next_gain;
             self.fade_left -= fade_frames;
             return false;
@@ -1828,8 +1892,11 @@ impl<P: Processing, S: Sink> Engine<P, S> {
             }
             self.analog.audible_reported = audible;
         }
+        // A DoP stream that cannot reach the sink unaltered is not reported:
+        // it does not take the output.
+        let routed = self.dop_routing.is_some();
         for source in self.table.iter_mut() {
-            let dop = source.stream == Stream::Dop && !source.stalled;
+            let dop = source.stream == Stream::Dop && !source.stalled && routed;
             if dop != source.dop_reported {
                 let event = if dop {
                     Event::DopStarted(source.id, source.dop_claim)
@@ -7812,5 +7879,274 @@ mod tests {
         wide_cycles_without_allocating::<I32>();
         wide_cycles_without_allocating::<F32>();
         wide_cycles_without_allocating::<F64>();
+    }
+
+    // Bit-perfect and DoP through the matrix.
+
+    /// The S32 values at and next to its edges, and odd ones `f32` cannot
+    /// hold.
+    const EDGES: [i32; 9] = [
+        i32::MIN,
+        i32::MIN + 1,
+        -ODD,
+        -1,
+        0,
+        1,
+        ODD,
+        i32::MAX - 1,
+        i32::MAX,
+    ];
+
+    /// Players left to channel 2 and right to channel 1, at `gain_db`.
+    fn swap_at(gain_db: f32) -> Matrix {
+        matrix(&[route(0, 2, gain_db), route(1, 1, gain_db)], 2)
+    }
+
+    /// Both players' channels into channels 1 and 2, at 0 dB.
+    fn mono_sum() -> Matrix {
+        matrix(
+            &[
+                route(0, 1, 0.0),
+                route(1, 1, 0.0),
+                route(0, 2, 0.0),
+                route(1, 2, 0.0),
+            ],
+            2,
+        )
+    }
+
+    fn dop_events(events: &[Event]) -> usize {
+        count(events, |e| {
+            matches!(e, Event::DopStarted(..) | Event::DopStopped(_))
+        })
+    }
+
+    #[test]
+    fn a_swap_matrix_is_bit_perfect_and_swaps() {
+        let mut rig = Rig::<F32>::wide(BitPerfect::Auto, swap_at(0.0), 2);
+        let mut a = client(1);
+        rig.add(&mut a);
+        let input: Vec<[i32; 2]> = (0..PERIOD)
+            .map(|i| [EDGES[i % EDGES.len()], EDGES[(i + 4) % EDGES.len()]])
+            .collect();
+        a.ring.write(&input);
+        rig.cycle();
+        let want: Vec<[i32; 2]> = input.iter().map(|f| [f[1], f[0]]).collect();
+        assert_eq!(rig.last_periods(1), want);
+        assert_eq!(decide(&rig.engine.situation()), Ok(()));
+    }
+
+    #[test]
+    fn a_route_at_minus_6_db_is_not_bit_perfect_in_auto() {
+        let lowered = matrix(&[route(0, 1, -6.0), route(1, 2, 0.0)], 2);
+        let mut rig = Rig::<F64>::wide(BitPerfect::Auto, lowered, 2);
+        let mut a = client(1);
+        rig.add(&mut a);
+        a.ring.write(&frames(1 << 24, PERIOD));
+        rig.cycle();
+        assert_eq!(decide(&rig.engine.situation()), Err(NotBitPerfect::Routing));
+        let left = (f64::from(1 << 24) * f64::from(db_to_gain(-6.0))).round() as i32;
+        assert_eq!(rig.last_periods(1), vec![[left, -(1 << 24)]; PERIOD]);
+    }
+
+    #[test]
+    fn a_mono_sum_is_not_bit_perfect() {
+        // Not in forced bit-perfect either: two channels into one cannot
+        // be copied, so they are mixed, at 0 dB.
+        for mode in [BitPerfect::Auto, BitPerfect::Forced] {
+            let mut rig = Rig::<F32>::wide(mode, mono_sum(), 2);
+            let mut a = client(1);
+            rig.add(&mut a);
+            a.ring.write(&[[3 << 24, 1 << 20]; PERIOD]);
+            rig.cycle();
+            assert_eq!(
+                decide(&rig.engine.situation()),
+                Err(NotBitPerfect::Routing),
+                "{mode:?}"
+            );
+            let sum = (3 << 24) + (1 << 20);
+            assert_eq!(rig.last_periods(1), vec![[sum, sum]; PERIOD], "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn the_copy_path_writes_zeros_to_channels_without_a_route() {
+        let apart = matrix(&[route(0, 2, 0.0), route(1, 4, 0.0)], 4);
+        let mut rig = Rig::<F32>::wide(BitPerfect::Auto, apart, 4);
+        let mut a = client(1);
+        rig.add(&mut a);
+        let input: Vec<[i32; 2]> = (0..PERIOD)
+            .map(|i| [EDGES[i % EDGES.len()], EDGES[(i + 2) % EDGES.len()]])
+            .collect();
+        a.ring.write(&input);
+        rig.cycle();
+        assert_eq!(decide(&rig.engine.situation()), Ok(()));
+        let want: Vec<Vec<i32>> = input.iter().map(|f| vec![0, f[0], 0, f[1]]).collect();
+        assert_eq!(rig.last_wide(1), want);
+    }
+
+    #[test]
+    fn an_impure_analog_route_does_not_stop_bit_perfect_for_a_player() {
+        let analog_summed = matrix(
+            &[
+                route(0, 1, 0.0),
+                route(1, 2, 0.0),
+                route(2, 1, -6.0),
+                route(3, 1, 0.0),
+            ],
+            2,
+        );
+        let mut rig = Rig::<F32>::wide(BitPerfect::Auto, analog_summed, 2);
+        let (capture, feed) = MemoryCapture::new();
+        rig.send(Command::SetCapture(Some(Box::new(capture))));
+        // Below the threshold: the analog input is not a source.
+        set_chain(&mut rig, Place::Analog, vec![times(1.0).neutral().quiet()]);
+        let mut a = client(1);
+        rig.add(&mut a);
+        let input: Vec<[i32; 2]> = (0..PERIOD)
+            .map(|i| [EDGES[i % EDGES.len()], EDGES[(i + 3) % EDGES.len()]])
+            .collect();
+        a.ring.write(&input);
+        feed.push(&frames(1 << 20, PERIOD));
+        rig.cycle();
+        assert_eq!(rig.last_periods(1), input);
+        assert_eq!(decide(&rig.engine.situation()), Ok(()));
+        // The analog input alone, with signal: its own routes decide.
+        rig.send(Command::Remove(1));
+        set_chain(&mut rig, Place::Analog, vec![times(1.0).neutral()]);
+        feed.push(&[[1 << 24, 1 << 20]; PERIOD]);
+        rig.cycle();
+        assert_eq!(decide(&rig.engine.situation()), Err(NotBitPerfect::Routing));
+        let half = f64::from(1 << 24) * f64::from(db_to_gain(-6.0));
+        for f in rig.last_periods(1) {
+            assert!(
+                (f64::from(f[0]) - half - f64::from(1 << 20)).abs() <= 2.0,
+                "{f:?}"
+            );
+            assert_eq!(f[1], 0);
+        }
+    }
+
+    #[test]
+    fn forced_takes_a_route_at_minus_6_db_as_0_db() {
+        let mut rig = Rig::<F32>::wide(BitPerfect::Forced, swap_at(-6.0), 2);
+        let mut a = client(1);
+        rig.add(&mut a);
+        let input: Vec<[i32; 2]> = (0..PERIOD)
+            .map(|i| [EDGES[i % EDGES.len()], EDGES[(i + 5) % EDGES.len()]])
+            .collect();
+        a.ring.write(&input);
+        rig.cycle();
+        assert_eq!(decide(&rig.engine.situation()), Ok(()));
+        let want: Vec<[i32; 2]> = input.iter().map(|f| [f[1], f[0]]).collect();
+        assert_eq!(rig.last_periods(1), want);
+        // A second client is mixed through the matrix at 0 dB too.
+        let mut b = client(2);
+        rig.add(&mut b);
+        a.ring.write(&[[1 << 24, 3 << 20]; PERIOD]);
+        b.ring.write(&[[1 << 22, 5 << 16]; PERIOD]);
+        rig.cycle();
+        assert_eq!(
+            decide(&rig.engine.situation()),
+            Err(NotBitPerfect::SeveralSources)
+        );
+        let want = [(3 << 20) + (5 << 16), (1 << 24) + (1 << 22)];
+        assert_eq!(rig.last_periods(1), vec![want; PERIOD]);
+    }
+
+    #[test]
+    fn a_dop_stream_reaches_swapped_channels_unaltered() {
+        let mut rig = Rig::<F32>::wide(BitPerfect::Auto, swap_at(0.0), 2);
+        let mut a = client(1);
+        rig.add(&mut a);
+        let dop = dop_frames(PERIOD);
+        a.ring.write(&dop);
+        rig.cycle();
+        let want: Vec<[i32; 2]> = dop.iter().map(|f| [f[1], f[0]]).collect();
+        assert_eq!(rig.last_periods(1), want);
+        assert!(matches!(rig.events()[..], [Event::DopStarted(1, _)]));
+    }
+
+    #[test]
+    fn a_dop_stream_is_silent_when_the_routing_is_not_pure() {
+        // A sum to mono, and in forced bit-perfect a route at -6 dB: a DoP
+        // stream is never scaled, so forced does not take that as 0 dB.
+        let cases = [
+            (BitPerfect::Auto, mono_sum()),
+            (BitPerfect::Forced, mono_sum()),
+            (BitPerfect::Forced, swap_at(-6.0)),
+        ];
+        for (mode, m) in cases {
+            let mut rig = Rig::<F32>::wide(mode, m, 2);
+            let (mut dop, mut pcm) = (client(1), client(2));
+            rig.add(&mut dop);
+            rig.add(&mut pcm);
+            dop.ring.write(&dop_frames(3 * PERIOD));
+            let mut out = Vec::new();
+            for _ in 0..3 {
+                pcm.ring.write(&[[1 << 20, 0]; PERIOD]);
+                rig.cycle();
+                out.extend(rig.last_periods(1));
+            }
+            // Discarded in real time; the other client plays alone.
+            assert_eq!(dop.ring.available(), 0, "{mode:?}");
+            assert!(
+                out.iter().all(|f| f[0] >> 24 != 0x05 && f[0] >> 24 != -6),
+                "{mode:?}"
+            );
+            assert!(
+                out.iter().any(|f| f[0] == 1 << 20 || f[1] == 1 << 20),
+                "{mode:?}"
+            );
+            assert_eq!(dop_events(&rig.events()), 0, "{mode:?}");
+        }
+        // Alone, it leaves the card silent.
+        let mut rig = Rig::<F32>::wide(BitPerfect::Auto, mono_sum(), 2);
+        let mut dop = client(1);
+        rig.add(&mut dop);
+        dop.ring.write(&dop_frames(PERIOD));
+        rig.cycle();
+        assert_eq!(rig.last_periods(1), frames(0, PERIOD));
+        assert_eq!(dop_events(&rig.events()), 0);
+    }
+
+    #[test]
+    fn a_dop_stream_is_silent_behind_a_chain_that_widens() {
+        // A four channel card behind a mix chain that widens the matrix's
+        // two: the chains are bypassed for DoP, and they would not be.
+        let mut rig = Rig::<F32>::closed_with(BitPerfect::Auto, 1024, Matrix::default_for(2), 4);
+        rig.send(Command::SetChain(
+            Place::Mix,
+            chain_at::<F32>(vec![widen()], 2),
+        ));
+        let mut rig = Rig::opened(rig);
+        let mut dop = client(1);
+        rig.add(&mut dop);
+        dop.ring.write(&dop_frames(2 * PERIOD));
+        rig.cycle();
+        rig.cycle();
+        assert_eq!(dop.ring.available(), 0);
+        assert!(rig.last_wide(2).iter().all(|f| f == &[0; 4]));
+        assert_eq!(dop_events(&rig.events()), 0);
+        // On a stereo card a widening chain that arrives while DoP plays
+        // ends it: the stream stops owning the output.
+        let mut rig = Rig::<F32>::wide(BitPerfect::Auto, Matrix::default_for(2), 2);
+        let mut dop = client(1);
+        rig.add(&mut dop);
+        dop.ring.write(&dop_frames(PERIOD));
+        rig.cycle();
+        assert_eq!(rig.last_periods(1), dop_frames(PERIOD));
+        assert!(matches!(rig.events()[..], [Event::DopStarted(1, _)]));
+        rig.send(Command::SetChain(
+            Place::Mix,
+            chain_at::<F32>(vec![widen()], 2),
+        ));
+        dop.ring.write(&dop_frames(PERIOD));
+        rig.cycle();
+        assert_eq!(dop.ring.available(), 0);
+        assert_eq!(rig.last_periods(1), frames(0, PERIOD));
+        let events = rig.events();
+        assert_eq!(count(&events, |e| matches!(e, Event::DopStopped(1))), 1);
+        assert_eq!(count(&events, |e| matches!(e, Event::DopStarted(..))), 0);
     }
 }
