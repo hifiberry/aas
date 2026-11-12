@@ -1242,8 +1242,7 @@ impl Control {
         dop: bool,
     ) -> Result<Vec<(PluginPlace, Chain)>, (PluginPlace, BuildError)> {
         let mut ready = self.ready.take().filter(|c| c.rate == rate);
-        let widths = widths(&self.plugins, self.channels, &mut self.libraries)
-            .map_err(|e| (PluginPlace::Mix, e))?;
+        let widths = widths(&self.plugins, self.channels, &mut self.libraries)?;
         let mut chains = Vec::new();
         for place in self.chain_places() {
             if (dop && place != PluginPlace::Analog) || self.built[slot(place)] == Some(rate) {

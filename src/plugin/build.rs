@@ -206,19 +206,21 @@ pub fn matrix_width(
     channels: usize,
     libraries: &mut Libraries,
 ) -> Result<usize, BuildError> {
-    widths(config, channels, libraries).map(|w| w.mix)
+    widths(config, channels, libraries)
+        .map(|w| w.mix)
+        .map_err(|(_, e)| e)
 }
 
 /// The counts at the `mix` and `output` chains from the plugins' declared
 /// counts, which loads every library they name. The matrix is as wide as
 /// `matrix_width` says, and each fixed plugin then sets the count to its
 /// output. A plugin that does not fit the count that reaches it is left to
-/// the chain to refuse.
+/// the chain to refuse. Fails with the place of the plugin at fault.
 pub fn widths(
     config: &[PluginConfig],
     channels: usize,
     libraries: &mut Libraries,
-) -> Result<Widths, BuildError> {
+) -> Result<Widths, (PluginPlace, BuildError)> {
     let config_error = |m: String| BuildError::new(Failure::Config, m);
     let mut declared = |place: PluginPlace| -> Result<Vec<Channels>, BuildError> {
         let mut counts = Vec::new();
@@ -242,8 +244,8 @@ pub fn widths(
         }
         Ok(counts)
     };
-    let mix = declared(PluginPlace::Mix)?;
-    let output = declared(PluginPlace::Output)?;
+    let mix = declared(PluginPlace::Mix).map_err(|e| (PluginPlace::Mix, e))?;
+    let output = declared(PluginPlace::Output).map_err(|e| (PluginPlace::Output, e))?;
     let width = mix
         .iter()
         .chain(&output)
@@ -286,7 +288,18 @@ impl Chains {
         channels: usize,
         libraries: &mut Libraries,
     ) -> Result<Chains, BuildError> {
-        let w = widths(config, channels, libraries)?;
+        let w = widths(config, channels, libraries).map_err(|(_, e)| e)?;
+        Chains::build_at(config, rate, format, w, libraries)
+    }
+
+    /// `build` with the counts already worked out by `widths`.
+    fn build_at(
+        config: &[PluginConfig],
+        rate: u32,
+        format: Format,
+        w: Widths,
+        libraries: &mut Libraries,
+    ) -> Result<Chains, BuildError> {
         let mut build =
             |place, channels| build_chain(config, place, rate, format, channels, libraries);
         Ok(Chains {
@@ -311,26 +324,21 @@ impl Chains {
         channels: usize,
         libraries: &mut Libraries,
     ) -> Result<Option<Chains>, String> {
-        let end = |libraries: &mut Libraries| -> Result<(), String> {
-            let w = widths(config, channels, libraries).map_err(|e| e.message)?;
-            if w.end == channels {
-                Ok(())
-            } else {
-                Err(format!(
-                    "the mix and output chains give {} channels, but the card has {channels}",
-                    w.end
-                ))
-            }
-        };
-        let e = match Chains::build(config, rate, format, channels, libraries) {
-            Ok(chains) => return end(libraries).map(|()| Some(chains)),
+        let w = widths(config, channels, libraries).map_err(|(_, e)| e.message)?;
+        if w.end != channels {
+            return Err(format!(
+                "the mix and output chains give {} channels, but the card has {channels}",
+                w.end
+            ));
+        }
+        let e = match Chains::build_at(config, rate, format, w, libraries) {
+            Ok(chains) => return Ok(Some(chains)),
             Err(e) if e.kind == Failure::Unsupported => e,
             Err(e) => return Err(e.message),
         };
         for &other in others.iter().filter(|&&r| r != rate) {
-            match Chains::build(config, other, format, channels, libraries) {
+            match Chains::build_at(config, other, format, w, libraries) {
                 Ok(_) => {
-                    end(libraries)?;
                     eprintln!("aas: {e}; the output does not run at {rate} Hz");
                     return Ok(None);
                 }
@@ -583,6 +591,14 @@ mod tests {
         )
         .unwrap_err();
         assert!(e.message.starts_with("plugin 1: there is no plugin"), "{e}");
+        // The error names the place of the plugin at fault.
+        let config = [
+            plugin(PluginPlace::Mix, "balance", &[]),
+            plugin(PluginPlace::Output, "reverb", &[]),
+        ];
+        let (place, e) = widths(&config, 2, &mut libraries).unwrap_err();
+        assert_eq!(place, PluginPlace::Output);
+        assert!(e.message.starts_with("plugin 2: "), "{e}");
     }
 
     #[test]

@@ -846,6 +846,15 @@ fn place_stereo(frames: &[[i32; 2]], channels: usize, out: &mut [i32]) {
     }
 }
 
+/// The channels `chain` gives for blocks of `count` channels: its own
+/// output count, or `count` for a chain that keeps any.
+fn gives(chain: &Chain, count: usize) -> usize {
+    match chain.channels_out() {
+        0 => count,
+        n => n,
+    }
+}
+
 /// The gains of `matrix` from each channel of `bus` to each output
 /// channel, as constant ramps.
 fn bus_gains(matrix: &Matrix, bus: Bus) -> [[Ramp; MAX_CHANNELS]; 2] {
@@ -1341,10 +1350,6 @@ impl<P: Processing, S: Sink> Engine<P, S> {
     /// `Command::SetChain` says. A count of 0 is any count.
     fn chain_fits(&self, place: Place, chain: &Chain) -> bool {
         let takes = |n: usize, count: usize| n == 0 || n == count;
-        let gives = |chain: &Chain, count: usize| match chain.channels_out() {
-            0 => count,
-            n => n,
-        };
         let width = self.matrix.width();
         match place {
             Place::Analog => takes(chain.channels_in(), 2) && takes(chain.channels_out(), 2),
@@ -1748,10 +1753,22 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         let samples = &mut self.samples[..period * channels];
         let has_plugins = !self.mix.is_empty() || !self.output.is_empty();
         let chains_ran = plugins_apply(self.mode) && has_plugins;
+        // What reaches the sink: what the chains give, or the matrix when
+        // they do not run.
+        let end = if chains_ran {
+            gives(&self.output, gives(&self.mix, width))
+        } else {
+            width
+        };
         // A chain never runs at a rate it was not built for, such as after
         // a DoP stream, until the one for this rate comes. Silence, not a
         // bypass: a crossover or a protection filter must not be skipped.
-        if chains_ran && !(self.mix.fits(rate) && self.output.fits(rate)) {
+        // Nor do chains run that do not end at the sink's count: a `mix`
+        // chain waiting for its `output` chain, or chains that change the
+        // count bypassed in forced bit-perfect. Nothing is routed to the
+        // sink's channels then. The audio fades in when it plays again.
+        let fits = self.mix.fits(rate) && self.output.fits(rate);
+        if (chains_ran && !fits) || end != channels {
             samples.fill(0);
             self.unmute_left = (rate * FADE_MS / 1000) as usize;
             self.gain = next_gain;
@@ -1759,7 +1776,6 @@ impl<P: Processing, S: Sink> Engine<P, S> {
             return false;
         }
         // Without plugins the mix is not copied for them at all.
-        let mut end = width;
         if chains_ran {
             // After periods that did not pass them, so that a filter or a
             // delay does not play an old tail.
@@ -1770,18 +1786,10 @@ impl<P: Processing, S: Sink> Engine<P, S> {
             let block = P::to_block(wide, width, &mut self.store);
             let (block, _) = self.mix.run(block);
             let (block, _) = self.output.run(block);
-            end = block.channels;
-            P::from_block(block, &mut self.wide[..period * end]);
+            debug_assert_eq!(block.channels, channels);
+            P::from_block(block, &mut self.wide[..period * channels]);
         }
-        if end == channels {
-            mix_finish_wide::<P>(&self.wide[..period * end], samples);
-        } else {
-            // Chains that do not end at the sink's count, which only a
-            // `mix` chain waiting for its `output` chain, or forced
-            // bit-perfect bypassing chains that change the count, can
-            // leave: nothing is routed to the sink's channels.
-            samples.fill(0);
-        }
+        mix_finish_wide::<P>(&self.wide[..period * channels], samples);
         if self.unmute_left > 0 {
             let fade = (rate * FADE_MS / 1000) as usize;
             unmute(samples, channels, &mut self.unmute_left, fade);
@@ -7175,16 +7183,47 @@ mod tests {
 
     #[test]
     fn the_default_matrix_plays_what_the_engine_played_before() {
-        /// The stereo mix as the engine made it before the matrix: both
-        /// clients and the analog chain's output into one accumulator, at
-        /// their gains times the output's, then the mix chain.
+        /// The output gain as the engine moved it before the matrix.
+        struct OldFade {
+            gain: f32,
+            target: f32,
+            left: usize,
+        }
+
+        impl OldFade {
+            /// This period's fade, as `next_fade_step` and `Fade` made it,
+            /// and the gain it ends on.
+            fn step(&mut self) -> Fade {
+                let frames = self.left.min(PERIOD);
+                let next = if frames == self.left {
+                    self.target
+                } else {
+                    let share = frames as f32 / self.left as f32;
+                    self.gain + (self.target - self.gain) * share
+                };
+                let fade = Fade {
+                    from: self.gain,
+                    to: next,
+                    frames,
+                    out: false,
+                };
+                self.gain = next;
+                self.left -= frames;
+                fade
+            }
+        }
+
+        /// One stereo period as the engine made it before the matrix: both
+        /// clients and the analog chain's output into one accumulator along
+        /// the output fade, at their gains, then the mix chain and the
+        /// output chain.
         fn before<P: Processing>(
-            a: &[[i32; 2]],
-            b: &[[i32; 2]],
-            analog: &[[i32; 2]],
-            gains: [f32; 4],
+            inputs: [&[[i32; 2]]; 3],
+            gains: [f32; 3],
+            fade: Fade,
         ) -> Vec<[i32; 2]> {
-            let [ga, gb, gin, gout] = gains;
+            let [a, b, analog] = inputs;
+            let [ga, gb, gin] = gains;
             let n = a.len();
             let mut store = BlockStore::new(n, 2);
             let mut processed = vec![[P::zero(); 2]; n];
@@ -7194,47 +7233,69 @@ mod tests {
             analog_chain.process(block.reborrow());
             P::from_block(block, processed.as_flattened_mut());
             let mut acc = vec![[P::zero(); 2]; n];
-            mix_add::<P>(a, Ramp::flat(gout * ga), &mut acc);
-            mix_add::<P>(b, Ramp::flat(gout * gb), &mut acc);
-            mix_add_acc::<P>(&processed, Ramp::flat(gout * gin), &mut acc);
+            fade.add(a, ga, &mut acc, mix_add::<P>);
+            fade.add(b, gb, &mut acc, mix_add::<P>);
+            fade.add(&processed, gin, &mut acc, mix_add_acc::<P>);
             let mut mix = chain_of::<P>(vec![times(1.5)]);
+            let mut output = chain_of::<P>(vec![plus(-12_345)]);
             let mut block = P::to_block(acc.as_flattened_mut(), 2, &mut store);
             mix.process(block.reborrow());
+            output.process(block.reborrow());
             P::from_block(block, acc.as_flattened_mut());
             let mut out = vec![[0; 2]; n];
             mix_finish::<P>(&acc, &mut out);
             out
         }
         fn check<P: Processing>() {
-            let gains = [0.3, db_to_gain(-1.5), 0.6, db_to_gain(-3.0)];
-            let mut rig = rig_at_gain::<P>(gains[3]);
+            let gains = [0.3, db_to_gain(-1.5), 0.6];
+            let mut old = OldFade {
+                gain: db_to_gain(-3.0),
+                target: db_to_gain(-3.0),
+                left: 0,
+            };
+            let mut rig = rig_at_gain::<P>(old.gain);
             let (capture, feed) = MemoryCapture::new();
             rig.send(Command::SetCapture(Some(Box::new(capture))));
             rig.send(Command::SetAnalogGain(gains[2]));
             set_chain(&mut rig, Place::Analog, vec![times(0.75)]);
             set_chain(&mut rig, Place::Mix, vec![times(1.5)]);
+            set_chain(&mut rig, Place::Output, vec![plus(-12_345)]);
             let (mut a, mut b) = (client(1), client(2));
             a.source.as_mut().unwrap().gain = gains[0];
             b.source.as_mut().unwrap().gain = gains[1];
             rig.add(&mut a);
             rig.add(&mut b);
-            // Odd values near full scale, which every format rounds, and a
-            // sum that goes over it.
-            let pa: Vec<[i32; 2]> = (0..PERIOD as i32)
-                .map(|i| [ODD + 977 * i, i32::MIN + 13 * i])
-                .collect();
-            let pb: Vec<[i32; 2]> = (0..PERIOD as i32)
-                .map(|i| [i32::MAX - 31 * i, -ODD + i])
-                .collect();
-            let pc: Vec<[i32; 2]> = (0..PERIOD as i32)
-                .map(|i| [0x7654_3211 - i, -0x0765_4321 * (i % 3)])
-                .collect();
-            a.ring.write(&pa);
-            b.ring.write(&pb);
-            feed.push(&pc);
-            rig.cycle();
-            let want = before::<P>(&pa, &pb, &pc, gains);
-            assert_eq!(rig.last_periods(1), want, "{:?}", format_of::<P>());
+            for k in 0..12 {
+                if k == 2 {
+                    // Heard, so it fades over 10 ms, 7.5 periods.
+                    rig.send(Command::SetGain(db_to_gain(-7.0)));
+                    old.target = db_to_gain(-7.0);
+                    old.left = (RATE * FADE_MS / 1000) as usize;
+                }
+                // Odd values near full scale, which every format rounds,
+                // and a sum that goes over it.
+                let pa: Vec<[i32; 2]> = (0..PERIOD as i32)
+                    .map(|i| [ODD + 977 * i + k, i32::MIN + 13 * i])
+                    .collect();
+                let pb: Vec<[i32; 2]> = (0..PERIOD as i32)
+                    .map(|i| [i32::MAX - 31 * i - k, -ODD + i])
+                    .collect();
+                let pc: Vec<[i32; 2]> = (0..PERIOD as i32)
+                    .map(|i| [0x7654_3211 - i * k, -0x0765_4321 * (i % 3)])
+                    .collect();
+                a.ring.write(&pa);
+                b.ring.write(&pb);
+                feed.push(&pc);
+                rig.cycle();
+                let want = before::<P>([&pa, &pb, &pc], gains, old.step());
+                assert_eq!(
+                    rig.last_periods(1),
+                    want,
+                    "period {k} in {:?}",
+                    format_of::<P>()
+                );
+            }
+            assert_eq!(old.left, 0, "the fade has ended");
         }
         check::<I32>();
         check::<F32>();
@@ -7397,19 +7458,20 @@ mod tests {
     #[test]
     fn a_chain_that_widens_feeds_a_four_channel_card() {
         fn check<P: Processing>() {
-            let mut rig = Rig::<P>::wide(BitPerfect::Auto, Matrix::default_for(2), 4);
+            // The chains come before the output opens, as the control
+            // thread sends them.
+            let mut rig = Rig::<P>::closed_with(BitPerfect::Auto, 1024, Matrix::default_for(2), 4);
             rig.send(Command::SetChain(
                 Place::Mix,
                 chain_at::<P>(vec![widen()], 2),
             ));
             let halve = boxed(vec![times(0.5).any()]);
             rig.send(Command::SetChain(Place::Output, chain_at::<P>(halve, 4)));
+            let mut rig = Rig::opened(rig);
             let mut a = client(1);
             rig.add(&mut a);
             a.ring.write(&[[1 << 24, -(1 << 22)]; PERIOD]);
             rig.cycle();
-            // Both chains were taken.
-            assert_eq!(old_chains(rig.events()), [Some(0), Some(0)]);
             let want = vec![1 << 23, -(1 << 21), 1 << 23, -(1 << 21)];
             assert_eq!(
                 rig.last_wide(1),
@@ -7536,6 +7598,8 @@ mod tests {
         check::<F64>();
     }
 
+    /// In f32 only: which chain is refused depends on its counts, not on
+    /// the format.
     #[test]
     fn a_mix_chain_of_the_wrong_width_is_sent_back() {
         let mut rig = Rig::<F32>::wide(BitPerfect::Auto, Matrix::default_for(2), 2);
@@ -7591,7 +7655,7 @@ mod tests {
             Place::Mix,
             chain_at::<F64>(vec![widen()], 2),
         ));
-        a.ring.write(&frames(1000, PERIOD));
+        a.ring.write(&frames(1 << 20, PERIOD));
         rig.cycle();
         assert_eq!(old_chains(rig.events()), [Some(0)]);
         // Four channels for a stereo sink: nothing is routed there.
@@ -7602,10 +7666,94 @@ mod tests {
             Place::Output,
             chain_at::<F64>(vec![narrow], 4),
         ));
-        a.ring.write(&frames(1000, PERIOD));
-        rig.cycle();
+        let mut out = Vec::new();
+        for _ in 0..10 {
+            a.ring.write(&frames(1 << 20, PERIOD));
+            rig.cycle();
+            out.extend(rig.last_periods(1));
+        }
         assert_eq!(old_chains(rig.events()), [Some(0)]);
-        assert_eq!(rig.last_periods(1), frames(1000, PERIOD));
+        // The pair plays, faded in over 10 ms as after a mute.
+        assert!(out[0][0] <= (1 << 20) / 480 + 1, "{:?}", out[0]);
+        assert!(out[240][0] > 1 << 18);
+        assert_eq!(out[480..], frames(1 << 20, 640 - 480));
+    }
+
+    #[test]
+    fn a_mix_chain_that_widens_alone_at_the_longest_period_is_silent() {
+        // Four channels from the chain would not fit the buffers sized for
+        // a stereo sink at the longest period: the chain does not run.
+        fn check<P: Processing>() {
+            let mut rig = Rig::<P>::wide(BitPerfect::Auto, Matrix::default_for(2), 2);
+            let longest = MAX_PERIOD as usize;
+            rig.send(Command::Reconfigure {
+                rate: RATE,
+                period: MAX_PERIOD,
+            });
+            rig.cycle();
+            rig.cycle();
+            let mut a = client(1);
+            rig.add(&mut a);
+            rig.send(Command::SetChain(
+                Place::Mix,
+                chain_at::<P>(vec![widen()], 2),
+            ));
+            for _ in 0..2 {
+                a.ring.write(&frames(1 << 20, longest));
+                rig.cycle();
+            }
+            let samples = rig.log.samples();
+            let last = &samples[samples.len() - 2 * longest..];
+            assert!(last.iter().all(|&v| v == 0), "{:?}", format_of::<P>());
+            assert_eq!(a.ring.available(), 0);
+        }
+        check::<I32>();
+        check::<F32>();
+        check::<F64>();
+    }
+
+    #[test]
+    fn a_matrix_wider_than_the_card_narrows_through_the_mix_chain() {
+        fn check<P: Processing>() {
+            // Players on 1 and 2, the analog input on 3 and 4, which the
+            // chain leaves out.
+            let apart = matrix(
+                &[
+                    route(0, 1, 0.0),
+                    route(1, 2, 0.0),
+                    route(2, 3, 0.0),
+                    route(3, 4, 0.0),
+                ],
+                4,
+            );
+            let (mut rig, feed) = wide_with_capture::<P>(BitPerfect::Auto, apart, 2);
+            let narrow = crate::plugin::builtin::create("narrow", RATE, 4);
+            let narrow = narrow.unwrap().unwrap();
+            rig.send(Command::SetChain(
+                Place::Mix,
+                chain_at::<P>(vec![narrow], 4),
+            ));
+            let mut a = client(1);
+            rig.add(&mut a);
+            // The rig cycled once before the chain came, silent, so the
+            // audio fades in over the first 10 ms.
+            for _ in 0..9 {
+                a.ring.write(&[[1 << 24, -(3 << 20)]; PERIOD]);
+                feed.push(&frames(1 << 22, PERIOD));
+                rig.cycle();
+            }
+            let taken = old_chains(rig.events()).into_iter().flatten().count();
+            assert_eq!(taken, 2);
+            assert_eq!(
+                rig.last_periods(1),
+                vec![[1 << 24, -(3 << 20)]; PERIOD],
+                "{:?}",
+                format_of::<P>()
+            );
+        }
+        check::<I32>();
+        check::<F32>();
+        check::<F64>();
     }
 
     #[test]

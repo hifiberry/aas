@@ -218,9 +218,10 @@ The same `from` and `to` may not appear twice, and `to` may not be above the
 width of the matrix. That is the number of channels the first plugin with a fixed
 count takes, looking at the `mix` and then the `output` plugins, and `channels`
 if there is none. The `mix` and `output` plugins must end at `channels`, or the
-daemon stops with an error that gives both counts. An unknown key, a `from` that is not one of the four names, a
-`to` that is not a whole number from 1 to 8 and a `gain_db` outside -100 to 0 stop
-the daemon with an error naming the table by its position in the file.
+daemon stops with an error that gives both counts. An unknown key, a `from` that
+is not one of the four names, a `to` that is not a whole number from 1 to 8 and a
+`gain_db` outside -100 to 0 stop the daemon with an error naming the table by its
+position in the file.
 
 ### Recording
 
