@@ -3,7 +3,7 @@
 //! A chain is built on the control thread and handed to the audio thread.
 //! It owns the buffers it converts in, so `process` never allocates.
 
-use super::{Block, Formats, Plugin, Status};
+use super::{Block, Formats, Plugin, Samples, Status};
 use crate::config::Format;
 use crate::format::BlockStore;
 
@@ -15,6 +15,8 @@ pub struct Chain {
     convert: Vec<Option<Format>>,
     format: Format,
     store: BlockStore,
+    /// The samples in one frame of `store`.
+    channels: usize,
     /// The rate its plugins were built for. None runs at any rate.
     rate: Option<u32>,
 }
@@ -33,7 +35,8 @@ impl Chain {
             plugins,
             convert,
             format,
-            store: BlockStore::new(max_frames),
+            store: BlockStore::new(max_frames, 2),
+            channels: 2,
             rate: None,
         }
     }
@@ -57,7 +60,8 @@ impl Chain {
             plugins: Vec::new(),
             convert: Vec::new(),
             format: Format::I32,
-            store: BlockStore::new(0),
+            store: BlockStore::new(0, 2),
+            channels: 2,
             rate: None,
         }
     }
@@ -71,11 +75,12 @@ impl Chain {
         let mut status = Status::default();
         for (plugin, convert) in self.plugins.iter_mut().zip(&self.convert) {
             let plugin = plugin.as_mut();
-            let s = match (*convert, &mut block) {
+            let channels = block.channels;
+            let s = match (*convert, &mut block.samples) {
                 (None, _) => plugin.process(block.reborrow()),
-                (Some(to), Block::I32(d)) => converted(plugin, d, to, &mut self.store),
-                (Some(to), Block::F32(d)) => converted(plugin, d, to, &mut self.store),
-                (Some(to), Block::F64(d)) => converted(plugin, d, to, &mut self.store),
+                (Some(to), Samples::I32(d)) => converted(plugin, d, channels, to, &mut self.store),
+                (Some(to), Samples::F32(d)) => converted(plugin, d, channels, to, &mut self.store),
+                (Some(to), Samples::F64(d)) => converted(plugin, d, channels, to, &mut self.store),
             };
             status.no_signal |= s.no_signal;
             status.changed |= s.changed;
@@ -106,7 +111,7 @@ impl Chain {
         if self.plugins.is_empty() {
             usize::MAX
         } else {
-            self.store.i32.len()
+            self.store.i32.len() / self.channels
         }
     }
 
@@ -155,8 +160,8 @@ const SCALE: f64 = 2_147_483_648.0;
 trait Sample: Copy {
     fn to_unit(self) -> f64;
     fn from_unit(v: f64) -> Self;
-    fn buffer(store: &mut BlockStore) -> &mut [[Self; 2]];
-    fn block(data: &mut [[Self; 2]]) -> Block<'_>;
+    fn buffer(store: &mut BlockStore) -> &mut [Self];
+    fn block(data: &mut [Self], channels: usize) -> Block<'_>;
 }
 
 impl Sample for i32 {
@@ -169,12 +174,15 @@ impl Sample for i32 {
         (v * SCALE).round() as i32
     }
 
-    fn buffer(store: &mut BlockStore) -> &mut [[i32; 2]] {
+    fn buffer(store: &mut BlockStore) -> &mut [i32] {
         &mut store.i32
     }
 
-    fn block(data: &mut [[i32; 2]]) -> Block<'_> {
-        Block::I32(data)
+    fn block(data: &mut [i32], channels: usize) -> Block<'_> {
+        Block {
+            channels,
+            samples: Samples::I32(data),
+        }
     }
 }
 
@@ -187,12 +195,15 @@ impl Sample for f32 {
         v as f32
     }
 
-    fn buffer(store: &mut BlockStore) -> &mut [[f32; 2]] {
+    fn buffer(store: &mut BlockStore) -> &mut [f32] {
         &mut store.f32
     }
 
-    fn block(data: &mut [[f32; 2]]) -> Block<'_> {
-        Block::F32(data)
+    fn block(data: &mut [f32], channels: usize) -> Block<'_> {
+        Block {
+            channels,
+            samples: Samples::F32(data),
+        }
     }
 }
 
@@ -205,41 +216,46 @@ impl Sample for f64 {
         v
     }
 
-    fn buffer(store: &mut BlockStore) -> &mut [[f64; 2]] {
+    fn buffer(store: &mut BlockStore) -> &mut [f64] {
         &mut store.f64
     }
 
-    fn block(data: &mut [[f64; 2]]) -> Block<'_> {
-        Block::F64(data)
+    fn block(data: &mut [f64], channels: usize) -> Block<'_> {
+        Block {
+            channels,
+            samples: Samples::F64(data),
+        }
     }
 }
 
 /// Runs `plugin` on `data` converted to `to`, and converts the result back.
 fn converted<S: Sample>(
     plugin: &mut dyn Plugin,
-    data: &mut [[S; 2]],
+    data: &mut [S],
+    channels: usize,
     to: Format,
     store: &mut BlockStore,
 ) -> Status {
     match to {
-        Format::I32 => through::<S, i32>(plugin, data, store),
-        Format::F32 => through::<S, f32>(plugin, data, store),
-        Format::F64 => through::<S, f64>(plugin, data, store),
+        Format::I32 => through::<S, i32>(plugin, data, channels, store),
+        Format::F32 => through::<S, f32>(plugin, data, channels, store),
+        Format::F64 => through::<S, f64>(plugin, data, channels, store),
     }
 }
 
 fn through<S: Sample, T: Sample>(
     plugin: &mut dyn Plugin,
-    data: &mut [[S; 2]],
+    data: &mut [S],
+    channels: usize,
     store: &mut BlockStore,
 ) -> Status {
     let buf = &mut T::buffer(store)[..data.len()];
     for (b, d) in buf.iter_mut().zip(data.iter()) {
-        *b = [T::from_unit(d[0].to_unit()), T::from_unit(d[1].to_unit())];
+        *b = T::from_unit(d.to_unit());
     }
-    let status = plugin.process(T::block(buf));
+    let status = plugin.process(T::block(buf, channels));
     for (d, b) in data.iter_mut().zip(buf.iter()) {
-        *d = [S::from_unit(b[0].to_unit()), S::from_unit(b[1].to_unit())];
+        *d = S::from_unit(b.to_unit());
     }
     status
 }
@@ -355,24 +371,24 @@ mod tests {
         fn process(&mut self, block: Block<'_>) -> Status {
             assert!(self.formats.has(block.format()), "{:?}", block.format());
             let (op, v) = (self.op, self.value);
-            let first = match block {
-                Block::I32(d) => {
-                    let first = f64::from(d[0][0]) / FULL;
-                    for s in d.iter_mut().flatten() {
+            let first = match block.samples {
+                Samples::I32(d) => {
+                    let first = f64::from(d[0]) / FULL;
+                    for s in d.iter_mut() {
                         *s = (op(f64::from(*s) / FULL, v) * FULL).round() as i32;
                     }
                     (Format::I32, first)
                 }
-                Block::F32(d) => {
-                    let first = f64::from(d[0][0]);
-                    for s in d.iter_mut().flatten() {
+                Samples::F32(d) => {
+                    let first = f64::from(d[0]);
+                    for s in d.iter_mut() {
                         *s = op(f64::from(*s), v) as f32;
                     }
                     (Format::F32, first)
                 }
-                Block::F64(d) => {
-                    let first = d[0][0];
-                    for s in d.iter_mut().flatten() {
+                Samples::F64(d) => {
+                    let first = d[0];
+                    for s in d.iter_mut() {
                         *s = op(*s, v);
                     }
                     (Format::F64, first)
@@ -396,7 +412,10 @@ mod tests {
     /// Runs `chain` on one f64 frame.
     fn run_f64(chain: &mut Chain, v: f64) -> f64 {
         let mut d = [[v, v]];
-        chain.process(Block::F64(&mut d));
+        chain.process(Block {
+            channels: 2,
+            samples: Samples::F64(d.as_flattened_mut()),
+        });
         d[0][0]
     }
 
@@ -417,9 +436,21 @@ mod tests {
             let mut c = Chain::empty();
             assert!(c.neutral());
             assert_eq!(c.latency_frames(), 0);
-            assert_eq!(c.process(Block::I32(&mut i)), Status::default());
-            c.process(Block::F32(&mut f));
-            c.process(Block::F64(&mut d));
+            assert_eq!(
+                c.process(Block {
+                    channels: 2,
+                    samples: Samples::I32(i.as_flattened_mut())
+                }),
+                Status::default()
+            );
+            c.process(Block {
+                channels: 2,
+                samples: Samples::F32(f.as_flattened_mut()),
+            });
+            c.process(Block {
+                channels: 2,
+                samples: Samples::F64(d.as_flattened_mut()),
+            });
             c.set_param(0, 0, 1.0);
         });
         assert_eq!(i, [[1, -7], [i32::MAX, i32::MIN]]);
@@ -432,7 +463,10 @@ mod tests {
         let (r, seen) = recorder(formats(false, false, true));
         let mut c = chain(vec![r], Format::I32);
         let mut d = [[1 << 30, -(1 << 30)]];
-        c.process(Block::I32(&mut d));
+        c.process(Block {
+            channels: 2,
+            samples: Samples::I32(d.as_flattened_mut()),
+        });
         assert_eq!(*seen.lock().unwrap(), Some((Format::F64, 0.5)));
         assert_eq!(d, [[1 << 30, -(1 << 30)]]);
 
@@ -442,7 +476,10 @@ mod tests {
             Format::I32,
         );
         let mut d = [[1, -(1 << 30)], [1 << 30, -1]];
-        c.process(Block::I32(&mut d));
+        c.process(Block {
+            channels: 2,
+            samples: Samples::I32(d.as_flattened_mut()),
+        });
         assert_eq!(d, [[3, i32::MIN], [i32::MAX, -3]]);
     }
 
@@ -463,9 +500,18 @@ mod tests {
             let mut f = [[0.25f32; 2]];
             let mut d = [[0.25; 2]];
             let block = match format {
-                Format::I32 => Block::I32(&mut i),
-                Format::F32 => Block::F32(&mut f),
-                Format::F64 => Block::F64(&mut d),
+                Format::I32 => Block {
+                    channels: 2,
+                    samples: Samples::I32(i.as_flattened_mut()),
+                },
+                Format::F32 => Block {
+                    channels: 2,
+                    samples: Samples::F32(f.as_flattened_mut()),
+                },
+                Format::F64 => Block {
+                    channels: 2,
+                    samples: Samples::F64(d.as_flattened_mut()),
+                },
             };
             c.process(block);
             assert_eq!(
@@ -509,9 +555,21 @@ mod tests {
         quiet.no_signal = true;
         let mut c = chain(vec![add(0.0), quiet, add(0.0)], Format::F64);
         let mut d = [[0.0; 2]];
-        assert!(c.process(Block::F64(&mut d)).no_signal);
+        assert!(
+            c.process(Block {
+                channels: 2,
+                samples: Samples::F64(d.as_flattened_mut())
+            })
+            .no_signal
+        );
         let mut c = chain(vec![add(0.0), add(0.0)], Format::F64);
-        assert!(!c.process(Block::F64(&mut d)).no_signal);
+        assert!(
+            !c.process(Block {
+                channels: 2,
+                samples: Samples::F64(d.as_flattened_mut())
+            })
+            .no_signal
+        );
     }
 
     #[test]
@@ -520,28 +578,34 @@ mod tests {
         assert_eq!(run_f64(&mut c, 0.9), 0.9);
         let mut c = chain(vec![mul(4.0), mul(0.25)], Format::F32);
         let mut f = [[0.9f32, -0.9]];
-        c.process(Block::F32(&mut f));
+        c.process(Block {
+            channels: 2,
+            samples: Samples::F32(f.as_flattened_mut()),
+        });
         assert_eq!(f, [[0.9, -0.9]]);
         // Nor where an f32 chain converts for an f64 plugin.
         let mut c = chain(
             vec![mul(4.0).only(formats(false, false, true)), mul(0.25)],
             Format::F32,
         );
-        c.process(Block::F32(&mut f));
+        c.process(Block {
+            channels: 2,
+            samples: Samples::F32(f.as_flattened_mut()),
+        });
         assert_eq!(f, [[0.9, -0.9]]);
     }
 
     #[test]
     fn an_i32_block_is_clipped_before_the_first_plugin() {
         let mut acc = [[i64::from(i32::MAX) + 1000, i64::from(i32::MIN) - 1000]];
-        let mut store = BlockStore::new(1);
+        let mut store = BlockStore::new(1, 2);
         let mut c = chain(
             vec![mul(0.5).only(formats(true, false, false))],
             Format::I32,
         );
-        let mut block = I32::to_block(&mut acc, &mut store);
+        let mut block = I32::to_block(acc.as_flattened_mut(), 2, &mut store);
         c.process(block.reborrow());
-        I32::from_block(block, &mut acc);
+        I32::from_block(block, acc.as_flattened_mut());
         // Half of the clipped values, not of the sums.
         assert_eq!(acc, [[1 << 30, -(1 << 30)]]);
     }
@@ -562,15 +626,15 @@ mod tests {
         let input = vec![[1 << 28, -(1 << 28)]; frames];
         let mut acc = vec![[P::zero(); 2]; frames];
         let mut out = vec![[0; 2]; frames];
-        let mut store = BlockStore::new(frames);
+        let mut store = BlockStore::new(frames, 2);
         let plugins = vec![add(0.0).boxed(), mul(2.0).only(other).boxed()];
         let mut c = Chain::new(plugins, format, frames);
         assert_no_alloc(|| {
             crate::format::mix_clear::<P>(&mut acc);
             crate::format::mix_add::<P>(&input, crate::format::Ramp::flat(1.0), &mut acc);
-            let mut block = P::to_block(&mut acc, &mut store);
+            let mut block = P::to_block(acc.as_flattened_mut(), 2, &mut store);
             c.process(block.reborrow());
-            P::from_block(block, &mut acc);
+            P::from_block(block, acc.as_flattened_mut());
             crate::format::mix_finish::<P>(&acc, &mut out);
         });
         assert_eq!(out[0], [1 << 29, -(1 << 29)], "{format:?}");

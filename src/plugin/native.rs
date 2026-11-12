@@ -6,7 +6,7 @@
 //! what it reports into Rust values when it is built, so the calls on the
 //! audio thread allocate nothing.
 
-use super::{Block, BuildError, Failure, Formats, Param, ParamKind, Plugin, Status};
+use super::{Block, BuildError, Failure, Formats, Param, ParamKind, Plugin, Samples, Status};
 use aas_plugin::{
     ABI, CREATE_OK, CREATE_UNSUPPORTED, DESCRIPTOR_SIZE_V1, Descriptor, FORMAT_F32, FORMAT_F64,
     FORMAT_I32, MAX_STRUCT_SIZE, PARAM_ENUMERATION, PARAM_FLOAT, PARAM_INFO_SIZE_V1, PARAM_INTEGER,
@@ -427,13 +427,12 @@ struct Native {
 impl Native {
     /// Passes `data` to the plugin in parts of at most `max_frames`
     /// frames, and returns the status bits of all parts together.
-    fn run<T>(&mut self, format: u32, data: &mut [[T; 2]]) -> u32 {
+    fn run<T>(&mut self, format: u32, data: &mut [T]) -> u32 {
         let mut bits = 0;
-        for part in data.chunks_mut(self.max_frames) {
-            // A frame is two samples with no padding, so the part is the
-            // `2 * frames` interleaved samples the ABI passes. The length
-            // fits, as it is at most `max_frames`.
-            let frames = part.len() as u32;
+        for part in data.chunks_mut(self.max_frames * 2) {
+            // The part is the `2 * frames` interleaved samples the ABI
+            // passes. The frame count fits, as it is at most `max_frames`.
+            let frames = (part.len() / 2) as u32;
             bits |= (self.fns.process)(self.instance, format, part.as_mut_ptr().cast(), frames);
         }
         bits
@@ -522,10 +521,10 @@ impl Plugin for Native {
         if !self.formats.has(block.format()) {
             return Status::default();
         }
-        let bits = match block {
-            Block::I32(d) => self.run(FORMAT_I32, d),
-            Block::F32(d) => self.run(FORMAT_F32, d),
-            Block::F64(d) => self.run(FORMAT_F64, d),
+        let bits = match block.samples {
+            Samples::I32(d) => self.run(FORMAT_I32, d),
+            Samples::F32(d) => self.run(FORMAT_F32, d),
+            Samples::F64(d) => self.run(FORMAT_F64, d),
         };
         Status {
             no_signal: bits & STATUS_NO_SIGNAL != 0,

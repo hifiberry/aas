@@ -4,7 +4,7 @@
 use aas::config::{Format, ParamValue, PluginConfig, PluginPlace};
 use aas::plugin::build::{Chains, Libraries as Loaded, build_chain};
 use aas::plugin::native::Library;
-use aas::plugin::{Block, Formats, ParamKind, Plugin, Status};
+use aas::plugin::{Block, Formats, ParamKind, Plugin, Samples, Status};
 use assert_no_alloc::assert_no_alloc;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -139,8 +139,14 @@ fn a_loaded_plugin_processes_audio() {
     let mut f = [[0.5f32, -1.0]; 64];
     let mut d = [[0.5f64, -1.0]; 64];
     let (sf, sd) = assert_no_alloc(|| {
-        let sf = p.process(Block::F32(&mut f));
-        let sd = p.process(Block::F64(&mut d));
+        let sf = p.process(Block {
+            channels: 2,
+            samples: Samples::F32(f.as_flattened_mut()),
+        });
+        let sd = p.process(Block {
+            channels: 2,
+            samples: Samples::F64(d.as_flattened_mut()),
+        });
         (sf, sd)
     });
     assert!(!sf.no_signal && !sd.no_signal);
@@ -159,12 +165,18 @@ fn a_loaded_plugin_processes_audio() {
     // Out of range values are clamped to the range, -60 dB here.
     p.set_param(0, -1000.0);
     let mut d = [[1.0f64, -1.0]];
-    p.process(Block::F64(&mut d));
+    p.process(Block {
+        channels: 2,
+        samples: Samples::F64(d.as_flattened_mut()),
+    });
     assert!((d[0][0] - 0.001).abs() < 1e-9, "{d:?}");
     // An index beyond the parameters is ignored.
     p.set_param(1, 0.0);
     let mut d = [[1.0f64, -1.0]];
-    p.process(Block::F64(&mut d));
+    p.process(Block {
+        channels: 2,
+        samples: Samples::F64(d.as_flattened_mut()),
+    });
     assert!((d[0][0] - 0.001).abs() < 1e-9, "{d:?}");
 }
 
@@ -187,7 +199,10 @@ fn it_is_neutral_at_its_default() {
     assert!(p.neutral());
     let mut d = [[0.1f64, -0.9], [1.0 / 3.0, f64::MAX]];
     let d0 = d;
-    p.process(Block::F64(&mut d));
+    p.process(Block {
+        channels: 2,
+        samples: Samples::F64(d.as_flattened_mut()),
+    });
     assert_eq!(
         d.map(|x| x.map(f64::to_bits)),
         d0.map(|x| x.map(f64::to_bits))
@@ -277,14 +292,23 @@ fn two_instances_do_not_share_state() {
     assert!(b.neutral());
     let mut da = [[1.0f64, 1.0]];
     let mut db = [[1.0f64, 1.0]];
-    a.process(Block::F64(&mut da));
-    b.process(Block::F64(&mut db));
+    a.process(Block {
+        channels: 2,
+        samples: Samples::F64(da.as_flattened_mut()),
+    });
+    b.process(Block {
+        channels: 2,
+        samples: Samples::F64(db.as_flattened_mut()),
+    });
     assert!((da[0][0] - 0.5).abs() < 1e-4, "{da:?}");
     assert_eq!(db, [[1.0, 1.0]]);
     drop(a);
     // The other instance still works after the first is destroyed.
     b.set_param(0, 20.0);
-    b.process(Block::F64(&mut db));
+    b.process(Block {
+        channels: 2,
+        samples: Samples::F64(db.as_flattened_mut()),
+    });
     assert!((db[0][0] - 10.0).abs() < 1e-9, "{db:?}");
 }
 
@@ -295,7 +319,13 @@ fn a_block_in_a_format_the_plugin_lacks_is_left_alone() {
     let mut p = gain();
     p.set_param(0, -6.02);
     let mut i = [[1000, -1000]; 4];
-    assert_eq!(p.process(Block::I32(&mut i)), Status::default());
+    assert_eq!(
+        p.process(Block {
+            channels: 2,
+            samples: Samples::I32(i.as_flattened_mut())
+        }),
+        Status::default()
+    );
     assert_eq!(i, [[1000, -1000]; 4]);
 }
 
@@ -309,14 +339,25 @@ fn a_block_longer_than_max_frames_is_passed_in_parts() {
         |path| {
             let mut p = Library::open(path).unwrap().create(48000, 4).unwrap();
             let mut f = [[0.0f32; 2]; 9];
-            let s = assert_no_alloc(|| p.process(Block::F32(&mut f)));
+            let s = assert_no_alloc(|| {
+                p.process(Block {
+                    channels: 2,
+                    samples: Samples::F32(f.as_flattened_mut()),
+                })
+            });
             let counts: Vec<f32> = f.iter().map(|x| x[0]).collect();
             assert_eq!(counts, [4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 1.0]);
             assert!(f.iter().all(|x| x[0] == x[1]));
             // Only the last part had an odd count; its bit is kept.
             assert!(s.no_signal);
             let mut f = [[0.0f32; 2]; 8];
-            assert!(!p.process(Block::F32(&mut f)).no_signal);
+            assert!(
+                !p.process(Block {
+                    channels: 2,
+                    samples: Samples::F32(f.as_flattened_mut())
+                })
+                .no_signal
+            );
             assert!(f.iter().all(|x| x[0] == 4.0));
         },
     );
@@ -482,11 +523,20 @@ fn reset_clears_a_plugins_state_and_is_optional() {
         |path| {
             let mut p = Library::open(path).unwrap().create(48000, 64).unwrap();
             let mut d = [[0.0f32; 2]; 4];
-            p.process(Block::F32(&mut d));
-            p.process(Block::F32(&mut d));
+            p.process(Block {
+                channels: 2,
+                samples: Samples::F32(d.as_flattened_mut()),
+            });
+            p.process(Block {
+                channels: 2,
+                samples: Samples::F32(d.as_flattened_mut()),
+            });
             assert_eq!(d[0][0], 2.0);
             assert_no_alloc(|| p.reset());
-            p.process(Block::F32(&mut d));
+            p.process(Block {
+                channels: 2,
+                samples: Samples::F32(d.as_flattened_mut()),
+            });
             assert_eq!(d[0][0], 1.0);
         },
     );

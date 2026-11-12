@@ -14,7 +14,7 @@
 //! threshold and leaves no trace in the next. An infinite sample is above
 //! any threshold.
 
-use super::{Block, Formats, Param, ParamKind, Plugin, Status};
+use super::{Block, Formats, Param, ParamKind, Plugin, Samples, Status};
 
 /// Full scale of an `i32` sample.
 const I32_FULL: f64 = 2_147_483_648.0;
@@ -92,14 +92,14 @@ impl Detect {
     /// multiplies a sample by a gain below 1. Returns the status.
     fn run<T: Copy>(
         &mut self,
-        data: &mut [[T; 2]],
+        data: &mut [T],
         level: impl Fn(T) -> f64,
         scale: impl Fn(T, f64) -> T,
         zero: T,
     ) -> Status {
         let mut changed = false;
         let mut heard = false;
-        for frame in data {
+        for frame in data.chunks_exact_mut(2) {
             let (l, r) = (level(frame[0]), level(frame[1]));
             self.sum += l * l + r * r;
             if self.open {
@@ -109,11 +109,12 @@ impl Detect {
             }
             heard |= self.level > 0;
             if self.level == 0 {
-                *frame = [zero, zero];
+                frame.fill(zero);
                 changed = true;
             } else if self.level < self.fade {
                 let gain = f64::from(self.level) / f64::from(self.fade);
-                *frame = [scale(frame[0], gain), scale(frame[1], gain)];
+                frame[0] = scale(frame[0], gain);
+                frame[1] = scale(frame[1], gain);
                 changed = true;
             }
             self.seen += 1;
@@ -197,15 +198,15 @@ impl Plugin for Detect {
     }
 
     fn process(&mut self, block: Block<'_>) -> Status {
-        match block {
-            Block::I32(d) => self.run(
+        match block.samples {
+            Samples::I32(d) => self.run(
                 d,
                 |x| f64::from(x) / I32_FULL,
                 |x, g| (f64::from(x) * g).round() as i32,
                 0,
             ),
-            Block::F32(d) => self.run(d, f64::from, |x, g| (f64::from(x) * g) as f32, 0.0),
-            Block::F64(d) => self.run(d, |x| x, |x, g| x * g, 0.0),
+            Samples::F32(d) => self.run(d, f64::from, |x, g| (f64::from(x) * g) as f32, 0.0),
+            Samples::F64(d) => self.run(d, |x| x, |x, g| x * g, 0.0),
         }
     }
 }
@@ -234,7 +235,10 @@ mod tests {
     }
 
     fn feed(d: &mut Detect, mut data: Vec<[f64; 2]>) -> Status {
-        d.process(Block::F64(&mut data))
+        d.process(Block {
+            channels: 2,
+            samples: Samples::F64(data.as_flattened_mut()),
+        })
     }
 
     #[test]
@@ -270,7 +274,13 @@ mod tests {
         let mut d = Detect::new(RATE);
         let mut data = silence(48_000);
         data[1000] = [0.1, 0.1];
-        assert!(d.process(Block::F64(&mut data)).no_signal);
+        assert!(
+            d.process(Block {
+                channels: 2,
+                samples: Samples::F64(data.as_flattened_mut())
+            })
+            .no_signal
+        );
         assert!(!d.open());
     }
 
@@ -307,19 +317,31 @@ mod tests {
         let mut d = Detect::new(RATE);
         // Quiet noise-like data below the threshold, in each format.
         let mut i = vec![[1000i32, -1000]; 4800];
-        d.process(Block::I32(&mut i));
+        d.process(Block {
+            channels: 2,
+            samples: Samples::I32(i.as_flattened_mut()),
+        });
         assert!(i.iter().all(|f| *f == [0, 0]));
         let mut f = vec![[1e-4f32, -1e-4]; 4800];
-        d.process(Block::F32(&mut f));
+        d.process(Block {
+            channels: 2,
+            samples: Samples::F32(f.as_flattened_mut()),
+        });
         assert!(f.iter().all(|f| *f == [0.0, 0.0]));
         let mut x = vec![[1e-4f64, -1e-4]; 4800];
-        d.process(Block::F64(&mut x));
+        d.process(Block {
+            channels: 2,
+            samples: Samples::F64(x.as_flattened_mut()),
+        });
         assert!(x.iter().all(|f| *f == [0.0, 0.0]));
         // The window that opens it is gone, the next 10 ms fade in, and
         // the samples pass from then on.
         let mut x = tone(-30.0, 4800, RATE);
         let loud = x.clone();
-        d.process(Block::F64(&mut x));
+        d.process(Block {
+            channels: 2,
+            samples: Samples::F64(x.as_flattened_mut()),
+        });
         assert!(x[..2400].iter().all(|f| *f == [0.0, 0.0]));
         assert_eq!(x[2400 + 479..], loud[2400 + 479..]);
     }
@@ -329,22 +351,34 @@ mod tests {
         let mut d = Detect::new(RATE);
         // Open, and faded in.
         let mut x = tone(-20.0, 2400 + 480, RATE);
-        d.process(Block::F64(&mut x));
+        d.process(Block {
+            channels: 2,
+            samples: Samples::F64(x.as_flattened_mut()),
+        });
         assert!(d.open());
         let loud = tone(-20.0, 480, RATE);
         let mut x = loud.clone();
-        d.process(Block::F64(&mut x));
+        d.process(Block {
+            channels: 2,
+            samples: Samples::F64(x.as_flattened_mut()),
+        });
         assert_eq!(x, loud);
         let mut f: Vec<[f32; 2]> = loud.iter().map(|f| f.map(|v| v as f32)).collect();
         let f0 = f.clone();
-        d.process(Block::F32(&mut f));
+        d.process(Block {
+            channels: 2,
+            samples: Samples::F32(f.as_flattened_mut()),
+        });
         assert_eq!(f, f0);
         let mut i: Vec<[i32; 2]> = loud
             .iter()
             .map(|f| f.map(|v| (v * I32_FULL * 0.5) as i32))
             .collect();
         let i0 = i.clone();
-        d.process(Block::I32(&mut i));
+        d.process(Block {
+            channels: 2,
+            samples: Samples::I32(i.as_flattened_mut()),
+        });
         assert_eq!(i, i0);
         assert!(d.neutral());
         assert_eq!(d.latency_frames(), 0);
@@ -361,9 +395,18 @@ mod tests {
                 .collect()
         };
         let mut q = as_i32(-60.0);
-        assert!(d.process(Block::I32(&mut q)).no_signal);
+        assert!(
+            d.process(Block {
+                channels: 2,
+                samples: Samples::I32(q.as_flattened_mut())
+            })
+            .no_signal
+        );
         let mut l = as_i32(-40.0);
-        d.process(Block::I32(&mut l));
+        d.process(Block {
+            channels: 2,
+            samples: Samples::I32(l.as_flattened_mut()),
+        });
         assert!(d.open());
     }
 
@@ -448,7 +491,10 @@ mod tests {
         let mut x = tone(-30.0, 2400, RATE);
         // Quiet, constant and below the threshold, for more than the hold.
         x.extend(vec![[1e-4, 1e-4]; 150_000]);
-        d.process(Block::F64(&mut x));
+        d.process(Block {
+            channels: 2,
+            samples: Samples::F64(x.as_flattened_mut()),
+        });
         // The hold ends 144000 frames after the loud window, and the fade
         // out 10 ms later.
         let closed = 2400 + 144_000;
@@ -469,11 +515,17 @@ mod tests {
         data.extend(tone(-30.0, 4800, RATE));
         let mut whole = Detect::new(RATE);
         let mut a = data.clone();
-        let status = whole.process(Block::F64(&mut a));
+        let status = whole.process(Block {
+            channels: 2,
+            samples: Samples::F64(a.as_flattened_mut()),
+        });
         let mut ones = Detect::new(RATE);
         let mut b = data.clone();
         for f in b.chunks_mut(1) {
-            ones.process(Block::F64(f));
+            ones.process(Block {
+                channels: 2,
+                samples: Samples::F64(f.as_flattened_mut()),
+            });
         }
         assert_eq!(a, b);
         assert_eq!(whole.open(), ones.open());
@@ -485,7 +537,13 @@ mod tests {
         let mut d = Detect::new(RATE);
         let mut x = tone(-30.0, 2400, RATE);
         x[10] = [f64::NAN, 0.0];
-        assert!(d.process(Block::F64(&mut x)).no_signal);
+        assert!(
+            d.process(Block {
+                channels: 2,
+                samples: Samples::F64(x.as_flattened_mut())
+            })
+            .no_signal
+        );
         assert!(!d.open());
         // The next window is clean and opens it.
         feed(&mut d, tone(-30.0, 2400, RATE));
@@ -520,7 +578,10 @@ mod tests {
             let fade = (rate / 100) as usize;
             let mut d = Detect::new(rate);
             let mut x = vec![[0.1, 0.1]; window + 2 * fade];
-            let status = d.process(Block::F64(&mut x));
+            let status = d.process(Block {
+                channels: 2,
+                samples: Samples::F64(x.as_flattened_mut()),
+            });
             assert!(!status.no_signal && status.changed, "{rate}");
             // The window that opens it is gone. The first frame after it
             // starts near zero, and the level rises by equal steps.
@@ -532,7 +593,10 @@ mod tests {
             assert!(x[window + fade - 1..].iter().all(|f| *f == [0.1, 0.1]));
             // A block that is open all through is left as it is.
             let mut y = vec![[0.1, 0.1]; 100];
-            let status = d.process(Block::F64(&mut y));
+            let status = d.process(Block {
+                channels: 2,
+                samples: Samples::F64(y.as_flattened_mut()),
+            });
             assert!(!status.changed && !status.no_signal);
         }
     }
@@ -546,7 +610,10 @@ mod tests {
         feed(&mut d, vec![[0.5, 0.5]; 4800]);
         assert!(d.open());
         let mut x = vec![[0.2, 0.2]; 2400 + 480 + 100];
-        let status = d.process(Block::F64(&mut x));
+        let status = d.process(Block {
+            channels: 2,
+            samples: Samples::F64(x.as_flattened_mut()),
+        });
         assert!(!d.open());
         // The block still carried the fade.
         assert!(!status.no_signal && status.changed);
@@ -572,7 +639,10 @@ mod tests {
     fn a_fade_in_i32_has_no_step_larger_than_the_ramp() {
         let mut d = Detect::new(RATE);
         let mut x = vec![[1 << 28, -(1 << 28)]; 2400 + 960];
-        d.process(Block::I32(&mut x));
+        d.process(Block {
+            channels: 2,
+            samples: Samples::I32(x.as_flattened_mut()),
+        });
         let step = (1 << 28) / 480 + 1;
         let largest = x.windows(2).map(|w| (w[1][0] - w[0][0]).abs()).max();
         assert!(largest.unwrap() <= step);
@@ -586,9 +656,18 @@ mod tests {
         let mut f = vec![[0.0f32; 2]; 4800];
         let mut i = vec![[0i32; 2]; 4800];
         assert_no_alloc(|| {
-            d.process(Block::F64(&mut x));
-            d.process(Block::F32(&mut f));
-            d.process(Block::I32(&mut i));
+            d.process(Block {
+                channels: 2,
+                samples: Samples::F64(x.as_flattened_mut()),
+            });
+            d.process(Block {
+                channels: 2,
+                samples: Samples::F32(f.as_flattened_mut()),
+            });
+            d.process(Block {
+                channels: 2,
+                samples: Samples::I32(i.as_flattened_mut()),
+            });
             d.set_param(0, -40.0);
             d.set_param(1, 1.0);
         });

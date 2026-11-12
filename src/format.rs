@@ -2,7 +2,7 @@
 //!
 //! The format is chosen once at startup. `mix` never allocates.
 
-use crate::plugin::Block;
+use crate::plugin::{Block, Samples};
 
 /// A per-block gain that moves linearly from `from` to `to`.
 ///
@@ -57,27 +57,34 @@ pub trait Processing {
     fn finish(acc: Self::Acc) -> i32;
     /// Copies `acc` into a block in `scratch` for the plugins. Float blocks
     /// have full scale at 1.0 and are not clipped. An `i32` block is clipped
-    /// to S32. `scratch` must hold `acc.len()` frames.
-    fn to_block<'s>(acc: &mut [[Self::Acc; 2]], scratch: &'s mut BlockStore) -> Block<'s>;
+    /// to S32. `acc` holds interleaved frames of `channels` samples, and
+    /// `scratch` must hold as many.
+    fn to_block<'s>(
+        acc: &mut [Self::Acc],
+        channels: usize,
+        scratch: &'s mut BlockStore,
+    ) -> Block<'s>;
     /// Copies a block that `to_block` gave back into `acc`.
-    fn from_block(block: Block<'_>, acc: &mut [[Self::Acc; 2]]);
+    fn from_block(block: Block<'_>, acc: &mut [Self::Acc]);
 }
 
 /// The buffers a block lives in between the mix and the plugins, one per
 /// sample type. Sized once, outside the audio thread.
 pub struct BlockStore {
-    pub(crate) i32: Vec<[i32; 2]>,
-    pub(crate) f32: Vec<[f32; 2]>,
-    pub(crate) f64: Vec<[f64; 2]>,
+    pub(crate) i32: Vec<i32>,
+    pub(crate) f32: Vec<f32>,
+    pub(crate) f64: Vec<f64>,
 }
 
 impl BlockStore {
-    /// Room for blocks of up to `max_frames` frames. Allocates nothing for 0.
-    pub fn new(max_frames: usize) -> Self {
+    /// Room for blocks of up to `max_frames` frames of `channels` samples.
+    /// Allocates nothing for 0 frames.
+    pub fn new(max_frames: usize, channels: usize) -> Self {
+        let samples = max_frames * channels;
         BlockStore {
-            i32: vec![[0; 2]; max_frames],
-            f32: vec![[0.0; 2]; max_frames],
-            f64: vec![[0.0; 2]; max_frames],
+            i32: vec![0; samples],
+            f32: vec![0.0; samples],
+            f64: vec![0.0; samples],
         }
     }
 }
@@ -130,20 +137,23 @@ impl Processing for I32 {
         acc.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
     }
 
-    fn to_block<'s>(acc: &mut [[i64; 2]], scratch: &'s mut BlockStore) -> Block<'s> {
-        let block = &mut scratch.i32[..acc.len()];
-        for (b, a) in block.iter_mut().zip(acc.iter()) {
-            *b = [Self::finish(a[0]), Self::finish(a[1])];
+    fn to_block<'s>(acc: &mut [i64], channels: usize, scratch: &'s mut BlockStore) -> Block<'s> {
+        let samples = &mut scratch.i32[..acc.len()];
+        for (b, a) in samples.iter_mut().zip(acc.iter()) {
+            *b = Self::finish(*a);
         }
-        Block::I32(block)
+        Block {
+            channels,
+            samples: Samples::I32(samples),
+        }
     }
 
-    fn from_block(block: Block<'_>, acc: &mut [[i64; 2]]) {
-        let Block::I32(block) = block else {
+    fn from_block(block: Block<'_>, acc: &mut [i64]) {
+        let Samples::I32(samples) = block.samples else {
             unreachable!("an i32 accumulator takes an i32 block")
         };
-        for (a, b) in acc.iter_mut().zip(block.iter()) {
-            *a = [i64::from(b[0]), i64::from(b[1])];
+        for (a, b) in acc.iter_mut().zip(samples.iter()) {
+            *a = i64::from(*b);
         }
     }
 }
@@ -173,17 +183,20 @@ impl Processing for F32 {
     }
 
     /// The accumulator already has full scale at 1.0, so this is a copy.
-    fn to_block<'s>(acc: &mut [[f32; 2]], scratch: &'s mut BlockStore) -> Block<'s> {
-        let block = &mut scratch.f32[..acc.len()];
-        block.copy_from_slice(acc);
-        Block::F32(block)
+    fn to_block<'s>(acc: &mut [f32], channels: usize, scratch: &'s mut BlockStore) -> Block<'s> {
+        let samples = &mut scratch.f32[..acc.len()];
+        samples.copy_from_slice(acc);
+        Block {
+            channels,
+            samples: Samples::F32(samples),
+        }
     }
 
-    fn from_block(block: Block<'_>, acc: &mut [[f32; 2]]) {
-        let Block::F32(block) = block else {
+    fn from_block(block: Block<'_>, acc: &mut [f32]) {
+        let Samples::F32(samples) = block.samples else {
             unreachable!("an f32 accumulator takes an f32 block")
         };
-        acc.copy_from_slice(&block[..acc.len()]);
+        acc.copy_from_slice(&samples[..acc.len()]);
     }
 }
 
@@ -212,17 +225,20 @@ impl Processing for F64 {
     }
 
     /// The accumulator already has full scale at 1.0, so this is a copy.
-    fn to_block<'s>(acc: &mut [[f64; 2]], scratch: &'s mut BlockStore) -> Block<'s> {
-        let block = &mut scratch.f64[..acc.len()];
-        block.copy_from_slice(acc);
-        Block::F64(block)
+    fn to_block<'s>(acc: &mut [f64], channels: usize, scratch: &'s mut BlockStore) -> Block<'s> {
+        let samples = &mut scratch.f64[..acc.len()];
+        samples.copy_from_slice(acc);
+        Block {
+            channels,
+            samples: Samples::F64(samples),
+        }
     }
 
-    fn from_block(block: Block<'_>, acc: &mut [[f64; 2]]) {
-        let Block::F64(block) = block else {
+    fn from_block(block: Block<'_>, acc: &mut [f64]) {
+        let Samples::F64(samples) = block.samples else {
             unreachable!("an f64 accumulator takes an f64 block")
         };
-        acc.copy_from_slice(&block[..acc.len()]);
+        acc.copy_from_slice(&samples[..acc.len()]);
     }
 }
 
@@ -494,13 +510,13 @@ mod tests {
     fn block_round_trip<P: Processing>(input: &[i32], look: impl Fn(&Block<'_>)) -> Vec<i32> {
         let frames: Vec<[i32; 2]> = input.iter().map(|&v| [v, v]).collect();
         let mut acc = vec![[P::zero(); 2]; frames.len()];
-        let mut store = BlockStore::new(frames.len());
+        let mut store = BlockStore::new(frames.len(), 2);
         let mut out = vec![[0; 2]; frames.len()];
         mix_clear::<P>(&mut acc);
         mix_add::<P>(&frames, Ramp::flat(1.0), &mut acc);
-        let block = P::to_block(&mut acc, &mut store);
+        let block = P::to_block(acc.as_flattened_mut(), 2, &mut store);
         look(&block);
-        P::from_block(block, &mut acc);
+        P::from_block(block, acc.as_flattened_mut());
         mix_finish::<P>(&acc, &mut out);
         out.iter().map(|f| f[0]).collect()
     }
@@ -510,10 +526,10 @@ mod tests {
         // Every S24 value, left aligned in an S32 sample.
         let v: Vec<i32> = (-(1 << 23)..(1 << 23)).map(|k| k << 8).collect();
         let got = block_round_trip::<F32>(&v, |block| {
-            let Block::F32(b) = block else {
+            let Samples::F32(b) = &block.samples else {
                 panic!("not an f32 block")
             };
-            for (f, &s) in b.iter().zip(v.iter()) {
+            for (f, &s) in b.chunks(2).zip(v.iter()) {
                 assert_eq!(f[0], s as f32 / 2_147_483_648.0);
             }
         });
@@ -525,19 +541,19 @@ mod tests {
         let mut v = EDGES.to_vec();
         v.extend([0x1234_5679, -0x1234_5679, 0x7FFF_FF01]);
         let got = block_round_trip::<F64>(&v, |block| {
-            let Block::F64(b) = block else {
+            let Samples::F64(b) = &block.samples else {
                 panic!("not an f64 block")
             };
-            for (f, &s) in b.iter().zip(v.iter()) {
+            for (f, &s) in b.chunks(2).zip(v.iter()) {
                 assert_eq!(f[0], f64::from(s) / 2_147_483_648.0);
             }
         });
         assert_eq!(got, v);
         let got = block_round_trip::<I32>(&v, |block| {
-            let Block::I32(b) = block else {
+            let Samples::I32(b) = &block.samples else {
                 panic!("not an i32 block")
             };
-            assert_eq!(b.iter().map(|f| f[0]).collect::<Vec<_>>(), v);
+            assert_eq!(b.chunks(2).map(|f| f[0]).collect::<Vec<_>>(), v);
         });
         assert_eq!(got, v);
     }
@@ -584,5 +600,25 @@ mod tests {
         mix_add_acc::<F64>(&[[2.0, -3.0]], Ramp::flat(0.25), &mut acc);
         mix_finish::<F64>(&acc, &mut out);
         assert_eq!(out, [[1 << 30, -(3 << 29)]]);
+    }
+
+    #[test]
+    fn a_block_round_trip_keeps_three_channels_apart() {
+        fn trip<P: Processing>(values: [P::Acc; 6])
+        where
+            P::Acc: PartialEq + std::fmt::Debug,
+        {
+            let mut acc = values;
+            let mut store = BlockStore::new(2, 3);
+            let block = P::to_block(&mut acc, 3, &mut store);
+            assert_eq!(block.channels, 3);
+            assert_eq!(block.frames(), 2);
+            let mut back = [P::zero(); 6];
+            P::from_block(block, &mut back);
+            assert_eq!(back, values);
+        }
+        trip::<F64>([1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        trip::<F32>([1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        trip::<I32>([1, 2, 3, 4, 5, 6]);
     }
 }

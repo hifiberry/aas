@@ -311,14 +311,20 @@ mod tests {
         let config = [plugin(PluginPlace::Analog, "detect", &[("threshold", 0.0)])];
         let mut chain = build(&config, PluginPlace::Analog).unwrap();
         let mut data = vec![[0.5f32; 2]; 4800];
-        let status = chain.process(crate::plugin::Block::F32(&mut data));
+        let status = chain.process(crate::plugin::Block {
+            channels: 2,
+            samples: crate::plugin::Samples::F32(data.as_flattened_mut()),
+        });
         assert!(status.no_signal);
         let default = build(&[], PluginPlace::Analog);
         let mut chain = default.unwrap();
         let mut data = vec![[0.5f32; 2]; 4800];
         assert!(
             !chain
-                .process(crate::plugin::Block::F32(&mut data))
+                .process(crate::plugin::Block {
+                    channels: 2,
+                    samples: crate::plugin::Samples::F32(data.as_flattened_mut())
+                })
                 .no_signal
         );
     }

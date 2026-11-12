@@ -557,7 +557,7 @@ impl<P: Processing> Analog<P> {
         let processed = &mut self.processed[..period];
         mix_clear::<P>(processed);
         mix_add::<P>(buf, Ramp::flat(1.0), processed);
-        let mut block = P::to_block(processed, store);
+        let mut block = P::to_block(processed.as_flattened_mut(), 2, store);
         if idle {
             self.chain.reset();
         }
@@ -569,7 +569,7 @@ impl<P: Processing> Analog<P> {
         // zeroed, so the frames stay as captured and can be copied
         // bit-perfect.
         if !neutral || status.changed {
-            P::from_block(block, processed);
+            P::from_block(block, processed.as_flattened_mut());
             self.altered = true;
             self.latency = self.chain.latency_frames();
         }
@@ -1046,7 +1046,7 @@ impl<P: Processing, S: Sink> Engine<P, S> {
             out: vec![[0; 2]; frames],
             scratch: vec![[0; 2]; frames * MAX_DOWNSAMPLING + dop::MIN_FRAMES],
             acc: vec![[P::zero(); 2]; frames],
-            store: BlockStore::new(frames),
+            store: BlockStore::new(frames, 2),
             analog: Analog::new(frames),
             taps: Taps::new(frames),
             mix: Chain::empty(),
@@ -1629,10 +1629,10 @@ impl<P: Processing, S: Sink> Engine<P, S> {
                     self.mix.reset();
                     self.output.reset();
                 }
-                let mut block = P::to_block(acc, &mut self.store);
+                let mut block = P::to_block(acc.as_flattened_mut(), 2, &mut self.store);
                 self.mix.process(block.reborrow());
                 self.output.process(block.reborrow());
-                P::from_block(block, acc);
+                P::from_block(block, acc.as_flattened_mut());
             }
             mix_finish::<P>(acc, out);
             if self.unmute_left > 0 {
@@ -1705,7 +1705,9 @@ mod tests {
     use crate::config::{Format, Quality};
     use crate::format::{BlockStore, F32, F64, I32, db_to_gain};
     use crate::plugin::detect::Detect;
-    use crate::plugin::{Block, Formats, Param, ParamKind, Plugin, Status as PluginStatus};
+    use crate::plugin::{
+        Block, Formats, Param, ParamKind, Plugin, Samples, Status as PluginStatus,
+    };
     use crate::sink::{MemorySink, SinkLog};
     use aas_client::ring::Ring;
     use assert_no_alloc::assert_no_alloc;
@@ -5010,19 +5012,19 @@ mod tests {
         fn process(&mut self, block: Block<'_>) -> PluginStatus {
             const FULL: f64 = 2_147_483_648.0;
             assert!(self.formats.has(block.format()));
-            match block {
-                Block::I32(d) => {
-                    for s in d.iter_mut().flatten() {
+            match block.samples {
+                Samples::I32(d) => {
+                    for s in d.iter_mut() {
                         *s = (self.apply(f64::from(*s) / FULL) * FULL).round() as i32;
                     }
                 }
-                Block::F32(d) => {
-                    for s in d.iter_mut().flatten() {
+                Samples::F32(d) => {
+                    for s in d.iter_mut() {
                         *s = self.apply(f64::from(*s)) as f32;
                     }
                 }
-                Block::F64(d) => {
-                    for s in d.iter_mut().flatten() {
+                Samples::F64(d) => {
+                    for s in d.iter_mut() {
                         *s = self.apply(*s);
                     }
                 }
@@ -5045,7 +5047,7 @@ mod tests {
 
     /// The format a rig of `P` processes in.
     fn format_of<P: Processing>() -> Format {
-        P::to_block(&mut [], &mut BlockStore::new(0)).format()
+        P::to_block(&mut [], 2, &mut BlockStore::new(0, 2)).format()
     }
 
     /// A chain in the processing format of `P`, built for the longest period,
@@ -5103,9 +5105,9 @@ mod tests {
         }
 
         fn process(&mut self, block: Block<'_>) -> PluginStatus {
-            if let Block::F64(d) = block {
-                for frame in d.iter_mut() {
-                    std::mem::swap(frame, &mut self.kept);
+            if let Samples::F64(d) = block.samples {
+                for frame in d.chunks_exact_mut(2) {
+                    frame.swap_with_slice(&mut self.kept);
                 }
             }
             PluginStatus::default()

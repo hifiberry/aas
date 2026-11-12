@@ -1,6 +1,6 @@
 //! Plugins: processing stages that change the audio in place.
 //!
-//! A plugin sees stereo blocks in the processing format. Float blocks are
+//! A plugin sees blocks of interleaved frames in the processing format. Float blocks are
 //! scaled so that full scale is 1.0. Plugins are built on the control thread
 //! and run on the audio thread, so `process` must not allocate, lock or
 //! block.
@@ -14,32 +14,54 @@ pub mod native;
 
 use crate::config::Format;
 
-/// Stereo frames in one of the processing formats, changed in place.
+/// Interleaved frames in one of the processing formats, changed in place.
 #[derive(Debug)]
-pub enum Block<'a> {
-    I32(&'a mut [[i32; 2]]),
-    F32(&'a mut [[f32; 2]]),
-    F64(&'a mut [[f64; 2]]),
+pub struct Block<'a> {
+    /// The samples in one frame.
+    pub channels: usize,
+    pub samples: Samples<'a>,
+}
+
+/// The samples of a block, in the processing format.
+#[derive(Debug)]
+pub enum Samples<'a> {
+    I32(&'a mut [i32]),
+    F32(&'a mut [f32]),
+    F64(&'a mut [f64]),
 }
 
 impl Block<'_> {
     /// The same frames, borrowed again, so the block can be handed to
     /// several plugins in turn.
     pub fn reborrow(&mut self) -> Block<'_> {
-        match self {
-            Block::I32(d) => Block::I32(d),
-            Block::F32(d) => Block::F32(d),
-            Block::F64(d) => Block::F64(d),
+        let samples = match &mut self.samples {
+            Samples::I32(d) => Samples::I32(d),
+            Samples::F32(d) => Samples::F32(d),
+            Samples::F64(d) => Samples::F64(d),
+        };
+        Block {
+            channels: self.channels,
+            samples,
         }
     }
 
     /// The format of the samples.
     pub fn format(&self) -> Format {
-        match self {
-            Block::I32(_) => Format::I32,
-            Block::F32(_) => Format::F32,
-            Block::F64(_) => Format::F64,
+        match self.samples {
+            Samples::I32(_) => Format::I32,
+            Samples::F32(_) => Format::F32,
+            Samples::F64(_) => Format::F64,
         }
+    }
+
+    /// The number of frames: the samples divided by the channels.
+    pub fn frames(&self) -> usize {
+        let samples = match &self.samples {
+            Samples::I32(d) => d.len(),
+            Samples::F32(d) => d.len(),
+            Samples::F64(d) => d.len(),
+        };
+        samples / self.channels
     }
 }
 
@@ -171,4 +193,21 @@ pub trait Plugin: Send {
     /// Called when the plugin runs again after blocks that did not pass it.
     /// Runs on the audio thread, so it must not allocate.
     fn reset(&mut self) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_block_of_six_samples_in_three_channels_has_two_frames() {
+        let mut d = [0.0f64; 6];
+        let mut block = Block {
+            channels: 3,
+            samples: Samples::F64(&mut d),
+        };
+        assert_eq!(block.frames(), 2);
+        assert_eq!(block.reborrow().frames(), 2);
+        assert_eq!(block.format(), Format::F64);
+    }
 }

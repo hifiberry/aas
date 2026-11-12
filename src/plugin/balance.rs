@@ -1,6 +1,6 @@
 //! Balance: turns one channel down to favour the other.
 
-use super::{Block, Formats, Param, ParamKind, Plugin, Status};
+use super::{Block, Formats, Param, ParamKind, Plugin, Samples, Status};
 
 /// Towards one side the other channel's gain falls linearly to 0. The near
 /// side stays at 1, so the centre leaves the audio untouched.
@@ -79,9 +79,9 @@ impl Plugin for Balance {
         let (gl, gr) = self.gains();
         let (ql, qr) = (q32(gl), q32(gr));
         // The channel at gain 1 is left alone, so it stays bit-identical.
-        match block {
-            Block::I32(d) => {
-                for f in d {
+        match block.samples {
+            Samples::I32(d) => {
+                for f in d.chunks_exact_mut(2) {
                     if gl != 1.0 {
                         f[0] = scale(f[0], ql);
                     }
@@ -90,8 +90,8 @@ impl Plugin for Balance {
                     }
                 }
             }
-            Block::F32(d) => {
-                for f in d {
+            Samples::F32(d) => {
+                for f in d.chunks_exact_mut(2) {
                     if gl != 1.0 {
                         f[0] *= gl as f32;
                     }
@@ -100,8 +100,8 @@ impl Plugin for Balance {
                     }
                 }
             }
-            Block::F64(d) => {
-                for f in d {
+            Samples::F64(d) => {
+                for f in d.chunks_exact_mut(2) {
                     if gl != 1.0 {
                         f[0] *= gl;
                     }
@@ -148,9 +148,21 @@ mod tests {
         let mut f = [[0.3f32, -0.7], [f32::MIN_POSITIVE, 1e30]];
         let mut d = [[0.1f64, -0.9], [1.0 / 3.0, f64::MAX]];
         let (i0, f0, d0) = (i, f, d);
-        assert_eq!(p.process(Block::I32(&mut i)), Status::default());
-        p.process(Block::F32(&mut f));
-        p.process(Block::F64(&mut d));
+        assert_eq!(
+            p.process(Block {
+                channels: 2,
+                samples: Samples::I32(i.as_flattened_mut())
+            }),
+            Status::default()
+        );
+        p.process(Block {
+            channels: 2,
+            samples: Samples::F32(f.as_flattened_mut()),
+        });
+        p.process(Block {
+            channels: 2,
+            samples: Samples::F64(d.as_flattened_mut()),
+        });
         assert_eq!(i, i0);
         assert_eq!(
             f.map(|x| x.map(f32::to_bits)),
@@ -171,13 +183,22 @@ mod tests {
     fn full_left_silences_the_right_channel_and_keeps_the_left() {
         let mut p = with(-1.0);
         let mut i = [[1000, -7], [i32::MAX, i32::MIN]];
-        p.process(Block::I32(&mut i));
+        p.process(Block {
+            channels: 2,
+            samples: Samples::I32(i.as_flattened_mut()),
+        });
         assert_eq!(i, [[1000, 0], [i32::MAX, 0]]);
         let mut f = [[0.5f32, -0.5]];
-        p.process(Block::F32(&mut f));
+        p.process(Block {
+            channels: 2,
+            samples: Samples::F32(f.as_flattened_mut()),
+        });
         assert_eq!(f, [[0.5, 0.0]]);
         let mut d = [[0.25f64, 0.75]];
-        p.process(Block::F64(&mut d));
+        p.process(Block {
+            channels: 2,
+            samples: Samples::F64(d.as_flattened_mut()),
+        });
         assert_eq!(d, [[0.25, 0.0]]);
     }
 
@@ -185,14 +206,23 @@ mod tests {
     fn half_right_halves_the_left_channel() {
         let mut p = with(0.5);
         let mut i = [[1000, -7], [-1001, 5]];
-        p.process(Block::I32(&mut i));
+        p.process(Block {
+            channels: 2,
+            samples: Samples::I32(i.as_flattened_mut()),
+        });
         // Halves round to the nearest, away from zero.
         assert_eq!(i, [[500, -7], [-501, 5]]);
         let mut f = [[0.5f32, -0.5]];
-        p.process(Block::F32(&mut f));
+        p.process(Block {
+            channels: 2,
+            samples: Samples::F32(f.as_flattened_mut()),
+        });
         assert_eq!(f, [[0.25, -0.5]]);
         let mut d = [[0.5f64, 0.75]];
-        p.process(Block::F64(&mut d));
+        p.process(Block {
+            channels: 2,
+            samples: Samples::F64(d.as_flattened_mut()),
+        });
         assert_eq!(d, [[0.25, 0.75]]);
     }
 
@@ -200,15 +230,24 @@ mod tests {
     fn a_value_outside_the_range_is_clamped() {
         let mut p = with(7.0);
         let mut d = [[1.0f64, 1.0]];
-        p.process(Block::F64(&mut d));
+        p.process(Block {
+            channels: 2,
+            samples: Samples::F64(d.as_flattened_mut()),
+        });
         assert_eq!(d, [[0.0, 1.0]]);
         p.set_param(0, -7.0);
         let mut d = [[1.0f64, 1.0]];
-        p.process(Block::F64(&mut d));
+        p.process(Block {
+            channels: 2,
+            samples: Samples::F64(d.as_flattened_mut()),
+        });
         assert_eq!(d, [[1.0, 0.0]]);
         p.set_param(3, 0.5);
         p.set_param(0, f64::NAN);
-        p.process(Block::F64(&mut d));
+        p.process(Block {
+            channels: 2,
+            samples: Samples::F64(d.as_flattened_mut()),
+        });
         assert_eq!(d, [[1.0, 0.0]]);
     }
 
@@ -228,7 +267,10 @@ mod tests {
             [1, 5],
             [-1, 5],
         ];
-        p.process(Block::I32(&mut i));
+        p.process(Block {
+            channels: 2,
+            samples: Samples::I32(i.as_flattened_mut()),
+        });
         let left: Vec<i32> = i.iter().map(|f| f[0]).collect();
         assert_eq!(
             left,
@@ -250,14 +292,23 @@ mod tests {
     fn full_right_silences_the_left_channel_and_keeps_the_right_bit_identical() {
         let mut p = with(1.0);
         let mut i = [[1000, i32::MIN], [i32::MAX, -7]];
-        p.process(Block::I32(&mut i));
+        p.process(Block {
+            channels: 2,
+            samples: Samples::I32(i.as_flattened_mut()),
+        });
         assert_eq!(i, [[0, i32::MIN], [0, -7]]);
         let mut f = [[0.5f32, 0.1]];
-        p.process(Block::F32(&mut f));
+        p.process(Block {
+            channels: 2,
+            samples: Samples::F32(f.as_flattened_mut()),
+        });
         assert_eq!(f[0][0], 0.0);
         assert_eq!(f[0][1].to_bits(), 0.1f32.to_bits());
         let mut d = [[0.5f64, 1.0 / 3.0]];
-        p.process(Block::F64(&mut d));
+        p.process(Block {
+            channels: 2,
+            samples: Samples::F64(d.as_flattened_mut()),
+        });
         assert_eq!(d[0][0], 0.0);
         assert_eq!(d[0][1].to_bits(), (1.0f64 / 3.0).to_bits());
     }
@@ -279,11 +330,23 @@ mod tests {
         let mut f = [[0.5f32, -0.5]; 64];
         let mut d = [[0.5f64, -0.5]; 64];
         assert_no_alloc(|| {
-            p.process(Block::I32(&mut i));
-            p.process(Block::F32(&mut f));
-            p.process(Block::F64(&mut d));
+            p.process(Block {
+                channels: 2,
+                samples: Samples::I32(i.as_flattened_mut()),
+            });
+            p.process(Block {
+                channels: 2,
+                samples: Samples::F32(f.as_flattened_mut()),
+            });
+            p.process(Block {
+                channels: 2,
+                samples: Samples::F64(d.as_flattened_mut()),
+            });
             p.set_param(0, -0.5);
-            p.process(Block::F64(&mut d));
+            p.process(Block {
+                channels: 2,
+                samples: Samples::F64(d.as_flattened_mut()),
+            });
         });
     }
 }
