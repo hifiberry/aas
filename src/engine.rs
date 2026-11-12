@@ -919,7 +919,8 @@ fn passes_through(gains: &Gains, width: usize) -> bool {
 /// and the sink's channels not at all.
 #[derive(Clone, Copy)]
 struct Routes {
-    /// How the copy path places each bus, by bus, as `copy_routing` says.
+    /// How the copy path places each bus, by `Bus::index`, as
+    /// `copy_routing` says.
     copy: [Option<Routing>; 2],
     /// The `players` routing for a DoP stream, if it keeps the sink's pairs
     /// whole, as `routing_for_dop` says before its checks of the ramp and
@@ -933,7 +934,7 @@ impl Routes {
     fn of(matrix: &Matrix, gains: &Gains, forced: bool, channels: usize) -> Routes {
         let dop = matrix.routing(Bus::Players, false);
         Routes {
-            copy: [Bus::Players, Bus::Analog].map(|bus| matrix.routing(bus, forced)),
+            copy: Bus::ALL.map(|bus| matrix.routing(bus, forced)),
             dop: dop.filter(|routing| keeps_pairs(routing, channels)),
             passes: passes_through(gains, matrix.width()),
         }
@@ -1887,10 +1888,7 @@ impl<P: Processing, S: Sink> Engine<P, S> {
     /// matrix routes it purely. In forced bit-perfect every route that is
     /// not off counts as 0 dB.
     fn copy_routing(&self) -> Option<Routing> {
-        match self.copy_bus() {
-            Bus::Players => self.routes.copy[0],
-            Bus::Analog => self.routes.copy[1],
-        }
+        self.routes.copy[self.copy_bus().index()]
     }
 
     /// How a DoP stream reaches the sink, if it can unaltered: through the

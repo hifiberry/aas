@@ -26,6 +26,17 @@ pub enum Bus {
 }
 
 impl Bus {
+    /// Every bus, in the order of `index`.
+    pub const ALL: [Bus; 2] = [Bus::Players, Bus::Analog];
+
+    /// Where the bus is in `ALL`, for a table kept by bus.
+    pub fn index(self) -> usize {
+        match self {
+            Bus::Players => 0,
+            Bus::Analog => 1,
+        }
+    }
+
     /// The input indices of the bus's left and right channel.
     pub fn inputs(self) -> [usize; 2] {
         match self {
