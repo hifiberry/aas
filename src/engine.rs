@@ -9079,4 +9079,77 @@ mod tests {
         check::<F32>();
         check::<F64>();
     }
+
+    #[test]
+    fn a_ramp_ending_on_a_pass_through_matrix_goes_on_by_the_direct_path() {
+        // The last cycle of the ramp mixes through the matrix, the next by
+        // the direct path, and the samples are those the matrix gives.
+        fn run<P: Processing>(direct: bool) -> Vec<[i32; 2]> {
+            let (mut rig, a) = swapped_and_playing::<P>(BitPerfect::Off);
+            rig.send(Command::SetMatrix(Box::new(stereo())));
+            let mut out = Vec::new();
+            let mut ramped = 0;
+            for _ in 0..12 {
+                a.ring.write(&ramp(PERIOD));
+                rig.cycle();
+                out.extend(rig.last_periods(1));
+                if rig.engine.ramp_left > 0 {
+                    ramped += 1;
+                }
+                if direct {
+                    assert!(rig.engine.routes.passes);
+                } else {
+                    rig.engine.routes.passes = false;
+                }
+            }
+            // 480 frames: 7.5 periods, then the direct path for the rest.
+            assert_eq!((ramped, rig.engine.ramp_left), (7, 0));
+            out
+        }
+        fn check<P: Processing>() {
+            let direct = run::<P>(true);
+            assert_eq!(direct, run::<P>(false), "{:?}", format_of::<P>());
+            assert!(direct[PERIOD * 8..].iter().any(|f| f[0] != 0));
+        }
+        check::<I32>();
+        check::<F32>();
+        check::<F64>();
+    }
+
+    #[test]
+    fn forced_bit_perfect_takes_a_lowered_stereo_matrix_by_the_direct_path() {
+        // Forced bit-perfect counts every route as 0 dB, so a stereo matrix
+        // at -6 dB passes through, and the direct path gives the sum as is.
+        fn run<P: Processing>(direct: bool) -> Vec<[i32; 2]> {
+            let routes = [
+                route(0, 1, -6.0),
+                route(1, 2, -6.0),
+                route(2, 1, -6.0),
+                route(3, 2, -6.0),
+            ];
+            let mut rig = Rig::<P>::wide(BitPerfect::Forced, matrix(&routes, 2), 2);
+            assert!(rig.engine.routes.passes);
+            rig.engine.routes.passes = direct;
+            let mut a = client(1);
+            rig.add(&mut a);
+            let mut b = client(2);
+            rig.add(&mut b);
+            for _ in 0..4 {
+                a.ring.write(&frames(3 << 20, PERIOD));
+                b.ring.write(&frames(1 << 20, PERIOD));
+                rig.cycle();
+            }
+            rig.log.frames()
+        }
+        fn check<P: Processing>() {
+            let direct = run::<P>(true);
+            assert_eq!(direct, run::<P>(false), "{:?}", format_of::<P>());
+            // At 0 dB, not lowered: the two clients' sum as it is.
+            let last = &direct[direct.len() - PERIOD..];
+            assert_eq!(last, frames(4 << 20, PERIOD), "{:?}", format_of::<P>());
+        }
+        check::<I32>();
+        check::<F32>();
+        check::<F64>();
+    }
 }
