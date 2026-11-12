@@ -1,0 +1,15 @@
+[package]
+name = "aas-plugin-fixture-wide"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Test fixture: a plugin of ABI version 2 that widens stereo to four channels"
+license = "MIT"
+publish = false
+
+[lib]
+name = "aas_fixture_wide"
+crate-type = ["cdylib"]
+
+[dependencies]
+aas-plugin = { version = "0.1.0", path = "../../crates/aas-plugin" }

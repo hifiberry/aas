@@ -5,6 +5,8 @@ members = [
     "crates/aas-client",
     "crates/aas-plugin",
     "plugins/fixture-bad",
+    "plugins/fixture-v1",
+    "plugins/fixture-wide",
     "plugins/gain",
     "tools/measure",
 ]
@@ -13,6 +15,8 @@ default-members = [
     "crates/aas-client",
     "crates/aas-plugin",
     "plugins/fixture-bad",
+    "plugins/fixture-v1",
+    "plugins/fixture-wide",
     "plugins/gain",
     "tools/measure",
 ]

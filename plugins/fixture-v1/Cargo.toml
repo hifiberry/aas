@@ -1,0 +1,12 @@
+[package]
+name = "aas-plugin-fixture-v1"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Test fixture: a gain plugin of ABI version 1, as the first crate described it"
+license = "MIT"
+publish = false
+
+[lib]
+name = "aas_fixture_v1"
+crate-type = ["cdylib"]

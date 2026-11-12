@@ -3,7 +3,7 @@
 use super::builtin;
 use super::chain::{self, Chain};
 use super::native::Library;
-use super::{BuildError, Failure, Param, ParamKind, Plugin};
+use super::{BuildError, Channels, Failure, Param, ParamKind, Plugin};
 use crate::config::{Format, ParamValue, PluginConfig, PluginPlace};
 use crate::engine::Place;
 use crate::latency::MAX_PERIOD;
@@ -57,8 +57,10 @@ pub fn build_chain(
 ) -> Result<Chain, BuildError> {
     let config_error = |m: String| BuildError::new(Failure::Config, m);
     let max_frames = MAX_PERIOD as usize;
-    let mut plugins = Vec::new();
+    let mut plugins: Vec<Box<dyn Plugin>> = Vec::new();
     let mut positions = Vec::new();
+    // The count that reaches the next plugin.
+    let mut width = channels;
     let listed = config.iter().enumerate().filter(|(_, p)| p.place == place);
     for (i, p) in listed {
         let n = i + 1;
@@ -69,7 +71,7 @@ pub fn build_chain(
                     .get(path)
                     .map_err(|e| config_error(format!("{prefix}{e}")))?;
                 library
-                    .create(rate, max_frames)
+                    .create(rate, max_frames, width)
                     .map_err(|e| e.context(&prefix))?
             }
             ("library", None) => {
@@ -119,6 +121,9 @@ pub fn build_chain(
                     })?;
                 }
             }
+        }
+        if let Channels::Fixed { output, .. } = plugin.channels() {
+            width = output;
         }
         plugins.push(plugin);
         positions.push(n);

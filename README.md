@@ -236,9 +236,24 @@ sudo install -D -m 0644 target/release/libaas_gain.so /usr/lib/aas/libaas_gain.s
 ```
 
 The descriptor and each parameter start with `size`, set to `DESCRIPTOR_SIZE`
-and `PARAM_INFO_SIZE`: fields are only ever appended within ABI version 1, and
-the daemon reads what it knows. Plugins are stereo in and out, in place;
-another channel count is ABI version 2.
+and `PARAM_INFO_SIZE`: fields are only ever appended within an ABI version, and
+the daemon reads what it knows. `abi` is `ABI`, 2.
+
+A plugin takes a fixed count of channels and gives a fixed count: `channels_in`
+and `channels_out`, each 1 to 8. A plugin that takes any count and keeps it, as
+`plugins/gain` does, has both 0, and `create` tells it the count in its
+`channels` argument; for a fixed plugin that is `channels_in`. A plugin whose
+counts are equal processes in place with `process`, `frames * channels`
+interleaved samples. One whose counts differ gives `process_into`, which reads
+`frames * channels_in` samples at `input` and writes `frames * channels_out` at
+`output`, two buffers that do not overlap; it may be left out otherwise. The
+daemon refuses a library with one count 0 and the other not, a count above 8,
+or counts that differ and no `process_into`, and refuses a chain in which a
+plugin does not get the count it takes. A plugin whose counts differ is never
+neutral.
+
+Libraries of ABI version 1, which are stereo and in place and whose `create` has
+no `channels` argument, still load, as plugins with two channels in and out.
 
 `create` stores the instance through its last argument and returns
 `CREATE_OK`, `CREATE_UNSUPPORTED` for a rate (or block size) it does not
@@ -259,10 +274,10 @@ UTF-8 that is not NUL terminated and is valid only for the call; it returns
 which the daemon takes as a rate the plugin does not support.
 
 `create`, `destroy`, `set_param_text` and `set_param` while the config's
-values are set run on the daemon's control thread. `process`, `reset`,
-`neutral` and `latency` run on the audio thread, and so will `set_param` once
-the API changes parameters at run time; these must not allocate, lock or
-block. Another instance of the same library may be processing while one is
+values are set run on the daemon's control thread. `process`, `process_into`,
+`reset`, `neutral` and `latency` run on the audio thread, and so will
+`set_param` once the API changes parameters at run time; these must not
+allocate, lock or block. Another instance of the same library may be processing while one is
 created or destroyed. A panic that leaves one of the plugin's
 functions aborts the daemon, so a plugin in Rust must not panic there, or must
 catch the panic with `std::panic::catch_unwind`. The crate's documentation
