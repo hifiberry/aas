@@ -1297,7 +1297,7 @@ on both boards.
 | Criterion | Pi 3 result | CM5 result | Verdict |
 |---|---|---|---|
 | Bit-exact through `snd-aloop`: the default matrix, a swap, and eight channels with players on 1, 2 and 7, 8 | Not run | 36 of 36 cases: `differing 0, breaks 0`, and no frame off the routing | Pass on the CM5 |
-| Stereo with the default matrix costs what `main` costs, 10 minutes at 48 kHz, 3 runs each | Worst cycle within `main`'s spread in `f32` and `f64`. **The mean CPU time of the audio thread per cycle is 16% higher in `f32` and 18% in `f64`**, 12 to 15 µs, against a spread of under 1 µs | Not run | **Fail** on the mean, by a margin far outside the spread. Pass on the worst cycle |
+| Stereo with the default matrix costs what `main` costs, 10 minutes at 48 kHz, 3 runs each | Worst cycle within `main`'s spread in `f32` and `f64`. **The mean CPU time of the audio thread per cycle is 16% higher in `f32` and 18% in `f64`**, 12 to 15 µs, against a spread of under 1 µs | Not run | **Fail** on the mean, by a margin far outside the spread. Pass on the worst cycle. After the direct mixing path: 0.7% in `f32`, within the spread, and 0.9% in `f64`, just above it (below) |
 | Eight channels to `snd-aloop`, `gain` on all eight, 10 minutes at 48 kHz | 1.9% of a period on the mean in `f32`, 2.7% in `f64`; worst cycle 2.9% and 3.7% | Not run | Measured |
 | One hour at 44.1 kHz, full load, real card, swap matrix, analog input on | 0 xruns, 0 wake-up gaps, worst gap 6.89 ms against 11.61 ms | 0 xruns, 0 wake-up gaps, worst gap 1.56 ms against 2.90 ms | Pass on both |
 | One hour at 96 kHz, the same | 0 xruns, 0 wake-up gaps, worst gap 6.43 ms against 10.67 ms | 0 xruns, 0 wake-up gaps, worst gap 1.45 ms against 2.67 ms | Pass on both |
@@ -1308,7 +1308,8 @@ on both boards.
 The stereo cost and the `channels = 8` finding were taken up after the figures
 here were taken. The default stereo matrix now takes a direct mixing path, as
 `main` does. The figures in this section are those of the build named above,
-before both changes.
+before both changes, except the stereo cost measured again after the direct
+path, under "Processing cost on the Pi 3".
 
 ### Bit-exactness through `snd-aloop`
 
@@ -1386,6 +1387,22 @@ readings do not explain it: the first `main` run, with no reading at 1.2 GHz,
 gave the same mean as the third, with five. The worst cycles are within
 `main`'s spread in both formats. Where the extra time goes was not measured.
 It is 0.2 to 0.3% of a period.
+
+The same runs again after the direct mixing path, with the branch at 84965e4
+and `main` at 2ce4e21, alternated as before, three of each per format:
+
+| Daemon | Format | Mean per cycle, three runs | Mean | Worst cycle, three runs |
+|---|---|---|---|---|
+| `main` | `f32` | 77.6, 76.6, 76.9 µs | 77.0 µs | 0.276, 0.133, 0.158 ms |
+| this stage | `f32` | 78.5, 76.7, 77.6 µs | 77.6 µs | 0.177, 0.201, 0.165 ms |
+| `main` | `f64` | 83.0, 82.2, 82.1 µs | 82.4 µs | 0.181, 0.137, 0.183 ms |
+| this stage | `f64` | 83.0, 83.1, 83.5 µs | 83.2 µs | 0.198, 0.196, 0.257 ms |
+
+Every run counted 0 xruns and 0 wake-up gaps. In `f32` the stage's mean is
+0.6 µs, 0.7%, above `main`'s and inside the range of `main`'s runs. In `f64` it
+is 0.8 µs, 0.9%, above, and 0.2 µs above `main`'s highest run. Against 16% and
+18% before, the matrix now costs the default config about what `main` costs;
+what is left is within a microsecond, 0.02% of a period.
 
 `i32`, which is not the default processing format, was not run on the board.
 An x86 figure, not one of the Pi 3: timed with `tests/cycle_cost.rs` after the
