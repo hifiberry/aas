@@ -38,8 +38,9 @@ pub struct Situation {
     /// route at 0 dB, at most one into an output channel. In forced mode
     /// every route counts as 0 dB. It also takes a matrix as wide as the
     /// card and chains that keep the channel count, without which no
-    /// routing reaches the card's channels as a copy. True with no source
-    /// active.
+    /// routing reaches the card's channels as a copy. False while a change
+    /// of matrix ramps, since the gains are then between two matrices, and
+    /// otherwise true with no source active.
     pub routing_pure: bool,
 }
 

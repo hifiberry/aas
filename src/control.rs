@@ -1507,7 +1507,8 @@ impl Control {
                 | Event::Replaced(_)
                 | Event::OldTable(_)
                 | Event::OldChain(_)
-                | Event::OldTaps(_) => {}
+                | Event::OldTaps(_)
+                | Event::OldMatrix(_) => {}
                 // The audio thread writes it no more, so a client that
                 // reads it empty after this has all of it. A client that
                 // gave the stream up meanwhile is told nothing it minds.
@@ -2182,6 +2183,7 @@ mod tests {
                     Command::AddTap(t) => (format!("AddTap {}", t.id), None),
                     Command::RemoveTap(id) => (format!("RemoveTap {id}"), None),
                     Command::GrowTaps(t) => ("GrowTaps".into(), Some(Event::OldTaps(t))),
+                    Command::SetMatrix(m) => ("SetMatrix".into(), Some(Event::OldMatrix(m))),
                     Command::Shutdown => ("Shutdown".into(), None),
                 };
                 seen.push(name);
