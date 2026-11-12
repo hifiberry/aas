@@ -79,9 +79,6 @@ and the daemon warns at its start while it is 1.
 
 Still missing:
 
-- An hour at 44.1 kHz under full load with the analog input on and the file
-  installed through `/etc/sysctl.d`, on the Pi 3. The passing hour had the
-  setting made by hand with `sysctl -w`.
 - After an xrun the restart of the DAC+ ADC takes 12 to 15 ms, longer than the
   11.6 ms buffer, so one stall shows as two gaps. Whether the restart can be
   shorter, or moved off the audio thread, is not looked at.
@@ -89,9 +86,11 @@ Still missing:
   pages. Not tested.
 - Why the CM5 passes is not measured.
 
-First step: install `dist/90-aas.conf` as the README says, check
-`sysctl vm.compact_unevictable_allowed` gives 0 after a reboot, and repeat the
-hour run from the stage 3a measurements.
+The hour with the file installed through `/etc/sysctl.d` and the board
+rebooted has passed; `doc/measurements.md` has the figures.
+
+First step: time `snd_pcm_prepare` on the playback after a forced xrun on the
+Pi 3 test board and see which part of the codec's restart takes the time.
 
 ## Owner decisions left by stage 3a
 

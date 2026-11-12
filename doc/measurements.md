@@ -1130,8 +1130,11 @@ What this means for the earlier results:
   a setting of the whole system, so `aas` ships it as a file for
   `/etc/sysctl.d`, `dist/90-aas.conf`, installed with the daemon, and the
   daemon warns at its start while the setting is 1. The hour above passed with
-  the setting made by hand; the installed file has not been run for an hour
-  yet. Locking alone cannot keep the pages in place,
+  the setting made by hand. A second hour passed with the file installed and
+  the board rebooted, so that the setting came from the file: 44.1 kHz, full
+  load, analog input on, 0 xruns, 0 wake gaps, worst gap 7.41 ms, worst cycle
+  0.43 ms over 620770 cycles, while compaction moved 83 thousand pages and the
+  board throttled at 87 °C. Locking alone cannot keep the pages in place,
   and a process has no other way to. Memory taken for the contiguous
   allocator can still move locked pages; that was not tested.
 
