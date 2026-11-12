@@ -1448,7 +1448,7 @@ at 82 to 87 °C and ran between 1.5 and 2.4 GHz.
 | 44.1 kHz | 0 | 0 | 1.56 / 2.90 ms | 0.07 ms | 128, 0 | 0 |
 | 96 kHz | 0 | 0 | 1.45 / 2.67 ms | 0.08 ms | 192, 0 | 0 |
 
-Both pass, with the same figures as stage 3a without the matrix. The board did
+Both pass, within 0.02 ms of stage 3a's figures without the matrix. The board did
 not hang, and the kernel log has nothing from the runs. The kernel migrated
 no pages in either hour.
 

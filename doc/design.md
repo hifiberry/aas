@@ -184,8 +184,8 @@ part 2 of stage 3b. What is decided for the one *(call)*:
   further channels are silent. `matrix = []` means the same. This is a third
   table that is not flat, for the reason `[[plugin]]` is not.
 - The card's channel count is `channels` in the config, 2 by default, at most 8.
-  A card that does not take that count counts as missing: the null sink plays,
-  the reason is logged, and the open is tried again every second.
+  A card that does not take that count is not opened: the null sink plays and
+  "does not take N channels" is logged once.
 - A count the card refuses at open is not retried every second. A card can
   answer the probe and still fail `snd_pcm_hw_params` with `EINVAL`. That counts
   as not taking the count only when the count is above 2: stereo is what every
