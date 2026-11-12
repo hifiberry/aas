@@ -1007,8 +1007,9 @@ pub enum Command {
     /// is taken as that. While something is heard, or the line still
     /// holds sound, the master fades out over 10 ms, the delay changes,
     /// and it fades in again: the frames in the line at the change are
-    /// lost. The fades alter what the copy path gives for those 10 ms. While a DoP stream holds the output
-    /// it changes at once, as a reopen would cut the stream.
+    /// lost. The fades alter what the copy path gives for those 10 ms.
+    /// While a DoP stream holds the output it changes at once, as a reopen
+    /// would cut the stream.
     SetDelay(u32),
     Shutdown,
 }
@@ -1113,7 +1114,8 @@ impl DelayLine {
         self.ring.len() / self.channels
     }
 
-    /// Whether anything audible is still in the line.
+    /// Whether anything audible is still in the line. Reads all of it, up to
+    /// `MAX_DELAY` frames, only for a `SetDelay` or a queued close.
     fn holds_sound(&self) -> bool {
         self.ring[..self.frames * self.channels]
             .iter()
@@ -1162,6 +1164,24 @@ impl DelayLine {
     /// The line holds frames back or fades: `process` has work to do.
     fn active(&self) -> bool {
         self.frames > 0 || self.moving != Moving::Still
+    }
+
+    /// Takes `samples`, interleaved frames that left the line, down to
+    /// silence over them as the fade before a reopen does at delay 0:
+    /// frame `i` of `n` at `1 - i / n`. The frames that entered the line
+    /// this period, from frame `frames` on, carry that fade already, at
+    /// `1 - j / n` for input frame `j`; they get only what is missing.
+    fn fade_out(&self, samples: &mut [i32]) {
+        let n = (samples.len() / self.channels) as f64;
+        for (i, frame) in samples.chunks_exact_mut(self.channels).enumerate() {
+            let mut gain = 1.0 - i as f64 / n;
+            if let Some(j) = i.checked_sub(self.frames) {
+                gain /= 1.0 - j as f64 / n;
+            }
+            for v in frame.iter_mut() {
+                *v = (f64::from(*v) * gain).round() as i32;
+            }
+        }
     }
 
     /// Passes `samples`, interleaved frames, through the line and the fades.
@@ -1335,7 +1355,7 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         let waited = self.wait_room();
         let mut start = Instant::now();
         self.woke_ns = self.wake_stamp();
-        let result = if self.open && !self.faded && self.reconfigure_queued() {
+        let result = if self.open && !self.faded && self.fade_queued() {
             self.faded = true;
             self.render(true, start)
         } else {
@@ -1439,15 +1459,26 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         }
     }
 
+    /// Whether the next commands end what the card plays, so that a
+    /// period fades to silence first: a reconfigure, or a close or the
+    /// shutdown while the delay line still holds sound. Without the line a
+    /// close comes when nothing plays, and cuts at once as it always did.
     /// Looks through the queue without taking anything from it.
-    fn reconfigure_queued(&mut self) -> bool {
+    fn fade_queued(&mut self) -> bool {
         let waiting = self.commands.slots();
         let Ok(chunk) = self.commands.read_chunk(waiting) else {
             return false;
         };
         let (first, second) = chunk.as_slices();
-        let is_reconfigure = |c: &Command| matches!(c, Command::Reconfigure { .. });
-        first.iter().chain(second).any(is_reconfigure)
+        let (mut reconfigure, mut close) = (false, false);
+        for command in first.iter().chain(second) {
+            match command {
+                Command::Reconfigure { .. } => reconfigure = true,
+                Command::CloseOutput | Command::Shutdown => close = true,
+                _ => {}
+            }
+        }
+        reconfigure || close && self.delay.holds_sound()
     }
 
     /// Stops early when the backlog is nearly full, which leaves the rest of
@@ -1768,7 +1799,9 @@ impl<P: Processing, S: Sink> Engine<P, S> {
     /// stream that starts then plays at once, and at a close or reopen of
     /// the output, which has faded to silence by then.
     fn set_matrix(&mut self, output: usize, matrix: Box<Matrix>) {
-        let forced = self.mode == BitPerfect::Forced;
+        // Forced bit-perfect takes the master's routes at 0 dB; a further
+        // output's gains always apply.
+        let forced = output == 0 && self.mode == BitPerfect::Forced;
         let dop = self.table.iter().any(|s| s.dop_claim != 0);
         let ramps = self.open && self.heard() && !dop;
         let ramp = ramps.then(|| (self.rate * FADE_MS / 1000) as usize);
@@ -1828,6 +1861,11 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         let samples = &mut self.samples[..self.period * self.master.channels];
         if self.delay.active() {
             self.delay.process(samples);
+        }
+        // The fade before a reopen or a close was played into the line,
+        // which the close empties: it fades what leaves the line instead.
+        if fade_out && owner.is_none() && self.delay.frames > 0 {
+            self.delay.fade_out(samples);
         }
         let before_write = Instant::now();
         let result = self.sink.write(samples);
@@ -2113,7 +2151,8 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         for output in self.further.iter_mut().flatten() {
             let samples = &mut self.further_samples[..period * output.mix.channels];
             let mix = &mut output.mix;
-            let ran = mix.mix_shared(players, analog, samples, rate, plugins, volumes);
+            // Never bit-perfect: their gains and chains apply in every mode.
+            let ran = mix.mix_shared(players, analog, samples, rate, true, true);
             mix.chains_ran(ran);
             output.feed.push_at(samples, woke);
         }
@@ -9254,8 +9293,8 @@ mod tests {
     ) -> FeedProbe {
         let channels = matrix.width();
         let (feed, probe) = FeedProbe::new(channels, frames);
-        let forced = rig.engine.mode == BitPerfect::Forced;
-        let mix = OutputMix::<P>::new(matrix, channels, forced, MAX_PERIOD as usize);
+        // Further outputs are never bit-perfect: their gains always apply.
+        let mix = OutputMix::<P>::new(matrix, channels, false, MAX_PERIOD as usize);
         rig.send(Command::AddOutput(index, Box::new(mix), feed));
         probe
     }
@@ -9452,7 +9491,7 @@ mod tests {
                 assert_eq!(rig.last_periods(1), dop_frames(PERIOD), "{what:?}");
                 assert_eq!(got, vec![frames(0, PERIOD); 2], "{what:?}");
             }
-            // The stream stops: the others play again, faded in.
+            // The stream stops: the others play the PCM source again.
             rig.send(Command::SetRunning(2, false));
             for _ in 0..12 {
                 pcm.ring.write(&frames(1000, PERIOD));
@@ -9815,5 +9854,196 @@ mod tests {
         let events = rig.events();
         assert_eq!(events.len(), 1);
         assert!(matches!(&events[0], Event::OldOutput(1, _, _)));
+    }
+
+    /// The last period the card gets before a reconfigure closes it, with
+    /// the master's delay line at `delay` frames.
+    fn last_before_reopen(delay: u32) -> Vec<[i32; 2]> {
+        let mut rig = Rig::<F64>::new(BitPerfect::Auto);
+        rig.send(Command::SetDelay(delay));
+        let mut a = client(1);
+        rig.add(&mut a);
+        for _ in 0..6 {
+            a.ring.write(&frames(1 << 24, PERIOD));
+            rig.cycle();
+        }
+        a.ring.write(&frames(1 << 24, PERIOD));
+        rig.send(Command::Reconfigure {
+            rate: 96000,
+            period: PERIOD as u32,
+        });
+        rig.cycle();
+        assert_eq!(rig.log.closes(), 0);
+        let last = rig.last_periods(1);
+        rig.cycle();
+        assert_eq!(rig.log.closes(), 1);
+        last
+    }
+
+    #[test]
+    fn a_reconfigure_fades_what_leaves_the_delay_line() {
+        let step = (1 << 24) / PERIOD as i32;
+        for delay in [0, 32, 64, 200] {
+            let period = last_before_reopen(delay);
+            // Down to the fade's last step, as at delay 0, by no larger
+            // steps.
+            let last = period[PERIOD - 1][0];
+            assert!((last - step).abs() <= 1, "delay {delay}: {last}");
+            for w in period.windows(2) {
+                assert!(w[0][0] - w[1][0] <= step + 1, "delay {delay}: {w:?}");
+                assert!(w[1][0] <= w[0][0], "delay {delay}: {w:?}");
+            }
+            assert_eq!(period[0][0], 1 << 24, "delay {delay}");
+        }
+        // At delay 0 the fade is as it always was.
+        assert_eq!(last_before_reopen(0)[PERIOD - 1], [step, -step]);
+    }
+
+    #[test]
+    fn closing_fades_what_the_delay_line_holds() {
+        // At delay 0 a close cuts at once, as before there was a line.
+        for delay in [0, 200] {
+            let mut rig = Rig::<F64>::new(BitPerfect::Auto);
+            rig.send(Command::SetDelay(delay));
+            let mut a = client(1);
+            rig.add(&mut a);
+            for _ in 0..6 {
+                a.ring.write(&frames(1 << 24, PERIOD));
+                rig.cycle();
+            }
+            let written = rig.log.frames().len();
+            rig.send(Command::CloseOutput);
+            a.ring.write(&frames(1 << 24, PERIOD));
+            rig.cycle();
+            rig.cycle();
+            assert_eq!(rig.log.closes(), 1, "delay {delay}");
+            let got = rig.log.frames();
+            if delay == 0 {
+                assert_eq!(got.len(), written);
+            } else {
+                // One faded period, then the close.
+                assert_eq!(got.len(), written + PERIOD);
+                let step = (1 << 24) / PERIOD as i32;
+                assert_eq!(got.last(), Some(&[step, -step]));
+            }
+        }
+    }
+
+    #[test]
+    fn a_delay_beyond_the_capacity_is_the_capacity() {
+        let script = |_: usize, clients: &[Client]| clients[0].ring.write(&ramp(PERIOD));
+        let script = move |c: usize, clients: &[Client]| {
+            script(c, clients);
+        };
+        let beyond = delayed::<I32>(BitPerfect::Auto, 5000, 20, script, 1);
+        let full = delayed::<I32>(BitPerfect::Auto, DELAY as u32, 20, script, 1);
+        assert_eq!(beyond, full);
+        assert_eq!(full[..DELAY], frames(0, DELAY)[..]);
+        assert_eq!(full[DELAY], ramp(PERIOD)[0]);
+    }
+
+    #[test]
+    fn an_engine_without_a_delay_line_takes_no_delay() {
+        let sink = MemorySink::with_channels(2);
+        let log = sink.log();
+        let (mut commands, consumer) = RingBuffer::new(16);
+        let (producer, _events) = RingBuffer::new(16);
+        let counters = Arc::new(Counters::default());
+        let mode = BitPerfect::Auto;
+        let mut engine =
+            Engine::<I32, _>::new(sink, consumer, producer, counters, mode, stereo(), 0);
+        let reconfigure = Command::Reconfigure {
+            rate: RATE,
+            period: PERIOD as u32,
+        };
+        assert!(commands.push(reconfigure).is_ok());
+        assert!(commands.push(Command::SetDelay(100)).is_ok());
+        let mut a = client(1);
+        assert!(
+            commands
+                .push(Command::Add(a.source.take().unwrap()))
+                .is_ok()
+        );
+        assert!(commands.push(Command::SetRunning(1, true)).is_ok());
+        a.ring.write(&ramp(PERIOD));
+        engine.cycle().unwrap();
+        assert_eq!(log.frames(), ramp(PERIOD));
+    }
+
+    #[test]
+    fn a_reopen_empties_the_delay_line() {
+        let mut rig = Rig::<I32>::new(BitPerfect::Auto);
+        rig.send(Command::SetDelay(100));
+        let mut a = client(1);
+        rig.add(&mut a);
+        for _ in 0..4 {
+            a.ring.write(&frames(1 << 24, PERIOD));
+            rig.cycle();
+        }
+        rig.send(Command::Reconfigure {
+            rate: RATE,
+            period: PERIOD as u32,
+        });
+        rig.cycle();
+        rig.cycle();
+        assert_eq!(rig.log.opens().len(), 2);
+        // The first 100 frames after the reopen are the empty line, not
+        // what it held before.
+        let after = rig.last_periods(1);
+        assert_eq!(after, frames(0, PERIOD));
+        a.ring.write(&frames(1 << 20, 2 * PERIOD));
+        rig.cycle();
+        rig.cycle();
+        let got = rig.last_periods(2);
+        assert_eq!(got[..100 - PERIOD], frames(0, 100 - PERIOD)[..]);
+        assert!(
+            got[100 - PERIOD..]
+                .iter()
+                .all(|f| f[0] == 0 || f[0] == 1 << 20)
+        );
+    }
+
+    #[test]
+    fn a_closed_feed_takes_nothing_and_never_waits() {
+        let mut rig = Rig::<F32>::new(BitPerfect::Auto);
+        let mut one = add_output(&mut rig, 1, stereo());
+        one.close();
+        let mut a = client(1);
+        rig.add(&mut a);
+        for _ in 0..10 {
+            a.ring.write(&frames(1000, PERIOD));
+            rig.cycle();
+        }
+        assert_eq!(rig.last_periods(10), frames(1000, 10 * PERIOD));
+        assert!(one.take().is_empty());
+        assert_eq!(one.overflows(), 0);
+        assert_eq!(one.last_push().0, 0);
+    }
+
+    #[test]
+    fn in_forced_bit_perfect_further_outputs_keep_their_gains_and_chains() {
+        let mut rig = Rig::<F64>::new(BitPerfect::Forced);
+        let mut one = add_output(&mut rig, 1, stereo());
+        let mut two = add_output(&mut rig, 2, stereo());
+        // Output 1: its own gain and a chain. Output 2: a matrix at -6 dB.
+        rig.send(Command::SetGain(1, 0.5));
+        let mix = Target {
+            output: 1,
+            place: Place::Mix,
+        };
+        rig.send(Command::SetChain(mix, chain_of::<F64>(vec![times(0.5)])));
+        let lowered = matrix(&[route(0, 1, -6.0), route(1, 2, -6.0)], 2);
+        rig.send(Command::SetMatrix(2, Box::new(lowered)));
+        // The master's gain and a client's volume stay unapplied.
+        rig.send(Command::SetGain(0, 0.5));
+        let mut a = client(1);
+        a.source.as_mut().unwrap().gain = 0.5;
+        rig.add(&mut a);
+        a.ring.write(&frames(1 << 20, PERIOD));
+        let got = cycle_outputs(&mut rig, &mut [&mut one, &mut two]);
+        assert_eq!(rig.last_periods(1), frames(1 << 20, PERIOD));
+        assert_eq!(got[0], frames(1 << 18, PERIOD));
+        let want = (f64::from(1 << 20) * f64::from(db_to_gain(-6.0))).round() as i32;
+        assert_eq!(got[1], frames(want, PERIOD));
     }
 }

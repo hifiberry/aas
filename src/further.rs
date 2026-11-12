@@ -859,6 +859,11 @@ impl FeedProbe {
     pub(crate) fn overflows(&self) -> u64 {
         self.counters.overflows.load(Relaxed)
     }
+
+    /// The writer closes the output: the feed takes nothing from now on.
+    pub(crate) fn close(&self) {
+        self.shared.open.store(false, Release);
+    }
 }
 
 #[cfg(test)]
