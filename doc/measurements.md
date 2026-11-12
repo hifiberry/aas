@@ -1305,6 +1305,11 @@ on both boards.
 | `dist/test-plugin.sh` with the capture and `ANALOG=1` | Not run | 32 of 33. The failure is the `mpd` case: `mpd` is not installed | Pass, except the case that needs `mpd` |
 | `channels = 8` on the stereo card | The card refuses 8 channels when probed. The null sink plays and the reason is logged once | **The card says it takes 8 channels when probed, then refuses them when opened. The null sink plays, but each retry costs the audio thread about 3.4 ms, which counts as a wake-up gap every second** | As designed on the Pi 3. A finding on the CM5, below |
 
+The stereo cost and the `channels = 8` finding were taken up after the figures
+here were taken. The default stereo matrix now takes a direct mixing path, as
+`main` does. The figures in this section are those of the build named above,
+before both changes.
+
 ### Bit-exactness through `snd-aloop`
 
 The method of [stage 2](#bit-exactness): `bit-check` plays a seeded
@@ -1331,11 +1336,12 @@ Each config and format ran S16 at 44.1 kHz, S24 at 96 kHz and S32 at 192 kHz,
 the routing, and each of the 12 daemons counted 0 xruns and 0 wake-up gaps,
 with a worst gap of 28.0 to 31.7 ms against buffers of 42.7 to 46.4 ms. The
 daemon chose 1024 frames per period on `snd-aloop` at 44.1 and 48 kHz, as in
-stage 2, 2048 at 96 kHz and 4096 at 192 kHz. With one client at 0 dB and pure routes the
-output is bit-perfect, so the samples are copied, swapped or duplicated as
-they are, and the processing format made no difference.
+stage 2, 2048 at 96 kHz and 4096 at 192 kHz. With one client at 0 dB and pure
+routes the output is bit-perfect, so the samples are copied, swapped or
+duplicated as they are, and the processing format made no difference.
 
-Two negative checks, in `f32`: the swap checked as `1=L,2=R` reported every
+Two negative checks, in `f32`, on a stream of 144000 frames, 3 s at 48 kHz and
+shorter than the 10 s cases: the swap checked as `1=L,2=R` reported every
 one of its 144000 frames as differing, with left and right exchanged; and the
 eight channels checked as stereo, `1=L,2=R` with channels 3 to 8 to be silent,
 reported every frame off the routing, the first one showing channels 7 and 8
@@ -1429,8 +1435,8 @@ to = 1
 
 The music played through the cable into the ADC, so the input opened a second
 after each start and stayed open, and came back swapped once more at -20 dB.
-The CM5 runs and the Pi 3 runs were made one after the other on each board,
-the CM5's while the Pi 3 measured its cost. On the CM5 the logs were kept in
+The two boards were run at overlapping times. The CM5 hours ran while the
+Pi 3 measured its cost, and the Pi 3 hours came after. On the CM5 the logs were kept in
 RAM and copied off every two minutes, and the kernel log was streamed off the
 board.
 
@@ -1506,7 +1512,8 @@ Nothing reached the ADC.
 
 On the CM5 the card answers the probe differently from the open. The probe
 logged `card hw:sndrpihifiberry takes 8 channels`: the card's configuration
-space allows 8 channels. Opening the card then fails in `snd_pcm_hw_params` with `Invalid argument`, and the kernel logs
+space allows 8 channels. Opening the card then fails in `snd_pcm_hw_params`
+with `Invalid argument`, and the kernel logs
 `designware-i2s ... ASoC error (-22): at snd_soc_dai_hw_params()`. So the daemon
 played to the null sink and nothing reached the ADC, as it should. But:
 
@@ -1519,9 +1526,10 @@ played to the null sink and nothing reached the ADC, as it should. But:
 - The kernel logged two lines per retry, so two a second for as long as the
   config stays.
 
-Nothing played wrongly. Whether the retry should run off the audio thread, or
-the daemon should treat a failure to apply the hardware parameters at the
-configured channel count as the card not taking the count, is left open.
+Nothing played wrongly. This was taken up after the figures above were taken:
+a refusal of a channel count above 2 is now logged as "does not take N
+channels" once, and not retried every second. See Mixing matrix in
+`doc/design.md`. This section does not hold a measurement of that fix.
 
 ### What these figures do not show
 

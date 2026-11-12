@@ -141,17 +141,57 @@ rate, bump the protocol version, and use it in `rate`.
 
 ## Plugins not built yet
 
-Stage 3a built chains at `analog`, `mix` and `output`, the ABI version 1 with
-stereo plugins, and the built-ins `detect` and `balance`. Still missing:
+Stage 3a built chains at `analog`, `mix` and `output` and the built-ins `detect`
+and `balance`. Stage 3b part 1 added the mixing matrix, the card's channel count
+and ABI version 2, with plugins for any channel count. Still missing:
 
 - The limiter plugin. Without it, mixed clients that sum above full scale clip.
 - Chains on a single client's input. `PluginPlace` in `src/config.rs` has no
   place for one.
-- Plugins with other channel counts. The loader refuses anything but two in and
-  two out; this comes with the matrix (stage 3b).
 - `input-processor` as a native plugin (stage 3c): RIAA, subsonic, gain,
   declick and notch, at 44.1 to 192 kHz. See "Input processor plugin" in
   `doc/design.md`.
+
+## Stage 3b part 2: several cards
+
+Part 1 has one output with one matrix and its chains. Missing: several cards,
+one the clock master and the others resampled adaptively to follow it, each
+with its own matrix, `mix` and `output` chains, volume and idle behaviour, and
+a plugin that names its card. Until a second card is on a board, test it with
+`snd-aloop`: that proves the samples and the routing, not the timing of two
+real clocks. First step: read "Output" and "Mixing matrix" in `doc/design.md`,
+then write the plan, starting with how the config names a card per matrix and
+per chain.
+
+## A real card with more than two channels
+
+No board has one. More than two channels were run only through `snd-aloop`
+(`doc/measurements.md`, Stage 3b, part 1), which proves the samples, not the
+timing, the period the card grants, or how the card's driver refuses a count.
+The DoP pair rule for channels 3 and up is checked in tests only. Missing: a
+board with such a card, for example a multichannel USB DAC or a HiFiBerry card
+with more than two outputs. First step: run `bit-check --channels 8 --expect`
+against it, then the hour runs of Stage 3b with `channels` set to its count.
+
+## Pi 3: the stereo cost of the matrix, and the 96 kHz input padding
+
+Stage 3b part 1 measured the mean CPU time of the audio thread per cycle on the
+Pi 3 test board 16% (`f32`) and 18% (`f64`) above `main` with the default
+matrix. The default stereo config now takes a direct mixing path as `main` does.
+Missing: the Pi 3 measurement of it with the same method, 3 runs of 10 minutes
+at 48 kHz against `main` at 2ce4e21. The figure is `schedstat` time per cycle,
+so it includes the card write and the wake-ups. Also not looked into: at 96 kHz
+with the analog input on, the Pi 3 padded 256 frames in the hour run against 768
+in stage 3a. First step: run the ignored test `tests/cycle_cost.rs` on the board.
+
+## Matrix changes through the API
+
+Part 1 sends a matrix only from the config. When the API sends it (stage 4),
+two things need a decision. A matrix changed more often than every 10 ms keeps
+a DoP stream that starts meanwhile waiting, since it waits for the fade to end.
+And a change made while a DoP claim at the wrong rate is held applies at once
+under PCM. Neither can happen from the config. First step: read the matrix
+fade in `src/engine.rs` (search for `ramp`) and decide a bound for the wait.
 
 ## Add cards to the ADC table
 
