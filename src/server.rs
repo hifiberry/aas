@@ -48,9 +48,13 @@ fn check(rc: isize) -> io::Result<usize> {
     }
 }
 
-/// Says whether the card the sink plays to is present. Called on the
-/// control thread, once a second while the sink is gone.
-pub type CardProbe = Box<dyn FnMut() -> bool + Send>;
+/// Says whether the audio thread should try the sink again. Called on the
+/// control thread, once a second while the sink is gone, with `false`: is
+/// the card present. While the card refuses the configuration it is called
+/// with `true`: has the set of cards changed since last time, so that a
+/// card unplugged and plugged in again, or another one, is tried once, and
+/// the refusal is not retried every second.
+pub type CardProbe = Box<dyn FnMut(bool) -> bool + Send>;
 
 /// Runs the daemon as `run_probing` does, with no probe for the card: the
 /// audio thread then tries a sink that is gone every second by itself.
@@ -393,7 +397,8 @@ impl Server {
         // After the card change above: the mixer of a card that has just
         // gone is closed by now, so the card is no longer listed for that.
         if let Some((search, probe)) = &mut self.search {
-            if self.probe_wait.due(search.is_gone(), now) && probe() {
+            let refused = search.is_refused();
+            if self.probe_wait.due(search.is_gone() || refused, now) && probe(refused) {
                 search.retry();
             }
         }
@@ -623,6 +628,27 @@ impl ProbeWait {
                 false
             }
         }
+    }
+}
+
+/// Notices a change in the list of cards between looks.
+#[derive(Default)]
+pub struct ListChange {
+    last: Option<Vec<String>>,
+}
+
+impl ListChange {
+    /// Whether `now` differs from the list at the last look. The first look
+    /// only takes the baseline.
+    pub fn changed(&mut self, now: Vec<String>) -> bool {
+        self.last
+            .replace(now.clone())
+            .is_some_and(|last| last != now)
+    }
+
+    /// Forgets the list, so that the next look is a baseline.
+    pub fn reset(&mut self) {
+        self.last = None;
     }
 }
 
@@ -892,6 +918,23 @@ mod tests {
         assert!(!wait.due(true, t + ms(4000)));
         assert!(!wait.due(true, t + ms(4900)));
         assert!(wait.due(true, t + ms(5000)));
+    }
+
+    #[test]
+    fn a_change_in_the_card_list_is_seen_once() {
+        let list = |ids: &[&str]| ids.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let mut change = ListChange::default();
+        // The first look is the baseline.
+        assert!(!change.changed(list(&["a"])));
+        assert!(!change.changed(list(&["a"])));
+        assert!(change.changed(list(&[])));
+        assert!(!change.changed(list(&[])));
+        assert!(change.changed(list(&["a"])));
+        assert!(change.changed(list(&["a", "b"])));
+        assert!(!change.changed(list(&["a", "b"])));
+        // Forgotten while not refused: the next look is a baseline again.
+        change.reset();
+        assert!(!change.changed(list(&["a"])));
     }
 
     #[test]

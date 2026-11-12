@@ -159,7 +159,15 @@ fn analog_input(config: &Config) -> Option<aas::control::OpenCapture> {
 /// ALSA never asks: its output is never gone.
 fn card_probe(config: &Config) -> server::CardProbe {
     let card = config.card.clone();
-    Box::new(move || aas::sink_alsa::card_is_present(card.as_deref()))
+    let mut list = server::ListChange::default();
+    Box::new(move |refused| {
+        if refused {
+            list.changed(aas::sink_alsa::card_ids())
+        } else {
+            list.reset();
+            aas::sink_alsa::card_is_present(card.as_deref())
+        }
+    })
 }
 
 fn main() -> ExitCode {

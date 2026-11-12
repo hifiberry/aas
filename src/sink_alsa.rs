@@ -522,6 +522,14 @@ mod card {
         Refused(String),
     }
 
+    impl OpenFailure {
+        fn message(self) -> String {
+            match self {
+                OpenFailure::Failed(m) | OpenFailure::Refused(m) => m,
+            }
+        }
+    }
+
     impl From<String> for OpenFailure {
         fn from(message: String) -> OpenFailure {
             OpenFailure::Failed(message)
@@ -565,7 +573,7 @@ mod card {
             let e = |err: alsa::Error| format!("{device}: {err}");
             let pcm = open_pcm(&device).map_err(e)?;
             let hw = HwParams::any(&pcm).map_err(e)?;
-            let (format, rates) = self.choose(&device, &hw)?;
+            let (format, rates) = self.choose(&device, &hw).map_err(OpenFailure::message)?;
             eprintln!(
                 "aas: card {device} takes {} channels, {}, {rates:?}",
                 self.channels,
@@ -576,14 +584,26 @@ mod card {
 
         /// `choose` for this sink's channel count, with the failure for a
         /// card that does not take it.
-        fn choose(&self, device: &str, hw: &HwParams) -> Result<(CardFormat, Vec<u32>), String> {
-            if hw.test_channels(self.channels as u32).is_err() {
-                return Err(format!(
-                    "{device}: does not take {} channels",
-                    self.channels
-                ));
+        fn choose(
+            &self,
+            device: &str,
+            hw: &HwParams,
+        ) -> Result<(CardFormat, Vec<u32>), OpenFailure> {
+            if hw.test_channels(self.channels as u32).is_err()
+                || hw.set_channels(self.channels as u32).is_err()
+            {
+                return Err(self.refusal(device));
             }
-            choose(hw, self.channels).map_err(|err| format!("{device}: format: {err}"))
+            choose(hw, self.channels)
+                .map_err(|err| OpenFailure::Failed(format!("{device}: format: {err}")))
+        }
+
+        /// The card is there and does not take the channel count.
+        fn refusal(&self, device: &str) -> OpenFailure {
+            OpenFailure::Refused(format!(
+                "{device}: does not take {} channels",
+                self.channels
+            ))
         }
 
         /// The device to open. A named card is looked for first, so that a
@@ -605,14 +625,6 @@ mod card {
             let pcm = open_pcm(&device).map_err(|x| e("open", x))?;
             let (format, buffer, card_period) = {
                 let hw = HwParams::any(&pcm).map_err(|x| e("hw params", x))?;
-                let channels = self.channels;
-                let refused =
-                    || OpenFailure::Refused(format!("{device}: does not take {channels} channels"));
-                if hw.test_channels(self.channels as u32).is_err()
-                    || hw.set_channels(self.channels as u32).is_err()
-                {
-                    return Err(refused());
-                }
                 let (format, rates) = self.choose(&device, &hw)?;
                 self.rates = rates;
                 if !self.rates.contains(&rate) {
@@ -625,12 +637,12 @@ mod card {
                 hw.set_periods(PERIODS, ValueOr::Nearest)
                     .map_err(|x| e("periods", x))?;
                 if let Err(x) = pcm.hw_params(&hw) {
-                    // The probe took the channel count and the rate and
-                    // period were granted within what the card takes, so a
-                    // driver that refuses here refuses the channels, as
-                    // some I2S controllers do for more than two.
-                    if x.errno() == libc::EINVAL {
-                        return Err(refused());
+                    // Some I2S controllers take a channel count in the
+                    // probe and refuse it here. Up to two channels every
+                    // card takes it, so an EINVAL there is about something
+                    // else, which may pass, and is retried.
+                    if x.errno() == libc::EINVAL && self.channels > 2 {
+                        return Err(self.refusal(&device));
                     }
                     return Err(e("apply", x).into());
                 }

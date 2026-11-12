@@ -401,9 +401,16 @@ impl CardWatch {
 pub struct CardSearch {
     gone: Arc<AtomicBool>,
     retry: Arc<AtomicBool>,
+    refused: Arc<AtomicBool>,
 }
 
 impl CardSearch {
+    /// Whether the output is meant to play and the card refuses the
+    /// configuration. Trying again helps only once something has changed.
+    pub fn is_refused(&self) -> bool {
+        self.refused.load(Ordering::Acquire)
+    }
+
     /// Whether the output is meant to play and the real sink is gone.
     pub fn is_gone(&self) -> bool {
         self.gone.load(Ordering::Acquire)
@@ -460,6 +467,8 @@ pub struct FallbackSink {
     /// The last open was refused for good: only a reopen or an asked-for
     /// retry tries again, never the clock.
     refused: bool,
+    /// `refused`, for the control thread, while the output is open.
+    refusing: Arc<AtomicBool>,
     retry_at: Instant,
     retry: Duration,
 }
@@ -481,6 +490,7 @@ impl FallbackSink {
             retry_now: Arc::default(),
             searched: false,
             refused: false,
+            refusing: Arc::default(),
             retry_at: Instant::now(),
             retry: RETRY,
         }
@@ -509,6 +519,7 @@ impl FallbackSink {
         CardSearch {
             gone: self.gone.clone(),
             retry: self.retry_now.clone(),
+            refused: self.refusing.clone(),
         }
     }
 
@@ -546,6 +557,7 @@ impl FallbackSink {
         // A card that refuses is not gone, so nothing looks for it.
         self.gone
             .store(!self.live && !self.refused, Ordering::Release);
+        self.refusing.store(self.refused, Ordering::Release);
         self.retry_at = Instant::now() + self.retry;
         let rates = self.inner.supported_rates();
         if rates == self.rates {
@@ -621,6 +633,7 @@ impl Sink for FallbackSink {
             self.closed_live = true;
         }
         self.gone.store(false, Ordering::Release);
+        self.refusing.store(false, Ordering::Release);
     }
 
     fn delay_frames(&self) -> u32 {
@@ -876,8 +889,9 @@ mod tests {
         let search = sink.card_search();
         log.fail(Some(SinkError::Refused));
         sink.open(48000, 48).unwrap();
-        // Nothing to wait for: the control thread does not search.
+        // Not gone, but refusing: only a change makes a try worth it.
         assert!(!search.is_gone());
+        assert!(search.is_refused());
         log.fail(None);
         for _ in 0..3 {
             sink.write([[1; 2]; 48].as_flattened()).unwrap();
@@ -886,6 +900,13 @@ mod tests {
         search.retry();
         sink.write([[2; 2]; 48].as_flattened()).unwrap();
         assert_eq!(log.frames(), [[2; 2]; 48]);
+        assert!(!search.is_refused());
+        // A closed output is not looked after.
+        log.fail(Some(SinkError::Refused));
+        sink.open(48000, 48).unwrap();
+        assert!(search.is_refused());
+        sink.close();
+        assert!(!search.is_refused());
     }
 
     #[test]
