@@ -16,6 +16,10 @@ pub enum SinkError {
     Xrun,
     /// The device has gone away.
     Gone,
+    /// The device is there and refuses this configuration, such as a
+    /// channel count it does not take. Trying again changes nothing until
+    /// the configuration does.
+    Refused,
 }
 
 /// A device that takes interleaved S32 frames of a fixed number of
@@ -453,6 +457,9 @@ pub struct FallbackSink {
     retry_now: Arc<AtomicBool>,
     /// A `CardSearch` was handed out, so retries come from there.
     searched: bool,
+    /// The last open was refused for good: only a reopen or an asked-for
+    /// retry tries again, never the clock.
+    refused: bool,
     retry_at: Instant,
     retry: Duration,
 }
@@ -473,6 +480,7 @@ impl FallbackSink {
             gone: Arc::default(),
             retry_now: Arc::default(),
             searched: false,
+            refused: false,
             retry_at: Instant::now(),
             retry: RETRY,
         }
@@ -506,7 +514,7 @@ impl FallbackSink {
 
     /// Whether to try the inner sink again now.
     fn retry_due(&mut self) -> bool {
-        if self.searched {
+        if self.searched || self.refused {
             self.retry_now.swap(false, Ordering::AcqRel)
         } else {
             Instant::now() >= self.retry_at
@@ -524,7 +532,9 @@ impl FallbackSink {
         // The control thread opened the mixer at the start, before any
         // open: a card gone at the very first open is a change too.
         let first = !std::mem::replace(&mut self.tried, true);
-        self.live = self.inner.open(rate, period).is_ok();
+        let opened = self.inner.open(rate, period);
+        self.live = opened.is_ok();
+        self.refused = opened == Err(SinkError::Refused);
         let changed = if self.live {
             !was_live
         } else {
@@ -533,7 +543,9 @@ impl FallbackSink {
         if changed {
             self.changes.fetch_add(1, Ordering::Release);
         }
-        self.gone.store(!self.live, Ordering::Release);
+        // A card that refuses is not gone, so nothing looks for it.
+        self.gone
+            .store(!self.live && !self.refused, Ordering::Release);
         self.retry_at = Instant::now() + self.retry;
         let rates = self.inner.supported_rates();
         if rates == self.rates {
@@ -839,6 +851,51 @@ mod tests {
         // A closed output is not looked for.
         sink.close();
         assert!(!search.is_gone());
+    }
+
+    #[test]
+    fn a_refused_open_is_not_retried_by_the_clock() {
+        let (mut sink, log) = fallback(Duration::ZERO);
+        log.fail(Some(SinkError::Refused));
+        sink.open(48000, 48).unwrap();
+        log.fail(None);
+        for _ in 0..5 {
+            sink.write([[1; 2]; 48].as_flattened()).unwrap();
+        }
+        assert!(log.frames().is_empty());
+        assert_eq!(log.opens().len(), 0);
+        // A reopen tries again.
+        sink.open(44100, 48).unwrap();
+        sink.write([[2; 2]; 48].as_flattened()).unwrap();
+        assert_eq!(log.frames(), [[2; 2]; 48]);
+    }
+
+    #[test]
+    fn a_refused_open_is_not_looked_for_but_an_asked_retry_tries_again() {
+        let (mut sink, log) = fallback(Duration::ZERO);
+        let search = sink.card_search();
+        log.fail(Some(SinkError::Refused));
+        sink.open(48000, 48).unwrap();
+        // Nothing to wait for: the control thread does not search.
+        assert!(!search.is_gone());
+        log.fail(None);
+        for _ in 0..3 {
+            sink.write([[1; 2]; 48].as_flattened()).unwrap();
+        }
+        assert!(log.frames().is_empty());
+        search.retry();
+        sink.write([[2; 2]; 48].as_flattened()).unwrap();
+        assert_eq!(log.frames(), [[2; 2]; 48]);
+    }
+
+    #[test]
+    fn an_ordinary_failed_open_is_retried_after_the_interval() {
+        let (mut sink, log) = fallback(Duration::ZERO);
+        log.fail(Some(SinkError::Gone));
+        sink.open(48000, 48).unwrap();
+        log.fail(None);
+        sink.write([[1; 2]; 48].as_flattened()).unwrap();
+        assert_eq!(log.frames(), [[1; 2]; 48]);
     }
 
     #[test]

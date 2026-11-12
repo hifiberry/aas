@@ -513,6 +513,21 @@ mod card {
         }
     }
 
+    /// Why an open failed. A refusal is the same at every try until the
+    /// configuration changes, so the fallback does not retry it by the clock.
+    enum OpenFailure {
+        /// The card is busy, gone, or failed in some way that may pass.
+        Failed(String),
+        /// The card is there and does not take this configuration.
+        Refused(String),
+    }
+
+    impl From<String> for OpenFailure {
+        fn from(message: String) -> OpenFailure {
+            OpenFailure::Failed(message)
+        }
+    }
+
     /// Plays to `hw:<card>` with a fixed number of channels, as S32 if the
     /// card takes it, else S24 in 32 bits, else S16. Two periods are
     /// buffered and the card starts once both are written.
@@ -584,16 +599,24 @@ mod card {
             }
         }
 
-        fn try_open(&mut self, rate: u32, period: u32) -> Result<Open, String> {
+        fn try_open(&mut self, rate: u32, period: u32) -> Result<Open, OpenFailure> {
             let device = self.device()?;
             let e = |what: &str, err: alsa::Error| format!("{device}: {what}: {err}");
             let pcm = open_pcm(&device).map_err(|x| e("open", x))?;
             let (format, buffer, card_period) = {
                 let hw = HwParams::any(&pcm).map_err(|x| e("hw params", x))?;
+                let channels = self.channels;
+                let refused =
+                    || OpenFailure::Refused(format!("{device}: does not take {channels} channels"));
+                if hw.test_channels(self.channels as u32).is_err()
+                    || hw.set_channels(self.channels as u32).is_err()
+                {
+                    return Err(refused());
+                }
                 let (format, rates) = self.choose(&device, &hw)?;
                 self.rates = rates;
                 if !self.rates.contains(&rate) {
-                    return Err(format!("{device}: does not take {rate} Hz"));
+                    return Err(format!("{device}: does not take {rate} Hz").into());
                 }
                 hw.set_rate(rate, ValueOr::Nearest)
                     .map_err(|x| e("rate", x))?;
@@ -601,10 +624,19 @@ mod card {
                     .map_err(|x| e("period", x))?;
                 hw.set_periods(PERIODS, ValueOr::Nearest)
                     .map_err(|x| e("periods", x))?;
-                pcm.hw_params(&hw).map_err(|x| e("apply", x))?;
+                if let Err(x) = pcm.hw_params(&hw) {
+                    // The probe took the channel count and the rate and
+                    // period were granted within what the card takes, so a
+                    // driver that refuses here refuses the channels, as
+                    // some I2S controllers do for more than two.
+                    if x.errno() == libc::EINVAL {
+                        return Err(refused());
+                    }
+                    return Err(e("apply", x).into());
+                }
                 let got_rate = hw.get_rate().map_err(|x| e("get rate", x))?;
                 if got_rate != rate {
-                    return Err(format!("{device}: asked for {rate} Hz, got {got_rate}"));
+                    return Err(format!("{device}: asked for {rate} Hz, got {got_rate}").into());
                 }
                 let got_period = hw.get_period_size().map_err(|x| e("get period", x))?;
                 let got_buffer = hw.get_buffer_size().map_err(|x| e("get buffer", x))?;
@@ -655,9 +687,13 @@ mod card {
                     self.last_failure = None;
                     Ok(())
                 }
-                Err(e) => {
+                Err(OpenFailure::Failed(e)) => {
                     self.failed(e);
                     Err(SinkError::Gone)
+                }
+                Err(OpenFailure::Refused(e)) => {
+                    self.failed(e);
+                    Err(SinkError::Refused)
                 }
             }
         }
