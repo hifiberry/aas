@@ -282,6 +282,21 @@ writer, which took 44% of a core on the throttled board, has a part in it.
 First step: repeat that hour of `doc/measurements.md`, Stage 3b, part 2,
 "Hour runs with a further output", and log the time of each dropped frame.
 
+## Pi 3: the USB driver and a lower latency
+
+On a Pi 3 B+ booted over the network, `dwc2` beat the default `dwc_otg` at
+6 ms under load (3 wake gaps against 8 to 10, worst cycles half as long), but
+both went over the 6 ms buffer; at 12 ms both kept about 3 ms of margin
+(`doc/measurements.md`, "The USB driver on the Pi 3 B+"). Every run had
+`vm.compact_unevictable_allowed = 1`, which is known to stall the audio
+thread on the Pi 3. Missing: the same series with `dist/90-aas.conf`
+installed, to see whether the gaps left at 6 ms are compaction or USB; then a
+decision whether to recommend `dwc2` on boards whose network is behind USB,
+and whether anything below 12 ms can be the Pi 3 default. First step: netboot
+the Pi 3 B+ (its boot directory for `dwc2` is kept beside the shared one),
+install `dist/90-aas.conf` on the network root, reboot, and repeat
+`latency 12/6 ms x idle/load` with each driver.
+
 ## A real card with more than two channels
 
 No board has one. More than two channels were run only through `snd-aloop`

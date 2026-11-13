@@ -2051,3 +2051,53 @@ with the loopback captured throughout; two runs.
 - The cost with a further output was measured at 48 kHz only; the writer's
   share at 96 kHz on the Pi 3 is known only from the hour under load, 44.5% of
   a core at about 550 MHz.
+
+## The USB driver on the Pi 3 B+
+
+A second Pi 3 class board, a Pi 3 Model B+ (905 MB) with a DAC+ ADC Pro, ran
+the same latency series with the kernel's two USB host drivers: `dwc_otg`, the
+default, and `dwc2` (`dtoverlay=dwc2,dr_mode=host`). On this board the
+Ethernet sits behind USB, so the driver carries the network too.
+
+Each run is a fresh daemon of the main build, 600 s of a 44.1 kHz sine from
+`aplay` through the `aas` ALSA plugin, card `sndrpihifiberry`, at the given
+`latency_ms`. "Load" is one `sha256sum` per core plus a 128 MB synchronous
+write every 5 s, started 60 s before the run. "Analog" enables the analog
+input. `vm.compact_unevictable_allowed` was 1 in every run (`dist/90-aas.conf`
+not installed), for both drivers alike.
+
+Two setups:
+
+- **SD:** the board's own system, kernel 6.18.50, `dwc_otg` only. Its writes
+  went to the SD card.
+- **Network boot:** kernel 6.18.34, root file system over NFS, so the load's
+  writes went out through the USB Ethernet. The same system was booted once
+  with each driver. Under load the board reached 80 to 82 °C and was held at
+  its soft temperature limit with the clock capped, equally for both drivers.
+
+Worst gap between two wake-ups of the audio thread, wake gaps (wake-ups later
+than the whole buffer) and the worst cycle. No run counted an xrun.
+
+| Run | SD, `dwc_otg` | Network, `dwc_otg` | Network, `dwc2` |
+|---|---|---|---|
+| 12 ms, idle | 6.03 ms, 0 gaps | 5.96 ms, 0 gaps, 0.23 ms | 6.07 ms, 0 gaps, 0.33 ms |
+| 12 ms, load | 6.45 ms, 0 gaps | 8.96 ms, 0 gaps, 1.67 ms | 8.73 ms, 0 gaps, 1.16 ms |
+| 6 ms, idle | 3.12 ms, 0 gaps | 3.14 ms, 0 gaps, 0.29 ms | 3.11 ms, 0 gaps, 0.20 ms |
+| 6 ms, load | 3.54 ms, 0 gaps | 7.91 ms, 8 gaps, 2.93 ms | 6.05 ms, 3 gaps, 1.47 ms |
+| 6 ms, load, analog | 3.64 ms, 0 gaps | 6.86 ms, 10 gaps, 4.20 ms | 6.30 ms, 3 gaps, 1.52 ms |
+
+The SD runs' worst cycles were not kept.
+
+- Idle, and at 12 ms, the two drivers are the same.
+- At 6 ms under load `dwc2` is better: 3 wake gaps against 8 and 10, worst
+  gaps 1 to 2 ms shorter, and worst cycles about half as long. It still goes
+  over the 6 ms buffer, so neither driver makes 6 ms safe on this board when
+  the network is busy.
+- The network-boot load is much harder on the audio thread than the SD load
+  with the same driver (7.91 against 3.54 ms at 6 ms): heavy traffic through
+  the USB Ethernet is what stalls it, and it is there that the driver
+  matters.
+- `dwc2` booted, and kept the network, with no other change. An earlier
+  failure of the board's SD system to come up after the overlay was added
+  is not explained by it: the SD system did not come up with the overlay
+  removed either.
