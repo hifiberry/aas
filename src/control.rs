@@ -74,6 +74,9 @@ const SAVE_DELAY: Duration = Duration::from_secs(1);
 const CAPTURE_RETRY: Duration = Duration::from_secs(1);
 /// Periods of the output a capture stream's ring holds at least.
 const RECORDER_PERIODS: u32 = 4;
+/// How long after the master's card opens under a parked cycle a further
+/// output's starve is put down to the open, which stalls the cycle.
+const RESUME_STARVE: Duration = Duration::from_secs(2);
 
 /// Chains built for a rate, not yet sent to the audio thread.
 struct Spare {
@@ -567,6 +570,9 @@ struct FurtherOutput {
     configured: bool,
     /// The writer has been told to play.
     open: bool,
+    /// The master's card opened under the parked cycle: a starve until
+    /// then gets a line of its own, outside the log's count.
+    resumed_until: Option<Instant>,
     log: OutputLog,
 }
 
@@ -964,6 +970,7 @@ impl Control {
             pending: None,
             configured: false,
             open: false,
+            resumed_until: None,
             log: OutputLog::default(),
         });
         let latencies: Vec<f32> = self.further.iter().map(|o| o.latency_ms).collect();
@@ -1058,7 +1065,7 @@ impl Control {
         if self.analog.is_some() {
             batch.push(Command::SetAnalogGain(self.analog_gain));
         }
-        self.open_output(&mut batch);
+        self.open_output(now, &mut batch);
         self.idle_since = Some(now);
         self.send(batch);
     }
@@ -1765,7 +1772,7 @@ impl Control {
             }
         };
         if reopen {
-            self.open_output(batch);
+            self.open_output(now, batch);
         } else {
             self.sync_resamplers(batch);
             // Chains for the rate the output already runs at, such as when
@@ -1987,7 +1994,7 @@ impl Control {
     /// and chains for the new rate go first, so that they take effect with
     /// it. The audio thread closes the capture first; a new one is opened
     /// once the output is open.
-    fn open_output(&mut self, batch: &mut Vec<Command>) {
+    fn open_output(&mut self, now: Instant, batch: &mut Vec<Command>) {
         let Some(rate) = self.usable_rate() else {
             return;
         };
@@ -2006,7 +2013,11 @@ impl Control {
             analog.retry_at = None;
         }
         self.end_recorders(rate, batch);
-        if !resumed {
+        if resumed {
+            for output in self.further.iter_mut().filter(|o| o.open) {
+                output.resumed_until = Some(now + RESUME_STARVE);
+            }
+        } else {
             // The writers close while the master reopens, and hear of its
             // new configuration once it is open.
             for output in &mut self.further {
@@ -2208,10 +2219,19 @@ impl Control {
     }
 
     /// Logs what the further outputs' writers report.
-    fn further_events(&mut self) {
+    fn further_events(&mut self, now: Instant) {
         for output in &mut self.further {
             let number = output.number();
             while let Some(event) = output.writer.event() {
+                let resuming = output.resumed_until.is_some_and(|until| now <= until);
+                if resuming && matches!(event, FurtherEvent::Starved { .. }) {
+                    output.resumed_until = None;
+                    eprintln!(
+                        "aas: output {number} starved while the master's card opened, \
+                         it primes again"
+                    );
+                    continue;
+                }
                 let line = event_line(number, event).or_else(|| output.log.line(number, event));
                 if let Some(line) = line {
                     eprintln!("{line}");
@@ -2423,7 +2443,7 @@ impl Control {
             }
         }
         self.send(batch);
-        self.further_events();
+        self.further_events(now);
     }
 
     /// Applies what is due by the clock: a settled rate change, the end of
@@ -4863,6 +4883,31 @@ mod tests {
         assert!(has(&engine.take(true), "Reconfigure 48000"));
         control.handle_events(now + s(6));
         assert_eq!(logs[0].take(), ["reconfigure 48000 48000 256", "open true"]);
+    }
+
+    #[test]
+    fn a_starve_as_the_masters_card_opens_under_the_parked_cycle_is_one_line() {
+        let (mut control, mut engine, logs, now) = master_off_with(&[Idle::Zeros]);
+        let s = Duration::from_secs;
+        control.tick(now + s(2));
+        engine.take(true);
+        play(&mut control, 1, 48000, now + s(3));
+        engine.take(true);
+        let starve = |at_ms| FurtherEvent::Starved {
+            at_ms,
+            fill: 0,
+            limit: 1024,
+        };
+        logs[0].events.lock().unwrap().push_back(starve(3000));
+        control.handle_events(now + s(3));
+        // Taken as the open's, outside the count: the log still has all ten
+        // lines before it goes to one a minute.
+        assert_eq!(control.further[0].log.lines, 0);
+        assert!(control.further[0].resumed_until.is_none());
+        // A second, later, is an ordinary starve.
+        logs[0].events.lock().unwrap().push_back(starve(5000));
+        control.handle_events(now + s(5));
+        assert_eq!(control.further[0].log.lines, 1);
     }
 
     #[test]
