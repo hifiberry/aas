@@ -314,15 +314,15 @@ How it works *(call)*:
   line cannot swallow it, and a closing master empties the line.
 - The feed holds what the target leaves to it, two card periods and two
   master periods, and at least four master periods. The writer takes a whole
-  card period at once, and only after it has resampled: a feed sized by the
-  target alone overflowed every 2.4 s on the Pi 3 test board at 96 kHz, where
-  the writer spent 9.5 ms resampling each period of 21.3 ms. A further output whose
+  card period at once, and only after it has resampled, so a feed sized by
+  the target alone overflowed on a slow board (`doc/measurements.md`, Stage
+  3b, part 2, "Hour runs with a further output"). A further output whose
   `latency_ms` is so much shorter than the master's that the drift could not
   believe a full feed stops the daemon at startup, with a message naming the
   output.
-- A card that cannot run its period counts xruns and stays silent. `snd-aloop`
-  needs about 48 ms: at the 4 ms default on the CM5 it counted 4748 xruns and
-  played nothing. Set that output's `latency_ms`. The master's delay
+- A card that cannot run its period counts xruns and stays silent.
+  `snd-aloop` needs about 48 ms, and at the 4 ms default it plays nothing.
+  Set that output's `latency_ms`. The master's delay
   follows the slowest output, so one such card makes every output late (see
   Latency).
 - Without further outputs the master's samples are bit for bit what they
@@ -681,7 +681,7 @@ The `Master` control moves every output together. The owner decided this on
 `[[output]]` table, from -60 to 0 dB and 0 by default, so it plays at the
 `Master` level plus its offset. A further output's volume is always
 calculated in software, also in forced bit-perfect; its card's own mixer is
-left alone *(call)*. At 0 a further output is silent.
+left alone *(call)*. With `Master` at 0 a further output is silent too.
 
 In forced bit-perfect mode `aas` never touches the master's samples, so the
 volume stops at the control's lowest level. On a card whose

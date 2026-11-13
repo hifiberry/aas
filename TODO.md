@@ -158,9 +158,10 @@ Two outputs naming the same card are refused at startup, by resolving each
 name to the kernel's card index (`distinct_cards` in `src/sink_alsa.rs`). A
 card that is not there at startup cannot be told, and passes, so two
 outputs may later try to play to one card. Missing: the
-decision whether a card found later is checked too. First step: call
-`distinct_cards` when a card is found, in `src/server.rs`, and decide what
-the later of the two outputs does then.
+decision whether a card found later is checked too. First step: find where
+a further card's search reports a card found, call `distinct_cards` there as
+`src/main.rs` does at startup, and decide what the later of the two outputs
+does then.
 
 ## Let the capture PCM ask for the daemon's rate without a stream
 
@@ -391,16 +392,60 @@ Found in the stage 3b part 2 reviews and left, each with the reason. None of
 them was seen to break playback. Search for the name given.
 
 - `src/engine.rs`, `holds_sound`: a change of the master's delay reads the
-  whole delay line once, up to about 27,600 frames times the channels, to
-  see whether it holds sound. Bounded, and only at a change of the delay. On
-  the Pi 3, twelve rate changes in silence showed no longer worst cycle with
-  it (`doc/measurements.md`, Stage 3b, part 2, "Processing cost on the
-  Pi 3"). Fix if it shows: keep a count of the sound in the line as it is
-  written.
-- `src/sink_alsa.rs`, `recover`: a restart that succeeds and fails again at
-  once is not followed by a sleep, so a card that does that could spin the
-  thread that plays to it. No real case was found. After a restart that
-  fails the thread sleeps a period (`rest`), which for the master is on the
-  audio thread; that is bounded.
-- `src/sink_alsa.rs`, the xrun count: one underrun of the master may be
-  counted twice. Cosmetic: the count is too high, never too low.
+  delay line once, in silence to its end, to see whether it holds sound. The
+  line is made as long as the config can need: about 27,600 frames, times
+  the channels, for a further output at `latency_ms = 48`. Bounded, and only
+  at a change of the delay. On the Pi 3, twelve rate changes in silence, with
+  delays up to 13887 frames at 192 kHz, showed no longer worst cycle with it
+  (`doc/measurements.md`, Stage 3b, part 2, "Processing cost on the Pi 3").
+  First step, if it ever shows: keep a count of the sound in the line as it
+  is written, and drop the scan.
+- `src/sink_alsa.rs`, `AlsaSink::io_failed`: after an xrun, a restart that
+  succeeds returns at once, with no sleep (the `Ok(()) => SinkError::Xrun`
+  arm). A card that took the restart and failed again at the next wait would
+  be restarted at every cycle. The restart writes the whole buffer of zeros,
+  which the card has to play, so it is paced, and no real case was found.
+  After a restart that fails, the thread sleeps a period (`rest`), which for
+  the master is the audio thread; that is bounded. First step: count
+  restarts in a row in `io_failed` and rest after the second.
+- `src/engine.rs`, the xrun count: when the master's wait finds an underrun,
+  `Engine::wait_room` counts an xrun and `AlsaSink::io_failed` restarts the
+  card; the cycle then goes on to its write, and if that write fails too
+  before the restarted card runs, `render` counts a second. So one underrun
+  may count twice. Cosmetic: the count is too high, never too low. First
+  step: a sink test that fails the wait and then the write once each, and a
+  decision whether the write after a failed wait counts.
+- `src/resample.rs`, `Resampler::delay_frames`: the clients' resampler
+  reports rubato's `output_delay`, about one output frame more than where a
+  step lands, as the adaptive resampler's own measurement found. It matters
+  only for the delay reported to clients. First step: measure it as
+  `Adaptive::delay_frames` was in `src/adaptive.rs` and subtract the frame.
+- `src/drift.rs`, `Drift::update`: a reading skipped as not believable does
+  not add to `missed`, as `Drift::pass` does for a withheld one, so the next
+  reading's change of the delay spans two periods and is taken as one, and
+  the estimate gets that step's slope twice. Negligible while locked, where
+  the slope is near 0, and the estimate averages it out. First step: count
+  the skip in `missed` too, with a test of the estimate across a skip.
+- `src/further.rs`, the drift's readings: with the master and the writer at
+  the same period, and the writer's read just before the master's push, up
+  to about half the readings can be withheld as overdue for minutes. The
+  controller keeps running on the rest. None was seen on the boards. Such
+  readings go to `Drift::pass` and are not in the stop line's skipped count.
+  First step: a simulated run at equal periods with that phase held
+  constant, counting the withheld readings.
+- `src/config.rs`, `an_output_takes_idle_and_channels_by_the_flat_rules`: the
+  unknown-key case of an `[[output]]` table is the test's last assertion and
+  checks only `is_err()`, not the message. First step: a test of its own
+  that checks the message names the output and the key.
+- `src/engine.rs`: no test shuts the engine down with sound in the delay
+  line. `Command::Shutdown` takes the same path as `CloseOutput`, which
+  `closing_fades_what_the_delay_line_holds` covers. First step: the same test
+  with `Shutdown`.
+- `tests/server.rs`, `a_lost_further_card_is_looked_for_every_second`: it
+  sleeps 3.5 s and accepts 2 to 5 looks, which is slow and depends on the
+  host's load. First step: wait for the second look, then check the count
+  within a bound.
+- `src/further.rs`, `a_lost_further_output_never_stalls_the_master`: it runs
+  a real writer thread and allows at most 5 refused pushes over about
+  0.8 s, so it can fail on a loaded host. First step: run it on a test clock,
+  as the writer's other tests do, or widen the bound with a reason.
