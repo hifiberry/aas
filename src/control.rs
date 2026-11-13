@@ -304,6 +304,48 @@ pub fn card_rate(rates: &[u32], master_rate: u32) -> u32 {
     nearest.copied().unwrap_or(master_rate)
 }
 
+/// How the master misses the time the further outputs play at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Misaligned {
+    /// The delay line holds `capacity` frames, not the `wanted`: the
+    /// master plays ahead.
+    Ahead { capacity: u32, wanted: u32 },
+    /// The master's own buffer is `frames` longer than the target: the
+    /// further outputs play ahead of it.
+    Behind { frames: u32 },
+}
+
+impl Misaligned {
+    pub fn line(self) -> String {
+        match self {
+            Misaligned::Ahead { capacity, wanted } => format!(
+                "aas: warning: the master can be held back by {capacity} frames, \
+                 not {wanted}: it plays ahead of the other outputs"
+            ),
+            Misaligned::Behind { frames } => format!(
+                "aas: warning: the master's own buffer is {frames} frames longer than \
+                 the delay the other outputs are held at: they play ahead of it"
+            ),
+        }
+    }
+}
+
+/// What the master's delay line holds for the alignment `target` at the
+/// master's `period`, with a line of `capacity` frames: the target less
+/// the master's own buffer. With how the master misses the time, if the
+/// line cannot hold that.
+pub fn master_delay(target: u32, period: u32, capacity: u32) -> (u32, Option<Misaligned>) {
+    let own = PERIODS * period;
+    let Some(wanted) = target.checked_sub(own) else {
+        let frames = own - target;
+        return (0, Some(Misaligned::Behind { frames }));
+    };
+    if wanted > capacity {
+        return (capacity, Some(Misaligned::Ahead { capacity, wanted }));
+    }
+    (wanted, None)
+}
+
 /// The line logged for an event of further output `number`, if any.
 /// Starves, overflows and the clamp are logged through an `OutputLog`.
 pub fn event_line(number: usize, event: FurtherEvent) -> Option<String> {
@@ -815,6 +857,9 @@ pub struct Control {
     delay_capacity: u32,
     /// The delay line was found too short, and that has been logged.
     delay_warned: bool,
+    /// The master's own buffer was found longer than the target, and that
+    /// has been logged.
+    behind_warned: bool,
 }
 
 impl Control {
@@ -876,6 +921,7 @@ impl Control {
             target: None,
             delay_capacity: 0,
             delay_warned: false,
+            behind_warned: false,
         }
     }
 
@@ -2010,17 +2056,17 @@ impl Control {
             return;
         }
         self.target = Some(target);
-        let mut delay = target.saturating_sub(PERIODS * period);
-        if delay > self.delay_capacity {
-            // Only a rate between the standard ones can get here.
-            if !std::mem::replace(&mut self.delay_warned, true) {
-                eprintln!(
-                    "aas: warning: the master can be held back by {} frames, not {delay}: \
-                     it plays ahead of the other outputs",
-                    self.delay_capacity
-                );
+        // Only a rate between the standard ones, or below 44.1 kHz, can
+        // miss: `check_alignment` rules it out for the others.
+        let (delay, missed) = master_delay(target, period, self.delay_capacity);
+        if let Some(missed) = missed {
+            let warned = match missed {
+                Misaligned::Ahead { .. } => &mut self.delay_warned,
+                Misaligned::Behind { .. } => &mut self.behind_warned,
+            };
+            if !std::mem::replace(warned, true) {
+                eprintln!("{}", missed.line());
             }
-            delay = self.delay_capacity;
         }
         if self.delay != Some(delay) {
             self.delay = Some(delay);
@@ -4738,6 +4784,32 @@ mod tests {
         };
         assert_eq!(line(starve), None);
         assert_eq!(line(FurtherEvent::Clamped { at_ms: 1 }), None);
+    }
+
+    #[test]
+    fn the_masters_delay_says_when_the_master_cannot_be_in_time() {
+        // Target less the master's two periods, within the line.
+        assert_eq!(master_delay(1000, 256, 2000), (488, None));
+        assert_eq!(master_delay(512, 256, 2000), (0, None));
+        // A further path shorter than the master's own buffer.
+        let (delay, missed) = master_delay(400, 256, 2000);
+        assert_eq!(
+            (delay, missed),
+            (0, Some(Misaligned::Behind { frames: 112 }))
+        );
+        assert_eq!(
+            missed.unwrap().line(),
+            "aas: warning: the master's own buffer is 112 frames longer than the delay \
+             the other outputs are held at: they play ahead of it"
+        );
+        // A line too short.
+        let (delay, missed) = master_delay(3000, 256, 2000);
+        let ahead = Misaligned::Ahead {
+            capacity: 2000,
+            wanted: 2488,
+        };
+        assert_eq!((delay, missed), (2000, Some(ahead)));
+        assert!(ahead.line().contains("held back by 2000 frames, not 2488"));
     }
 
     #[test]
