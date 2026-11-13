@@ -2000,6 +2000,38 @@ the read is not visible against the rest of a cycle. The loopback output
 counted 1 and 4 overflows over the twelve rate changes, and did not lock,
 since no rate lasted the 5 s a lock takes.
 
+### The master off while a further output plays on
+
+Measured on the CM5 with the first build of the parked cycle, before the
+silence that makes up the open's step (`doc/design.md`, Several outputs). The
+master was the DAC at `latency_ms = 48`, `idle = "off"` after 5 s; the further
+output `snd-aloop` at `latency_ms = 48`, which here takes only 48 kHz, so it
+resampled from 44.1 kHz. A 997 Hz tone played 20 s, stopped 30 s, played 20 s,
+with the loopback captured throughout; two runs.
+
+- The master's card was closed from about 1.2 s after the "off" line to the
+  next play; the loopback ran throughout. The capture was digital silence
+  between the tones, with no click at either edge.
+- The further output counted no xrun, starve or overflow, and kept its lock
+  over the park and the open.
+- Opening the card under the parked cycle stalled it about 3.2 to 3.4 ms:
+  the worst cycle of each run was 3.42 ms and the worst gap 26.43 ms against
+  23.26 ms. The open is the only candidate for both.
+- After each open the tone on the loopback rose from 997.0 to 999.0 Hz,
+  about +2000 ppm, from about 2.2 s after the open, and was back within
+  about 12 s. That was the step in the feeds' pace, taken as drift.
+- With the silence added at the open, two more runs: over the 15 s after
+  each open the tone stayed between 996.97 and 997.04 Hz, at most +40 ppm
+  against +2000 before. The further output again counted no xrun, starve or
+  overflow and kept its lock; the worst cycle was 3.42 ms and the worst gap
+  23.57 and 23.27 ms, no longer above the normal gap.
+- With the further output on `idle = "off"` and a delay of 15 s, it closed
+  15 s after the source stopped, 10 s after the master, and the cycle then
+  stopped. At the next play it reopened and locked again in 5 s, as from
+  closed, with no excursion of the tone.
+- Without further outputs the log was line for line that of the build
+  before.
+
 ### What these figures do not show
 
 - No board has a second real card, so the further output is `snd-aloop`, a

@@ -1414,6 +1414,10 @@ mod tests {
         gone: bool,
         wake_jitter: Lcg,
         opens: usize,
+        /// How much later than its clock the master pushes from now on, ns.
+        late_ns: u64,
+        /// Frames of silence the master pushes ahead of its next period.
+        pad: u32,
     }
 
     impl World {
@@ -1440,6 +1444,8 @@ mod tests {
                 gone: false,
                 wake_jitter: Lcg(0xfeed),
                 opens: 0,
+                late_ns: 0,
+                pad: 0,
             };
             world.schedule();
             world
@@ -1463,7 +1469,7 @@ mod tests {
             let nominal =
                 self.periods as f64 * self.sim.master_period as f64 * 1e9 / self.master_rate();
             let range = self.sim.push_late_us;
-            let late = self.push_jitter.between(range) * 1e3;
+            let late = self.push_jitter.between(range) * 1e3 + self.late_ns as f64;
             // A late push delays the next: they never overtake each other.
             self.push_at = ((nominal + late) as u64).max(self.push_at);
         }
@@ -1473,6 +1479,10 @@ mod tests {
             while self.push_at <= t {
                 self.set_now(self.push_at);
                 if let Source::Dc(value) = self.source {
+                    let pad = std::mem::take(&mut self.pad);
+                    if pad > 0 {
+                        self.feed.as_mut().unwrap().silence(pad);
+                    }
                     self.period.fill(value);
                     if self.skip > 0 {
                         self.skip -= 1;
@@ -2163,6 +2173,55 @@ mod tests {
             .filter(|e| matches!(e, FurtherEvent::Starved { .. }));
         assert_eq!(starved.count(), 1, "{events:?}");
         assert!(!events.contains(&FurtherEvent::Unlocked), "{events:?}");
+    }
+
+    /// How far the ratio moves, ppm, over the 15 s after the master's pace
+    /// steps `step_us` later, as when its card opens under a parked cycle,
+    /// with the step's frames pushed as silence ahead of the next period
+    /// if `padded`, as the engine does then.
+    fn ratio_over_a_step(step_us: u64, padded: bool) -> f64 {
+        // The CM5 test board's master: 48 ms at 44.1 kHz.
+        let mut sim = Sim::new(44_100, 1058, 48_000, 1152);
+        sim.ppm = -20.0;
+        let mut rig = Rig::new(sim);
+        rig.world().source = Source::Dc(1 << 20);
+        rig.run_until(60.0);
+        assert!(rig.counters.locked.load(Relaxed));
+        let before = rig.writer.ratio();
+        {
+            let mut world = rig.world();
+            world.late_ns = step_us * 1000;
+            world.push_at += step_us * 1000;
+            if padded {
+                world.pad = (step_us as f64 * 44_100.0 / 1e6).round() as u32;
+            }
+        }
+        let start = rig.seconds();
+        let mut moved = 0.0f64;
+        while rig.seconds() < start + 15.0 {
+            rig.cycle();
+            moved = moved.max((rig.writer.ratio() - before).abs() * 1e6);
+        }
+        assert!(rig.counters.locked.load(Relaxed));
+        moved
+    }
+
+    #[test]
+    fn a_step_in_the_masters_pace_made_up_with_silence_leaves_the_ratio_still() {
+        // The open of the CM5 test board's card under a parked cycle took
+        // 3.4 ms; before the pad, the step was most of a master period.
+        let padded = ratio_over_a_step(3400, true);
+        let bare = ratio_over_a_step(3400, false);
+        let period = ratio_over_a_step(20_000, false);
+        eprintln!(
+            "the ratio moved {padded:.1} ppm with the pad, {bare:.1} without, \
+             {period:.1} for a step of 20 ms"
+        );
+        assert!(padded < 5.0, "the ratio moved {padded:.1} ppm");
+        assert!(
+            bare > 10.0 * padded.max(1.0),
+            "{bare:.1} ppm without the pad"
+        );
     }
 
     /// A card `ppm` from the master on a feed made as the daemon makes it,

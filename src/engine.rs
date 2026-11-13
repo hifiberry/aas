@@ -23,7 +23,7 @@ use crate::output_mix::{OutputMix, Routing};
 use crate::plugin::chain::Chain;
 use crate::rate::ClientId;
 use crate::resample::Resampler;
-use crate::sink::{Sink, SinkError};
+use crate::sink::{NullSink, Sink, SinkError};
 use aas_client::ring::Ring;
 use rtrb::{Consumer, Producer, PushError};
 use std::any::Any;
@@ -926,6 +926,15 @@ pub enum Command {
         period: u32,
     },
     CloseOutput,
+    /// Closes the master's card but keeps the cycle going at `rate` and
+    /// `period` on a timed null sink, which feeds the further outputs that
+    /// their own idle rules keep open. A `Reconfigure` opens the card again
+    /// and a `CloseOutput` ends the cycle. Nothing is delivered to the
+    /// recorders meanwhile, as when the output is closed.
+    ParkOutput {
+        rate: u32,
+        period: u32,
+    },
     /// The gain of an output, 0 being the master. Fades over 10 ms from
     /// the current level. One for an output that is not there is ignored.
     SetGain(usize, f32),
@@ -1290,7 +1299,17 @@ pub struct Engine<P: Processing, S: Sink> {
     taps: Taps,
     rate: u32,
     period: usize,
+    /// The cycle runs: the sink is open, or the cycle is parked.
     open: bool,
+    /// The card is closed and the cycle runs on `timer`, for the further
+    /// outputs.
+    parked: bool,
+    /// Keeps time like the card while the cycle is parked.
+    timer: NullSink,
+    /// Frames of silence each further output gets ahead of the next period:
+    /// how much later than the timer's the card's pace runs after it opened
+    /// under a parked cycle.
+    pad: u32,
     /// A format waiting to be opened.
     reopen: Option<(u32, u32)>,
     /// The fade for a queued `Reconfigure` has been played.
@@ -1343,6 +1362,9 @@ impl<P: Processing, S: Sink> Engine<P, S> {
             rate: 0,
             period: 0,
             open: false,
+            parked: false,
+            timer: NullSink::new(channels),
+            pad: 0,
             reopen: None,
             faded: false,
             stopped: false,
@@ -1351,8 +1373,9 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         }
     }
 
-    /// True while there is no open sink. `cycle` then returns at once, so the
-    /// caller must wait for a command rather than call it in a loop.
+    /// True while there is no open sink and no parked cycle. `cycle` then
+    /// returns at once, so the caller must wait for a command rather than
+    /// call it in a loop.
     pub fn is_closed(&self) -> bool {
         !self.open
     }
@@ -1460,6 +1483,9 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         if !self.open {
             return Ok(());
         }
+        if self.parked {
+            return self.timer.wait_room();
+        }
         let waited = self.sink.wait_room();
         if waited == Err(SinkError::Xrun) {
             self.counters.xruns.fetch_add(1, Ordering::Relaxed);
@@ -1501,7 +1527,9 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         for command in first.iter().chain(second) {
             match command {
                 Command::Reconfigure { .. } => reconfigure = true,
-                Command::CloseOutput | Command::Shutdown => close = true,
+                Command::CloseOutput | Command::ParkOutput { .. } | Command::Shutdown => {
+                    close = true;
+                }
                 _ => {}
             }
         }
@@ -1549,6 +1577,7 @@ impl<P: Processing, S: Sink> Engine<P, S> {
                 self.cancel_reopen();
                 self.close();
             }
+            Command::ParkOutput { rate, period } => self.park(rate, period),
             Command::SetGain(output, gain) => self.set_gain(output, gain),
             Command::Grow(table) => self.grow(table),
             Command::SetChain(target, mut chain) => {
@@ -1758,10 +1787,12 @@ impl<P: Processing, S: Sink> Engine<P, S> {
                 c.close();
             }
         }
-        if self.open {
+        if self.open && !self.parked {
             self.sink.close();
-            self.open = false;
         }
+        self.open = false;
+        self.parked = false;
+        self.pad = 0;
         for mix in self.mixes_mut() {
             mix.finish_fade();
             mix.finish_ramp();
@@ -1770,12 +1801,51 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         self.delay.clear();
     }
 
+    /// Closes the card and runs the cycle on the timer, as
+    /// `Command::ParkOutput` says. The timer starts with what the card still
+    /// held, so the further outputs' feeds keep the pace the card set. The
+    /// timer keeps `PERIODS` periods, as the card is asked to: what a card
+    /// granted beyond that it holds back from the seed, since the card's
+    /// wait returns that much earlier.
+    fn park(&mut self, rate: u32, period: u32) {
+        self.cancel_reopen();
+        let queued = match (self.open && !self.parked, self.sink.delay_now()) {
+            (true, Ok(frames)) => {
+                let kept = PERIODS * self.period as u32;
+                let beyond = self
+                    .sink
+                    .granted()
+                    .map_or(0, |(_, b)| b.saturating_sub(kept));
+                frames.saturating_sub(beyond)
+            }
+            _ => 0,
+        };
+        // Read with the queue: the close takes time the card would have
+        // played.
+        let at = Instant::now();
+        self.close();
+        let period = period.min(MAX_PERIOD);
+        self.timer.open_queued(rate, period, queued, at);
+        self.open = true;
+        self.parked = true;
+        self.rate = rate;
+        for mix in self.mixes_mut() {
+            mix.reopened(rate);
+        }
+        self.period = period as usize;
+        self.last_start = None;
+    }
+
     fn apply_reopen(&mut self) -> Result<(), SinkError> {
         let Some((rate, period)) = self.reopen else {
             return Ok(());
         };
+        let resumed = self.parked && (rate, period as usize) == (self.rate, self.period);
         self.close();
         self.sink.open(rate, period)?;
+        if resumed {
+            self.pad = self.prefill(period as usize);
+        }
         self.reopen = None;
         self.open = true;
         self.rate = rate;
@@ -1786,6 +1856,46 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         self.last_start = None;
         self.emit(Event::Reconfigured);
         Ok(())
+    }
+
+    /// Fills the card just opened under a parked cycle with zeros, so that
+    /// the cycles go on at the pace the timer set, and returns how many
+    /// frames later than the timer's the card's pace still runs, which the
+    /// further outputs' feeds get as silence so that they see no step.
+    ///
+    /// A sink that plays from the first frame gets what the timer still
+    /// holds, and runs on the timer's pace. A card that starts only once its
+    /// buffer is full, as `granted` says it is, as ALSA's do here, gets its
+    /// buffer less a period, which the first period then fills. It starts
+    /// then, and its wait returns a period later, where the timer's would
+    /// have returned once its queue had played: later by the time the open
+    /// took and the timer's wait woke late. The first period follows at
+    /// once, so the card starts about now.
+    fn prefill(&mut self, period: usize) -> u32 {
+        let timer = self.timer.delay_now().unwrap_or(0) as usize;
+        let (frames, later) = match self.sink.granted() {
+            Some((_, buffer)) => {
+                let frames = (buffer as usize).saturating_sub(period);
+                (frames, period.saturating_sub(timer))
+            }
+            None => (timer, 0),
+        };
+        let channels = self.master.channels;
+        let chunk = self.samples.len() / channels;
+        self.samples.fill(0);
+        let mut left = frames;
+        while left > 0 {
+            let n = left.min(chunk);
+            match self.sink.write(&self.samples[..n * channels]) {
+                Err(SinkError::Xrun) => {
+                    self.counters.xruns.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(_) => return 0,
+                Ok(()) => {}
+            }
+            left -= n;
+        }
+        later as u32
     }
 
     /// A change fades only while something is audible, to avoid a click.
@@ -1858,7 +1968,9 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         let plugins = plugins_apply(self.mode);
         self.analog
             .read(self.period, self.rate, &self.counters, store, plugins);
-        self.taps.deliver(&self.analog, self.period);
+        if !self.parked {
+            self.taps.deliver(&self.analog, self.period);
+        }
         self.scan();
         // A ramp with nothing left to hear has nothing to fade.
         let ramping = self.master.ramping()
@@ -1870,6 +1982,13 @@ impl<P: Processing, S: Sink> Engine<P, S> {
             self.master.route_dop();
         }
         self.order_claims();
+        let pad = std::mem::take(&mut self.pad);
+        if pad > 0 {
+            let at = self.stamp();
+            for output in self.further.iter_mut().flatten() {
+                output.feed.silence_at(pad, at);
+            }
+        }
         let (rate, routed) = (self.rate, self.master.dop_routing.is_some());
         let holders = self.table.iter().enumerate();
         let holders = holders.filter(|(_, s)| s.holds_output(rate, routed));
@@ -1898,7 +2017,11 @@ impl<P: Processing, S: Sink> Engine<P, S> {
             self.delay.fade_out(samples);
         }
         let before_write = Instant::now();
-        let result = self.sink.write(samples);
+        let result = if self.parked {
+            self.timer.write(samples)
+        } else {
+            self.sink.write(samples)
+        };
         let after_write = Instant::now();
         if result == Err(SinkError::Xrun) {
             self.counters.xruns.fetch_add(1, Ordering::Relaxed);
@@ -1911,17 +2034,18 @@ impl<P: Processing, S: Sink> Engine<P, S> {
             0
         };
         let held = self.delay.frames as u32;
-        let delay = self
-            .sink
-            .delay_frames()
-            .saturating_add(plugins)
-            .saturating_add(held);
+        let sink_delay = if self.parked {
+            0
+        } else {
+            self.sink.delay_frames()
+        };
+        let delay = sink_delay.saturating_add(plugins).saturating_add(held);
         for source in self.table.iter_mut().filter(|s| s.running) {
             source.notify(delay, rate);
         }
         let work = before_write - start + after_write.elapsed();
         self.record_timing(start, work.as_nanos() as u64);
-        if self.sink.switched() {
+        if !self.parked && self.sink.switched() {
             // The write opened another device. The next cycle has nothing
             // to measure from, as after any open.
             self.last_start = None;
@@ -9385,6 +9509,324 @@ mod tests {
         check::<F64>();
     }
 
+    #[test]
+    fn a_parked_cycle_closes_the_card_and_feeds_the_further_outputs_on_its_timer() {
+        fn check<P: Processing>() {
+            let what = format_of::<P>();
+            let park = Command::ParkOutput {
+                rate: RATE,
+                period: PERIOD as u32,
+            };
+            let mut rig = Rig::<P>::new(BitPerfect::Auto);
+            let mut one = add_output(&mut rig, 1, stereo());
+            rig.cycle();
+            one.take();
+            let written = rig.log.frames().len();
+            // Parked, the card is closed and gets nothing, and the output
+            // gets a period of silence each cycle, which the timer paces.
+            rig.send(park);
+            let start = Instant::now();
+            assert_no_alloc(|| {
+                for _ in 0..8 {
+                    rig.cycle();
+                }
+            });
+            assert!(start.elapsed() >= Duration::from_millis(6), "{what:?}");
+            assert_eq!(rig.log.closes(), 1, "{what:?}");
+            assert!(!rig.engine.is_closed(), "{what:?}");
+            assert_eq!(
+                stereo_frames(&one.take()),
+                frames(0, 8 * PERIOD),
+                "{what:?}"
+            );
+            assert_eq!(rig.log.frames().len(), written, "{what:?}");
+            // A source that starts with the reopen plays on both from its
+            // first frame, and the output never missed a period.
+            let mut a = client(1);
+            a.ring.write(&exact(2 * PERIOD));
+            rig.send(Command::Reconfigure {
+                rate: RATE,
+                period: PERIOD as u32,
+            });
+            rig.add(&mut a);
+            rig.cycle();
+            assert_eq!(stereo_frames(&one.take()), frames(0, PERIOD), "{what:?}");
+            assert_eq!(rig.log.frames().len(), written, "{what:?}");
+            rig.cycle();
+            assert_eq!(rig.log.opens(), [(RATE, PERIOD as u32); 2], "{what:?}");
+            assert!(
+                rig.events()
+                    .iter()
+                    .any(|e| matches!(e, Event::Reconfigured))
+            );
+            assert_eq!(rig.last_periods(1), exact(PERIOD), "{what:?}");
+            assert_eq!(stereo_frames(&one.take()), exact(PERIOD), "{what:?}");
+            // Parked again, a close ends the cycle without closing the
+            // card twice.
+            rig.send(Command::SetRunning(1, false));
+            rig.send(Command::ParkOutput {
+                rate: RATE,
+                period: PERIOD as u32,
+            });
+            rig.cycle();
+            rig.cycle();
+            assert_eq!(rig.log.closes(), 2, "{what:?}");
+            rig.send(Command::CloseOutput);
+            rig.cycle();
+            assert!(rig.engine.is_closed(), "{what:?}");
+            assert_eq!(rig.log.closes(), 2, "{what:?}");
+        }
+        check::<I32>();
+        check::<F32>();
+        check::<F64>();
+    }
+
+    /// A card as ALSA runs it for the master: it holds `buffer` frames,
+    /// starts once they are all written, then plays in real time. Its wait
+    /// returns once there is room for an engine period. A wait that could
+    /// only return once it plays, on a card that has not started, panics:
+    /// a real card would hang there. Opening it takes 3.4 ms, as the CM5
+    /// test board's card took to open under a parked cycle.
+    struct ThresholdCard {
+        rate: u32,
+        period: u32,
+        buffer: u32,
+        written: u64,
+        /// When it started, and what it had been written then.
+        started: Option<(Instant, u64)>,
+    }
+
+    impl ThresholdCard {
+        fn new(buffer_periods: u32) -> ThresholdCard {
+            ThresholdCard {
+                rate: 0,
+                period: 0,
+                buffer: buffer_periods,
+                written: 0,
+                started: None,
+            }
+        }
+
+        fn queued(&self) -> u64 {
+            let Some((at, _)) = self.started else {
+                return self.written;
+            };
+            let played = at.elapsed().as_nanos() as u64 * u64::from(self.rate) / 1_000_000_000;
+            self.written.saturating_sub(played)
+        }
+    }
+
+    impl Sink for ThresholdCard {
+        fn open(&mut self, rate: u32, period: u32) -> Result<(), SinkError> {
+            std::thread::sleep(Duration::from_micros(3400));
+            // `buffer` holds the periods until the first open.
+            let periods = if self.rate == 0 {
+                self.buffer
+            } else {
+                self.buffer / self.period
+            };
+            *self = ThresholdCard {
+                rate,
+                period,
+                buffer: periods * period,
+                written: 0,
+                started: None,
+            };
+            Ok(())
+        }
+
+        fn wait_room(&mut self) -> Result<(), SinkError> {
+            let most = u64::from(self.buffer - self.period);
+            if self.queued() <= most {
+                return Ok(());
+            }
+            assert!(self.started.is_some(), "waits on a card that never starts");
+            while self.queued() > most {
+                std::thread::sleep(Duration::from_micros(50));
+            }
+            Ok(())
+        }
+
+        fn write(&mut self, samples: &[i32]) -> Result<(), SinkError> {
+            let frames = (samples.len() / 2) as u64;
+            assert!(
+                self.queued() + frames <= u64::from(self.buffer),
+                "overfilled"
+            );
+            self.written += frames;
+            if self.started.is_none() && self.written >= u64::from(self.buffer) {
+                self.started = Some((Instant::now(), 0));
+            }
+            Ok(())
+        }
+
+        fn channels(&self) -> usize {
+            2
+        }
+
+        fn close(&mut self) {}
+
+        fn delay_frames(&self) -> u32 {
+            self.buffer
+        }
+
+        fn delay_now(&mut self) -> Result<u32, SinkError> {
+            Ok(self.queued() as u32)
+        }
+
+        fn supported_rates(&self) -> Vec<u32> {
+            Vec::new()
+        }
+
+        fn granted(&self) -> Option<(u32, u32)> {
+            Some((self.period, self.buffer))
+        }
+    }
+
+    /// The step, in frames, in the pace of a further output's pushes when
+    /// the master parks and when its card opens again under the parked
+    /// cycle, playing to `sink`. Each is the median of where a push came
+    /// against the frames pushed, after the change less before it.
+    fn steps_over_park_and_resume<S: Sink>(sink: S) -> (f64, f64) {
+        const SLOW: u32 = 480;
+        let (mut commands, consumer) = RingBuffer::new(64);
+        let (producer, _events) = RingBuffer::new(1024);
+        let mut engine = Engine::<F32, _>::new(
+            sink,
+            consumer,
+            producer,
+            Arc::new(Counters::default()),
+            BitPerfect::Auto,
+            Matrix::default_for(2),
+            0,
+        );
+        let (feed, mut probe) = FeedProbe::new(2, 16 * SLOW as usize);
+        let mix = OutputMix::<F32>::new(stereo(), 2, false, MAX_PERIOD as usize);
+        let mut send = |command| assert!(commands.push(command).is_ok());
+        send(Command::AddOutput(1, Box::new(mix), feed));
+        send(Command::Reconfigure {
+            rate: RATE,
+            period: SLOW,
+        });
+        let ns_per_frame = 1e9 / f64::from(RATE);
+        let segment = |engine: &mut Engine<F32, _>, probe: &mut FeedProbe| {
+            let mut phases = Vec::new();
+            for cycle in 0..24 {
+                engine.cycle().unwrap();
+                probe.discard();
+                let (frames, at_ns) = probe.last_push();
+                // The first cycles of each run settle.
+                if cycle >= 8 {
+                    phases.push(at_ns as f64 - frames as f64 * ns_per_frame);
+                }
+            }
+            phases.sort_by(f64::total_cmp);
+            phases[phases.len() / 2]
+        };
+        let before = segment(&mut engine, &mut probe);
+        send(Command::ParkOutput {
+            rate: RATE,
+            period: SLOW,
+        });
+        let parked = segment(&mut engine, &mut probe);
+        send(Command::Reconfigure {
+            rate: RATE,
+            period: SLOW,
+        });
+        let after = segment(&mut engine, &mut probe);
+        (
+            (parked - before) / ns_per_frame,
+            (after - parked) / ns_per_frame,
+        )
+    }
+
+    #[test]
+    fn the_feeds_keep_their_pace_when_the_master_parks_and_opens_again() {
+        let cards: [(&str, Box<dyn Sink>); 3] = [
+            ("a paced sink", Box::new(MemorySink::paced())),
+            ("a card of two periods", Box::new(ThresholdCard::new(2))),
+            ("a card of three periods", Box::new(ThresholdCard::new(3))),
+        ];
+        for (what, sink) in cards {
+            let (park, resume) = steps_over_park_and_resume(sink);
+            eprintln!("{what}: {park:+.1} frames at the park, {resume:+.1} at the open");
+            // A period is 480 frames, and the open used to step the pace by
+            // most of one. What is left is a wake-up's lateness, the same
+            // jitter every push carries.
+            assert!(park.abs() < 48.0, "{what}: {park:+.1} frames at the park");
+            assert!(
+                resume.abs() < 48.0,
+                "{what}: {resume:+.1} frames at the open"
+            );
+        }
+    }
+
+    #[test]
+    fn a_park_and_a_reopen_in_one_cycle_close_and_open_the_card_once_each() {
+        let mut rig = Rig::<F32>::new(BitPerfect::Auto);
+        let mut one = add_output(&mut rig, 1, stereo());
+        rig.cycle();
+        one.take();
+        // The control thread parks, and a player starts before the audio
+        // thread has read it.
+        let mut a = client(1);
+        a.ring.write(&exact(2 * PERIOD));
+        let format = (RATE, PERIOD as u32);
+        rig.send(Command::ParkOutput {
+            rate: format.0,
+            period: format.1,
+        });
+        rig.send(Command::Reconfigure {
+            rate: format.0,
+            period: format.1,
+        });
+        rig.add(&mut a);
+        // The fade for the reopen, then the park, the open and the period.
+        rig.cycle();
+        rig.cycle();
+        assert_eq!(rig.log.closes(), 1);
+        assert_eq!(rig.log.opens(), [format; 2]);
+        assert!(!rig.engine.parked);
+        assert_eq!(rig.last_periods(1), exact(PERIOD));
+        let got = stereo_frames(&one.take());
+        assert_eq!(got[got.len() - PERIOD..], exact(PERIOD)[..]);
+    }
+
+    #[test]
+    fn a_shutdown_while_parked_closes_nothing_again() {
+        let mut rig = Rig::<F32>::new(BitPerfect::Auto);
+        let _one = add_output(&mut rig, 1, stereo());
+        rig.send(Command::ParkOutput {
+            rate: RATE,
+            period: PERIOD as u32,
+        });
+        rig.cycle();
+        rig.cycle();
+        assert_eq!(rig.log.closes(), 1);
+        rig.send(Command::Shutdown);
+        rig.cycle();
+        assert!(rig.engine.is_stopped());
+        assert!(rig.engine.is_closed());
+        assert_eq!(rig.log.closes(), 1);
+    }
+
+    #[test]
+    fn a_parked_cycle_delivers_nothing_to_the_recorders() {
+        let mut rig = Rig::<F32>::new(BitPerfect::Auto);
+        let _one = add_output(&mut rig, 1, stereo());
+        let recorder = add_tap(&mut rig, 5);
+        rig.cycle();
+        assert_eq!(recorder.take(), frames(0, PERIOD));
+        rig.send(Command::ParkOutput {
+            rate: RATE,
+            period: PERIOD as u32,
+        });
+        for _ in 0..4 {
+            rig.cycle();
+        }
+        assert!(recorder.take().is_empty());
+    }
+
     /// Takes a millisecond over each block, and leaves it as it is.
     struct Slow;
 
@@ -9992,12 +10434,16 @@ mod tests {
         // word scaled by a fade is none of these.
         let valid = |f: &[i32; 2]| words.contains(f) || f[1] == -f[0] && f[0].abs() <= 1 << 20;
         type Make = fn() -> Command;
-        let commands: [(&str, Make); 4] = [
+        let commands: [(&str, Make); 5] = [
             ("reconfigure", || Command::Reconfigure {
                 rate: RATE,
                 period: PERIOD as u32,
             }),
             ("close", || Command::CloseOutput),
+            ("park", || Command::ParkOutput {
+                rate: RATE,
+                period: PERIOD as u32,
+            }),
             ("shutdown", || Command::Shutdown),
             ("delay", || Command::SetDelay(100)),
         ];

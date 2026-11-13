@@ -396,11 +396,52 @@ Idle, failure and DoP with several outputs:
   rule counts: a running client, or the analog input with signal. The analog
   input being enabled keeps the master open, not a further output.
 - Each output follows its own idle rule; the owner decided this. When the
-  master goes off, a further output with `idle = "zeros"` stays open and
-  gets silence. Not built yet: today every further output closes with the
-  master (`TODO.md`).
+  master goes off by its idle rule while a further output's own rule keeps
+  it open, `idle = "zeros"`, or `idle = "off"` with its delay not run out,
+  the master's card is closed, so it is free and may power down, and the
+  cycle runs on at the master's rate and period on a timed null sink, as
+  for a lost master. The null sink starts with what the card still held,
+  so the feeds keep the pace the card set *(call)*. The further outputs
+  get silence and are neither closed nor reconfigured. A line after the
+  master's own says its card is closed and how many other outputs keep
+  running. Recorders get nothing meanwhile, as with the master closed.
+- A further output with `idle = "off"` closes after its own delay, counted
+  from when the last source stopped, so one with a longer delay than the
+  master's now outlives it. Once no further output is open the cycle stops.
+  With no further output, or every one off by the master's delay or
+  sooner, the master closes and the cycle stops as before.
+- A source at the rate the cycle runs at opens the master's card under the
+  running cycle *(call)*. The further outputs are not touched, and their
+  feeds keep the pace the timer set *(call)*. The card's queue goes on from
+  the timer's: a sink that plays from the first frame is filled with zeros
+  for what the timer still holds; an ALSA card, which starts only once its
+  buffer is full, is filled to its buffer less a period, and the first
+  period starts it. That card's pace then runs later than the timer's by
+  the time the open took, and the further outputs' feeds get that many
+  frames of silence ahead of the next period, which puts them on the
+  card's pace without a step. On the CM5 test board the open stalled the
+  cycle about 3.4 ms, at `latency_ms = 48`, with no starve
+  (`doc/measurements.md`, Stage 3b, part 2, "The master off while a
+  further output plays on"). The open stays on the audio thread. An open
+  slower than a further output's feed lasts would make that writer starve
+  and prime once, which keeps its lock; such a starve within 2 s of the
+  open is logged as one line of its own, outside the count of starve
+  lines.
+- Without that, the first build stepped the feeds' pace by most of a master
+  period at each open: the card opened empty and took two periods at
+  once. The writers took the step as drift and pulled their ratio to the
+  clamp: on the test board a 997 Hz tone rose to 999 Hz from about 2 s
+  after the open and settled in about 12 s. In simulation a 20 ms step
+  holds the ratio at the clamp; 3.4 ms of open alone would move it about
+  840 ppm; with the silence it moves under 5 ppm, and on the test board the
+  tone then stayed within 40 ppm of 997 Hz. The clock under the
+  path still changes from the system's to the card's, which the drift
+  follows as for a lost master.
+- A source at another rate reopens the master and every further card with
+  it, as any rate change does.
 - Every reopen of the master reopens every further card, even at an
-  unchanged rate *(call: parked for the owner)*.
+  unchanged rate *(call: parked for the owner)*. Opening the card under a
+  parked cycle at its rate is not a reopen in this sense.
 - A lost master card plays to its timed null sink, which keeps the cycle
   going as it does with one output, and the writers follow it. A lost further
   card plays to a null sink of its own and is looked for every second
