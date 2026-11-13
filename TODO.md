@@ -217,7 +217,12 @@ output's `latency_ms` (`Writer::check_grant`, `event_line`). The remedy is
 still manual. Missing: plan the output's `card_part`, the target and the
 master's delay from the granted buffer, as `set_output_rates` already
 replans when a card's rates change; and a decision whether a grant smaller
-than asked replans too. First step: have the control thread handle
+than asked replans too. Until then the warning's advice does not fit every
+case: a card that runs the asked period but four periods instead of three
+keeps starving whatever `latency_ms` is set, since the excess stays one
+period. And `Writer::watch_card` (`src/further.rs`) marks the card opened on
+any watch change that ends not gone, so a spurious change could repeat the
+warning; rare, and it goes away with the replan. First step: have the control thread handle
 `FurtherEvent::Granted` by storing the granted period and buffer on the
 `FurtherOutput` and calling `plan_further` with `only` set to that output;
 in the writer tests, a `Sim` with `granted_periods = 4` that runs with no
