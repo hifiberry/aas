@@ -239,8 +239,10 @@ of `[[matrix]]` and `[[plugin]]`, except that `place = "analog"` and `detect` ar
 for the master. An output without a matrix plays left to channel 1 and right to
 channel 2 for both sources at 0 dB. A further output follows the master's clock
 through a resampler, so it is never bit-perfect, and it is silent while the master
-plays a DoP stream. If the master's card is lost, the others play on. An error
-names the output, counting the master as output 1:
+plays a DoP stream. If the master's card is lost, the others play on. Each output
+follows its own `idle`: when the master's card goes off, a further output with
+`idle = "zeros"` plays on, and one with `idle = "off"` closes after its own
+`idle_delay_s`. An error names the output, counting the master as output 1:
 
 ```toml
 card = "sndrpihifiberry"

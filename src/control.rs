@@ -577,6 +577,18 @@ impl FurtherOutput {
     }
 }
 
+/// Whether a further output's idle rule closes it now, with no source
+/// active since `quiet_since`.
+fn output_idle(idle: Idle, quiet_since: Option<Instant>, now: Instant) -> bool {
+    match idle {
+        Idle::Off { delay_s } => {
+            let delay = Duration::from_secs(u64::from(delay_s));
+            quiet_since.is_some_and(|since| now >= since + delay)
+        }
+        Idle::Zeros => false,
+    }
+}
+
 /// The mix of a further output in the engine's processing format, at
 /// `gain`. Further outputs are never bit-perfect.
 fn further_mix(format: Format, matrix: Matrix, channels: usize, gain: f32) -> Box<dyn Any + Send> {
@@ -790,6 +802,10 @@ pub struct Control {
     /// The rate and period the output was last told to open at. None while
     /// it is closed.
     output: Option<(u32, u32)>,
+    /// The rate and period the cycle runs at on the timer while the
+    /// master's card is closed by its idle rule and a further output's own
+    /// rule keeps that output open. None otherwise.
+    parked: Option<(u32, u32)>,
     /// How many times the audio thread has been told to open the output
     /// and has not yet answered. Nothing plays while one is under way. A
     /// count, since an answer to an earlier open says nothing of a later
@@ -892,6 +908,7 @@ impl Control {
             taps_capacity: INITIAL_TAPS,
             taps_len: 0,
             output: None,
+            parked: None,
             reopening: 0,
             switch_at: None,
             idle_since: None,
@@ -1976,6 +1993,9 @@ impl Control {
         };
         let period = period_frames(rate, self.latency_ms);
         eprintln!("aas: output at {rate} Hz, {period} frames per period");
+        // The cycle ran on the timer at this rate, and the further outputs
+        // played on: the card opens under them, and they go on as they are.
+        let resumed = self.parked.take() == Some((rate, period));
         self.output = Some((rate, period));
         self.reopening += 1;
         self.switch_at = None;
@@ -1986,14 +2006,16 @@ impl Control {
             analog.retry_at = None;
         }
         self.end_recorders(rate, batch);
-        // The writers close while the master reopens, and hear of its new
-        // configuration once it is open.
-        for output in &mut self.further {
-            if std::mem::take(&mut output.open) {
-                output.writer.set_open(false);
+        if !resumed {
+            // The writers close while the master reopens, and hear of its
+            // new configuration once it is open.
+            for output in &mut self.further {
+                if std::mem::take(&mut output.open) {
+                    output.writer.set_open(false);
+                }
             }
+            self.plan_further(rate, period, batch, None);
         }
-        self.plan_further(rate, period, batch, None);
         batch.push(Command::Reconfigure { rate, period });
     }
 
@@ -2105,7 +2127,7 @@ impl Control {
     /// Hands each further output its configuration, once the master is
     /// open at it, and opens it as its idle rule says.
     fn hand_over(&mut self, now: Instant) {
-        let (Some((rate, _)), 0) = (self.output, self.reopening) else {
+        let (Some((rate, _)), 0) = (self.output.or(self.parked), self.reopening) else {
             return;
         };
         for output in &mut self.further {
@@ -2121,8 +2143,10 @@ impl Control {
         self.sync_further(now);
     }
 
-    /// Opens each further output while the master is open, unless its idle
-    /// rule has closed it, and closes it otherwise.
+    /// Opens each further output while the cycle runs, on the master's card
+    /// or on the timer, and its writer has the configuration for it, unless
+    /// its idle rule has closed it, and closes it otherwise. A parked cycle
+    /// ends once no further output is open.
     fn sync_further(&mut self, now: Instant) {
         if self.further.is_empty() {
             return;
@@ -2133,25 +2157,34 @@ impl Control {
         } else {
             self.quiet_since.get_or_insert(now);
         }
-        let master = self.output.is_some() && self.reopening == 0;
+        // A reopen gives every writer a configuration to wait for, which
+        // keeps it closed until the master is open at it.
+        let cycle = self.output.or(self.parked).is_some();
+        let quiet_since = self.quiet_since;
         for output in &mut self.further {
-            let idle = match output.idle {
-                Idle::Off { delay_s } => {
-                    let delay = Duration::from_secs(u64::from(delay_s));
-                    self.quiet_since.is_some_and(|since| now >= since + delay)
-                }
-                Idle::Zeros => false,
-            };
-            let want = master && output.configured && !idle;
+            let idle = output_idle(output.idle, quiet_since, now);
+            let want = cycle && output.configured && output.pending.is_none() && !idle;
             if want == output.open {
                 continue;
             }
-            if let (Idle::Off { delay_s }, true) = (output.idle, master && idle) {
+            if let (Idle::Off { delay_s }, true) = (output.idle, cycle && idle) {
                 eprintln!("aas: output {} off after {delay_s} s idle", output.number());
             }
             output.writer.set_open(want);
             output.open = want;
         }
+        if self.parked.is_some() && !self.further.iter().any(|o| o.open) {
+            self.parked = None;
+            self.send(vec![Command::CloseOutput]);
+        }
+    }
+
+    /// The further outputs whose own idle rules keep them open now.
+    fn kept_open(&self, now: Instant) -> usize {
+        let outputs = self.further.iter().filter(|o| o.configured);
+        outputs
+            .filter(|o| !output_idle(o.idle, self.quiet_since, now))
+            .count()
     }
 
     /// The rates a further output's card takes have changed, such as when
@@ -2165,7 +2198,7 @@ impl Control {
             output.number()
         );
         output.rates = rates;
-        let Some((rate, period)) = self.output else {
+        let Some((rate, period)) = self.output.or(self.parked) else {
             return;
         };
         let mut batch = Vec::new();
@@ -2438,11 +2471,30 @@ impl Control {
         };
         if let (Idle::Off { delay_s }, Some(since)) = (idle, self.idle_since) {
             let delay = Duration::from_secs(u64::from(delay_s));
-            if self.output.is_some() && now >= since + delay {
+            let kept = self.kept_open(now);
+            // A reopen under way is waited for: the cycle parks at the
+            // format the engine runs at.
+            let parks = kept > 0 && self.reopening == 0;
+            if let Some(format) = self.output
+                && now >= since + delay
+                && (kept == 0 || parks)
+            {
                 eprintln!("aas: output off after {delay_s} s idle");
                 self.output = None;
                 self.switch_at = None;
-                batch.push(Command::CloseOutput);
+                if parks {
+                    let (rate, period) = format;
+                    let others = if kept == 1 {
+                        "1 other output keeps".to_string()
+                    } else {
+                        format!("{kept} other outputs keep")
+                    };
+                    eprintln!("aas: the master's card is closed, {others} running");
+                    self.parked = Some(format);
+                    batch.push(Command::ParkOutput { rate, period });
+                } else {
+                    batch.push(Command::CloseOutput);
+                }
             }
         }
         self.send(batch);
@@ -3016,6 +3068,9 @@ mod tests {
                         opened.then_some(Event::Reconfigured),
                     ),
                     Command::CloseOutput => ("CloseOutput".into(), None),
+                    Command::ParkOutput { rate, period } => {
+                        (format!("ParkOutput {rate} {period}"), None)
+                    }
                     Command::SetGain(output, gain) => {
                         self.gains.push((output, gain));
                         ("SetGain".into(), None)
@@ -4707,18 +4762,116 @@ mod tests {
         assert!(logs[0].take().is_empty());
     }
 
-    #[test]
-    fn a_further_output_closes_with_the_master() {
+    /// A started control thread whose master goes off after 1 s, with
+    /// further outputs on the idle rules given, open and handed over.
+    fn master_off_with(rules: &[Idle]) -> (Control, FakeEngine, Vec<WriterLog>, Instant) {
         let config = Config {
             idle: Idle::Off { delay_s: 1 },
             ..Config::default()
         };
-        let (mut control, mut engine, logs, now) = started_with(&config, vec![further(&[])]);
+        let outputs = rules.iter().map(|&idle| {
+            let (mut output, rates) = further(&[]);
+            output.idle = idle;
+            (output, rates)
+        });
+        let (mut control, mut engine, logs, now) = started_with(&config, outputs.collect());
         engine.take(true);
         control.handle_events(now);
-        logs[0].take();
+        for log in &logs {
+            assert_eq!(log.take(), ["reconfigure 48000 48000 256", "open true"]);
+        }
+        (control, engine, logs, now)
+    }
+
+    #[test]
+    fn a_further_output_on_zeros_keeps_the_cycle_on_the_timer_when_the_master_goes_off() {
+        let (mut control, mut engine, logs, now) = master_off_with(&[Idle::Zeros]);
+        let s = Duration::from_secs;
+        let period = period_frames(48000, 12.0);
+        control.tick(now + s(2));
+        let seen = engine.take(true);
+        assert!(
+            has(&seen, &format!("ParkOutput 48000 {period}")),
+            "{seen:?}"
+        );
+        assert!(!has(&seen, "CloseOutput"));
+        assert!(!control.output_is_open());
+        // The output plays on, for as long as nothing plays.
+        control.tick(now + s(600));
+        assert!(engine.take(true).is_empty());
+        assert!(logs[0].take().is_empty());
+        // A player at the rate the cycle runs at opens the card under it:
+        // the output goes on as it is, neither closed nor reconfigured.
+        play(&mut control, 1, 48000, now + s(601));
+        let seen = engine.take(true);
+        assert!(
+            has(&seen, &format!("Reconfigure 48000 {period}")),
+            "{seen:?}"
+        );
+        assert!(!has(&seen, "SetDelay"));
+        control.handle_events(now + s(601));
+        assert!(control.output_is_open());
+        assert!(logs[0].take().is_empty());
+        // Off again once the player has gone, and parked again.
+        control.request(1, Some(Request::Stop), now + s(602));
+        control.tick(now + s(604));
+        assert!(has(&engine.take(true), "ParkOutput"));
+        assert!(logs[0].take().is_empty());
+    }
+
+    #[test]
+    fn a_player_at_another_rate_reopens_a_parked_master_as_any_rate_change_does() {
+        let (mut control, mut engine, logs, now) = master_off_with(&[Idle::Zeros]);
+        let s = Duration::from_secs;
+        control.tick(now + s(2));
+        engine.take(true);
+        play(&mut control, 1, 44100, now + s(3));
+        let seen = engine.take(true);
+        assert!(has(&seen, "Reconfigure 44100"), "{seen:?}");
+        assert_eq!(logs[0].take(), ["open false"]);
+        control.handle_events(now + s(3));
+        assert_eq!(logs[0].take(), ["reconfigure 44100 44100 256", "open true"]);
+    }
+
+    #[test]
+    fn a_further_output_on_off_closes_after_its_own_delay_while_the_master_is_parked() {
+        let rules = [Idle::Off { delay_s: 5 }, Idle::Zeros];
+        let (mut control, mut engine, logs, now) = master_off_with(&rules);
+        let s = Duration::from_secs;
+        control.tick(now + s(2));
+        assert!(has(&engine.take(true), "ParkOutput"));
+        control.tick(now + s(4));
+        assert!(logs[0].take().is_empty());
+        // Its delay counts from when the last source stopped, here the start.
+        control.tick(now + s(5));
+        assert_eq!(logs[0].take(), ["open false"]);
+        assert!(logs[1].take().is_empty());
+        assert!(engine.take(true).is_empty());
+    }
+
+    #[test]
+    fn the_parked_cycle_ends_with_the_last_further_output() {
+        let (mut control, mut engine, logs, now) = master_off_with(&[Idle::Off { delay_s: 5 }]);
+        let s = Duration::from_secs;
+        control.tick(now + s(2));
+        assert!(has(&engine.take(true), "ParkOutput"));
+        control.tick(now + s(5));
+        assert_eq!(logs[0].take(), ["open false"]);
+        assert_eq!(engine.take(true), ["CloseOutput"]);
+        // A player opens the master and the output as from closed.
+        play(&mut control, 1, 48000, now + s(6));
+        assert!(has(&engine.take(true), "Reconfigure 48000"));
+        control.handle_events(now + s(6));
+        assert_eq!(logs[0].take(), ["reconfigure 48000 48000 256", "open true"]);
+    }
+
+    #[test]
+    fn further_outputs_off_by_the_masters_delay_close_with_it() {
+        let (mut control, mut engine, logs, now) = master_off_with(&[Idle::Off { delay_s: 1 }]);
         control.tick(now + Duration::from_secs(2));
-        assert!(has(&engine.take(true), "CloseOutput"));
+        let seen = engine.take(true);
+        assert!(has(&seen, "CloseOutput"), "{seen:?}");
+        assert!(!has(&seen, "ParkOutput"));
         assert_eq!(logs[0].take(), ["open false"]);
     }
 

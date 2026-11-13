@@ -702,6 +702,54 @@ fn a_lost_further_card_is_looked_for_every_second() {
 }
 
 #[test]
+fn a_further_output_on_zeros_plays_on_while_the_masters_card_is_off() {
+    let (sink, log) = memory_sink();
+    let card = MemorySink::paced_buffering(3);
+    let further = card.log();
+    let output = OutputConfig {
+        card: "Loopback".into(),
+        channels: 2,
+        latency_ms: None,
+        idle: Idle::Zeros,
+        volume_db: 0.0,
+        plugins: Vec::new(),
+        matrix: None,
+    };
+    let config = Config {
+        outputs: vec![output],
+        ..config(Idle::Off { delay_s: 1 })
+    };
+    let outputs = vec![FurtherSink {
+        sink: Box::new(card),
+        probe: None,
+    }];
+    let daemon = Daemon::start_outputs(config, sink, outputs);
+    assert!(wait_for(|| log.closes() >= 1), "the master never went off");
+    // The master's card is closed and gets nothing; the further card gets
+    // zeros, as the master's own clock ran it.
+    let (master, played) = (log.frames().len(), further.frames().len());
+    thread::sleep(Duration::from_millis(500));
+    assert_eq!(log.frames().len(), master, "the master still plays");
+    let got = further.frames().len() - played;
+    assert!(
+        got >= 48000 * 4 / 10,
+        "the further card got {got} frames in 0.5 s"
+    );
+    assert!(further.frames().iter().all(|f| *f == [0, 0]));
+    assert_eq!(further.closes(), 0);
+    // A player at the same rate opens the master's card under it, and the
+    // further card plays on, never closed or opened again.
+    let mut client = daemon.client_at(48000, 1 << 20);
+    write_all(&mut client, &vec![[1 << 24, 1 << 24]; 96000]);
+    client.start().unwrap();
+    assert!(wait_for(|| log.frames().contains(&[1 << 24, 1 << 24])));
+    assert_eq!(log.opens(), [(48000, PERIOD); 2]);
+    assert!(wait_for(|| further.samples().iter().any(|&s| s != 0)));
+    assert_eq!(further.opens().len(), 1);
+    assert_eq!(further.closes(), 0);
+}
+
+#[test]
 fn a_refused_sink_is_tried_again_only_when_the_card_list_changes() {
     let (sink, log) = memory_sink();
     log.fail(Some(SinkError::Refused));

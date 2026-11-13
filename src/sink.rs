@@ -139,6 +139,14 @@ impl Pacer {
         self.next = None;
     }
 
+    /// Starts as if `queued` frames had been written and not played yet.
+    fn start_queued(&mut self, rate: u32, period: u32, queued: u32) {
+        self.start(rate, period);
+        if queued > 0 && rate > 0 {
+            self.next = Some(Instant::now() + self.length(u64::from(queued)));
+        }
+    }
+
     fn length(&self, frames: u64) -> Duration {
         Duration::from_nanos(frames * 1_000_000_000 / u64::from(self.rate))
     }
@@ -192,6 +200,13 @@ impl NullSink {
             pacer: Pacer::buffering(periods),
             channels,
         }
+    }
+
+    /// Opens it as if `queued` frames were still to play, such as those a
+    /// card held when it was closed, so that the writes keep the pace the
+    /// card set. Never allocates.
+    pub fn open_queued(&mut self, rate: u32, period: u32, queued: u32) {
+        self.pacer.start_queued(rate, period, queued);
     }
 }
 
@@ -816,6 +831,20 @@ mod tests {
     fn null_sink_has_room_while_less_than_two_periods_are_queued() {
         let took = time_of_cycles(&mut NullSink::new(2), 2);
         assert!(took < Duration::from_millis(10), "{took:?}");
+    }
+
+    #[test]
+    fn a_null_sink_opened_with_frames_queued_waits_for_them_first() {
+        let mut sink = NullSink::new(2);
+        // 4.8 ms queued at 48 kHz, 2.4 ms periods: the first write waits
+        // until a period of the queue is left.
+        sink.open_queued(48000, 120, 240);
+        assert!(sink.delay_now().unwrap() > 200);
+        let start = Instant::now();
+        sink.wait_room().unwrap();
+        assert!(start.elapsed() >= Duration::from_millis(2));
+        sink.write(&[0; 240]).unwrap();
+        assert!(sink.delay_now().unwrap() > 100);
     }
 
     #[test]

@@ -396,11 +396,31 @@ Idle, failure and DoP with several outputs:
   rule counts: a running client, or the analog input with signal. The analog
   input being enabled keeps the master open, not a further output.
 - Each output follows its own idle rule; the owner decided this. When the
-  master goes off, a further output with `idle = "zeros"` stays open and
-  gets silence. Not built yet: today every further output closes with the
-  master (`TODO.md`).
+  master goes off by its idle rule while a further output's own rule keeps
+  it open, `idle = "zeros"`, or `idle = "off"` with its delay not run out,
+  the master's card is closed, so it is free and may power down, and the
+  cycle runs on at the master's rate and period on a timed null sink, as
+  for a lost master. The null sink starts with what the card still held,
+  so the feeds keep the pace the card set *(call)*. The further outputs
+  get silence and are neither closed nor reconfigured. A line after the
+  master's own says its card is closed and how many other outputs keep
+  running. Recorders get nothing meanwhile, as with the master closed.
+- A further output with `idle = "off"` closes after its own delay, counted
+  from when the last source stopped, so one with a longer delay than the
+  master's now outlives it. Once no further output is open the cycle stops.
+  With no further output, or every one off by the master's delay or
+  sooner, the master closes and the cycle stops as before.
+- A source at the rate the cycle runs at opens the master's card under the
+  running cycle *(call)*. The further outputs are not touched: they follow
+  the change from the timer's clock to the card's as they do when a lost
+  master comes back, with nothing to prime or relock. The cycle stalls
+  while the card opens; an open slower than a further output's feed lasts
+  makes that writer starve and prime once, which keeps its lock. A source
+  at another rate reopens the master and every further card with it, as
+  any rate change does.
 - Every reopen of the master reopens every further card, even at an
-  unchanged rate *(call: parked for the owner)*.
+  unchanged rate *(call: parked for the owner)*. Opening the card under a
+  parked cycle at its rate is not a reopen in this sense.
 - A lost master card plays to its timed null sink, which keeps the cycle
   going as it does with one output, and the writers follow it. A lost further
   card plays to a null sink of its own and is looked for every second
