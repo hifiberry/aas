@@ -918,7 +918,12 @@ mod tests {
 
     /// Connects a client called `name` on `conn` and has it play at 48 kHz.
     fn play_as(control: &mut Control, conn: ConnId, name: &str, now: Instant) {
-        control.connected(conn, name.into());
+        play_labelled(control, conn, name, name, now);
+    }
+
+    /// As `play_as`, with `label` the client's name in the log.
+    fn play_labelled(control: &mut Control, conn: ConnId, name: &str, label: &str, now: Instant) {
+        control.connected_as(conn, name.into(), label.into());
         let hello = Request::Hello {
             version: proto::VERSION,
         };
@@ -1134,6 +1139,22 @@ mod tests {
         play_as(&mut control, 2, "other", now);
         engine.take(true);
         assert_eq!(engine.added.last(), Some(&(2, 1.0)));
+    }
+
+    #[test]
+    fn a_client_volume_applies_to_the_same_process_name_after_a_reconnect() {
+        let (mut control, mut engine, now) = open(&Config::default(), None);
+        play_labelled(&mut control, 1, "mpd", "mpd (100)", now);
+        let answer = control.call(Call::PatchClient("mpd".into(), input_db(-6.0)), now);
+        assert!(answer.is_ok());
+        control.disconnected(1, now);
+        engine.take(true);
+        // Another process of the same name, so another pid.
+        play_labelled(&mut control, 2, "mpd", "mpd (200)", now);
+        engine.take(true);
+        assert_eq!(engine.added.last(), Some(&(2, db_to_gain(-6.0))));
+        let state = control.call(Call::State, now).unwrap();
+        assert_eq!(state["clients"][0]["name"], json!("mpd"));
     }
 
     #[test]

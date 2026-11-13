@@ -769,7 +769,10 @@ struct Recorder {
 }
 
 struct Conn {
+    /// The process name: the key of its volume, and its name in the API.
     name: String,
+    /// The name with the pid, for the log.
+    label: String,
     hello: bool,
     /// A connection has one stream at a time, this or a recorder.
     stream: Option<Stream>,
@@ -1158,14 +1161,24 @@ impl Control {
         }
     }
 
+    /// A client has connected, known in the log by its name alone.
     pub fn connected(&mut self, conn: ConnId, name: String) {
-        eprintln!("aas: {name} connected");
+        let label = name.clone();
+        self.connected_as(conn, name, label);
+    }
+
+    /// A client has connected. `name` is its process name, what the API
+    /// and the state file know it by, so that its volume survives a
+    /// reconnect; `label` is how the log names it, with its pid.
+    pub fn connected_as(&mut self, conn: ConnId, name: String, label: String) {
+        eprintln!("aas: {label} connected");
         self.publish(ApiEvent::Client {
             name: name.clone(),
             change: "connected".into(),
         });
         let state = Conn {
             name,
+            label,
             hello: false,
             stream: None,
             recorder: None,
@@ -1179,7 +1192,7 @@ impl Control {
         let Some(state) = self.conns.remove(&conn) else {
             return;
         };
-        eprintln!("aas: {} disconnected", state.name);
+        eprintln!("aas: {} disconnected", state.label);
         if let Some(stream) = state.stream {
             if stream.running {
                 self.client_changed(&state.name, "stopped");
@@ -1261,7 +1274,7 @@ impl Control {
                     })
                 }
                 Request::Hello { version } => {
-                    eprintln!("aas: {} speaks protocol {version}", state.name);
+                    eprintln!("aas: {} speaks protocol {version}", state.label);
                     Answer::fatal(libc::EPROTONOSUPPORT)
                 }
                 _ => Answer::fatal(libc::EPROTO),

@@ -750,9 +750,9 @@ impl Server {
             }
             let conn = self.next_conn;
             self.next_conn += 1;
-            let name = peer_name(&fd);
+            let (name, label) = peer_name(&fd);
             self.conns.insert(conn, fd);
-            self.control.connected(conn, name);
+            self.control.connected_as(conn, name, label);
         }
     }
 
@@ -940,8 +940,11 @@ fn notice_is_due(fd: &OwnedFd) -> bool {
     !matches!(unread_bytes(fd), Some(unread) if unread > 0)
 }
 
-/// The client's process name, from its credentials, for the log.
-fn peer_name(fd: &OwnedFd) -> String {
+/// The client's process name, from its credentials, and its label for the
+/// log, the name with the pid. A client whose name cannot be read has an
+/// empty name, which no API path can give, so no volume is ever set for
+/// it and it plays at 0 dB.
+fn peer_name(fd: &OwnedFd) -> (String, String) {
     // SAFETY: an all-zero ucred is valid, and getsockopt fills at most len.
     let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
     let mut len = size_of::<libc::ucred>() as libc::socklen_t;
@@ -955,11 +958,12 @@ fn peer_name(fd: &OwnedFd) -> String {
         )
     };
     if rc < 0 {
-        return "a client".into();
+        return (String::new(), "a client".into());
     }
     let comm = fs::read_to_string(format!("/proc/{}/comm", cred.pid));
     let name = comm.map(|c| c.trim_end().to_string()).unwrap_or_default();
-    format!("{name} ({})", cred.pid)
+    let label = format!("{name} ({})", cred.pid);
+    (name, label)
 }
 
 /// A listening seqpacket socket at `path`, readable and writable by its

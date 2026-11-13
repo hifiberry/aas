@@ -173,7 +173,7 @@ fn running_client(daemon: &Daemon) -> String {
         let clients = state["clients"].as_array().cloned().unwrap_or_default();
         found = clients
             .into_iter()
-            .find(|c| c["name"].as_str().unwrap().starts_with(&own_name()))
+            .find(|c| c["name"] == json!(own_name()))
             .filter(|c| c["running"] == json!(true));
         found.is_some()
     });
@@ -197,8 +197,8 @@ fn get_state_lists_a_playing_client() {
     let clients = state["clients"].as_array().unwrap();
     let ours = clients
         .iter()
-        .find(|c| c["name"].as_str().unwrap().starts_with(&own_name()))
-        .unwrap();
+        .find(|c| c["name"] == json!(own_name()))
+        .expect("the client is not under its bare process name");
     assert_eq!(ours["running"], json!(true));
     assert_eq!(ours["rate"], json!(48000));
 }
@@ -310,7 +310,6 @@ fn a_reader_that_never_reads_does_not_slow_the_daemon() {
         slowest < Duration::from_millis(100),
         "a patch took {slowest:?}"
     );
-    // Its handler did wait, and fell behind by more than the channel holds.
 }
 
 #[test]
