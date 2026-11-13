@@ -9762,6 +9762,55 @@ mod tests {
     }
 
     #[test]
+    fn a_park_and_a_reopen_in_one_cycle_close_and_open_the_card_once_each() {
+        let mut rig = Rig::<F32>::new(BitPerfect::Auto);
+        let mut one = add_output(&mut rig, 1, stereo());
+        rig.cycle();
+        one.take();
+        // The control thread parks, and a player starts before the audio
+        // thread has read it.
+        let mut a = client(1);
+        a.ring.write(&exact(2 * PERIOD));
+        let format = (RATE, PERIOD as u32);
+        rig.send(Command::ParkOutput {
+            rate: format.0,
+            period: format.1,
+        });
+        rig.send(Command::Reconfigure {
+            rate: format.0,
+            period: format.1,
+        });
+        rig.add(&mut a);
+        // The fade for the reopen, then the park, the open and the period.
+        rig.cycle();
+        rig.cycle();
+        assert_eq!(rig.log.closes(), 1);
+        assert_eq!(rig.log.opens(), [format; 2]);
+        assert!(!rig.engine.parked);
+        assert_eq!(rig.last_periods(1), exact(PERIOD));
+        let got = stereo_frames(&one.take());
+        assert_eq!(got[got.len() - PERIOD..], exact(PERIOD)[..]);
+    }
+
+    #[test]
+    fn a_shutdown_while_parked_closes_nothing_again() {
+        let mut rig = Rig::<F32>::new(BitPerfect::Auto);
+        let _one = add_output(&mut rig, 1, stereo());
+        rig.send(Command::ParkOutput {
+            rate: RATE,
+            period: PERIOD as u32,
+        });
+        rig.cycle();
+        rig.cycle();
+        assert_eq!(rig.log.closes(), 1);
+        rig.send(Command::Shutdown);
+        rig.cycle();
+        assert!(rig.engine.is_stopped());
+        assert!(rig.engine.is_closed());
+        assert_eq!(rig.log.closes(), 1);
+    }
+
+    #[test]
     fn a_parked_cycle_delivers_nothing_to_the_recorders() {
         let mut rig = Rig::<F32>::new(BitPerfect::Auto);
         let _one = add_output(&mut rig, 1, stereo());

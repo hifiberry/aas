@@ -4886,6 +4886,52 @@ mod tests {
     }
 
     #[test]
+    fn a_further_card_found_while_parked_is_handed_its_path_at_the_parked_rate() {
+        let (mut control, mut engine, logs, now) = master_off_with(&[Idle::Zeros]);
+        let s = Duration::from_secs;
+        control.tick(now + s(2));
+        assert!(has(&engine.take(true), "ParkOutput"));
+        // Found again, it takes only 44.1 kHz: it is given a path from the
+        // parked master's 48 kHz to that, and plays on.
+        control.set_output_rates(1, vec![44100], now + s(3));
+        assert_eq!(logs[0].take(), ["reconfigure 48000 44100 256"]);
+        let seen = engine.take(true);
+        assert!(!has(&seen, "CloseOutput"), "{seen:?}");
+        assert!(!has(&seen, "Reconfigure"), "{seen:?}");
+        control.tick(now + s(4));
+        assert!(engine.take(true).is_empty());
+        assert!(logs[0].take().is_empty());
+    }
+
+    #[test]
+    fn the_master_parks_only_once_a_reopen_under_way_is_done() {
+        let (mut control, mut engine, logs, now) = master_off_with(&[Idle::Zeros]);
+        let ms = Duration::from_millis;
+        play(&mut control, 1, 44100, now);
+        engine.take(true);
+        control.handle_events(now);
+        logs[0].take();
+        control.request(1, Some(Request::Stop), now + ms(100));
+        // The card now takes only 48 kHz: the master reopens at once, and
+        // the reopen is not answered yet when the idle delay runs out.
+        control.set_supported(vec![48000], now + ms(1500));
+        control.tick(now + ms(1500));
+        let seen = engine.take(false);
+        assert!(has(&seen, "Reconfigure 48000"), "{seen:?}");
+        assert!(!has(&seen, "ParkOutput") && !has(&seen, "CloseOutput"));
+        assert!(control.output_is_open());
+        assert_eq!(logs[0].take(), ["open false"]);
+        control.tick(now + ms(1600));
+        assert!(engine.take(false).is_empty());
+        engine.send(Event::Reconfigured);
+        control.handle_events(now + ms(1700));
+        assert_eq!(logs[0].take(), ["reconfigure 48000 48000 256", "open true"]);
+        control.tick(now + ms(1800));
+        assert!(has(&engine.take(true), "ParkOutput 48000"));
+        assert!(logs[0].take().is_empty());
+    }
+
+    #[test]
     fn a_starve_as_the_masters_card_opens_under_the_parked_cycle_is_one_line() {
         let (mut control, mut engine, logs, now) = master_off_with(&[Idle::Zeros]);
         let s = Duration::from_secs;
