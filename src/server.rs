@@ -305,9 +305,13 @@ pub fn run_outputs(
     if let Some(open) = capture {
         control.set_analog(open);
     }
+    control.set_counters(counters.clone());
     let found = hardware.as_mut().and_then(|open| open());
     let volume = OutputVolume::new(found, config.bit_perfect);
-    control.restore_volume(volume, state.to_path_buf());
+    let master = config.card.clone().unwrap_or_default();
+    let further_cards = config.outputs.iter().map(|o| o.card.clone());
+    let cards: Vec<String> = std::iter::once(master).chain(further_cards).collect();
+    control.restore(volume, state.to_path_buf(), &cards);
     let mut server = Server {
         listener,
         notify,

@@ -5,13 +5,17 @@
 //! back is freed here. Commands that belong together go into the queue in
 //! one commit, so the audio thread never sees half a decision.
 
+mod api;
+
 use crate::adaptive::{Adaptive, MAX_DRIFT};
+use crate::api::ApiEvent;
 use crate::capture::{Capture, OpenError};
 use crate::config::{Config, Format, Idle, OutputConfig, PluginConfig, PluginPlace, Quality};
+use crate::counters::Counters;
 use crate::dop;
 use crate::drift::SANE;
 use crate::engine::{Command, Event, INITIAL_SOURCES, INITIAL_TAPS, Source, Tap, Target};
-use crate::format::{F32, F64, I32, Processing, db_to_gain};
+use crate::format::{F32, F64, I32, Processing};
 use crate::further::{BUFFERED, FEED_PERIODS, Feed, FurtherEvent, FurtherHandle};
 use crate::latency::{MAX_PERIOD, PERIODS, period_frames};
 use crate::matrix::Matrix;
@@ -21,7 +25,7 @@ use crate::plugin::chain::Chain;
 use crate::plugin::{BuildError, Failure};
 use crate::rate::{ClientId, MAX_RATE, MIN_RATE, RatePolicy, SETTLE, STANDARD_RATES};
 use crate::resample::{Resampler, taps};
-use crate::state::{Saver, State};
+use crate::state::{Saver, State, Stored, StoredInput};
 use crate::volume::{HardwareVolume, OutputVolume};
 use aas_client::convert::ClientFormat;
 use aas_client::proto::{self, Reply, Request};
@@ -33,6 +37,7 @@ use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::ptr::NonNull;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::thread::Thread;
 use std::time::{Duration, Instant};
@@ -548,13 +553,21 @@ struct Pending {
 /// A further output as the control thread keeps it.
 struct FurtherOutput {
     index: usize,
+    /// The card, as the config names it, which keys its state.
+    card: String,
     channels: usize,
     /// Its own latency target, or the master's.
     latency_ms: f32,
     /// Its card's part of the path as its writer was last given it.
     current: Option<(u32, u32, f64)>,
     idle: Idle,
+    /// What the config says, which a stored value is checked against.
+    config_idle: Idle,
+    /// Its idle rule closed it, and the API has changed the rule since:
+    /// it stays closed until a source is active.
+    held_off: bool,
     volume_db: f32,
+    config_volume_db: f32,
     plugins: Vec<PluginConfig>,
     rates: Vec<u32>,
     writer: Box<dyn FurtherWriter>,
@@ -789,7 +802,12 @@ pub struct Control {
     latency_ms: f32,
     quality: Quality,
     format: Format,
+    /// The master's idle rule, and what the config says.
     idle: Idle,
+    config_idle: Idle,
+    /// The master's card as the config names it, or empty, which keys its
+    /// state.
+    card: String,
     supported: Vec<u32>,
     policy: RatePolicy,
     epoch: Instant,
@@ -834,6 +852,9 @@ pub struct Control {
     saver: Option<Saver>,
     /// When the state file is due to be written.
     save_at: Option<Instant>,
+    /// Everything the state file keeps, as loaded and as changed since,
+    /// with the values of cards no longer in the config. Saved whole.
+    state: State,
     /// Volume notifications for subscribers, not yet sent.
     notices: Vec<(ConnId, Reply)>,
     /// The plugins of the config, to build chains from at each rate.
@@ -863,8 +884,9 @@ pub struct Control {
     /// No other rate built either, in this rate decision, while the output
     /// was closed. Not tried again before the next one.
     no_fallback: bool,
-    /// The gain of the analog input, from the config.
-    analog_gain: f32,
+    /// The analog input's volume and mute, and what the config says.
+    analog_input: StoredInput,
+    analog_config: StoredInput,
     /// None unless the config enables the input and the card has an ADC.
     analog: Option<AnalogInput>,
     /// The further outputs, in the order of the config.
@@ -882,6 +904,12 @@ pub struct Control {
     /// The master's own buffer was found longer than the target, and that
     /// has been logged.
     behind_warned: bool,
+    /// Where events for the API go. None without the API.
+    api: Option<tokio::sync::broadcast::Sender<ApiEvent>>,
+    /// The rate and the outputs' states last published.
+    published: Option<api::Published>,
+    /// The audio thread's counters, for its bit-perfect decision.
+    counters: Arc<Counters>,
 }
 
 impl Control {
@@ -900,6 +928,8 @@ impl Control {
             quality: config.resampling,
             format: config.format,
             idle: config.idle,
+            config_idle: config.idle,
+            card: config.card.clone().unwrap_or_default(),
             policy: RatePolicy::new(config.default_rate, supported.clone()),
             supported,
             epoch: Instant::now(),
@@ -924,6 +954,7 @@ impl Control {
             volume: OutputVolume::new(None, config.bit_perfect),
             saver: None,
             save_at: None,
+            state: State::default(),
             notices: Vec::new(),
             plugins: config.plugins.clone(),
             channels: config.channels,
@@ -936,7 +967,8 @@ impl Control {
             stuck: false,
             failed: None,
             no_fallback: false,
-            analog_gain: db_to_gain(config.analog.volume_db),
+            analog_input: api::config_input(config),
+            analog_config: api::config_input(config),
             analog: None,
             further: Vec::new(),
             quiet_since: None,
@@ -945,6 +977,9 @@ impl Control {
             delay_capacity: 0,
             delay_warned: false,
             behind_warned: false,
+            api: None,
+            published: None,
+            counters: Arc::new(Counters::default()),
         }
     }
 
@@ -955,11 +990,15 @@ impl Control {
         let latency_ms = config.latency_ms.unwrap_or(self.latency_ms);
         self.further.push(FurtherOutput {
             index: setup.index,
+            card: config.card,
             channels: config.channels,
             latency_ms,
             current: None,
             idle: config.idle,
+            config_idle: config.idle,
+            held_off: false,
             volume_db: config.volume_db,
+            config_volume_db: config.volume_db,
             plugins: config.plugins,
             rates: setup.rates,
             writer: setup.writer,
@@ -1014,11 +1053,35 @@ impl Control {
         });
     }
 
-    /// Takes over the output volume, at the level the state file keeps.
-    /// In hardware mode this sets the card's mixer. Call before `start`.
-    pub fn restore_volume(&mut self, mut volume: OutputVolume, state: PathBuf) {
-        volume.set(State::load(&state).output_percent);
+    /// Takes over the output volume and restores what the state file
+    /// keeps. In hardware mode this sets the card's mixer. Call before
+    /// `start`, after the further outputs and the analog input are set.
+    ///
+    /// `cards` are the outputs' cards as the config names them, the
+    /// master's first, empty when the config names none. A stored value
+    /// with a config key applies only while the config still says what it
+    /// said when the value was stored; the master's volume and the
+    /// clients' have none and always apply. Values of cards no longer in
+    /// the config are kept, unused.
+    pub fn restore(&mut self, mut volume: OutputVolume, state: PathBuf, cards: &[String]) {
+        let stored = State::load(&state);
+        volume.set(stored.output_percent);
         self.volume = volume;
+        self.analog_input = Stored::resolve(stored.analog.as_ref(), &self.analog_config);
+        if let Some(card) = cards.first() {
+            self.card = card.clone();
+        }
+        self.idle = api::resolve_idle(stored.outputs.get(&self.card), self.config_idle);
+        for (output, card) in self.further.iter_mut().zip(cards.iter().skip(1)) {
+            output.card = card.clone();
+        }
+        for output in &mut self.further {
+            let entry = stored.outputs.get(&output.card);
+            let volume_db = entry.and_then(|e| e.volume_db.as_ref());
+            output.volume_db = Stored::resolve(volume_db, &output.config_volume_db);
+            output.idle = api::resolve_idle(entry, output.config_idle);
+        }
+        self.state = stored;
         self.saver = Some(Saver::new(state));
         eprintln!(
             "aas: output volume {}%, in {}",
@@ -1063,11 +1126,12 @@ impl Control {
             }
         }
         if self.analog.is_some() {
-            batch.push(Command::SetAnalogGain(self.analog_gain));
+            batch.push(Command::SetAnalogGain(api::input_gain(&self.analog_input)));
         }
         self.open_output(now, &mut batch);
         self.idle_since = Some(now);
         self.send(batch);
+        self.publish_changes();
     }
 
     /// Stops the audio thread. It returns once it has seen this.
@@ -1085,6 +1149,10 @@ impl Control {
 
     pub fn connected(&mut self, conn: ConnId, name: String) {
         eprintln!("aas: {name} connected");
+        self.publish(ApiEvent::Client {
+            name: name.clone(),
+            change: "connected".into(),
+        });
         let state = Conn {
             name,
             hello: false,
@@ -1102,6 +1170,9 @@ impl Control {
         };
         eprintln!("aas: {} disconnected", state.name);
         if let Some(stream) = state.stream {
+            if stream.running {
+                self.client_changed(&state.name, "stopped");
+            }
             let mut batch = Vec::new();
             self.remove_stream(stream, now, &mut batch);
             self.decide(now, false, &mut batch);
@@ -1112,6 +1183,8 @@ impl Control {
             self.remove_recorder(recorder, &mut batch);
             self.send(batch);
         }
+        self.client_changed(&state.name, "gone");
+        self.publish_changes();
     }
 
     /// Replies that have become ready, such as finished drains.
@@ -1153,6 +1226,12 @@ impl Control {
 
     /// Handles one message. `None` is a message that does not decode.
     pub fn request(&mut self, conn: ConnId, request: Option<Request>, now: Instant) -> Answer {
+        let answer = self.handle_request(conn, request, now);
+        self.publish_changes();
+        answer
+    }
+
+    fn handle_request(&mut self, conn: ConnId, request: Option<Request>, now: Instant) -> Answer {
         let Some(state) = self.conns.get_mut(&conn) else {
             return Answer::fatal(libc::ENOTCONN);
         };
@@ -1251,20 +1330,25 @@ impl Control {
         let notice = Reply::VolumeChanged { percent };
         self.notices
             .extend(subscribers.map(|(&conn, _)| (conn, notice)));
+        self.publish_output(0);
+        self.save_later(now);
+    }
+
+    /// Has the state file written once changes have been left alone for a
+    /// while.
+    fn save_later(&mut self, now: Instant) {
         if self.saver.is_some() {
             self.save_at = Some(now + SAVE_DELAY);
         }
     }
 
-    /// Has the state file written. The write and its sync to disk run on
-    /// the saver's thread, so a slow SD card holds up no request.
+    /// Has the state file written, whole. The write and its sync to disk
+    /// run on the saver's thread, so a slow SD card holds up no request.
     fn save(&mut self) {
         self.save_at = None;
+        self.state.output_percent = self.volume.percent();
         if let Some(saver) = &self.saver {
-            saver.save(State {
-                output_percent: self.volume.percent(),
-                ..State::default()
-            });
+            saver.save(self.state.clone());
         }
     }
 
@@ -1287,6 +1371,7 @@ impl Control {
         }
         let mut batch = Vec::new();
         if let Some(old) = self.conns.get_mut(&conn).and_then(|c| c.stream.take()) {
+            self.stream_gone(conn, &old);
             self.remove_stream(old, now, &mut batch);
         }
         if let Some(old) = self.conns.get_mut(&conn).and_then(|c| c.recorder.take()) {
@@ -1315,7 +1400,13 @@ impl Control {
             self.table_capacity *= 2;
             batch.push(Command::Grow(Vec::with_capacity(self.table_capacity)));
         }
-        batch.push(Command::Add(Box::new(Source::new(id, ring, wake, rate))));
+        // The client's volume is in the source from its first frame.
+        let mut source = Source::new(id, ring, wake, rate);
+        source.gain = self
+            .conns
+            .get(&conn)
+            .map_or(1.0, |c| self.client_gain(&c.name));
+        batch.push(Command::Add(Box::new(source)));
         self.table_len += 1;
         let stream = Stream {
             id,
@@ -1362,6 +1453,9 @@ impl Control {
         stream.running = true;
         stream.drained = false;
         let (id, rate) = (stream.id, stream.rate);
+        if let Some(name) = self.conns.get(&conn).map(|c| c.name.clone()) {
+            self.client_changed(&name, "running");
+        }
         let t = now - self.epoch;
         self.policy.client_started(id, rate, t);
         let mut batch = Vec::new();
@@ -1423,6 +1517,14 @@ impl Control {
         };
         if !std::mem::take(&mut stream.running) {
             return;
+        }
+        let conns = self.conns.values();
+        let name = conns
+            .filter(|c| c.stream.as_ref().is_some_and(|s| s.id == id))
+            .map(|c| c.name.clone())
+            .next();
+        if let Some(name) = name {
+            self.client_changed(&name, "stopped");
         }
         self.policy.client_stopped(id, now - self.epoch);
         batch.push(Command::SetRunning(id, false));
@@ -1508,6 +1610,7 @@ impl Control {
         let capacity = buffer_frames.max(least);
         let mut batch = Vec::new();
         if let Some(old) = self.conns.get_mut(&conn).and_then(|c| c.stream.take()) {
+            self.stream_gone(conn, &old);
             self.remove_stream(old, now, &mut batch);
             self.decide(now, false, &mut batch);
         }
@@ -2174,7 +2277,10 @@ impl Control {
         let cycle = self.output.or(self.parked).is_some();
         let quiet_since = self.quiet_since;
         for output in &mut self.further {
-            let idle = output_idle(output.idle, quiet_since, now);
+            if quiet_since.is_none() {
+                output.held_off = false;
+            }
+            let idle = output_idle(output.idle, quiet_since, now) || output.held_off;
             let want = cycle && output.configured && output.pending.is_none() && !idle;
             if want == output.open {
                 continue;
@@ -2217,6 +2323,7 @@ impl Control {
         self.plan_further(rate, period, &mut batch, Some(index));
         self.send(batch);
         self.hand_over(now);
+        self.publish_changes();
     }
 
     /// Logs what the further outputs' writers report.
@@ -2367,6 +2474,7 @@ impl Control {
         self.update_dop(now, &mut batch);
         self.decide(now, true, &mut batch);
         self.send(batch);
+        self.publish_changes();
     }
 
     /// Whether the output has been told to stay open.
@@ -2445,6 +2553,7 @@ impl Control {
         }
         self.send(batch);
         self.further_events(now);
+        self.publish_changes();
     }
 
     /// Applies what is due by the clock: a settled rate change, the end of
@@ -2523,6 +2632,7 @@ impl Control {
         if self.save_at.is_some_and(|at| now >= at) {
             self.save();
         }
+        self.publish_changes();
     }
 
     /// Queues the commands in one commit and wakes the audio thread. Waits
@@ -2585,7 +2695,7 @@ mod tests {
     use crate::adaptive::Adaptive;
     use crate::capture::MemoryCapture;
     use crate::config::{self, Format, OutputConfig, Quality};
-    use crate::format::F32;
+    use crate::format::{F32, db_to_gain};
     use crate::further::{FeedProbe, FurtherEvent};
     use crate::output_mix::OutputMix;
     use crate::plugin::chain::Chain;
@@ -2659,7 +2769,7 @@ mod tests {
         (control, engine_commands, now)
     }
 
-    fn configure(rate: u32, buffer_frames: u32) -> Request {
+    pub(super) fn configure(rate: u32, buffer_frames: u32) -> Request {
         Request::Configure {
             rate,
             format: ClientFormat::S16,
@@ -2865,7 +2975,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.toml");
         let volume = OutputVolume::new(None, config::BitPerfect::Auto);
-        control.restore_volume(volume, path.clone());
+        control.restore(volume, path.clone(), &[]);
         let set = |percent| Some(Request::SetVolume { percent });
         control.request(1, set(40), now);
         // A slider still moving: each change starts the second again.
@@ -2889,7 +2999,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.toml");
         let volume = OutputVolume::new(None, config::BitPerfect::Auto);
-        control.restore_volume(volume, path.clone());
+        control.restore(volume, path.clone(), &[]);
         control.request(1, Some(Request::SetVolume { percent: 20 }), now);
         control.shutdown();
         assert_eq!(State::load(&path).output_percent, 20);
@@ -3018,13 +3128,13 @@ mod tests {
     /// Opens `MemoryCapture`s for the control thread and records the rate
     /// and period of each open. The next `fails` opens fail.
     #[derive(Clone, Default)]
-    struct Opener {
+    pub(super) struct Opener {
         asked: Arc<Mutex<Vec<(u32, u32)>>>,
         fails: Arc<Mutex<u32>>,
     }
 
     impl Opener {
-        fn open(&self) -> OpenCapture {
+        pub(super) fn open(&self) -> OpenCapture {
             let me = self.clone();
             Box::new(move |rate, period| {
                 me.asked.lock().unwrap().push((rate, period));
@@ -3049,14 +3159,16 @@ mod tests {
 
     /// The audio thread as far as the control thread can tell: it takes the
     /// commands, answers each as the engine does, and names them.
-    struct FakeEngine {
+    pub(super) struct FakeEngine {
         commands: rtrb::Consumer<Command>,
         events: rtrb::Producer<Event>,
         capture: Option<Box<dyn Capture>>,
         /// Every `SetGain`, by output.
-        gains: Vec<(usize, f32)>,
+        pub(super) gains: Vec<(usize, f32)>,
         /// Every further output put in place, with the gain of its mix.
-        outputs: Vec<(usize, f32)>,
+        pub(super) outputs: Vec<(usize, f32)>,
+        /// Every source added, with the gain it comes with.
+        pub(super) added: Vec<(ClientId, f32)>,
     }
 
     impl FakeEngine {
@@ -3067,16 +3179,20 @@ mod tests {
                 capture: None,
                 gains: Vec::new(),
                 outputs: Vec::new(),
+                added: Vec::new(),
             }
         }
 
         /// Takes every queued command and answers it. A reopen answers at
         /// once only with `opened`.
-        fn take(&mut self, opened: bool) -> Vec<String> {
+        pub(super) fn take(&mut self, opened: bool) -> Vec<String> {
             let mut seen = Vec::new();
             while let Ok(command) = self.commands.pop() {
                 let (name, answer) = match command {
-                    Command::Add(_) => ("Add".into(), None),
+                    Command::Add(source) => {
+                        self.added.push((source.id, source.gain));
+                        ("Add".into(), None)
+                    }
                     Command::Remove(_) => ("Remove".into(), None),
                     Command::SetRunning(id, on) => (format!("SetRunning {id} {on}"), None),
                     Command::Flush(id) => (format!("Flush {id}"), Some(Event::Flushed(id))),
@@ -3137,14 +3253,17 @@ mod tests {
             seen
         }
 
-        fn send(&mut self, event: Event) {
+        pub(super) fn send(&mut self, event: Event) {
             assert!(self.events.push(event).is_ok());
         }
     }
 
     /// A started control thread with one client said hello on connection
     /// 1, the analog input on if `opener` is given, and the fake engine.
-    fn started(config: &Config, opener: Option<&Opener>) -> (Control, FakeEngine, Instant) {
+    pub(super) fn started(
+        config: &Config,
+        opener: Option<&Opener>,
+    ) -> (Control, FakeEngine, Instant) {
         let (commands, engine_commands) = rtrb::RingBuffer::new(256);
         let (engine_events, events) = rtrb::RingBuffer::new(256);
         let audio = std::thread::current();
@@ -3159,7 +3278,7 @@ mod tests {
     }
 
     /// Connects a client on `conn` and has it play at `rate`.
-    fn play(control: &mut Control, conn: ConnId, rate: u32, now: Instant) {
+    pub(super) fn play(control: &mut Control, conn: ConnId, rate: u32, now: Instant) {
         control.connected(conn, "test".into());
         let hello = Request::Hello {
             version: proto::VERSION,
@@ -3172,11 +3291,11 @@ mod tests {
         assert_eq!(start.reply, Some(Reply::Ok));
     }
 
-    fn has(seen: &[String], what: &str) -> bool {
+    pub(super) fn has(seen: &[String], what: &str) -> bool {
         seen.iter().any(|s| s.starts_with(what))
     }
 
-    fn analog_config() -> Config {
+    pub(super) fn analog_config() -> Config {
         Config {
             analog: config::Analog {
                 enabled: true,
@@ -4377,7 +4496,7 @@ mod tests {
     /// What a further output's writer was told, as the control thread
     /// tells it, and the events it has for the control thread.
     #[derive(Clone, Default)]
-    struct WriterLog {
+    pub(super) struct WriterLog {
         calls: Arc<Mutex<Vec<String>>>,
         /// The target and the feed of each `reconfigure`, and the delay of
         /// the resampler it brought.
@@ -4387,7 +4506,7 @@ mod tests {
 
     impl WriterLog {
         /// The calls since the last time.
-        fn take(&self) -> Vec<String> {
+        pub(super) fn take(&self) -> Vec<String> {
             std::mem::take(&mut *self.calls.lock().unwrap())
         }
 
@@ -4424,7 +4543,7 @@ mod tests {
     }
 
     /// A stereo `[[output]]` on a card that takes `rates`, any for none.
-    fn further(rates: &[u32]) -> (OutputConfig, Vec<u32>) {
+    pub(super) fn further(rates: &[u32]) -> (OutputConfig, Vec<u32>) {
         let config = OutputConfig {
             card: "Loopback".into(),
             channels: 2,
@@ -4439,10 +4558,21 @@ mod tests {
 
     /// A started control thread with the further outputs given, its fake
     /// engine and each writer's log.
-    fn started_with(
+    pub(super) fn started_with(
         config: &Config,
         outputs: Vec<(OutputConfig, Vec<u32>)>,
     ) -> (Control, FakeEngine, Vec<WriterLog>, Instant) {
+        let (mut control, engine, logs) = unstarted_with(config, outputs);
+        let now = Instant::now();
+        control.start(now);
+        (control, engine, logs, now)
+    }
+
+    /// The same, not started yet.
+    pub(super) fn unstarted_with(
+        config: &Config,
+        outputs: Vec<(OutputConfig, Vec<u32>)>,
+    ) -> (Control, FakeEngine, Vec<WriterLog>) {
         let (commands, engine_commands) = rtrb::RingBuffer::new(256);
         let (engine_events, events) = rtrb::RingBuffer::new(256);
         let audio = std::thread::current();
@@ -4467,10 +4597,8 @@ mod tests {
             });
             logs.push(log);
         }
-        let now = Instant::now();
-        control.start(now);
         let engine = FakeEngine::new(engine_commands, engine_events);
-        (control, engine, logs, now)
+        (control, engine, logs)
     }
 
     /// The delay a resampler from `from` to `to` brings, in frames at `to`.

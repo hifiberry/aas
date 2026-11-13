@@ -1,6 +1,7 @@
 //! Alternative audio server.
 
 pub mod adaptive;
+pub mod api;
 pub mod bitperfect;
 pub mod board;
 pub mod capture;
