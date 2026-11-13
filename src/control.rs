@@ -1078,7 +1078,7 @@ impl Control {
         let stored = State::load(&state);
         volume.set(stored.output_percent);
         self.volume = volume;
-        self.analog_input = Stored::resolve(stored.analog.as_ref(), &self.analog_config);
+        self.analog_input = api::resolve_input(stored.analog.as_ref(), &self.analog_config);
         if let Some(card) = cards.first() {
             self.card = card.clone();
         }
@@ -2346,9 +2346,11 @@ impl Control {
         }
     }
 
-    /// The further outputs whose own idle rules keep them open now.
+    /// The further outputs whose own idle rules keep them open now. One
+    /// held off after a change of its rule is closed, and keeps nothing
+    /// running.
     fn kept_open(&self, now: Instant) -> usize {
-        let outputs = self.further.iter().filter(|o| o.configured);
+        let outputs = self.further.iter().filter(|o| o.configured && !o.held_off);
         outputs
             .filter(|o| !output_idle(o.idle, self.quiet_since, now))
             .count()

@@ -253,9 +253,14 @@ fn output_7_is_404() {
 #[test]
 fn volume_101_is_422() {
     let daemon = Daemon::start();
-    let (status, body) = daemon.patch("/outputs/1", r#"{"volume": 101}"#);
-    assert_eq!(status, 422);
-    assert!(body["error"].is_string(), "{body}");
+    // Also beyond what a byte holds, or below 0: out of range, not a
+    // value of the wrong type.
+    for volume in ["101", "256", "-1", "100000"] {
+        let body = format!(r#"{{"volume": {volume}}}"#);
+        let (status, body) = daemon.patch("/outputs/1", &body);
+        assert_eq!(status, 422, "{volume}");
+        assert_eq!(body["error"], json!("volume must be from 0 to 100"));
+    }
     // And nothing changed.
     assert_eq!(daemon.get("/outputs/1").1["volume"], json!(100));
 }

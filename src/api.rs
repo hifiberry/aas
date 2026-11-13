@@ -69,6 +69,15 @@ impl ApiError {
         }
     }
 
+    /// A fault of the daemon's own, such as a view that does not
+    /// serialise.
+    pub fn internal(message: impl Into<String>) -> ApiError {
+        ApiError {
+            status: 500,
+            message: message.into(),
+        }
+    }
+
     /// The control thread has not answered in time.
     pub fn unavailable(message: impl Into<String>) -> ApiError {
         ApiError {
@@ -82,8 +91,10 @@ impl ApiError {
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OutputPatch {
-    /// The master only: the `Master` control, 0 to 100.
-    pub volume: Option<u8>,
+    /// The master only: the `Master` control, 0 to 100. Taken wide, so
+    /// that a value out of that range is refused as one, not as a value
+    /// of the wrong type.
+    pub volume: Option<i64>,
     /// A further output only: its offset, -60 to 0 dB.
     pub volume_db: Option<f32>,
     /// `"zeros"` or `"off"`.
@@ -245,5 +256,18 @@ pub struct StateView {
 
 /// The answer to a call whose view serialises, which every view does.
 pub fn answer<T: Serialize>(view: &T) -> Answer {
-    serde_json::to_value(view).map_err(|e| ApiError::unavailable(e.to_string()))
+    serde_json::to_value(view).map_err(|e| ApiError::internal(e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn a_view_that_does_not_serialise_is_500() {
+        // JSON has no map with keys that are not strings.
+        let view: BTreeMap<(u8, u8), u8> = [((1, 2), 3)].into();
+        assert_eq!(answer(&view).unwrap_err().status, 500);
+    }
 }

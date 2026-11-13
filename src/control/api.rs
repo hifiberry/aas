@@ -36,6 +36,28 @@ pub(super) fn config_input(config: &Config) -> StoredInput {
     }
 }
 
+/// The analog input to start with. Its volume is the stored one while
+/// the config's `volume_db` still says what it said then, else the
+/// config's. Its mute has no config key: the stored one always applies.
+/// The file keeps the input whole, with the config's side as it was, so
+/// files written before this was so load as they are.
+pub(super) fn resolve_input(
+    stored: Option<&Stored<StoredInput>>,
+    config: &StoredInput,
+) -> StoredInput {
+    let Some(stored) = stored else {
+        return config.clone();
+    };
+    let volume_db = Stored {
+        value: stored.value.volume_db,
+        config: stored.config.volume_db,
+    };
+    StoredInput {
+        volume_db: Stored::resolve(Some(&volume_db), &config.volume_db),
+        muted: stored.value.muted,
+    }
+}
+
 /// The gain an input plays at: 0 when muted.
 pub(super) fn input_gain(input: &StoredInput) -> f32 {
     if input.muted {
@@ -70,13 +92,28 @@ pub(super) fn resolve_idle(stored: Option<&StoredOutput>, config: Idle) -> Idle 
     idle_from_parts(&kind, delay)
 }
 
+/// The delay `idle = "off"` takes when a patch names none and the rule in
+/// place is zeros: the output's own from the config, `config`, as a config
+/// that says `idle = "off"` alone would give it.
+fn fallback_delay(config: Idle) -> u32 {
+    idle_parts(config).1
+}
+
 /// The idle rule a patch makes of `current`, with the config's rules, or
-/// None when it names neither key.
-fn patched_idle(current: Idle, patch: &OutputPatch) -> Result<Option<Idle>, ApiError> {
+/// None when it names neither key. `config` is the output's rule in the
+/// config.
+fn patched_idle(
+    current: Idle,
+    config: Idle,
+    patch: &OutputPatch,
+) -> Result<Option<Idle>, ApiError> {
     if patch.idle.is_none() && patch.idle_delay_s.is_none() {
         return Ok(None);
     }
-    let (current_kind, current_delay) = idle_parts(current);
+    let (current_kind, current_delay) = match current {
+        Idle::Zeros => ("zeros", fallback_delay(config)),
+        Idle::Off { delay_s } => ("off", delay_s),
+    };
     let kind = match patch.idle.as_deref() {
         None => current_kind,
         Some(kind @ ("zeros" | "off")) => kind,
@@ -447,7 +484,7 @@ impl Control {
                     "volume_db is only for a further output; the master has volume",
                 ));
             }
-            if patch.volume.is_some_and(|v| v > 100) {
+            if patch.volume.is_some_and(|v| !(0..=100).contains(&v)) {
                 return Err(ApiError::unprocessable("volume must be from 0 to 100"));
             }
         } else {
@@ -463,12 +500,15 @@ impl Control {
                 return Err(ApiError::unprocessable("volume_db must be from -60 to 0"));
             }
         }
-        let current = match index {
-            0 => self.idle,
-            _ => self.further[index - 1].idle,
+        let (current, config) = match index {
+            0 => (self.idle, self.config_idle),
+            _ => (
+                self.further[index - 1].idle,
+                self.further[index - 1].config_idle,
+            ),
         };
-        let idle = patched_idle(current, &patch)?.filter(|&idle| idle != current);
-        if let Some(percent) = patch.volume {
+        let idle = patched_idle(current, config, &patch)?.filter(|&idle| idle != current);
+        if let Some(percent) = patch.volume.and_then(|v| u8::try_from(v).ok()) {
             self.set_volume(percent, now);
         }
         let mut changed = false;
@@ -699,7 +739,10 @@ impl Control {
             match index {
                 0 => self.matrices[0].due = Some((self.epoch, Box::new(matrix))),
                 _ => {
-                    if let Some((unsent, _)) = &mut self.further[index - 1].unsent {
+                    // Restore runs before start, which sends the mix.
+                    let unsent = &mut self.further[index - 1].unsent;
+                    debug_assert!(unsent.is_some(), "matrices restored after the start");
+                    if let Some((unsent, _)) = unsent {
                         *unsent = matrix;
                     }
                 }
@@ -902,7 +945,7 @@ mod tests {
 
     fn volume(percent: u8) -> OutputPatch {
         OutputPatch {
-            volume: Some(percent),
+            volume: Some(i64::from(percent)),
             ..OutputPatch::default()
         }
     }
@@ -1360,6 +1403,47 @@ mod tests {
     }
 
     #[test]
+    fn the_analog_mute_survives_an_edit_of_the_configs_volume() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        // Muted at -10 dB through the API while the config said -6 dB.
+        let state = State {
+            analog: Some(Stored {
+                value: StoredInput {
+                    volume_db: -10.0,
+                    muted: true,
+                },
+                config: StoredInput {
+                    volume_db: -6.0,
+                    muted: false,
+                },
+            }),
+            ..State::default()
+        };
+        state.save(&path).unwrap();
+        let restore = |config: &Config| {
+            let (mut control, _engine, _logs) = unstarted_with(config, Vec::new());
+            let volume = OutputVolume::new(None, config::BitPerfect::Auto);
+            control.restore(volume, path.clone(), &[]);
+            control.analog_input
+        };
+        let with_db = |volume_db: f32| Config {
+            analog: config::Analog {
+                enabled: true,
+                volume_db,
+            },
+            ..Config::default()
+        };
+        // The config left alone: both as stored.
+        let input = restore(&with_db(-6.0));
+        assert_eq!((input.volume_db, input.muted), (-10.0, true));
+        // The config's volume edited: it wins, and the mute, which has no
+        // config key, stays.
+        let input = restore(&with_db(-3.0));
+        assert_eq!((input.volume_db, input.muted), (-3.0, true));
+    }
+
+    #[test]
     fn every_change_is_saved() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.toml");
@@ -1738,6 +1822,64 @@ mod tests {
         // Quiet again, it stays open, as zeros says.
         control.request(1, Some(Request::Stop), now + Duration::from_secs(7));
         control.tick(now + Duration::from_secs(60));
+        assert!(logs[0].take().is_empty());
+    }
+
+    #[test]
+    fn off_after_zeros_takes_the_configs_delay() {
+        let config = Config {
+            idle: Idle::Off { delay_s: 30 },
+            ..Config::default()
+        };
+        let (mut output, rates) = further(&[]);
+        output.idle = Idle::Off { delay_s: 20 };
+        let (mut control, mut engine, _logs, now) =
+            started_with(&config, vec![(output, rates), further(&[])]);
+        engine.take(true);
+        let kind = |kind: &str| OutputPatch {
+            idle: Some(kind.into()),
+            ..OutputPatch::default()
+        };
+        // Each output's own delay from the config, or 60 s where the
+        // config says zeros.
+        for (id, delay) in [(1, 30), (2, 20), (3, 60)] {
+            control
+                .call(Call::PatchOutput(id, kind("zeros")), now)
+                .unwrap();
+            let view = control
+                .call(Call::PatchOutput(id, kind("off")), now)
+                .unwrap();
+            assert_eq!(view["idle_delay_s"], json!(delay), "output {id}");
+        }
+    }
+
+    #[test]
+    fn a_further_output_held_off_does_not_keep_the_master_running() {
+        let config = Config {
+            idle: Idle::Off { delay_s: 10 },
+            ..Config::default()
+        };
+        let (mut output, rates) = further(&[]);
+        output.idle = Idle::Off { delay_s: 1 };
+        let (mut control, mut engine, logs, now) = started_with(&config, vec![(output, rates)]);
+        engine.take(true);
+        control.handle_events(now);
+        logs[0].take();
+        control.tick(now + Duration::from_secs(1));
+        assert_eq!(logs[0].take(), ["open false"]);
+        let zeros = OutputPatch {
+            idle: Some("zeros".into()),
+            ..OutputPatch::default()
+        };
+        control
+            .call(Call::PatchOutput(2, zeros), now + Duration::from_secs(2))
+            .unwrap();
+        engine.take(true);
+        // The master closes, rather than parking for an output that is off.
+        control.tick(now + Duration::from_secs(10));
+        let commands = engine.take(true);
+        assert!(has(&commands, "CloseOutput"), "{commands:?}");
+        assert!(!has(&commands, "ParkOutput"), "{commands:?}");
         assert!(logs[0].take().is_empty());
     }
 
