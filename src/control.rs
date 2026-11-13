@@ -317,6 +317,25 @@ pub fn event_line(number: usize, event: FurtherEvent) -> Option<String> {
             format!("aas: output {number} locked, its card runs {ppm:+.1} ppm from the master")
         }
         FurtherEvent::Unlocked => format!("aas: output {number} lost its lock"),
+        FurtherEvent::Granted {
+            rate,
+            asked_period,
+            period,
+            asked_buffer,
+            buffer,
+        } => {
+            let ms = |frames: u32| f64::from(frames) * 1000.0 / f64::from(rate.max(1));
+            format!(
+                "aas: warning: output {number}: its card runs a period of {period} frames \
+                 ({:.1} ms) and a buffer of {buffer} frames ({:.1} ms), asked for {asked_period} \
+                 ({:.1} ms) and {asked_buffer} ({:.1} ms); its delay is planned from what was \
+                 asked and it may starve, set this output's latency_ms to a period the card runs",
+                ms(period),
+                ms(buffer),
+                ms(asked_period),
+                ms(asked_buffer),
+            )
+        }
         FurtherEvent::Clamped { .. }
         | FurtherEvent::Starved { .. }
         | FurtherEvent::Overflowed { .. } => return None,
@@ -4719,6 +4738,26 @@ mod tests {
         };
         assert_eq!(line(starve), None);
         assert_eq!(line(FurtherEvent::Clamped { at_ms: 1 }), None);
+    }
+
+    #[test]
+    fn a_card_that_runs_another_buffer_is_logged_with_what_to_set() {
+        let granted = FurtherEvent::Granted {
+            rate: 48000,
+            asked_period: 1024,
+            period: 1024,
+            asked_buffer: 3072,
+            buffer: 4096,
+        };
+        assert_eq!(
+            event_line(3, granted).as_deref(),
+            Some(
+                "aas: warning: output 3: its card runs a period of 1024 frames (21.3 ms) \
+                 and a buffer of 4096 frames (85.3 ms), asked for 1024 (21.3 ms) and 3072 \
+                 (64.0 ms); its delay is planned from what was asked and it may starve, \
+                 set this output's latency_ms to a period the card runs"
+            )
+        );
     }
 
     #[test]

@@ -48,6 +48,12 @@ pub trait Sink: Send {
     }
     /// Rates the device takes. Empty means any.
     fn supported_rates(&self) -> Vec<u32>;
+    /// The period and the buffer, in frames, that the open device runs
+    /// with, if it says: a card may round what it was asked for. `None`
+    /// for a sink that is not a card, or a card that is not open.
+    fn granted(&self) -> Option<(u32, u32)> {
+        None
+    }
     /// True once after a `write` that moved to another device, such as
     /// from no card to a card that is back. Opening it took that write
     /// far longer than the buffer lasts, with nothing audible at stake, so
@@ -89,6 +95,10 @@ impl Sink for Box<dyn Sink> {
 
     fn supported_rates(&self) -> Vec<u32> {
         (**self).supported_rates()
+    }
+
+    fn granted(&self) -> Option<(u32, u32)> {
+        (**self).granted()
     }
 
     fn switched(&mut self) -> bool {
@@ -725,6 +735,14 @@ impl Sink for FallbackSink {
 
     fn supported_rates(&self) -> Vec<u32> {
         self.inner.supported_rates()
+    }
+
+    fn granted(&self) -> Option<(u32, u32)> {
+        if self.live {
+            self.inner.granted()
+        } else {
+            None
+        }
     }
 
     fn switched(&mut self) -> bool {

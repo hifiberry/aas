@@ -371,6 +371,17 @@ pub enum FurtherEvent {
         limit: u32,
         count: u32,
     },
+    /// The card, just opened at `rate`, runs another period or buffer, in
+    /// card frames, than the path was planned for. The writer fills what
+    /// the card grants, so a larger buffer holds the path past its target
+    /// and it starves; told once each time the card opens.
+    Granted {
+        rate: u32,
+        asked_period: u32,
+        period: u32,
+        asked_buffer: u32,
+        buffer: u32,
+    },
 }
 
 /// What a writer plays with at one configuration. Made on the control
@@ -451,6 +462,9 @@ pub struct Writer {
     /// it has not pushed are missing from it, which says nothing about the
     /// clocks, so the drift does not see it.
     overdue: bool,
+    /// The card has opened since the writer last compared what it granted
+    /// with what was asked.
+    opened: bool,
 }
 
 impl Writer {
@@ -484,6 +498,7 @@ impl Writer {
             self.reprime();
         }
         self.watch_card();
+        self.check_grant();
         self.watch_overflows();
         let played = self.play(now);
         self.report();
@@ -549,6 +564,7 @@ impl Writer {
         };
         // A card that does not open plays to the null sink meanwhile.
         let _ = self.sink.open(path.card_rate, path.period);
+        self.opened = true;
         self.discard();
         self.shared.open.store(true, Release);
         self.playing = true;
@@ -669,6 +685,8 @@ impl Writer {
             return;
         }
         let gone = self.search.is_gone();
+        // A card back has been opened anew.
+        self.opened |= !gone;
         if gone != self.gone {
             self.gone = gone;
             self.emit(if gone {
@@ -678,6 +696,29 @@ impl Writer {
             });
         }
         self.restart();
+    }
+
+    /// Tells the control thread, once after each open, when the card runs
+    /// another period or buffer than the path was planned for. The path
+    /// stays planned from what was asked; the line logged says to set
+    /// the output's `latency_ms`.
+    fn check_grant(&mut self) {
+        if !std::mem::take(&mut self.opened) {
+            return;
+        }
+        let (Some(path), Some((period, buffer))) = (&self.path, self.sink.granted()) else {
+            return;
+        };
+        let asked_buffer = BUFFERED * path.period;
+        if (period, buffer) != (path.period, asked_buffer) {
+            self.emit(FurtherEvent::Granted {
+                rate: path.card_rate,
+                asked_period: path.period,
+                period,
+                asked_buffer,
+                buffer,
+            });
+        }
     }
 
     fn watch_overflows(&mut self) {
@@ -1172,6 +1213,7 @@ fn parts(
         ratio: 1.0,
         applied: 1.0,
         overdue: false,
+        opened: false,
         born: clock.now(),
         skipped: 0,
     };
@@ -1308,6 +1350,8 @@ mod tests {
         /// The feed is made as the daemon makes it for this configuration,
         /// not `FEED_PERIODS` master periods.
         sized: bool,
+        /// Periods the card buffers, whatever it was asked for.
+        granted_periods: u32,
     }
 
     impl Sim {
@@ -1326,6 +1370,7 @@ mod tests {
                 read_cost_us: 0.0,
                 margin: master_period as f64 / 2.0,
                 sized: false,
+                granted_periods: BUFFERED,
             }
         }
     }
@@ -1479,7 +1524,7 @@ mod tests {
             }
             assert_eq!(rate, w.sim.card_rate);
             w.card_period = period as usize;
-            w.buffer = f64::from(BUFFERED * period);
+            w.buffer = f64::from(w.sim.granted_periods * period);
             w.queued = 0.0;
             w.started = false;
             w.at = w.now();
@@ -1555,6 +1600,11 @@ mod tests {
 
         fn supported_rates(&self) -> Vec<u32> {
             vec![self.world().sim.card_rate]
+        }
+
+        fn granted(&self) -> Option<(u32, u32)> {
+            let w = self.world();
+            Some((w.card_period as u32, w.buffer as u32))
         }
     }
 
@@ -1676,6 +1726,44 @@ mod tests {
         fn count(&self, counter: &AtomicU64) -> u64 {
             counter.load(Relaxed)
         }
+    }
+
+    fn grants(rig: &Rig) -> Vec<FurtherEvent> {
+        let events = rig.events().into_iter();
+        events
+            .filter(|e| matches!(e, FurtherEvent::Granted { .. }))
+            .collect()
+    }
+
+    #[test]
+    fn a_card_that_buffers_more_than_asked_is_told_once_per_open() {
+        let sim = Sim::new(48_000, 256, 48_000, 256);
+        let mut rig = Rig::new(sim);
+        rig.world().source = Source::Dc(1 << 20);
+        rig.run_until(1.0);
+        assert!(grants(&rig).is_empty());
+
+        let mut sim = Sim::new(48_000, 256, 48_000, 256);
+        sim.granted_periods = 4;
+        let mut rig = Rig::new(sim);
+        rig.world().source = Source::Dc(1 << 20);
+        rig.run_until(1.0);
+        let told = FurtherEvent::Granted {
+            rate: 48_000,
+            asked_period: 256,
+            period: 256,
+            asked_buffer: 3 * 256,
+            buffer: 4 * 256,
+        };
+        assert_eq!(grants(&rig), vec![told]);
+        rig.run_until(2.0);
+        assert!(grants(&rig).is_empty());
+        // Each open is told again.
+        rig.handle.set_open(false);
+        rig.cycle();
+        rig.handle.set_open(true);
+        rig.run_until(3.0);
+        assert_eq!(grants(&rig), vec![told]);
     }
 
     #[test]

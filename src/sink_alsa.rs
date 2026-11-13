@@ -910,6 +910,11 @@ mod card {
         fn supported_rates(&self) -> Vec<u32> {
             self.rates.clone()
         }
+
+        fn granted(&self) -> Option<(u32, u32)> {
+            let open = self.open.as_ref()?;
+            Some((open.period as u32, open.buffer))
+        }
     }
 }
 
