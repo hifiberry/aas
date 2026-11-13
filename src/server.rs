@@ -595,8 +595,7 @@ impl Server {
             return;
         };
         while let Ok(call) = received.try_recv() {
-            // A caller that has given up has dropped its one-shot.
-            let _ = call.answer.send(self.control.call(call.call, now));
+            self.control.answer(call, now);
         }
     }
 

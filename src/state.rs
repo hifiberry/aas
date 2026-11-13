@@ -132,6 +132,9 @@ impl State {
             }
             ok
         });
+        // 0 dB unmuted is what a name without a volume plays at: it needs
+        // no place among the 64.
+        self.clients.retain(|_, i| i.volume_db != 0.0 || i.muted);
         while self.clients.len() > MAX_CLIENTS {
             if let Some(name) = self.clients.keys().next_back().cloned() {
                 eprintln!(
@@ -580,6 +583,15 @@ mod tests {
         }
         state.save(&path).unwrap();
         assert_eq!(State::load(&path).clients.len(), MAX_CLIENTS);
+    }
+
+    #[test]
+    fn a_client_at_0_db_unmuted_is_dropped_on_load() {
+        let s = load_text(&format!(
+            "{KEEP}[clients.plain]\nvolume_db = 0.0\nmuted = false\n\
+             [clients.quiet]\nvolume_db = 0.0\nmuted = true\n"
+        ));
+        assert_eq!(s.clients.keys().collect::<Vec<_>>(), ["keep", "quiet"]);
     }
 
     fn load_text(text: &str) -> State {

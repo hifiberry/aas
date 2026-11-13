@@ -4,8 +4,8 @@
 
 use super::{ConnId, Control, Stream};
 use crate::api::{
-    self, ApiError, ApiEvent, Call, ClientView, InputPatch, InputView, MatrixPut, OutputPatch,
-    OutputRoutes, OutputState, OutputView, RouteJson, StateView,
+    self, ApiCall, ApiError, ApiEvent, Call, ClientView, InputPatch, InputView, MatrixPut,
+    OutputPatch, OutputRoutes, OutputState, OutputView, RouteJson, StateView,
 };
 use crate::bitperfect::NotBitPerfect;
 use crate::config::{self, Config, DEFAULT_IDLE_DELAY_S, Format, Idle, Route};
@@ -105,6 +105,9 @@ fn patched_input(current: &StoredInput, patch: &InputPatch) -> StoredInput {
         muted: patch.muted.unwrap_or(current.muted),
     }
 }
+
+/// The longest process name, in bytes, as the kernel keeps it.
+const MAX_NAME: usize = 15;
 
 /// A client without a stored volume plays at 0 dB.
 const UNITY: StoredInput = StoredInput {
@@ -266,6 +269,19 @@ impl Control {
         };
         self.publish_changes();
         answer
+    }
+
+    /// Handles a call from the API thread and sends its answer back. One
+    /// whose caller has given up, answered 503 after 2 s, is dropped
+    /// unapplied. A caller can still give up between this check and the
+    /// answer; it then got a 503 for a call that applied, which is why a
+    /// 503 on a change says to repeat it rather than that nothing changed.
+    pub fn answer(&mut self, call: ApiCall, now: Instant) {
+        if call.answer.is_closed() {
+            return;
+        }
+        // A caller that has given up meanwhile has dropped its one-shot.
+        let _ = call.answer.send(self.call(call.call, now));
     }
 
     /// When the earliest matrix that waits for its turn is due, so that
@@ -739,8 +755,16 @@ impl Control {
     }
 
     /// Sets the volume of every stream of the clients called `name`, now
-    /// and after a reconnect. A name not connected can be set too.
+    /// and after a reconnect. A name not connected can be set too. A name
+    /// set back to 0 dB, unmuted, is what one without a stored volume
+    /// plays at: it is no longer stored, and frees its place among the 64.
+    /// A name is a process name, which the kernel cuts to 15 bytes, so a
+    /// longer one could never match a client.
     fn patch_client(&mut self, name: String, patch: InputPatch, now: Instant) -> api::Answer {
+        if name.len() > MAX_NAME {
+            let message = format!("a process name has at most {MAX_NAME} bytes");
+            return Err(ApiError::unprocessable(message));
+        }
         check_input(&patch)?;
         let stored = self.state.clients.get(&name);
         let input = patched_input(stored.unwrap_or(&UNITY), &patch);
@@ -753,7 +777,11 @@ impl Control {
             )));
         }
         let gain = input_gain(&input);
-        self.state.clients.insert(name.clone(), input);
+        if input == UNITY {
+            self.state.clients.remove(&name);
+        } else {
+            self.state.clients.insert(name.clone(), input);
+        }
         let streams = self.conns.values().filter(|c| c.name == name);
         let batch = streams
             .filter_map(|c| c.stream.as_ref())
@@ -845,7 +873,8 @@ mod tests {
     };
     use super::super::*;
     use crate::api::{
-        ApiError, ApiEvent, Call, InputPatch, MatrixPut, OutputPatch, OutputRoutes, RouteJson,
+        ApiCall, ApiError, ApiEvent, Call, InputPatch, MatrixPut, OutputPatch, OutputRoutes,
+        RouteJson,
     };
     use crate::bitperfect::NotBitPerfect;
     use crate::config::{self, Idle, Route};
@@ -1217,6 +1246,78 @@ mod tests {
         let call = Call::PatchClient("player7".into(), input_db(-2.0));
         assert_eq!(status(control.call(call, now)), 200);
         assert_eq!(control.state.clients.len(), 64);
+    }
+
+    #[test]
+    fn a_client_back_at_0_db_frees_its_slot() {
+        let (mut control, mut engine, now) = open(&Config::default(), None);
+        play_as(&mut control, 1, "player7", now);
+        engine.take(true);
+        for n in 0..64 {
+            let call = Call::PatchClient(format!("player{n}"), input_db(-1.0));
+            assert_eq!(status(control.call(call, now)), 200, "{n}");
+        }
+        engine.take(true);
+        let mut published = subscribe(&mut control);
+        let call = Call::PatchClient("player7".into(), input_db(0.0));
+        let answer = control.call(call, now).unwrap();
+        assert_eq!(answer["volume_db"], json!(0.0));
+        assert_eq!(control.state.clients.len(), 63);
+        // Its stream plays at 0 dB, and the change is published.
+        assert_eq!(engine.take(true), ["SetSourceGain 1 1"]);
+        let id = |e: &ApiEvent| matches!(e, ApiEvent::Input { id, .. } if id == "clients/player7");
+        assert!(events(&mut published).iter().any(id));
+        // A new name is taken in its place.
+        let call = Call::PatchClient("one-more".into(), input_db(-1.0));
+        assert_eq!(status(control.call(call, now)), 200);
+        // Muted is not 0 dB unmuted: that one keeps its slot.
+        let mute = InputPatch {
+            volume_db: Some(0.0),
+            muted: Some(true),
+        };
+        assert_eq!(
+            status(control.call(Call::PatchClient("player8".into(), mute), now)),
+            200
+        );
+        assert!(control.state.clients.contains_key("player8"));
+        // A freed name that is not connected is not known any more.
+        let call = Call::PatchClient("player9".into(), input_db(0.0));
+        assert_eq!(status(control.call(call, now)), 200);
+        assert_eq!(
+            status(control.call(Call::Client("player9".into()), now)),
+            404
+        );
+    }
+
+    #[test]
+    fn a_call_whose_caller_has_given_up_is_not_applied() {
+        let (mut control, mut engine, now) = open(&Config::default(), None);
+        let (answer, answered) = tokio::sync::oneshot::channel();
+        // The API thread answered 503 after 2 s and dropped its end.
+        drop(answered);
+        let call = Call::PatchClient("mpd".into(), input_db(-6.0));
+        control.answer(ApiCall { call, answer }, now);
+        assert!(control.state.clients.is_empty());
+        assert!(engine.take(true).is_empty());
+        // One still waited for is applied and answered.
+        let (answer, mut answered) = tokio::sync::oneshot::channel();
+        let call = Call::PatchClient("mpd".into(), input_db(-6.0));
+        control.answer(ApiCall { call, answer }, now);
+        assert!(control.state.clients.contains_key("mpd"));
+        assert!(answered.try_recv().unwrap().is_ok());
+    }
+
+    #[test]
+    fn a_name_longer_than_a_process_name_is_422() {
+        let (mut control, _engine, now) = open(&Config::default(), None);
+        let call = Call::PatchClient("a".repeat(16), input_db(-1.0));
+        let answer = control.call(call, now);
+        assert_eq!(status(answer.clone()), 422);
+        assert_eq!(message(answer), "a process name has at most 15 bytes");
+        assert!(control.state.clients.is_empty());
+        // 15 bytes, two of them one character, is a name.
+        let call = Call::PatchClient(format!("{}é", "a".repeat(13)), input_db(-1.0));
+        assert_eq!(status(control.call(call, now)), 200);
     }
 
     #[test]
