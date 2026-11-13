@@ -484,6 +484,9 @@ impl Writer {
         };
         let now = self.clock.now();
         self.drain_commands();
+        // Opening the card is not part of the path's delay: what it
+        // queues is read from the end of the open.
+        let now = if self.opened { self.clock.now() } else { now };
         if !self.playing {
             self.discard();
             return Ok(());
@@ -562,6 +565,10 @@ impl Writer {
         let Some(path) = &self.path else {
             return;
         };
+        // The feed takes nothing while the card opens, which can take
+        // longer than it lasts: what it held from before is dropped after
+        // the open anyway, and a push it refused meanwhile is no overflow.
+        self.shared.open.store(false, Release);
         // A card that does not open plays to the null sink meanwhile.
         let _ = self.sink.open(path.card_rate, path.period);
         self.opened = true;
@@ -1352,6 +1359,8 @@ mod tests {
         sized: bool,
         /// Periods the card buffers, whatever it was asked for.
         granted_periods: u32,
+        /// How long opening the card takes, ms; the master pushes meanwhile.
+        open_ms: u64,
     }
 
     impl Sim {
@@ -1371,6 +1380,7 @@ mod tests {
                 margin: master_period as f64 / 2.0,
                 sized: false,
                 granted_periods: BUFFERED,
+                open_ms: 0,
             }
         }
     }
@@ -1523,6 +1533,8 @@ mod tests {
                 return Err(SinkError::Gone);
             }
             assert_eq!(rate, w.sim.card_rate);
+            let opened = w.now() + w.sim.open_ms * 1_000_000;
+            w.advance_to(opened);
             w.card_period = period as usize;
             w.buffer = f64::from(w.sim.granted_periods * period);
             w.queued = 0.0;
@@ -1733,6 +1745,46 @@ mod tests {
         events
             .filter(|e| matches!(e, FurtherEvent::Granted { .. }))
             .collect()
+    }
+
+    /// A writer on a card that takes 80 ms to open, longer than the feed
+    /// lasts, opened and then reopened for a reconfigure.
+    fn slow_open() -> Rig {
+        let mut sim = Sim::new(48_000, 256, 48_000, 256);
+        sim.open_ms = 80;
+        let mut rig = Rig::new(sim);
+        rig.world().source = Source::Dc(1 << 20);
+        rig.run_until(2.0);
+        let resampler = Box::new(Adaptive::new(
+            48_000,
+            48_000,
+            sim.channels,
+            256,
+            Quality::Medium,
+            Format::F32,
+        ));
+        rig.handle
+            .reconfigure(48_000, 48_000, 256, resampler, rig.target);
+        rig.run_until(4.0);
+        rig
+    }
+
+    #[test]
+    fn a_slow_open_is_not_counted_as_queued() {
+        let rig = slow_open();
+        assert_eq!(rig.world().opens, 2);
+        assert_eq!(rig.count(&rig.counters.starves), 0);
+    }
+
+    #[test]
+    fn a_reopen_for_a_reconfigure_overflows_nothing() {
+        let rig = slow_open();
+        assert_eq!(rig.count(&rig.counters.overflows), 0);
+        let events = rig.events();
+        let overflowed = events
+            .iter()
+            .any(|e| matches!(e, FurtherEvent::Overflowed { .. }));
+        assert!(!overflowed, "{events:?}");
     }
 
     #[test]
