@@ -194,6 +194,13 @@ impl Control {
         });
     }
 
+    /// The client on `conn` has changed, as `client_changed` says.
+    pub(super) fn conn_changed(&self, conn: ConnId, change: &str) {
+        if let Some(c) = self.conns.get(&conn) {
+            self.client_changed(&c.name, change);
+        }
+    }
+
     /// A stream of `conn` is replaced: if it ran, its client has stopped.
     pub(super) fn stream_gone(&self, conn: ConnId, stream: &Stream) {
         if let (true, Some(c)) = (stream.running, self.conns.get(&conn)) {
@@ -1152,6 +1159,91 @@ mod tests {
             })
             .collect();
         assert_eq!(changes, ["connected", "running", "stopped", "gone"]);
+    }
+
+    /// The client changes published since the last time, by name.
+    fn changes(published: &mut broadcast::Receiver<ApiEvent>) -> Vec<(String, String)> {
+        events(published)
+            .into_iter()
+            .filter_map(|e| match e {
+                ApiEvent::Client { name, change } => Some((name, change)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn recorder(control: &mut Control, conn: ConnId, now: Instant) {
+        control.connected(conn, "arecord".into());
+        let hello = Request::Hello {
+            version: proto::VERSION,
+        };
+        control.request(conn, Some(hello), now);
+        let capture = Request::Configure {
+            rate: 0,
+            format: ClientFormat::S32,
+            channels: 2,
+            buffer_frames: 4096,
+            capture: true,
+        };
+        let answer = control.request(conn, Some(capture), now);
+        assert!(matches!(answer.reply, Some(Reply::Configured { .. })));
+    }
+
+    #[test]
+    fn recorder_events_are_published() {
+        let (mut control, mut engine, now) = open(&Config::default(), None);
+        let mut published = subscribe(&mut control);
+        recorder(&mut control, 1, now);
+        assert_eq!(
+            control.request(1, Some(Request::Start), now).reply,
+            Some(Reply::Ok)
+        );
+        let state = control.call(Call::State, now).unwrap();
+        assert_eq!(state["clients"][0]["running"], json!(true));
+        control.request(1, Some(Request::Stop), now);
+        control.disconnected(1, now);
+        engine.take(true);
+        let name = |change: &str| ("arecord".to_string(), change.to_string());
+        let want = ["connected", "running", "stopped", "gone"].map(name);
+        assert_eq!(changes(&mut published), want);
+        // A recorder that runs is stopped by a reset, by a disconnect, and
+        // by the output moving to another rate, which ends it.
+        recorder(&mut control, 2, now);
+        control.request(2, Some(Request::Start), now);
+        control.request(2, Some(Request::Reset), now);
+        control.request(2, Some(Request::Start), now);
+        control.disconnected(2, now);
+        recorder(&mut control, 3, now);
+        control.request(3, Some(Request::Start), now);
+        play_as(&mut control, 4, "hq", now);
+        let buffer = min_buffer_frames(96000, 12.0);
+        control.request(4, Some(configure(96000, buffer)), now);
+        control.request(4, Some(Request::Start), now);
+        engine.take(true);
+        let seen: Vec<(String, String)> = changes(&mut published)
+            .into_iter()
+            .filter(|(n, _)| n == "arecord")
+            .collect();
+        let want = [
+            "connected",
+            "running",
+            "stopped",
+            "running",
+            "stopped",
+            "gone",
+            "connected",
+            "running",
+            "stopped",
+        ]
+        .map(name);
+        assert_eq!(seen, want);
+        let state = control.call(Call::State, now).unwrap();
+        let clients = state["clients"].as_array().unwrap();
+        assert!(
+            clients
+                .iter()
+                .all(|c| c["name"] != json!("arecord") || c["running"] == json!(false))
+        );
     }
 
     #[test]

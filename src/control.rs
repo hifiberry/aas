@@ -1179,6 +1179,9 @@ impl Control {
             self.send(batch);
         }
         if let Some(recorder) = state.recorder {
+            if recorder.running {
+                self.client_changed(&state.name, "stopped");
+            }
             let mut batch = Vec::new();
             self.remove_recorder(recorder, &mut batch);
             self.send(batch);
@@ -1375,6 +1378,9 @@ impl Control {
             self.remove_stream(old, now, &mut batch);
         }
         if let Some(old) = self.conns.get_mut(&conn).and_then(|c| c.recorder.take()) {
+            if old.running {
+                self.conn_changed(conn, "stopped");
+            }
             self.remove_recorder(old, &mut batch);
         }
         let capacity = buffer_frames.max(min_ring_frames(rate, self.latency_ms));
@@ -1615,6 +1621,9 @@ impl Control {
             self.decide(now, false, &mut batch);
         }
         if let Some(old) = self.conns.get_mut(&conn).and_then(|c| c.recorder.take()) {
+            if old.running {
+                self.conn_changed(conn, "stopped");
+            }
             self.remove_recorder(old, &mut batch);
         }
         let made = Ring::create(capacity).and_then(|(ring, memfd)| {
@@ -1675,6 +1684,7 @@ impl Control {
         if !std::mem::replace(&mut recorder.running, true) {
             let id = recorder.id;
             self.send(vec![Command::SetRunning(id, true)]);
+            self.conn_changed(conn, "running");
         }
         Answer::reply(Reply::Ok)
     }
@@ -1686,6 +1696,7 @@ impl Control {
         if std::mem::take(&mut recorder.running) {
             let id = recorder.id;
             self.send(vec![Command::SetRunning(id, false)]);
+            self.conn_changed(conn, "stopped");
         }
         Answer::reply(Reply::Ok)
     }
@@ -1697,9 +1708,12 @@ impl Control {
         let Some(recorder) = self.recorder_mut(conn) else {
             return Answer::error(libc::EBADFD);
         };
-        recorder.running = false;
+        let was_running = std::mem::take(&mut recorder.running);
         let id = recorder.id;
         self.send(vec![Command::Flush(id)]);
+        if was_running {
+            self.conn_changed(conn, "stopped");
+        }
         Answer {
             reply: None,
             fds: Vec::new(),
@@ -1718,12 +1732,23 @@ impl Control {
     /// The capture runs at the output's rate only, so the client has to
     /// configure again. It is told through the ring once the tap is back.
     fn end_recorders(&mut self, rate: u32, batch: &mut Vec<Command>) {
-        let recorders = self.conns.values_mut().filter_map(|c| c.recorder.as_mut());
-        for recorder in recorders.filter(|r| !r.ended && r.rate != rate) {
+        let mut stopped = Vec::new();
+        for conn in self.conns.values_mut() {
+            let Some(recorder) = conn.recorder.as_mut() else {
+                continue;
+            };
+            if recorder.ended || recorder.rate == rate {
+                continue;
+            }
             recorder.ended = true;
-            recorder.running = false;
+            if std::mem::take(&mut recorder.running) {
+                stopped.push(conn.name.clone());
+            }
             batch.push(Command::RemoveTap(recorder.id));
             self.taps_len -= 1;
+        }
+        for name in stopped {
+            self.client_changed(&name, "stopped");
         }
     }
 
