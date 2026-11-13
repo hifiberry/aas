@@ -305,7 +305,7 @@ pub fn card_rate(rates: &[u32], master_rate: u32) -> u32 {
 }
 
 /// The line logged for an event of further output `number`, if any.
-/// Starves and overflows are counted, and logged through a `FeedLog`.
+/// Starves, overflows and the clamp are logged through an `OutputLog`.
 pub fn event_line(number: usize, event: FurtherEvent) -> Option<String> {
     let line = match event {
         FurtherEvent::Gone => format!(
@@ -317,48 +317,64 @@ pub fn event_line(number: usize, event: FurtherEvent) -> Option<String> {
             format!("aas: output {number} locked, its card runs {ppm:+.1} ppm from the master")
         }
         FurtherEvent::Unlocked => format!("aas: output {number} lost its lock"),
-        FurtherEvent::Clamped => format!(
-            "aas: output {number}: its card runs more than {:.0} ppm from the master, \
-             it plays on with gaps",
-            MAX_DRIFT * 1e6
-        ),
-        FurtherEvent::Starved { .. } | FurtherEvent::Overflowed { .. } => return None,
+        FurtherEvent::Clamped { .. }
+        | FurtherEvent::Starved { .. }
+        | FurtherEvent::Overflowed { .. } => return None,
     };
     Some(line)
 }
 
 /// Starves and overflows logged one by one at first, each.
 const FEED_LINES: u32 = 10;
-/// After that, at most one line in this many ms.
-const FEED_LINE_MS: u64 = 60_000;
+/// After that, at most one line in this many ms, and as often for the
+/// clamp.
+const LINE_MS: u64 = 60_000;
 
-/// The log of a further output's starves and overflows: the first
-/// [`FEED_LINES`] one by one, then one a minute with how many went unlogged.
-/// The counters at the stop have them all.
+/// The lines of a further output that can come again and again: its
+/// starves and overflows, the first [`FEED_LINES`] one by one, then one a
+/// minute with how many went unlogged; and the clamp, once a minute at
+/// most. The counters at the stop have them all.
 #[derive(Default)]
-struct FeedLog {
+struct OutputLog {
     lines: u32,
-    /// When the last line was, ms after the writer started.
+    /// When the feed's last line was, ms after the writer started.
     last_ms: u64,
+    /// Starves and overflows since.
     unlogged: u64,
+    /// When the clamp's last line was.
+    clamp_ms: Option<u64>,
+    /// Clamps since.
+    clamps: u64,
 }
 
-impl FeedLog {
-    /// The line for `event` of output `number`, if it is a starve or an
-    /// overflow and its turn has come.
+impl OutputLog {
+    /// The line for `event` of output `number`, if it is a starve, an
+    /// overflow or the clamp and its turn has come.
     fn line(&mut self, number: usize, event: FurtherEvent) -> Option<String> {
-        let (what, at_ms, fill, limit) = match event {
-            FurtherEvent::Starved { at_ms, fill, limit } => ("starved", at_ms, fill, limit),
-            FurtherEvent::Overflowed { at_ms, fill, limit } => ("overflowed", at_ms, fill, limit),
+        let (what, at_ms, fill, limit, count) = match event {
+            FurtherEvent::Starved { at_ms, fill, limit } => ("starved", at_ms, fill, limit, 1),
+            FurtherEvent::Overflowed {
+                at_ms,
+                fill,
+                limit,
+                count,
+            } => ("overflowed", at_ms, fill, limit, count.max(1)),
+            FurtherEvent::Clamped { at_ms } => return self.clamped(number, at_ms),
             _ => return None,
         };
-        if self.lines >= FEED_LINES && at_ms < self.last_ms + FEED_LINE_MS {
-            self.unlogged += 1;
+        if self.lines >= FEED_LINES && at_ms < self.last_ms + LINE_MS {
+            self.unlogged += u64::from(count);
             return None;
         }
+        let when = if count > 1 {
+            format!("{count} times by")
+        } else {
+            String::new()
+        };
         let mut line = format!(
-            "aas: output {number} {what} {}.{:03} s after the start, \
+            "aas: output {number} {what} {when}{}{}.{:03} s after the start, \
              its feed held {fill} of {limit} frames",
+            if when.is_empty() { "" } else { " " },
             at_ms / 1000,
             at_ms % 1000
         );
@@ -370,6 +386,24 @@ impl FeedLog {
         self.lines += 1;
         self.last_ms = at_ms;
         self.unlogged = 0;
+        Some(line)
+    }
+
+    fn clamped(&mut self, number: usize, at_ms: u64) -> Option<String> {
+        if self.clamp_ms.is_some_and(|last| at_ms < last + LINE_MS) {
+            self.clamps += 1;
+            return None;
+        }
+        let mut line = format!(
+            "aas: output {number}: its card runs more than {:.0} ppm from the master, \
+             it plays on with gaps",
+            MAX_DRIFT * 1e6
+        );
+        if self.clamp_ms.is_some() {
+            line.push_str(&format!(", {} more times since the last line", self.clamps));
+        }
+        self.clamp_ms = Some(at_ms);
+        self.clamps = 0;
         Some(line)
     }
 }
@@ -472,7 +506,7 @@ struct FurtherOutput {
     configured: bool,
     /// The writer has been told to play.
     open: bool,
-    feed_log: FeedLog,
+    log: OutputLog,
 }
 
 impl FurtherOutput {
@@ -848,7 +882,7 @@ impl Control {
             pending: None,
             configured: false,
             open: false,
-            feed_log: FeedLog::default(),
+            log: OutputLog::default(),
         });
         let latencies: Vec<f32> = self.further.iter().map(|o| o.latency_ms).collect();
         self.delay_capacity = delay_capacity(self.latency_ms, &latencies, self.quality);
@@ -2080,8 +2114,7 @@ impl Control {
         for output in &mut self.further {
             let number = output.number();
             while let Some(event) = output.writer.event() {
-                let line =
-                    event_line(number, event).or_else(|| output.feed_log.line(number, event));
+                let line = event_line(number, event).or_else(|| output.log.line(number, event));
                 if let Some(line) = line {
                     eprintln!("{line}");
                 }
@@ -4678,27 +4711,29 @@ mod tests {
         );
         let lost = line(FurtherEvent::Unlocked);
         assert_eq!(lost.as_deref(), Some("aas: output 2 lost its lock"));
-        // Starves and overflows go through their own log.
+        // Starves, overflows and the clamp go through an output's log.
         let starve = FurtherEvent::Starved {
             at_ms: 1,
             fill: 0,
             limit: 1,
         };
         assert_eq!(line(starve), None);
+        assert_eq!(line(FurtherEvent::Clamped { at_ms: 1 }), None);
     }
 
     #[test]
     fn the_first_starves_and_overflows_are_logged_then_one_a_minute() {
-        let mut log = FeedLog::default();
+        let mut log = OutputLog::default();
         let starve = |at_ms| FurtherEvent::Starved {
             at_ms,
             fill: 300,
             limit: 2944,
         };
-        let overflow = |at_ms| FurtherEvent::Overflowed {
+        let overflow = |at_ms, count| FurtherEvent::Overflowed {
             at_ms,
             fill: 2560,
             limit: 2944,
+            count,
         };
         assert_eq!(
             log.line(2, starve(12_345)).as_deref(),
@@ -4707,12 +4742,18 @@ mod tests {
             )
         );
         assert_eq!(
-            log.line(2, overflow(15_000)).as_deref(),
+            log.line(2, overflow(15_000, 1)).as_deref(),
             Some(
                 "aas: output 2 overflowed 15.000 s after the start, its feed held 2560 of 2944 frames"
             )
         );
-        for n in 2..9 {
+        // Several overflows seen at once are told as such.
+        let three = log.line(2, overflow(16_000, 3)).unwrap();
+        assert!(
+            three.starts_with("aas: output 2 overflowed 3 times by 16.000 s"),
+            "{three}"
+        );
+        for n in 3..9 {
             assert!(log.line(2, starve(20_000 + n)).is_some());
         }
         let tenth = log.line(2, starve(30_000)).unwrap();
@@ -4720,23 +4761,50 @@ mod tests {
             tenth.ends_with("frames; from now on one line a minute"),
             "{tenth}"
         );
-        // Then one a minute, with how many went unlogged.
+        // Then one a minute, with how many starves and overflows went
+        // unlogged.
         for n in 0..5 {
-            assert_eq!(log.line(2, overflow(31_000 + n * 10_000)), None);
+            assert_eq!(log.line(2, overflow(31_000 + n * 10_000, 2)), None);
         }
         assert_eq!(log.line(2, starve(89_999)), None);
-        let next = log.line(2, overflow(90_000)).unwrap();
+        let next = log.line(2, overflow(90_000, 1)).unwrap();
         assert!(
             next.starts_with("aas: output 2 overflowed 90.000 s"),
             "{next}"
         );
         assert!(
-            next.ends_with("frames, 6 more since the last line"),
+            next.ends_with("frames, 11 more since the last line"),
             "{next}"
         );
         assert_eq!(log.line(2, starve(90_001)), None);
-        // Other events are not its business.
+        // Lines it does not keep are not its business.
         assert_eq!(log.line(2, FurtherEvent::Unlocked), None);
+    }
+
+    #[test]
+    fn the_clamp_is_logged_at_most_once_a_minute() {
+        let mut log = OutputLog::default();
+        let clamped = |at_ms| FurtherEvent::Clamped { at_ms };
+        let first = log.line(2, clamped(31_000)).unwrap();
+        assert_eq!(
+            first,
+            "aas: output 2: its card runs more than 2000 ppm from the master, \
+             it plays on with gaps"
+        );
+        assert_eq!(log.line(2, clamped(40_000)), None);
+        assert_eq!(log.line(2, clamped(90_999)), None);
+        let again = log.line(2, clamped(91_000)).unwrap();
+        assert!(
+            again.ends_with(", 2 more times since the last line"),
+            "{again}"
+        );
+        // The feed's lines are counted apart.
+        let starve = FurtherEvent::Starved {
+            at_ms: 91_001,
+            fill: 0,
+            limit: 1,
+        };
+        assert!(log.line(2, starve).is_some());
     }
 
     #[test]

@@ -268,7 +268,8 @@ impl Feed {
         let refuse = || {
             let frames = (queued / self.channels) as u64;
             self.shared.refused_fill.store(frames, Relaxed);
-            self.counters.overflows.fetch_add(1, Relaxed);
+            // The writer that sees this overflow sees its fill, or a later.
+            self.counters.overflows.fetch_add(1, Release);
             false
         };
         if queued + samples > limit {
@@ -355,14 +356,21 @@ pub enum FurtherEvent {
     Locked { ppm: Option<f64> },
     /// It no longer is, or the writer started over.
     Unlocked,
-    /// The card needs more than the ratio's clamp allows.
-    Clamped,
+    /// The card needs more than the ratio's clamp allows, found `at_ms`
+    /// after the writer started.
+    Clamped { at_ms: u64 },
     /// The feed held too little for a period, which played as zeros: `at_ms`
     /// after the writer started, with `fill` of its `limit` frames in it.
     Starved { at_ms: u64, fill: u32, limit: u32 },
-    /// The feed was full and refused a master period: seen `at_ms` after
-    /// the writer started, refused with `fill` of its `limit` frames in it.
-    Overflowed { at_ms: u64, fill: u32, limit: u32 },
+    /// The feed was full and refused `count` master periods since the
+    /// writer last looked: seen `at_ms` after the writer started, the last
+    /// refused with `fill` of its `limit` frames in it.
+    Overflowed {
+        at_ms: u64,
+        fill: u32,
+        limit: u32,
+        count: u32,
+    },
 }
 
 /// What a writer plays with at one configuration. Made on the control
@@ -673,13 +681,17 @@ impl Writer {
     }
 
     fn watch_overflows(&mut self) {
-        let overflows = self.counters.overflows.load(Relaxed);
+        let overflows = self.counters.overflows.load(Acquire);
         if overflows != self.overflows {
+            let count = overflows
+                .wrapping_sub(self.overflows)
+                .min(u64::from(u32::MAX)) as u32;
             self.overflows = overflows;
             self.emit(FurtherEvent::Overflowed {
                 at_ms: self.since_born(),
                 fill: self.shared.refused_fill.load(Relaxed) as u32,
                 limit: self.feed_limit() as u32,
+                count,
             });
             // The writer fell behind: all the feed holds is from before
             // the gap.
@@ -859,7 +871,8 @@ impl Writer {
             });
         }
         if clamped && !self.clamped {
-            self.emit(FurtherEvent::Clamped);
+            let at_ms = self.since_born();
+            self.emit(FurtherEvent::Clamped { at_ms });
         }
         self.clamped = clamped;
     }
@@ -1844,14 +1857,21 @@ mod tests {
         assert_eq!(rig.count(&rig.counters.overflows), 1);
         // The new period went, the four before it stay.
         assert_eq!(rig.writer.feed_ends(), Some((1, 4)));
+        // And the next before the writer looks.
+        assert!(!rig.world().feed.as_mut().unwrap().push(&[6; 256]));
         rig.cycle();
-        // Told with the four periods it held when it refused the fifth.
+        // Told once, as two, with the four periods it held when it refused.
         let events = rig.events();
-        let overflow = events.iter().find_map(|e| match *e {
-            FurtherEvent::Overflowed { fill, limit, .. } => Some((fill, limit)),
-            _ => None,
-        });
-        assert_eq!(overflow, Some((4 * 256, 4 * 256)), "{events:?}");
+        let overflows: Vec<_> = events
+            .iter()
+            .filter_map(|e| match *e {
+                FurtherEvent::Overflowed {
+                    fill, limit, count, ..
+                } => Some((fill, limit, count)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(overflows, [(4 * 256, 4 * 256, 2)], "{events:?}");
         // A full feed means the writer fell behind: all of it is from before
         // the gap, and goes.
         assert_eq!(rig.world().feed.as_ref().unwrap().queued(), 0);
@@ -2039,7 +2059,10 @@ mod tests {
         let at = clamped.unwrap_or_else(|| panic!("{ppm} ppm: never clamped"));
         assert!(at < 40.0, "{ppm} ppm: clamped only at {at:.1} s");
         let events = rig.events();
-        assert!(events.contains(&FurtherEvent::Clamped), "{events:?}");
+        let clamps = events
+            .iter()
+            .filter(|e| matches!(e, FurtherEvent::Clamped { .. }));
+        assert_eq!(clamps.count(), 1, "{events:?}");
         let locks = events
             .iter()
             .filter(|e| matches!(e, FurtherEvent::Locked { .. }));
