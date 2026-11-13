@@ -129,32 +129,6 @@ not need the 1 s; the Pro does, for up to 700 ms (`doc/measurements.md`, Stage
 3a). The design keeps 1 s for every card. First step: the owner confirms that,
 or `SETTLE_MS` moves into the card table with 0 for the DAC+ ADC.
 
-## Owner decisions left by stage 3b part 2
-
-Stage 3b part 2 built each of these one way, marked *(call)* in
-`doc/design.md`, "Several outputs". Each needs the owner's yes or no.
-
-### Should a reopen of the master reopen every further card?
-
-Every reopen of the master, a rate change for example, reopens every further
-card, even one whose rate does not change. Each then primes and locks again,
-about 5 s. Opening the master's card under a cycle parked by the idle rule,
-at the rate the cycle runs at, touches no further card. Missing: the
-decision. If no, first step: in `plan_further` in `src/control.rs`, give a
-further output a new configuration only when its own rate, period or the
-target changes, as a change of one card's rates already does.
-
-### Should the same card be refused after startup too?
-
-Two outputs naming the same card are refused at startup, by resolving each
-name to the kernel's card index (`distinct_cards` in `src/sink_alsa.rs`). A
-card that is not there at startup cannot be told, and passes, so two
-outputs may later try to play to one card. Missing: the
-decision whether a card found later is checked too. First step: find where
-a further card's search reports a card found, call `distinct_cards` there as
-`src/main.rs` does at startup, and decide what the later of the two outputs
-does then.
-
 ## Let the capture PCM ask for the daemon's rate without a stream
 
 The capture PCM learns the daemon's rate at open by setting up a one-frame

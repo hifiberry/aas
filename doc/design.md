@@ -352,7 +352,7 @@ How it works *(call)*:
 - No two outputs may name the same card. The names are resolved to the
   kernel's card index at startup, so an index and an id of one card are
   caught. A card not there at startup cannot be told and passes. The check
-  runs at startup only.
+  runs at startup only; the owner decided a card found later is not checked.
 
 The drift controller *(call)*:
 
@@ -440,7 +440,8 @@ Idle, failure and DoP with several outputs:
 - A source at another rate reopens the master and every further card with
   it, as any rate change does.
 - Every reopen of the master reopens every further card, even at an
-  unchanged rate *(call: parked for the owner)*. Opening the card under a
+  unchanged rate, each then priming and locking again; the owner decided
+  this. Opening the card under a
   parked cycle at its rate is not a reopen in this sense.
 - A lost master card plays to its timed null sink, which keeps the cycle
   going as it does with one output, and the writers follow it. A lost further
