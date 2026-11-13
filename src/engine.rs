@@ -1092,6 +1092,13 @@ struct DelayLine {
     moving: Moving,
     /// Frames of a fade.
     fade: usize,
+    /// Frames at the front of the line, the next to leave, that a DoP
+    /// stream may have put there. They leave unaltered or, under a fade,
+    /// as zeros: a scaled DoP word is no DoP word.
+    dop: usize,
+    /// Of the frames the last `process` took out of the line, how many
+    /// from the first were DoP.
+    dop_out: usize,
 }
 
 impl DelayLine {
@@ -1104,6 +1111,8 @@ impl DelayLine {
             pending: None,
             moving: Moving::Still,
             fade: 1,
+            dop: 0,
+            dop_out: 0,
         }
     }
 
@@ -1156,6 +1165,15 @@ impl DelayLine {
     fn clear(&mut self) {
         self.ring[..self.frames * self.channels].fill(0);
         self.pos = 0;
+        self.dop = 0;
+    }
+
+    /// Notes that a DoP stream has just been played through the line, so
+    /// that all it holds may be DoP. Counting the whole line keeps this
+    /// O(1); frames before the stream that are counted with it can only
+    /// be zeroed, never altered otherwise.
+    fn hold_dop(&mut self) {
+        self.dop = self.frames;
     }
 
     /// The line holds frames back or fades: `process` has work to do.
@@ -1168,9 +1186,14 @@ impl DelayLine {
     /// frame `i` of `n` at `1 - i / n`. The frames that entered the line
     /// this period, from frame `frames` on, carry that fade already, at
     /// `1 - j / n` for input frame `j`; they get only what is missing.
+    /// DoP frames that left the line are zeroed instead.
     fn fade_out(&self, samples: &mut [i32]) {
         let n = (samples.len() / self.channels) as f64;
         for (i, frame) in samples.chunks_exact_mut(self.channels).enumerate() {
+            if i < self.dop_out {
+                frame.fill(0);
+                continue;
+            }
             let mut gain = 1.0 - i as f64 / n;
             if let Some(j) = i.checked_sub(self.frames) {
                 gain /= 1.0 - j as f64 / n;
@@ -1194,6 +1217,9 @@ impl DelayLine {
                 Moving::Up(left)
             };
         }
+        // The DoP frames among those that leave the line now.
+        self.dop_out = self.dop.min(samples.len() / channels);
+        self.dop -= self.dop_out;
         let line = &mut self.ring[..self.frames * channels];
         let mut done = 0;
         while done < samples.len() && !line.is_empty() {
@@ -1202,10 +1228,14 @@ impl DelayLine {
             done += n;
             self.pos = (self.pos + n) % line.len();
         }
-        // A fade out goes after it, on what is heard.
+        // A fade out goes after it, on what is heard. It zeroes DoP.
         if let Moving::Down(mut left) = self.moving {
-            for frame in samples.chunks_exact_mut(channels) {
+            for (i, frame) in samples.chunks_exact_mut(channels).enumerate() {
                 left = left.saturating_sub(1);
+                if i < self.dop_out {
+                    frame.fill(0);
+                    continue;
+                }
                 let gain = left as f64 / self.fade as f64;
                 for v in frame.iter_mut() {
                     *v = (f64::from(*v) * gain).round() as i32;
@@ -1858,6 +1888,9 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         let samples = &mut self.samples[..self.period * self.master.channels];
         if self.delay.active() {
             self.delay.process(samples);
+        }
+        if owner.is_some() {
+            self.delay.hold_dop();
         }
         // The fade before a reopen or a close was played into the line,
         // which the close empties: it fades what leaves the line instead.
@@ -9924,6 +9957,64 @@ mod tests {
                 assert_eq!(got.last(), Some(&[step, -step]));
             }
         }
+    }
+
+    /// Everything the master's card gets when a DoP stream, through a
+    /// delay line of 200 frames, turns into PCM and `command` comes
+    /// `after` PCM periods, while the line still holds DoP.
+    fn dop_then(command: fn() -> Command, after: usize) -> Vec<[i32; 2]> {
+        let mut rig = Rig::<I32>::new(BitPerfect::Auto);
+        rig.send(Command::SetDelay(200));
+        let mut a = client(1);
+        rig.add(&mut a);
+        let start = rig.log.frames().len();
+        for _ in 0..6 {
+            a.ring.write(&dop_frames(PERIOD));
+            rig.cycle();
+        }
+        for cycle in 0..8 {
+            if cycle == after {
+                rig.send(command());
+            }
+            a.ring.write(&frames(1 << 20, PERIOD));
+            rig.cycle();
+        }
+        rig.log.frames()[start..].to_vec()
+    }
+
+    #[test]
+    fn dop_in_the_delay_line_is_never_scaled() {
+        let words: Vec<[i32; 2]> = dop_frames(2)
+            .into_iter()
+            .chain(dop_silence(0x05, 2))
+            .collect();
+        // A DoP word as written, silence, or the PCM, faded or not: a DoP
+        // word scaled by a fade is none of these.
+        let valid = |f: &[i32; 2]| words.contains(f) || f[1] == -f[0] && f[0].abs() <= 1 << 20;
+        type Make = fn() -> Command;
+        let commands: [(&str, Make); 4] = [
+            ("reconfigure", || Command::Reconfigure {
+                rate: RATE,
+                period: PERIOD as u32,
+            }),
+            ("close", || Command::CloseOutput),
+            ("shutdown", || Command::Shutdown),
+            ("delay", || Command::SetDelay(100)),
+        ];
+        for (what, command) in commands {
+            for after in 0..4 {
+                let got = dop_then(command, after);
+                assert!(got.iter().any(|f| words.contains(f)), "{what} {after}");
+                for (i, f) in got.iter().enumerate() {
+                    assert!(valid(f), "{what} after {after}: frame {i} is {f:x?}");
+                }
+            }
+        }
+        // Without a change the line plays the stream out whole, and then
+        // the PCM.
+        let got = dop_then(|| Command::SetGain(1, 1.0), 99);
+        assert_eq!(got[200..200 + 6 * PERIOD], dop_frames(6 * PERIOD)[..]);
+        assert_eq!(got.last(), Some(&[1 << 20, -(1 << 20)]));
     }
 
     #[test]
