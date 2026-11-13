@@ -4,19 +4,20 @@
 
 use super::{ConnId, Control, Stream};
 use crate::api::{
-    self, ApiError, ApiEvent, Call, ClientView, InputPatch, InputView, OutputPatch, OutputState,
-    OutputView, StateView,
+    self, ApiError, ApiEvent, Call, ClientView, InputPatch, InputView, MatrixPut, OutputPatch,
+    OutputRoutes, OutputState, OutputView, RouteJson, StateView,
 };
 use crate::bitperfect::NotBitPerfect;
-use crate::config::{Config, DEFAULT_IDLE_DELAY_S, Format, Idle};
+use crate::config::{self, Config, DEFAULT_IDLE_DELAY_S, Format, Idle, Route};
 use crate::counters::Counters;
 use crate::engine::Command;
 use crate::format::db_to_gain;
-use crate::state::{MAX_CLIENTS, Stored, StoredInput, StoredOutput};
+use crate::matrix::{Bus, INPUT_NAMES, Matrix};
+use crate::state::{MAX_CLIENTS, State, Stored, StoredInput, StoredOutput, StoredRoute};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 
 /// What was last published of the outputs, to publish only changes.
@@ -111,6 +112,109 @@ const UNITY: StoredInput = StoredInput {
     muted: false,
 };
 
+/// The shortest time between two matrices sent to one output. A change
+/// fades over 10 ms, and a DoP stream that starts meanwhile waits for the
+/// fade to end: so it waits for at most one.
+const MATRIX_GAP: Duration = Duration::from_millis(20);
+
+/// An output's matrix as the control thread keeps it.
+pub(super) struct OutputMatrix {
+    /// The width its buffers and chains on the audio thread are built for,
+    /// fixed at the start. A matrix of another width is refused.
+    width: usize,
+    /// The routes as last set; empty is the default matrix.
+    routes: Vec<Route>,
+    /// The routes of the config, which a stored matrix is checked against.
+    config: Vec<StoredRoute>,
+    /// A matrix that waits for its turn, and when it is due. A later one
+    /// replaces it.
+    due: Option<(Instant, Box<Matrix>)>,
+    /// When the last one was sent.
+    sent_at: Option<Instant>,
+    /// The address of the last one sent. The audio thread sends back the
+    /// one it replaced, or this one if it refused it, and only the address
+    /// tells the two apart: both may hold the same gains.
+    sent: Option<usize>,
+    /// A refused matrix has been logged.
+    refused: bool,
+}
+
+impl OutputMatrix {
+    /// `config` is the config's routes, None for the default matrix.
+    pub(super) fn new(width: usize, config: Option<&[Route]>) -> OutputMatrix {
+        let routes = config.unwrap_or_default().to_vec();
+        OutputMatrix {
+            width,
+            config: stored_routes(&routes),
+            routes,
+            due: None,
+            sent_at: None,
+            sent: None,
+            refused: false,
+        }
+    }
+}
+
+/// The routes of the default matrix: left to channel 1 and right to
+/// channel 2 for both buses, as far as `width` goes.
+fn default_routes(width: usize) -> Vec<Route> {
+    let sides = Bus::ALL
+        .into_iter()
+        .flat_map(|bus| bus.inputs().into_iter().enumerate());
+    sides
+        .filter(|&(side, _)| side < width)
+        .map(|(side, from)| Route {
+            from,
+            to: side + 1,
+            gain_db: 0.0,
+        })
+        .collect()
+}
+
+/// The matrix of `routes`, `width` channels wide, with the config's rules
+/// and messages. No route is the default matrix, as `matrix = []` is.
+fn matrix_of(routes: &[Route], width: usize) -> Result<Matrix, String> {
+    if routes.is_empty() {
+        Ok(Matrix::default_for(width))
+    } else {
+        Matrix::from_routes(routes, width)
+    }
+}
+
+/// Checks routes given by their parts, each as a `[[matrix]]` table, and
+/// makes their matrix.
+fn routes_and_matrix(
+    parts: impl Iterator<Item = (String, i64, f64)>,
+    width: usize,
+) -> Result<(Vec<Route>, Matrix), String> {
+    let routes = parts
+        .enumerate()
+        .map(|(i, (from, to, gain_db))| config::route_from_parts(i + 1, &from, to, gain_db))
+        .collect::<Result<Vec<Route>, String>>()?;
+    let matrix = matrix_of(&routes, width)?;
+    Ok((routes, matrix))
+}
+
+fn stored_routes(routes: &[Route]) -> Vec<StoredRoute> {
+    let stored = |r: &Route| StoredRoute {
+        from: INPUT_NAMES[r.from].to_string(),
+        to: r.to,
+        gain_db: r.gain_db,
+    };
+    routes.iter().map(stored).collect()
+}
+
+/// A route as the API writes it. The gain is kept as an `f32`; it is
+/// widened through its shortest text, so that -0.1 dB reads as -0.1 and
+/// not as the `f64` nearest the `f32`.
+fn route_json(route: &Route) -> RouteJson {
+    RouteJson {
+        from: INPUT_NAMES[route.from].to_string(),
+        to: route.to as i64,
+        gain_db: Some(route.gain_db.to_string().parse().unwrap_or(0.0)),
+    }
+}
+
 fn format_name(format: Format) -> &'static str {
     match format {
         Format::I32 => "i32",
@@ -162,12 +266,24 @@ impl Control {
                 api::answer(&self.client_view(&name))
             }
             Call::PatchClient(name, patch) => self.patch_client(name, patch, now),
-            Call::Matrix | Call::PutMatrix(_) => {
-                Err(ApiError::not_found("the matrix is not served yet"))
-            }
+            Call::Matrix => api::answer(&self.matrix_view()),
+            Call::PutMatrix(put) => self.put_matrix(put, now),
         };
         self.publish_changes();
         answer
+    }
+
+    /// When the earliest matrix that waits for its turn is due, so that
+    /// the poll can wake for it before its tick.
+    pub fn next_due(&self) -> Option<Instant> {
+        let due = self.matrices.iter().filter_map(|m| m.due.as_ref());
+        due.map(|&(at, _)| at).min()
+    }
+
+    /// The width of the master's matrix, as its chains make it, where the
+    /// config's channels are taken until then. Call before `restore`.
+    pub fn set_matrix_width(&mut self, width: usize) {
+        self.matrices[0].width = width;
     }
 
     /// Sends an event to the API's subscribers, if any.
@@ -399,6 +515,188 @@ impl Control {
         });
     }
 
+    /// The card of the output at engine index `index`, which keys its
+    /// state.
+    fn card_of(&self, index: usize) -> &str {
+        match index {
+            0 => &self.card,
+            _ => &self.further[index - 1].card,
+        }
+    }
+
+    /// The engine index of the output at `index`: its place in the config.
+    fn engine_index(&self, index: usize) -> usize {
+        match index {
+            0 => 0,
+            _ => self.further[index - 1].index,
+        }
+    }
+
+    /// The routes of the output at `index` as last set, the default matrix
+    /// written out route by route.
+    fn route_views(&self, index: usize) -> Vec<RouteJson> {
+        let slot = &self.matrices[index];
+        let default;
+        let routes = if slot.routes.is_empty() {
+            default = default_routes(slot.width);
+            &default
+        } else {
+            &slot.routes
+        };
+        routes.iter().map(route_json).collect()
+    }
+
+    fn matrix_view(&self) -> MatrixPut {
+        let outputs = (0..self.matrices.len())
+            .map(|index| OutputRoutes {
+                output: index + 1,
+                routes: self.route_views(index),
+            })
+            .collect();
+        MatrixPut { outputs }
+    }
+
+    /// Checks every output's routes first, so that a refused put changes
+    /// no output's matrix. An output not named keeps its matrix.
+    fn put_matrix(&mut self, put: MatrixPut, now: Instant) -> api::Answer {
+        let mut checked: Vec<(usize, Vec<Route>, Matrix)> = Vec::new();
+        for OutputRoutes { output: id, routes } in put.outputs {
+            let index = self.output_index(id)?;
+            if checked.iter().any(|&(i, ..)| i == index) {
+                let message = format!("output {id} is named twice");
+                return Err(ApiError::unprocessable(message));
+            }
+            let parts = routes
+                .into_iter()
+                .map(|r| (r.from, r.to, r.gain_db.unwrap_or(0.0)));
+            // The config names a further output's matrix by its output.
+            let (routes, matrix) =
+                routes_and_matrix(parts, self.matrices[index].width).map_err(|e| match index {
+                    0 => ApiError::unprocessable(e),
+                    _ => ApiError::unprocessable(format!("output {id}: {e}")),
+                })?;
+            checked.push((index, routes, matrix));
+        }
+        for (index, routes, matrix) in checked {
+            if routes != self.matrices[index].routes {
+                self.set_matrix(index, routes, matrix, now);
+            }
+        }
+        api::answer(&self.matrix_view())
+    }
+
+    /// Sets the matrix of the output at `index`, stores it with what the
+    /// config says, and sends it when its turn comes.
+    fn set_matrix(&mut self, index: usize, routes: Vec<Route>, matrix: Matrix, now: Instant) {
+        let card = self.card_of(index).to_string();
+        let slot = &mut self.matrices[index];
+        let stored = Stored {
+            value: stored_routes(&routes),
+            config: slot.config.clone(),
+        };
+        slot.routes = routes;
+        self.state.outputs.entry(card).or_default().matrix = Some(stored);
+        self.publish(ApiEvent::Matrix {
+            output: index + 1,
+            routes: self.route_views(index),
+        });
+        self.save_later(now);
+        let slot = &mut self.matrices[index];
+        match slot.sent_at {
+            Some(at) if now < at + MATRIX_GAP => {
+                slot.due = Some((at + MATRIX_GAP, Box::new(matrix)))
+            }
+            _ => {
+                slot.due = None;
+                self.send_matrix(index, Box::new(matrix), now);
+            }
+        }
+    }
+
+    fn send_matrix(&mut self, index: usize, matrix: Box<Matrix>, now: Instant) {
+        let slot = &mut self.matrices[index];
+        slot.sent_at = Some(now);
+        slot.sent = Some(std::ptr::from_ref::<Matrix>(&*matrix).addr());
+        let engine = self.engine_index(index);
+        self.send(vec![Command::SetMatrix(engine, matrix)]);
+    }
+
+    /// Sends each matrix whose turn has come.
+    pub(super) fn send_due_matrices(&mut self, now: Instant) {
+        for index in 0..self.matrices.len() {
+            let slot = &mut self.matrices[index];
+            if slot.due.as_ref().is_some_and(|&(at, _)| now >= at)
+                && let Some((_, matrix)) = slot.due.take()
+            {
+                self.send_matrix(index, matrix, now);
+            }
+        }
+    }
+
+    /// A matrix the audio thread sent back for output `output`, which is
+    /// dropped here. It is the one a `SetMatrix` replaced, or, if that was
+    /// refused, the one it brought. Every put is checked against the
+    /// width, so a refusal means the widths kept here are wrong: logged
+    /// once.
+    pub(super) fn old_matrix(&mut self, output: usize, matrix: &Matrix) {
+        let index = match output {
+            0 => Some(0),
+            _ => self
+                .further
+                .iter()
+                .position(|o| o.index == output)
+                .map(|i| i + 1),
+        };
+        let Some(slot) = index.and_then(|i| self.matrices.get_mut(i)) else {
+            return;
+        };
+        if slot.sent == Some(std::ptr::from_ref(matrix).addr()) && !slot.refused {
+            slot.refused = true;
+            eprintln!(
+                "aas: output {}: a matrix of {} channels was refused, the one in place stays",
+                output + 1,
+                matrix.width()
+            );
+        }
+    }
+
+    /// Takes each output's stored matrix while the config's routes still
+    /// say what they said when it was stored. A further output's goes out
+    /// with its mix at the start; the master's is sent then. One that no
+    /// longer fits the output's width is logged, and the config's stays.
+    pub(super) fn restore_matrices(&mut self, stored: &State) {
+        for index in 0..self.matrices.len() {
+            let entry = stored.outputs.get(self.card_of(index));
+            let slot = &self.matrices[index];
+            let saved = entry.and_then(|e| e.matrix.as_ref());
+            let resolved = Stored::resolve(saved, &slot.config);
+            if resolved == slot.config {
+                continue;
+            }
+            let parts = resolved.into_iter().map(|r| {
+                let to = i64::try_from(r.to).unwrap_or(i64::MAX);
+                (r.from, to, f64::from(r.gain_db))
+            });
+            let (routes, matrix) = match routes_and_matrix(parts, slot.width) {
+                Ok(made) => made,
+                Err(e) => {
+                    let n = index + 1;
+                    eprintln!("aas: the stored matrix of output {n}: {e}, the config's applies");
+                    continue;
+                }
+            };
+            self.matrices[index].routes = routes;
+            match index {
+                0 => self.matrices[0].due = Some((self.epoch, Box::new(matrix))),
+                _ => {
+                    if let Some((unsent, _)) = &mut self.further[index - 1].unsent {
+                        *unsent = matrix;
+                    }
+                }
+            }
+        }
+    }
+
     fn analog_present(&self) -> Result<(), ApiError> {
         match self.analog {
             Some(_) => Ok(()),
@@ -552,12 +850,14 @@ mod tests {
         unstarted_with,
     };
     use super::super::*;
-    use crate::api::{ApiError, ApiEvent, Call, InputPatch, OutputPatch};
+    use crate::api::{
+        ApiError, ApiEvent, Call, InputPatch, MatrixPut, OutputPatch, OutputRoutes, RouteJson,
+    };
     use crate::bitperfect::NotBitPerfect;
-    use crate::config::{self, Idle};
+    use crate::config::{self, Idle, Route};
     use crate::counters::Counters;
     use crate::format::db_to_gain;
-    use crate::state::{Stored, StoredInput, StoredOutput};
+    use crate::state::{Stored, StoredInput, StoredOutput, StoredRoute};
     use serde_json::json;
     use std::sync::Arc;
     use tokio::sync::broadcast;
@@ -1374,5 +1674,415 @@ mod tests {
         assert_eq!(state["outputs"][0]["state"], json!("parked"));
         assert_eq!(state["bit_perfect"], json!(false));
         assert_eq!(state["reason"], json!("no source"));
+    }
+
+    fn route(from: &str, to: i64, gain_db: Option<f64>) -> RouteJson {
+        RouteJson {
+            from: from.into(),
+            to,
+            gain_db,
+        }
+    }
+
+    /// Left to channel 2 and right to channel 1.
+    fn swap() -> Vec<RouteJson> {
+        vec![
+            route("players.left", 2, None),
+            route("players.right", 1, Some(0.0)),
+        ]
+    }
+
+    fn swap_matrix(width: usize) -> Matrix {
+        let routes = [
+            Route {
+                from: 0,
+                to: 2,
+                gain_db: 0.0,
+            },
+            Route {
+                from: 1,
+                to: 1,
+                gain_db: 0.0,
+            },
+        ];
+        Matrix::from_routes(&routes, width).unwrap()
+    }
+
+    fn put(outputs: Vec<(usize, Vec<RouteJson>)>) -> Call {
+        let outputs = outputs
+            .into_iter()
+            .map(|(output, routes)| OutputRoutes { output, routes })
+            .collect();
+        Call::PutMatrix(MatrixPut { outputs })
+    }
+
+    /// The routes `GET /matrix` gives for API output `id`.
+    fn routes_of(control: &mut Control, id: usize, now: Instant) -> serde_json::Value {
+        let view = control.call(Call::Matrix, now).unwrap();
+        let outputs = view["outputs"].as_array().unwrap();
+        let entry = outputs.iter().find(|o| o["output"] == json!(id)).unwrap();
+        entry["routes"].clone()
+    }
+
+    fn default_routes() -> serde_json::Value {
+        json!([
+            {"from": "players.left", "to": 1, "gain_db": 0.0},
+            {"from": "players.right", "to": 2, "gain_db": 0.0},
+            {"from": "analog.left", "to": 1, "gain_db": 0.0},
+            {"from": "analog.right", "to": 2, "gain_db": 0.0},
+        ])
+    }
+
+    fn swap_routes() -> serde_json::Value {
+        json!([
+            {"from": "players.left", "to": 2, "gain_db": 0.0},
+            {"from": "players.right", "to": 1, "gain_db": 0.0},
+        ])
+    }
+
+    #[test]
+    fn a_matrix_put_reaches_the_engine() {
+        let (mut control, mut engine, _logs, now) =
+            started_with(&Config::default(), vec![further(&[])]);
+        engine.take(true);
+        for id in [1, 2] {
+            let answer = control.call(put(vec![(id, swap())]), now);
+            assert_eq!(status(answer), 200, "{id}");
+            assert_eq!(engine.take(true), ["SetMatrix"], "{id}");
+            assert_eq!(engine.matrices, [(id - 1, swap_matrix(2))], "{id}");
+            engine.matrices.clear();
+            assert_eq!(routes_of(&mut control, id, now), swap_routes(), "{id}");
+        }
+    }
+
+    #[test]
+    fn a_matrix_of_another_width_is_422() {
+        let (mut output, rates) = further(&[]);
+        output.channels = 1;
+        let (mut control, mut engine, _logs, now) =
+            started_with(&Config::default(), vec![(output, rates)]);
+        engine.take(true);
+        // A stereo matrix for a mono output.
+        let answer = control.call(put(vec![(2, swap())]), now);
+        assert_eq!(status(answer.clone()), 422);
+        assert_eq!(
+            message(answer),
+            "output 2: matrix 1: channel 2 is outside the matrix, which has 1 channel"
+        );
+        assert!(engine.take(true).is_empty());
+        let mono = json!([
+            {"from": "players.left", "to": 1, "gain_db": 0.0},
+            {"from": "analog.left", "to": 1, "gain_db": 0.0},
+        ]);
+        assert_eq!(routes_of(&mut control, 2, now), mono);
+    }
+
+    #[test]
+    fn a_route_above_the_width_is_422() {
+        let (mut control, mut engine, _logs, now) =
+            started_with(&Config::default(), vec![further(&[])]);
+        engine.take(true);
+        let mut published = subscribe(&mut control);
+        let routes = vec![
+            route("players.left", 1, None),
+            route("analog.left", 3, None),
+        ];
+        let answer = control.call(put(vec![(1, routes)]), now);
+        assert_eq!(
+            message(answer),
+            "matrix 2: channel 3 is outside the matrix, which has 2 channels"
+        );
+        let answer = control.call(put(vec![(1, vec![route("players.left", 9, None)])]), now);
+        assert_eq!(
+            message(answer),
+            "matrix 1: to must be a channel from 1 to 8"
+        );
+        let loud = vec![route("players.left", 1, Some(0.5))];
+        let answer = control.call(put(vec![(1, loud)]), now);
+        assert_eq!(message(answer), "matrix 1: gain_db must be from -100 to 0");
+        // A 422 for one output changes nothing for another named before it.
+        let bad = vec![route("players.left", 3, None)];
+        let answer = control.call(put(vec![(2, swap()), (1, bad)]), now);
+        assert_eq!(status(answer), 422);
+        assert!(engine.take(true).is_empty());
+        assert!(events(&mut published).is_empty());
+        assert!(control.save_at.is_none());
+        assert_eq!(routes_of(&mut control, 2, now), default_routes());
+    }
+
+    #[test]
+    fn an_unknown_source_is_422() {
+        let (mut control, mut engine, now) = open(&Config::default(), None);
+        let routes = vec![
+            route("players.left", 1, None),
+            route("players.middle", 1, None),
+        ];
+        let answer = control.call(put(vec![(1, routes)]), now);
+        assert_eq!(status(answer.clone()), 422);
+        let want = config::route_from_parts(2, "players.middle", 1, 0.0).unwrap_err();
+        assert_eq!(message(answer), want);
+        assert!(
+            want.starts_with("matrix 2: from \"players.middle\""),
+            "{want}"
+        );
+        assert!(engine.take(true).is_empty());
+    }
+
+    #[test]
+    fn output_9_is_404() {
+        let (mut control, mut engine, _logs, now) =
+            started_with(&Config::default(), vec![further(&[])]);
+        engine.take(true);
+        for id in [0, 3, 9] {
+            let answer = control.call(put(vec![(1, swap()), (id, swap())]), now);
+            assert_eq!(status(answer.clone()), 404, "{id}");
+            assert_eq!(message(answer), format!("no output {id}"));
+        }
+        assert!(engine.take(true).is_empty());
+        assert_eq!(routes_of(&mut control, 1, now), default_routes());
+    }
+
+    #[test]
+    fn an_output_named_twice_is_422() {
+        let (mut control, mut engine, now) = open(&Config::default(), None);
+        let answer = control.call(put(vec![(1, swap()), (1, Vec::new())]), now);
+        assert_eq!(status(answer.clone()), 422);
+        assert_eq!(message(answer), "output 1 is named twice");
+        assert!(engine.take(true).is_empty());
+    }
+
+    #[test]
+    fn an_empty_route_list_is_the_default_matrix() {
+        let (mut control, mut engine, now) = open(&Config::default(), None);
+        control.call(put(vec![(1, swap())]), now).unwrap();
+        engine.take(true);
+        engine.matrices.clear();
+        let later = now + Duration::from_millis(20);
+        control.call(put(vec![(1, Vec::new())]), later).unwrap();
+        engine.take(true);
+        assert_eq!(engine.matrices, [(0, Matrix::default_for(2))]);
+        assert_eq!(routes_of(&mut control, 1, later), default_routes());
+    }
+
+    #[test]
+    fn an_output_not_named_keeps_its_matrix() {
+        let (mut control, mut engine, _logs, now) =
+            started_with(&Config::default(), vec![further(&[])]);
+        engine.take(true);
+        control.call(put(vec![(2, swap())]), now).unwrap();
+        engine.take(true);
+        engine.matrices.clear();
+        control.call(put(vec![(1, swap())]), now).unwrap();
+        engine.take(true);
+        assert_eq!(engine.matrices, [(0, swap_matrix(2))]);
+        assert_eq!(routes_of(&mut control, 2, now), swap_routes());
+    }
+
+    #[test]
+    fn matrices_are_paced_at_20_ms() {
+        let (mut control, mut engine, now) = open(&Config::default(), None);
+        // Each put a little quieter, so that each matrix is told apart.
+        let quieter = |i: u32| vec![route("players.left", 1, Some(-f64::from(i) * 0.5))];
+        let matrix_of = |i: u32| {
+            let route = Route {
+                from: 0,
+                to: 1,
+                gain_db: -(i as f32) * 0.5,
+            };
+            Matrix::from_routes(&[route], 2).unwrap()
+        };
+        for i in 0..100 {
+            let at = now + Duration::from_micros(10 * u64::from(i));
+            control.call(put(vec![(1, quieter(i))]), at).unwrap();
+        }
+        assert_eq!(engine.take(true), ["SetMatrix"]);
+        assert_eq!(engine.matrices, [(0, matrix_of(0))]);
+        let due = now + Duration::from_millis(20);
+        assert_eq!(control.next_due(), Some(due));
+        control.handle_events(now + Duration::from_millis(1));
+        control.tick(now + Duration::from_millis(19));
+        assert!(engine.take(true).is_empty());
+        control.tick(due);
+        assert_eq!(engine.take(true), ["SetMatrix"]);
+        assert_eq!(engine.matrices, [(0, matrix_of(0)), (0, matrix_of(99))]);
+        assert_eq!(control.next_due(), None);
+        control.tick(due + Duration::from_millis(40));
+        assert!(engine.take(true).is_empty());
+        // Every matrix that came back is taken off the queue, and freed.
+        control.handle_events(due);
+        assert!(control.events.is_empty());
+        assert!(control.stash.is_empty());
+        // Once 20 ms have passed, the next one goes at once.
+        let later = due + Duration::from_millis(20);
+        control.call(put(vec![(1, quieter(1))]), later).unwrap();
+        assert_eq!(engine.take(true), ["SetMatrix"]);
+        assert_eq!(control.next_due(), None);
+    }
+
+    #[test]
+    fn a_refused_matrix_is_noticed_once() {
+        let (mut control, mut engine, now) = open(&Config::default(), None);
+        control.call(put(vec![(1, swap())]), now).unwrap();
+        engine.take(true);
+        control.handle_events(now);
+        assert!(!control.matrices[0].refused);
+        engine.refuse_matrices = true;
+        let later = now + Duration::from_millis(20);
+        control.call(put(vec![(1, Vec::new())]), later).unwrap();
+        engine.take(true);
+        control.handle_events(later);
+        assert!(control.matrices[0].refused);
+        assert!(control.events.is_empty());
+    }
+
+    #[test]
+    fn a_matrix_put_is_saved_and_published() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        let (mut control, _engine, now) = restored_matrices(&path, None);
+        let mut published = subscribe(&mut control);
+        let answer = control.call(put(vec![(2, swap())]), now).unwrap();
+        assert_eq!(answer["outputs"][1]["routes"], swap_routes());
+        let want = ApiEvent::Matrix {
+            output: 2,
+            routes: vec![
+                route("players.left", 2, Some(0.0)),
+                route("players.right", 1, Some(0.0)),
+            ],
+        };
+        assert_eq!(events(&mut published), [want]);
+        assert!(control.save_at.is_some());
+        let swap = vec![
+            stored_route("players.left", 2),
+            stored_route("players.right", 1),
+        ];
+        control.save_at = Some(now);
+        control.shutdown();
+        let stored = |value| {
+            Some(Stored {
+                value,
+                config: Vec::new(),
+            })
+        };
+        assert_eq!(State::load(&path).outputs["A"].matrix, stored(swap));
+        // The default matrix is stored as an empty list.
+        let (mut control, _engine, now) = restored_matrices(&path, None);
+        assert_eq!(routes_of(&mut control, 2, now), swap_routes());
+        control.call(put(vec![(2, Vec::new())]), now).unwrap();
+        assert!(control.save_at.is_some());
+        control.save_at = Some(now);
+        control.shutdown();
+        assert_eq!(State::load(&path).outputs["A"].matrix, stored(Vec::new()));
+    }
+
+    fn stored_route(from: &str, to: usize) -> StoredRoute {
+        StoredRoute {
+            from: from.into(),
+            to,
+            gain_db: 0.0,
+        }
+    }
+
+    /// A state file whose master ("master") and further output ("A") each
+    /// keep the swap, stored against the config matrix given.
+    fn stored_matrices(path: &std::path::Path, config: Vec<StoredRoute>) {
+        let mut state = State::default();
+        let swap = vec![
+            stored_route("players.left", 2),
+            stored_route("players.right", 1),
+        ];
+        for card in ["master", "A"] {
+            let output = StoredOutput {
+                matrix: Some(Stored {
+                    value: swap.clone(),
+                    config: config.clone(),
+                }),
+                ..StoredOutput::default()
+            };
+            state.outputs.insert(card.into(), output);
+        }
+        state.save(path).unwrap();
+    }
+
+    /// Starts a control thread with a further output on card "A", both it
+    /// and the master with the config matrix given, restored from `path`.
+    fn restored_matrices(
+        path: &std::path::Path,
+        matrix: Option<Vec<Route>>,
+    ) -> (Control, FakeEngine, Instant) {
+        let config = Config {
+            matrix: matrix.clone(),
+            ..Config::default()
+        };
+        let (mut output, rates) = further(&[]);
+        output.card = "A".into();
+        output.matrix = matrix;
+        let (mut control, mut engine, _logs) = unstarted_with(&config, vec![(output, rates)]);
+        let volume = OutputVolume::new(None, config::BitPerfect::Auto);
+        let cards = ["master".to_string(), "A".to_string()];
+        control.restore(volume, path.to_path_buf(), &cards);
+        let now = Instant::now();
+        control.start(now);
+        engine.take(true);
+        (control, engine, now)
+    }
+
+    #[test]
+    fn a_stored_matrix_is_restored_while_the_config_matrix_is_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        stored_matrices(&path, Vec::new());
+        let (mut control, engine, now) = restored_matrices(&path, None);
+        assert_eq!(engine.matrices, [(0, swap_matrix(2))]);
+        assert_eq!(engine.mixes, [(1, swap_matrix(2))]);
+        for id in [1, 2] {
+            assert_eq!(routes_of(&mut control, id, now), swap_routes(), "{id}");
+        }
+        // The pacing starts from the restore's matrix.
+        control.call(put(vec![(1, Vec::new())]), now).unwrap();
+        assert!(control.next_due().is_some());
+    }
+
+    #[test]
+    fn an_edited_config_matrix_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        // Stored against the default matrix; the config has routes now.
+        stored_matrices(&path, Vec::new());
+        let right = Route {
+            from: 1,
+            to: 1,
+            gain_db: -6.0,
+        };
+        let (mut control, engine, now) = restored_matrices(&path, Some(vec![right]));
+        let configured = Matrix::from_routes(&[right], 2).unwrap();
+        assert!(engine.matrices.is_empty());
+        assert_eq!(engine.mixes, [(1, configured)]);
+        let want = json!([{"from": "players.right", "to": 1, "gain_db": -6.0}]);
+        for id in [1, 2] {
+            assert_eq!(routes_of(&mut control, id, now), want, "{id}");
+        }
+        // Stored against routes the config no longer has: the default.
+        stored_matrices(&path, vec![stored_route("players.left", 1)]);
+        let (mut control, engine, now) = restored_matrices(&path, None);
+        assert!(engine.matrices.is_empty());
+        assert_eq!(engine.mixes, [(1, Matrix::default_for(2))]);
+        assert_eq!(routes_of(&mut control, 1, now), default_routes());
+        // A stored matrix that does not fit the width any more is dropped
+        // for the config's, while the config is unchanged.
+        let mut state = State::default();
+        let wide = vec![stored_route("players.left", 3)];
+        let output = StoredOutput {
+            matrix: Some(Stored {
+                value: wide,
+                config: Vec::new(),
+            }),
+            ..StoredOutput::default()
+        };
+        state.outputs.insert("master".into(), output);
+        state.save(&path).unwrap();
+        let (mut control, engine, now) = restored_matrices(&path, None);
+        assert!(engine.matrices.is_empty());
+        assert_eq!(routes_of(&mut control, 1, now), default_routes());
     }
 }

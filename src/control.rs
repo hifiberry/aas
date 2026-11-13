@@ -910,6 +910,8 @@ pub struct Control {
     published: Option<api::Published>,
     /// The audio thread's counters, for its bit-perfect decision.
     counters: Arc<Counters>,
+    /// Each output's matrix, by engine index: the master first.
+    matrices: Vec<api::OutputMatrix>,
 }
 
 impl Control {
@@ -980,6 +982,10 @@ impl Control {
             api: None,
             published: None,
             counters: Arc::new(Counters::default()),
+            matrices: vec![api::OutputMatrix::new(
+                config.channels,
+                config.matrix.as_deref(),
+            )],
         }
     }
 
@@ -988,6 +994,8 @@ impl Control {
     pub fn add_output(&mut self, setup: FurtherSetup) {
         let config = setup.config;
         let latency_ms = config.latency_ms.unwrap_or(self.latency_ms);
+        let matrix = api::OutputMatrix::new(setup.matrix.width(), config.matrix.as_deref());
+        self.matrices.push(matrix);
         self.further.push(FurtherOutput {
             index: setup.index,
             card: config.card,
@@ -1081,6 +1089,7 @@ impl Control {
             output.volume_db = Stored::resolve(volume_db, &output.config_volume_db);
             output.idle = api::resolve_idle(entry, output.config_idle);
         }
+        self.restore_matrices(&stored);
         self.state = stored;
         self.saver = Some(Saver::new(state));
         eprintln!(
@@ -1131,6 +1140,8 @@ impl Control {
         self.open_output(now, &mut batch);
         self.idle_since = Some(now);
         self.send(batch);
+        // A stored matrix of the master, which the engine starts without.
+        self.send_due_matrices(now);
         self.publish_changes();
     }
 
@@ -2522,8 +2533,9 @@ impl Control {
                 | Event::OldTable(_)
                 | Event::OldChain(..)
                 | Event::OldTaps(_)
-                | Event::OldMatrix(..)
                 | Event::OldOutput(..) => {}
+                // Freed here too, once looked at for a refusal.
+                Event::OldMatrix(output, matrix) => self.old_matrix(output, &matrix),
                 // The audio thread writes it no more, so a client that
                 // reads it empty after this has all of it. A client that
                 // gave the stream up meanwhile is told nothing it minds.
@@ -2582,8 +2594,9 @@ impl Control {
     }
 
     /// Applies what is due by the clock: a settled rate change, the end of
-    /// a drain the audio thread never reported, and the idle timer. Such a
-    /// drain is not ended while the output is being opened.
+    /// a drain the audio thread never reported, the idle timer, and a
+    /// matrix that waited for its turn. Such a drain is not ended while the
+    /// output is being opened.
     pub fn tick(&mut self, now: Instant) {
         let mut batch = Vec::new();
         let before = self.policy.current();
@@ -2653,6 +2666,7 @@ impl Control {
             }
         }
         self.send(batch);
+        self.send_due_matrices(now);
         self.sync_further(now);
         if self.save_at.is_some_and(|at| now >= at) {
             self.save();
@@ -3194,6 +3208,14 @@ mod tests {
         pub(super) outputs: Vec<(usize, f32)>,
         /// Every source added, with the gain it comes with.
         pub(super) added: Vec<(ClientId, f32)>,
+        /// Every matrix a `SetMatrix` brought, by output.
+        pub(super) matrices: Vec<(usize, Matrix)>,
+        /// The matrix of each further output's mix put in place, by index.
+        pub(super) mixes: Vec<(usize, Matrix)>,
+        /// The matrix in place for each output, as `SetMatrix` left it.
+        in_place: BTreeMap<usize, Box<Matrix>>,
+        /// Every `SetMatrix` is refused, as one of another width is.
+        pub(super) refuse_matrices: bool,
     }
 
     impl FakeEngine {
@@ -3205,6 +3227,10 @@ mod tests {
                 gains: Vec::new(),
                 outputs: Vec::new(),
                 added: Vec::new(),
+                matrices: Vec::new(),
+                mixes: Vec::new(),
+                in_place: BTreeMap::new(),
+                refuse_matrices: false,
             }
         }
 
@@ -3259,11 +3285,20 @@ mod tests {
                     Command::RemoveTap(id) => (format!("RemoveTap {id}"), None),
                     Command::GrowTaps(t) => ("GrowTaps".into(), Some(Event::OldTaps(t))),
                     Command::SetMatrix(output, m) => {
-                        ("SetMatrix".into(), Some(Event::OldMatrix(output, m)))
+                        self.matrices.push((output, (*m).clone()));
+                        // The one replaced comes back, or this one if refused.
+                        let back = if self.refuse_matrices {
+                            m
+                        } else {
+                            let first = || Box::new(Matrix::default_for(2));
+                            self.in_place.insert(output, m).unwrap_or_else(first)
+                        };
+                        ("SetMatrix".into(), Some(Event::OldMatrix(output, back)))
                     }
                     Command::AddOutput(index, mix, _feed) => {
                         let mix = mix.downcast::<OutputMix<F32>>().expect("an f32 mix");
                         self.outputs.push((index, mix.target_gain));
+                        self.mixes.push((index, mix.matrix.clone()));
                         (format!("AddOutput {index}"), None)
                     }
                     Command::RemoveOutput(index) => (format!("RemoveOutput {index}"), None),
@@ -4611,9 +4646,14 @@ mod tests {
         for (i, (output, rates)) in outputs.into_iter().enumerate() {
             let log = WriterLog::default();
             let (feed, _probe) = FeedProbe::new(output.channels, capacity);
+            // As the server builds it from the config.
+            let matrix = match &output.matrix {
+                None => Matrix::default_for(output.channels),
+                Some(routes) => Matrix::from_routes(routes, output.channels).unwrap(),
+            };
             control.add_output(FurtherSetup {
                 index: i + 1,
-                matrix: Matrix::default_for(output.channels),
+                matrix,
                 config: output,
                 rates,
                 writer: Box::new(FakeWriter(log.clone())),

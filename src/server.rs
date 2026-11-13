@@ -177,6 +177,7 @@ pub fn run_outputs(
     };
     let mut libraries = Libraries::default();
     let matrix = build_matrix(&config, &mut libraries)?;
+    let master_width = matrix.width();
     let chains = Chains::build_for_start(
         &config.plugins,
         config.default_rate,
@@ -306,6 +307,7 @@ pub fn run_outputs(
         control.set_analog(open);
     }
     control.set_counters(counters.clone());
+    control.set_matrix_width(master_width);
     let found = hardware.as_mut().and_then(|open| open());
     let volume = OutputVolume::new(found, config.bit_perfect);
     let master = config.card.clone().unwrap_or_default();
@@ -531,6 +533,19 @@ struct FurtherSearch {
     wait: ProbeWait,
 }
 
+/// How long the poll waits, in ms: a tick, or less when a matrix is due
+/// before it, so that the 20 ms between two matrices is not stretched to
+/// a tick. Rounded up, so that the poll does not wake just before.
+fn poll_timeout(due: Option<Instant>, now: Instant) -> i32 {
+    match due {
+        None => TICK_MS,
+        Some(at) => {
+            let wait = at.saturating_duration_since(now).as_micros().div_ceil(1000);
+            i32::try_from(wait).unwrap_or(TICK_MS).min(TICK_MS)
+        }
+    }
+}
+
 impl Server {
     /// Waits for something to do, or the timer, and does it.
     fn step(&mut self) {
@@ -550,8 +565,9 @@ impl Server {
         let mut fds = vec![poll_in(listener), poll_in(self.notify.as_raw_fd())];
         let ids: Vec<ConnId> = self.conns.keys().copied().collect();
         fds.extend(self.conns.values().map(|fd| poll_in(fd.as_raw_fd())));
+        let timeout = poll_timeout(self.control.next_due(), Instant::now());
         // SAFETY: fds is a valid array of its length.
-        let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, TICK_MS) };
+        let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
         if rc < 0 {
             // Only EINTR is expected; the next step polls again.
             return;
@@ -983,6 +999,17 @@ mod tests {
         let n = unsafe { libc::recv(theirs.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0) };
         assert!(n > 0);
         assert!(notice_is_due(&ours));
+    }
+
+    #[test]
+    fn the_poll_wakes_for_a_matrix_due_before_the_tick() {
+        let now = Instant::now();
+        assert_eq!(poll_timeout(None, now), TICK_MS);
+        let ms = |n| Some(now + Duration::from_millis(n));
+        assert_eq!(poll_timeout(ms(20), now), 20);
+        assert_eq!(poll_timeout(ms(200), now), TICK_MS);
+        assert_eq!(poll_timeout(Some(now + Duration::from_micros(1)), now), 1);
+        assert_eq!(poll_timeout(Some(now), now + Duration::from_millis(5)), 0);
     }
 
     #[test]

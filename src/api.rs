@@ -101,8 +101,8 @@ pub struct InputPatch {
     pub muted: Option<bool>,
 }
 
-/// The body of `PUT /matrix`.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+/// The body of `PUT /matrix`, and what `GET /matrix` gives.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MatrixPut {
     pub outputs: Vec<OutputRoutes>,
@@ -110,7 +110,7 @@ pub struct MatrixPut {
 
 /// One output's routes in a `PUT /matrix`. An empty list is the default
 /// matrix.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OutputRoutes {
     pub output: usize,
