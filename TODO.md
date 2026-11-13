@@ -414,6 +414,17 @@ Search for the name given; line numbers drift.
 Found in the stage 3b part 2 reviews and left, each with the reason. None of
 them was seen to break playback. Search for the name given.
 
+- `src/engine.rs`, the master's card opening under a parked cycle: the card
+  is filled to its buffer less a period, on the assumption that a sink
+  reporting `granted()` starts only once that buffer is full, as the ALSA
+  sink does. Nothing checks it; a sink that starts earlier would step the
+  feeds' pace again (heard as a short pitch glide on the further outputs).
+  First step: a `starts_when_full()` method on `Sink`, true for the ALSA
+  sink, and the prefill only when it is true. Also untested on a board: a
+  further output at the master's own rate across park and open (the
+  loopback takes only 48 kHz), and the one-line starve at an open, which
+  never fired there.
+
 - `src/engine.rs`, `holds_sound`: a change of the master's delay reads the
   delay line once, in silence to its end, to see whether it holds sound. The
   line is made as long as the config can need: about 27,600 frames, times

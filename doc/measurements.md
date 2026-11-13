@@ -2019,9 +2019,12 @@ with the loopback captured throughout; two runs.
   23.26 ms. The open is the only candidate for both.
 - After each open the tone on the loopback rose from 997.0 to 999.0 Hz,
   about +2000 ppm, from about 2.2 s after the open, and was back within
-  about 12 s. That was the step in the feeds' pace, taken as drift; the
-  silence added since removes it, in simulation, but has not been measured
-  on the board.
+  about 12 s. That was the step in the feeds' pace, taken as drift.
+- With the silence added at the open, two more runs: over the 15 s after
+  each open the tone stayed between 996.97 and 997.04 Hz, at most +40 ppm
+  against +2000 before. The further output again counted no xrun, starve or
+  overflow and kept its lock; the worst cycle was 3.42 ms and the worst gap
+  23.57 and 23.27 ms, no longer above the normal gap.
 - With the further output on `idle = "off"` and a delay of 15 s, it closed
   15 s after the source stopped, 10 s after the master, and the cycle then
   stopped. At the next play it reopened and locked again in 5 s, as from
