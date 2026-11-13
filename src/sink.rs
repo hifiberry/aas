@@ -139,11 +139,12 @@ impl Pacer {
         self.next = None;
     }
 
-    /// Starts as if `queued` frames had been written and not played yet.
-    fn start_queued(&mut self, rate: u32, period: u32, queued: u32) {
+    /// Starts as if `queued` frames, still to play at `at`, had been
+    /// written.
+    fn start_queued(&mut self, rate: u32, period: u32, queued: u32, at: Instant) {
         self.start(rate, period);
         if queued > 0 && rate > 0 {
-            self.next = Some(Instant::now() + self.length(u64::from(queued)));
+            self.next = Some(at + self.length(u64::from(queued)));
         }
     }
 
@@ -202,11 +203,11 @@ impl NullSink {
         }
     }
 
-    /// Opens it as if `queued` frames were still to play, such as those a
-    /// card held when it was closed, so that the writes keep the pace the
-    /// card set. Never allocates.
-    pub fn open_queued(&mut self, rate: u32, period: u32, queued: u32) {
-        self.pacer.start_queued(rate, period, queued);
+    /// Opens it as if `queued` frames were still to play at `at`, such as
+    /// those a card held when it was closed, so that the writes keep the
+    /// pace the card set. Never allocates.
+    pub fn open_queued(&mut self, rate: u32, period: u32, queued: u32, at: Instant) {
+        self.pacer.start_queued(rate, period, queued, at);
     }
 }
 
@@ -838,7 +839,7 @@ mod tests {
         let mut sink = NullSink::new(2);
         // 4.8 ms queued at 48 kHz, 2.4 ms periods: the first write waits
         // until a period of the queue is left.
-        sink.open_queued(48000, 120, 240);
+        sink.open_queued(48000, 120, 240, Instant::now());
         assert!(sink.delay_now().unwrap() > 200);
         let start = Instant::now();
         sink.wait_room().unwrap();

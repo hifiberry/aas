@@ -411,13 +411,33 @@ Idle, failure and DoP with several outputs:
   With no further output, or every one off by the master's delay or
   sooner, the master closes and the cycle stops as before.
 - A source at the rate the cycle runs at opens the master's card under the
-  running cycle *(call)*. The further outputs are not touched: they follow
-  the change from the timer's clock to the card's as they do when a lost
-  master comes back, with nothing to prime or relock. The cycle stalls
-  while the card opens; an open slower than a further output's feed lasts
-  makes that writer starve and prime once, which keeps its lock. A source
-  at another rate reopens the master and every further card with it, as
-  any rate change does.
+  running cycle *(call)*. The further outputs are not touched, and their
+  feeds keep the pace the timer set *(call)*. The card's queue goes on from
+  the timer's: a sink that plays from the first frame is filled with zeros
+  for what the timer still holds; an ALSA card, which starts only once its
+  buffer is full, is filled to its buffer less a period, and the first
+  period starts it. That card's pace then runs later than the timer's by
+  the time the open took, and the further outputs' feeds get that many
+  frames of silence ahead of the next period, which puts them on the
+  card's pace without a step. On the CM5 test board the open stalled the
+  cycle about 3.4 ms, at `latency_ms = 48`, with no starve
+  (`doc/measurements.md`, Stage 3b, part 2, "The master off while a
+  further output plays on"). The open stays on the audio thread. An open
+  slower than a further output's feed lasts would make that writer starve
+  and prime once, which keeps its lock; such a starve within 2 s of the
+  open is logged as one line of its own, outside the count of starve
+  lines.
+- Without that, the first build stepped the feeds' pace by most of a master
+  period at each open: the card opened empty and took two periods at
+  once. The writers took the step as drift and pulled their ratio to the
+  clamp: on the test board a 997 Hz tone rose to 999 Hz from about 2 s
+  after the open and settled in about 12 s. In simulation a 20 ms step
+  holds the ratio at the clamp; 3.4 ms of open alone would move it about
+  840 ppm; with the silence it moves under 5 ppm. The clock under the
+  path still changes from the system's to the card's, which the drift
+  follows as for a lost master.
+- A source at another rate reopens the master and every further card with
+  it, as any rate change does.
 - Every reopen of the master reopens every further card, even at an
   unchanged rate *(call: parked for the owner)*. Opening the card under a
   parked cycle at its rate is not a reopen in this sense.
