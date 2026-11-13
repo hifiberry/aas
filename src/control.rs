@@ -143,15 +143,25 @@ pub fn align_frames(master_rate: u32, master_period: u32, further: &[(u32, u32, 
 }
 
 /// The frames the feed of a further output holds at a configuration: what
-/// the target leaves to the feed and two master periods more, at least
-/// `FEED_PERIODS` master periods, and two of the card's periods and the
-/// margin, which a card period much longer than the master's needs.
-fn feed_frames(master_rate: u32, master_period: u32, target: u32, part: (u32, u32, f64)) -> usize {
+/// the target leaves to the feed; a card period, which the feed holds
+/// while the card is a period short of the full buffer the target counts,
+/// when the writer wakes; another, which the master pushes on while the
+/// writer wakes late and resamples before it takes its period from the
+/// feed at once; and two master periods. At least `FEED_PERIODS` master
+/// periods, and two of the card's periods and the margin.
+///
+/// The target holds three card periods and the feed's share, so this is
+/// at most the target and two master periods.
+pub(crate) fn feed_frames(
+    master_rate: u32,
+    master_period: u32,
+    target: u32,
+    part: (u32, u32, f64),
+) -> usize {
     let share = f64::from(target) - card_part(master_rate, part);
-    let fed = share.ceil().max(0.0) as usize + 2 * master_period as usize;
-    let (rate, period, _) = part;
-    let card = f64::from(2 * period) * f64::from(master_rate) / f64::from(rate);
-    let least = (card + margin_frames(master_rate, master_period)).ceil() as usize;
+    let card = writer_frames(master_rate, part);
+    let fed = (share.max(0.0) + 2.0 * card).ceil() as usize + 2 * master_period as usize;
+    let least = (2.0 * card + margin_frames(master_rate, master_period)).ceil() as usize;
     fed.max(FEED_PERIODS * master_period as usize).max(least)
 }
 
@@ -246,7 +256,8 @@ fn all_parts(master: u32, latencies: &[f32], quality: Quality) -> Vec<(u32, u32,
 /// The frames a further output's feed is made with: the most it holds at
 /// any rate the master and the cards may run at, the further outputs'
 /// latencies being `latencies`, with a master period to spare for a rate
-/// between the standard ones.
+/// between the standard ones. A feed holds at most the target and two
+/// master periods (`feed_frames`), the target here being the longest path.
 pub fn feed_capacity(master_latency_ms: f32, latencies: &[f32], quality: Quality) -> usize {
     STANDARD_RATES
         .iter()
@@ -294,7 +305,7 @@ pub fn card_rate(rates: &[u32], master_rate: u32) -> u32 {
 }
 
 /// The line logged for an event of further output `number`, if any.
-/// Starves and overflows are counted, and logged with the counters.
+/// Starves and overflows are counted, and logged through a `FeedLog`.
 pub fn event_line(number: usize, event: FurtherEvent) -> Option<String> {
     let line = match event {
         FurtherEvent::Gone => format!(
@@ -311,9 +322,56 @@ pub fn event_line(number: usize, event: FurtherEvent) -> Option<String> {
              it plays on with gaps",
             MAX_DRIFT * 1e6
         ),
-        FurtherEvent::Starved | FurtherEvent::Overflowed => return None,
+        FurtherEvent::Starved { .. } | FurtherEvent::Overflowed { .. } => return None,
     };
     Some(line)
+}
+
+/// Starves and overflows logged one by one at first, each.
+const FEED_LINES: u32 = 10;
+/// After that, at most one line in this many ms.
+const FEED_LINE_MS: u64 = 60_000;
+
+/// The log of a further output's starves and overflows: the first
+/// [`FEED_LINES`] one by one, then one a minute with how many went unlogged.
+/// The counters at the stop have them all.
+#[derive(Default)]
+struct FeedLog {
+    lines: u32,
+    /// When the last line was, ms after the writer started.
+    last_ms: u64,
+    unlogged: u64,
+}
+
+impl FeedLog {
+    /// The line for `event` of output `number`, if it is a starve or an
+    /// overflow and its turn has come.
+    fn line(&mut self, number: usize, event: FurtherEvent) -> Option<String> {
+        let (what, at_ms, fill, limit) = match event {
+            FurtherEvent::Starved { at_ms, fill, limit } => ("starved", at_ms, fill, limit),
+            FurtherEvent::Overflowed { at_ms, fill, limit } => ("overflowed", at_ms, fill, limit),
+            _ => return None,
+        };
+        if self.lines >= FEED_LINES && at_ms < self.last_ms + FEED_LINE_MS {
+            self.unlogged += 1;
+            return None;
+        }
+        let mut line = format!(
+            "aas: output {number} {what} {}.{:03} s after the start, \
+             its feed held {fill} of {limit} frames",
+            at_ms / 1000,
+            at_ms % 1000
+        );
+        if self.lines + 1 == FEED_LINES {
+            line.push_str("; from now on one line a minute");
+        } else if self.lines >= FEED_LINES {
+            line.push_str(&format!(", {} more since the last line", self.unlogged));
+        }
+        self.lines += 1;
+        self.last_ms = at_ms;
+        self.unlogged = 0;
+        Some(line)
+    }
 }
 
 /// The control thread's side of a further output's writer: a
@@ -414,6 +472,7 @@ struct FurtherOutput {
     configured: bool,
     /// The writer has been told to play.
     open: bool,
+    feed_log: FeedLog,
 }
 
 impl FurtherOutput {
@@ -789,6 +848,7 @@ impl Control {
             pending: None,
             configured: false,
             open: false,
+            feed_log: FeedLog::default(),
         });
         let latencies: Vec<f32> = self.further.iter().map(|o| o.latency_ms).collect();
         self.delay_capacity = delay_capacity(self.latency_ms, &latencies, self.quality);
@@ -2017,9 +2077,12 @@ impl Control {
 
     /// Logs what the further outputs' writers report.
     fn further_events(&mut self) {
-        for output in &self.further {
+        for output in &mut self.further {
+            let number = output.number();
             while let Some(event) = output.writer.event() {
-                if let Some(line) = event_line(output.number(), event) {
+                let line =
+                    event_line(number, event).or_else(|| output.feed_log.line(number, event));
+                if let Some(line) = line {
                     eprintln!("{line}");
                 }
             }
@@ -4291,6 +4354,9 @@ mod tests {
                         let writer = writer_frames(master, part);
                         assert!((feed as f64) < believed(master, target, part), "{what}");
                         assert!(feed as f64 >= 2.0 * writer + margin, "{what}: {feed}");
+                        let share = f64::from(target) - card_part(master, part);
+                        let held = share + 2.0 * writer + 2.0 * f64::from(period);
+                        assert!(feed as f64 >= held, "{what}: {feed} < {held}");
                         let delay = target.saturating_sub(PERIODS * period);
                         assert!(delay <= line, "{what}: delay {delay} > {line}");
                     }
@@ -4612,8 +4678,85 @@ mod tests {
         );
         let lost = line(FurtherEvent::Unlocked);
         assert_eq!(lost.as_deref(), Some("aas: output 2 lost its lock"));
-        // Starves and overflows are counted, not logged one by one.
-        assert_eq!(line(FurtherEvent::Starved), None);
-        assert_eq!(line(FurtherEvent::Overflowed), None);
+        // Starves and overflows go through their own log.
+        let starve = FurtherEvent::Starved {
+            at_ms: 1,
+            fill: 0,
+            limit: 1,
+        };
+        assert_eq!(line(starve), None);
+    }
+
+    #[test]
+    fn the_first_starves_and_overflows_are_logged_then_one_a_minute() {
+        let mut log = FeedLog::default();
+        let starve = |at_ms| FurtherEvent::Starved {
+            at_ms,
+            fill: 300,
+            limit: 2944,
+        };
+        let overflow = |at_ms| FurtherEvent::Overflowed {
+            at_ms,
+            fill: 2560,
+            limit: 2944,
+        };
+        assert_eq!(
+            log.line(2, starve(12_345)).as_deref(),
+            Some(
+                "aas: output 2 starved 12.345 s after the start, its feed held 300 of 2944 frames"
+            )
+        );
+        assert_eq!(
+            log.line(2, overflow(15_000)).as_deref(),
+            Some(
+                "aas: output 2 overflowed 15.000 s after the start, its feed held 2560 of 2944 frames"
+            )
+        );
+        for n in 2..9 {
+            assert!(log.line(2, starve(20_000 + n)).is_some());
+        }
+        let tenth = log.line(2, starve(30_000)).unwrap();
+        assert!(
+            tenth.ends_with("frames; from now on one line a minute"),
+            "{tenth}"
+        );
+        // Then one a minute, with how many went unlogged.
+        for n in 0..5 {
+            assert_eq!(log.line(2, overflow(31_000 + n * 10_000)), None);
+        }
+        assert_eq!(log.line(2, starve(89_999)), None);
+        let next = log.line(2, overflow(90_000)).unwrap();
+        assert!(
+            next.starts_with("aas: output 2 overflowed 90.000 s"),
+            "{next}"
+        );
+        assert!(
+            next.ends_with("frames, 6 more since the last line"),
+            "{next}"
+        );
+        assert_eq!(log.line(2, starve(90_001)), None);
+        // Other events are not its business.
+        assert_eq!(log.line(2, FurtherEvent::Unlocked), None);
+    }
+
+    #[test]
+    fn the_feed_holds_a_card_period_and_two_master_periods() {
+        // A card period of 2048 frames on a 48 ms output beside a master
+        // of 512 at 96 kHz. When the writer wakes its card holds a period
+        // less than the target counts, which the feed holds meanwhile; then
+        // it takes up to a whole card period, late wake and resampling
+        // together, while the master pushes on; and two master periods.
+        for quality in [Quality::Medium, Quality::High] {
+            let part = part_at(96000, 96000, 48.0, quality);
+            assert_eq!(part.1, 2048);
+            let target = align_frames(96000, 512, &[part]);
+            let share = f64::from(target) - card_part(96000, part);
+            let feed = feed_frames(96000, 512, target, part);
+            let least = share + 2.0 * 2048.0 + 2.0 * 512.0;
+            assert!(feed as f64 >= least, "{feed} < {least}");
+            assert!((feed as f64) < believed(96000, target, part));
+            check_alignment(12.0, 2, 48.0, quality).unwrap();
+            assert!(feed <= feed_capacity(12.0, &[48.0], quality));
+        }
     }
 }

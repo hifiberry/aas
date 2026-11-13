@@ -56,6 +56,8 @@ pub struct OutputCounters {
     /// How far the card runs from the master, in thousandths of a ppm:
     /// positive for a card that runs fast.
     pub ppm_milli: AtomicI64,
+    /// Readings of the path's delay its drift controller did not believe.
+    pub skipped: AtomicU64,
     /// The path's delay has stayed on its target for the lock time.
     pub locked: AtomicBool,
 }
@@ -70,12 +72,13 @@ impl std::fmt::Display for OutputCounters {
         write!(
             f,
             "{} xruns, {} wake gaps, worst gap {:.3} ms, {} starves, {} overflows, \
-             {:+.3} ppm, {lock}",
+             {} drift readings skipped, {:+.3} ppm, {lock}",
             self.xruns.load(Relaxed),
             self.wake_gaps.load(Relaxed),
             self.worst_gap_ns.load(Relaxed) as f64 / 1e6,
             self.starves.load(Relaxed),
             self.overflows.load(Relaxed),
+            self.skipped.load(Relaxed),
             self.ppm_milli.load(Relaxed) as f64 / 1e3,
         )
     }
@@ -200,10 +203,11 @@ mod tests {
         c.overflows.fetch_add(3, Relaxed);
         c.worst_gap_ns.store(1_500_000, Relaxed);
         c.ppm_milli.store(-12_345, Relaxed);
+        c.skipped.fetch_add(4, Relaxed);
         assert_eq!(
             c.to_string(),
             "1 xruns, 0 wake gaps, worst gap 1.500 ms, 2 starves, 3 overflows, \
-             -12.345 ppm, not locked"
+             4 drift readings skipped, -12.345 ppm, not locked"
         );
         c.locked.store(true, Relaxed);
         c.ppm_milli.store(100_000, Relaxed);

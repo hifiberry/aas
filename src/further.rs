@@ -59,14 +59,17 @@
 //! under the path are new: the drift starts over, and the resampler
 //! empties. After a starve, an overflow, a stall or an xrun they are the
 //! same: the resampler empties and the drift only starts its reading
-//! afresh, keeping its integral, its lock and its estimate, so the ratio
-//! stays where the card needs it and the lock is not lost.
+//! afresh, keeping its integral and its estimate, so the ratio stays where
+//! the card needs it. A lock outlasts one such gap, not a second within
+//! 10 s (`Drift::reprime`).
 //!
 //! A starve plays a period of zeros and drops what is left in the feed. A
 //! full feed refuses the new period and counts an overflow; the writer sees
 //! it at its next cycle and drops the whole feed, as it does after a stall
 //! longer than the feed lasts: all of it is from before the gap. Old audio
-//! is never played twice, nor late.
+//! is never played twice, nor late. Both reach the control thread as events
+//! with the time since the writer started and what the feed held, which it
+//! logs; the writer itself never logs while it plays.
 //!
 //! # A card that goes
 //!
@@ -164,6 +167,8 @@ struct Shared {
     /// The most samples the feed holds at the configuration the writer
     /// plays, at most the ring's capacity; 0 for the whole ring.
     limit: AtomicU64,
+    /// Frames in the feed when it last refused a push.
+    refused_fill: AtomicU64,
 }
 
 impl Shared {
@@ -260,13 +265,17 @@ impl Feed {
             limit => limit.min(capacity),
         };
         let queued = capacity - self.ring.slots();
-        if queued + samples > limit {
+        let refuse = || {
+            let frames = (queued / self.channels) as u64;
+            self.shared.refused_fill.store(frames, Relaxed);
             self.counters.overflows.fetch_add(1, Relaxed);
-            return false;
+            false
+        };
+        if queued + samples > limit {
+            return refuse();
         }
         let Ok(chunk) = self.ring.write_chunk_uninit(samples) else {
-            self.counters.overflows.fetch_add(1, Relaxed);
-            return false;
+            return refuse();
         };
         chunk.fill_from_iter(from);
         let frames = (samples / self.channels) as u64;
@@ -348,10 +357,12 @@ pub enum FurtherEvent {
     Unlocked,
     /// The card needs more than the ratio's clamp allows.
     Clamped,
-    /// The feed held too little for a period, which played as zeros.
-    Starved,
-    /// The feed was full and refused a master period.
-    Overflowed,
+    /// The feed held too little for a period, which played as zeros: `at_ms`
+    /// after the writer started, with `fill` of its `limit` frames in it.
+    Starved { at_ms: u64, fill: u32, limit: u32 },
+    /// The feed was full and refused a master period: seen `at_ms` after
+    /// the writer started, refused with `fill` of its `limit` frames in it.
+    Overflowed { at_ms: u64, fill: u32, limit: u32 },
 }
 
 /// What a writer plays with at one configuration. Made on the control
@@ -424,6 +435,10 @@ pub struct Writer {
     ratio: f64,
     /// The ratio the resampler last ran at: 1 after its reset.
     applied: f64,
+    /// When the writer was made, on its clock.
+    born: u64,
+    /// Readings skipped by the drifts of the paths replaced.
+    skipped: u64,
     /// The last reading came after the master's next push was due: frames
     /// it has not pushed are missing from it, which says nothing about the
     /// clocks, so the drift does not see it.
@@ -485,6 +500,7 @@ impl Writer {
                 Command::Reconfigure(path) => {
                     self.shared.limit.store(path.feed_samples as u64, Release);
                     if let Some(old) = self.path.replace(path) {
+                        self.skipped += old.drift.skipped();
                         self.retire(old);
                     }
                     // Another master rate draws another line.
@@ -576,7 +592,7 @@ impl Writer {
 
     /// Primes again after a starve, an overflow, a stall or an xrun, with
     /// the clocks as they were: the resampler empties, the drift starts its
-    /// reading afresh and keeps its integral, its lock and its estimate.
+    /// reading afresh and keeps its integral and its estimate.
     fn reprime(&mut self) {
         self.running = false;
         self.held = 0.0;
@@ -615,16 +631,26 @@ impl Writer {
         gap
     }
 
-    /// How long a full feed lasts, ns.
-    fn feed_ns(&self) -> u64 {
+    /// The most frames the feed holds at the configuration played.
+    fn feed_limit(&self) -> usize {
         let capacity = self.ring.buffer().capacity();
         let samples = match self.path.as_ref().map_or(0, |p| p.feed_samples) {
             0 => capacity,
             limit => limit.min(capacity),
         };
-        let frames = (samples / self.channels) as u64;
+        samples / self.channels
+    }
+
+    /// How long a full feed lasts, ns.
+    fn feed_ns(&self) -> u64 {
+        let frames = self.feed_limit() as u64;
         let rate = self.path.as_ref().map_or(1, |p| p.master_rate);
         frames * 1_000_000_000 / u64::from(rate)
+    }
+
+    /// Milliseconds since the writer was made.
+    fn since_born(&self) -> u64 {
+        self.clock.now().saturating_sub(self.born) / 1_000_000
     }
 
     /// The card gone or back puts another clock under the path, the null
@@ -650,7 +676,11 @@ impl Writer {
         let overflows = self.counters.overflows.load(Relaxed);
         if overflows != self.overflows {
             self.overflows = overflows;
-            self.emit(FurtherEvent::Overflowed);
+            self.emit(FurtherEvent::Overflowed {
+                at_ms: self.since_born(),
+                fill: self.shared.refused_fill.load(Relaxed) as u32,
+                limit: self.feed_limit() as u32,
+            });
             // The writer fell behind: all the feed holds is from before
             // the gap.
             self.discard();
@@ -737,7 +767,9 @@ impl Writer {
         let channels = self.channels;
         let path = self.path.as_deref_mut().expect("playing has a path");
         let period = path.period as usize;
-        if !self.overdue {
+        if self.overdue {
+            path.drift.pass();
+        } else {
             self.ratio = path.drift.update(delay);
         }
         path.resampler.set_ratio(self.ratio);
@@ -774,9 +806,14 @@ impl Writer {
     /// is left in the feed goes too: it was made before the gap, which may
     /// last.
     fn starve(&mut self) -> Result<(), SinkError> {
+        let fill = (self.ring.slots() / self.channels) as u32;
         self.discard();
         self.counters.starves.fetch_add(1, Relaxed);
-        self.emit(FurtherEvent::Starved);
+        self.emit(FurtherEvent::Starved {
+            at_ms: self.since_born(),
+            fill,
+            limit: self.feed_limit() as u32,
+        });
         self.reprime();
         self.write(true)
     }
@@ -810,6 +847,8 @@ impl Writer {
         self.counters
             .ppm_milli
             .store((ppm * 1e3).round() as i64, Relaxed);
+        let skipped = self.skipped + drift.skipped();
+        self.counters.skipped.store(skipped, Relaxed);
         if locked != self.locked {
             self.locked = locked;
             self.counters.locked.store(locked, Relaxed);
@@ -1120,6 +1159,8 @@ fn parts(
         ratio: 1.0,
         applied: 1.0,
         overdue: false,
+        born: clock.now(),
+        skipped: 0,
     };
     let feed = Feed {
         ring: feed_in,
@@ -1192,6 +1233,7 @@ fn writer_loop(mut writer: Writer, number: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adaptive::MAX_DRIFT;
     use crate::config::{Format, Quality};
     use crate::sink::{MemorySink, Sink, SinkError};
     use assert_no_alloc::assert_no_alloc;
@@ -1250,6 +1292,9 @@ mod tests {
         /// a card period in the feed when the writer wakes, and starves at
         /// a frame of rounding.
         margin: f64,
+        /// The feed is made as the daemon makes it for this configuration,
+        /// not `FEED_PERIODS` master periods.
+        sized: bool,
     }
 
     impl Sim {
@@ -1267,6 +1312,7 @@ mod tests {
                 record: false,
                 read_cost_us: 0.0,
                 margin: master_period as f64 / 2.0,
+                sized: false,
             }
         }
     }
@@ -1522,16 +1568,6 @@ mod tests {
                 world: world.clone(),
                 channels: sim.channels,
             };
-            let counters = Arc::new(OutputCounters::default());
-            let (writer, feed, handle) = parts(
-                1,
-                FallbackSink::new(Box::new(card)),
-                FEED_PERIODS * sim.master_period,
-                sim.channels,
-                counters.clone(),
-                Clock::Virtual(now),
-            );
-            world.lock().unwrap().feed = Some(feed);
             let resampler = Box::new(Adaptive::new(
                 sim.master_rate,
                 sim.card_rate,
@@ -1548,6 +1584,24 @@ mod tests {
                 + f64::from(BUFFERED) * period
                 + resampler.delay_frames() * scale
                 + sim.margin;
+            let feed_frames = if sim.sized {
+                let part = (sim.card_rate, sim.card_period, resampler.delay_frames());
+                let master_period = sim.master_period as u32;
+                let target = target.ceil() as u32;
+                crate::control::feed_frames(sim.master_rate, master_period, target, part)
+            } else {
+                FEED_PERIODS * sim.master_period
+            };
+            let counters = Arc::new(OutputCounters::default());
+            let (writer, feed, handle) = parts(
+                1,
+                FallbackSink::new(Box::new(card)),
+                feed_frames,
+                sim.channels,
+                counters.clone(),
+                Clock::Virtual(now),
+            );
+            world.lock().unwrap().feed = Some(feed);
             handle.reconfigure(
                 sim.master_rate,
                 sim.card_rate,
@@ -1725,7 +1779,17 @@ mod tests {
         let dry = rig.world().written().len();
         rig.run_until(2.5);
         assert!(rig.count(&rig.counters.starves) >= 1);
-        assert!(rig.events().contains(&FurtherEvent::Starved));
+        // Told with the time since the writer started, and with less than
+        // the card period the writer needed in the feed.
+        let events = rig.events();
+        let starve = events.iter().find_map(|e| match *e {
+            FurtherEvent::Starved { at_ms, fill, limit } => Some((at_ms, fill, limit)),
+            _ => None,
+        });
+        let (at_ms, fill, limit) = starve.unwrap_or_else(|| panic!("{events:?}"));
+        assert!((2_000..2_500).contains(&at_ms), "{at_ms} ms");
+        assert!(fill < 256, "{fill}");
+        assert_eq!(limit as usize, FEED_PERIODS * 256);
         {
             let w = rig.world();
             let after = &w.written()[dry..];
@@ -1781,7 +1845,13 @@ mod tests {
         // The new period went, the four before it stay.
         assert_eq!(rig.writer.feed_ends(), Some((1, 4)));
         rig.cycle();
-        assert!(rig.events().contains(&FurtherEvent::Overflowed));
+        // Told with the four periods it held when it refused the fifth.
+        let events = rig.events();
+        let overflow = events.iter().find_map(|e| match *e {
+            FurtherEvent::Overflowed { fill, limit, .. } => Some((fill, limit)),
+            _ => None,
+        });
+        assert_eq!(overflow, Some((4 * 256, 4 * 256)), "{events:?}");
         // A full feed means the writer fell behind: all of it is from before
         // the gap, and goes.
         assert_eq!(rig.world().feed.as_ref().unwrap().queued(), 0);
@@ -1928,8 +1998,120 @@ mod tests {
         eprintln!("the ratio moved {moved:.2} ppm over the starve");
         assert_eq!(rig.count(&rig.counters.starves), 1);
         let events = rig.events();
-        assert!(events.contains(&FurtherEvent::Starved), "{events:?}");
+        let starved = events
+            .iter()
+            .filter(|e| matches!(e, FurtherEvent::Starved { .. }));
+        assert_eq!(starved.count(), 1, "{events:?}");
         assert!(!events.contains(&FurtherEvent::Unlocked), "{events:?}");
+    }
+
+    /// A card `ppm` from the master on a feed made as the daemon makes it,
+    /// the master at `rate` with periods of `master_period` frames and the
+    /// card's of `card_period`: the ratio holds the clamp, and the path
+    /// starves or overflows every few seconds and is primed again each time.
+    fn beyond_the_clamp(rate: u32, master_period: usize, card_period: u32, ppm: f64) -> Rig {
+        let mut sim = Sim::new(rate, master_period, rate, card_period);
+        sim.margin = (master_period as f64 / 2.0).max(f64::from(rate) / 500.0);
+        sim.ppm = ppm;
+        sim.sized = true;
+        let mut rig = Rig::new(sim);
+        rig.world().source = Source::Dc(1 << 20);
+        let mut clamped = None;
+        while rig.seconds() < 60.0 {
+            rig.cycle();
+            let drift = &rig.writer.path.as_ref().unwrap().drift;
+            if clamped.is_none() && drift.clamped() {
+                clamped = Some(rig.seconds());
+            }
+            if rig.seconds() > 10.0 {
+                assert!(
+                    !rig.counters.locked.load(Relaxed),
+                    "locked at {}",
+                    rig.seconds()
+                );
+            }
+        }
+        let reprimes = rig.count(&rig.counters.starves) + rig.count(&rig.counters.overflows);
+        assert!(
+            reprimes >= 4,
+            "{ppm} ppm: primed again only {reprimes} times"
+        );
+        let at = clamped.unwrap_or_else(|| panic!("{ppm} ppm: never clamped"));
+        assert!(at < 40.0, "{ppm} ppm: clamped only at {at:.1} s");
+        let events = rig.events();
+        assert!(events.contains(&FurtherEvent::Clamped), "{events:?}");
+        let locks = events
+            .iter()
+            .filter(|e| matches!(e, FurtherEvent::Locked { .. }));
+        assert_eq!(locks.count(), 0, "{events:?}");
+        // The estimate reads the side of the clamp the card is on.
+        let estimate = rig.writer.path.as_ref().unwrap().drift.ppm();
+        assert!(
+            estimate * ppm.signum() > MAX_DRIFT * 1e6,
+            "{ppm} ppm: estimate {estimate:.1}"
+        );
+        rig
+    }
+
+    #[test]
+    fn a_card_5000_ppm_off_that_overflows_is_reported_clamped_and_unlocked() {
+        // A master of 2.7 ms beside a 48 ms output, as on the CM5, and a
+        // master of 512 frames at 96 kHz.
+        for (rate, master_period, card_period) in [(48_000, 64, 1_024), (96_000, 512, 2_048)] {
+            let slow = beyond_the_clamp(rate, master_period, card_period, -5_000.0);
+            assert!(slow.count(&slow.counters.overflows) > 0);
+            let fast = beyond_the_clamp(rate, master_period, card_period, 5_000.0);
+            assert!(fast.count(&fast.counters.starves) > 0);
+        }
+    }
+
+    #[test]
+    fn repeated_reprimes_unlock() {
+        let mut sim = Sim::new(44_100, 256, 48_000, 256);
+        sim.ppm = 100.0;
+        let mut rig = Rig::new(sim);
+        rig.world().source = Source::Dc(1 << 20);
+        rig.run_until(40.0);
+        assert!(rig.counters.locked.load(Relaxed));
+        let _ = rig.events();
+        // Two starves 3 s apart: the lock goes, once.
+        rig.world().skip = 2;
+        let until = rig.seconds() + 3.0;
+        rig.run_until(until);
+        assert!(
+            rig.counters.locked.load(Relaxed),
+            "one starve keeps the lock"
+        );
+        rig.world().skip = 2;
+        let until = rig.seconds() + 1.0;
+        rig.run_until(until);
+        assert!(!rig.counters.locked.load(Relaxed));
+        assert_eq!(rig.count(&rig.counters.starves), 2);
+        let events = rig.events();
+        let unlocked = events.iter().filter(|&&e| e == FurtherEvent::Unlocked);
+        assert_eq!(unlocked.count(), 1, "{events:?}");
+        // Without another, it locks again.
+        let until = rig.seconds() + 10.0;
+        rig.run_until(until);
+        assert!(rig.counters.locked.load(Relaxed));
+    }
+
+    #[test]
+    fn a_late_writer_cycle_does_not_overflow() {
+        // The writer wakes up to half a card period late and then takes
+        // 9.5 ms to resample a period, as on a throttled Pi 3: all the
+        // while the master goes on pushing.
+        let mut sim = Sim::new(96_000, 512, 96_000, 2_048);
+        sim.sized = true;
+        sim.wake_late_us = (20.0, 2_048.0 / 96_000.0 / 2.0 * 1e6);
+        sim.read_cost_us = 9_500.0;
+        let mut rig = Rig::new(sim);
+        rig.world().source = Source::Dc(1 << 20);
+        rig.run_until(60.0);
+        assert!(rig.counters.locked.load(Relaxed));
+        assert_eq!(rig.count(&rig.counters.overflows), 0);
+        assert_eq!(rig.count(&rig.counters.starves), 0);
+        assert_eq!(rig.world().underruns, 0);
     }
 
     #[test]
@@ -2170,7 +2352,13 @@ mod tests {
         });
         assert!(rig.count(&rig.counters.starves) >= 1);
         assert!(rig.count(&rig.counters.overflows) >= 1);
-        assert!(rig.events().contains(&FurtherEvent::Overflowed));
+        let events = rig.events();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, FurtherEvent::Overflowed { .. })),
+            "{events:?}"
+        );
     }
 
     #[test]

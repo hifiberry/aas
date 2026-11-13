@@ -42,7 +42,22 @@
 //! no clock made, a lost period, moves it by the jump over the window, about
 //! 40 ppm for a period of 256 frames at 48 kHz, decaying over the window. An
 //! error above a period is taken for such a jump, and the estimate starts
-//! over once the error is back under it.
+//! over once the error is back under it, unless the ratio has held the
+//! clamp for longer than such a jump keeps it there: then the error grows
+//! from a card the clamp cannot follow.
+//!
+//! A path primed onto its target again after a starve or an overflow jumps
+//! too, by what was dropped or played as zeros. [`Drift::reprime`] knows
+//! when: the delay the estimate sees is moved by the difference between the
+//! readings on either side, so the jump stays out of it and the estimate
+//! goes on, however often the path is primed.
+//!
+//! A reprime also ends the run of readings on target that a lock needs, so
+//! the path counts as locked only after [`LOCK`] seconds without one. A
+//! locked path keeps its lock over a single reprime, a starve now and then;
+//! a second within [`REPRIMES`] seconds ends it. The run at the clamp is
+//! kept over a reprime while the ratio comes back to the clamp, which a
+//! card beyond it does within a second or two.
 //!
 //! A reading outside what a path can hold, below nothing or far above the
 //! target, or one that is not finite, is skipped before it reaches any of
@@ -63,6 +78,17 @@ pub const LOCK: f64 = 5.0;
 /// back a lost period, or four at 256 frames, holds it there for 10 s at
 /// most.
 pub const CLAMPED: f64 = 30.0;
+/// Seconds the ratio stays at the clamp at most to bring back a jump of the
+/// delay. Longer, a large error comes from the card's clock.
+pub const RECOVERY: f64 = 10.0;
+/// Seconds within which a second reprime ends a lock.
+pub const REPRIMES: f64 = 10.0;
+/// Seconds after a reprime in which the run at the clamp is kept while the
+/// ratio is not back at it.
+pub const HOLD: f64 = 5.0;
+/// Seconds of readings in [`Drift::ppm`]'s window after which an estimate
+/// beyond the clamp counts as clamped.
+pub const BEYOND: f64 = 10.0;
 /// Periods above the target beyond which a reading is not believed.
 pub const SANE: f64 = 8.0;
 /// Seconds of readings in a row not believed after which the controller
@@ -90,6 +116,15 @@ pub struct Drift {
     lock_updates: u32,
     /// Updates the ratio has to stay at the clamp to count as clamped.
     clamped_updates: u32,
+    /// Updates at the clamp after which a large error is no jump.
+    recovery_updates: u32,
+    /// Updates within which a second reprime ends a lock.
+    reprime_updates: u32,
+    /// Updates a reprime keeps the run at the clamp for.
+    hold_updates: u32,
+    /// Updates in the estimate before it may say the card is beyond the
+    /// clamp.
+    beyond_updates: u32,
     /// Updates of readings in a row not believed before starting over.
     lost_updates: u32,
     /// The largest reading believed, frames.
@@ -104,10 +139,23 @@ pub struct Drift {
     slow: f64,
     /// The integral part of the ratio, less 1.
     integral: f64,
-    /// Consecutive updates inside `window`, up to `lock_updates`.
+    /// Consecutive updates inside `window` since the last reprime, up to
+    /// `lock_updates`.
     inside: u32,
+    locked: bool,
+    /// Updates since the last reprime, up to `reprime_updates`.
+    since_reprime: u32,
     /// Consecutive updates at the clamp, up to `clamped_updates`.
     pinned: u32,
+    /// Updates left in which the run at the clamp is kept after a reprime.
+    held: u32,
+    /// The estimate says the card runs beyond the clamp.
+    beyond: bool,
+    /// Periods since the last reading believed, less one.
+    missed: u32,
+    /// The last reading believed, less the target; `None` before the
+    /// first or after a reset.
+    last_raw: Option<f64>,
     /// Consecutive readings not believed.
     lost: u32,
     /// Readings not believed since the controller was made.
@@ -143,6 +191,10 @@ impl Drift {
             window: period / 4.0,
             lock_updates: (LOCK / seconds).ceil() as u32,
             clamped_updates: (CLAMPED / seconds).ceil() as u32,
+            recovery_updates: (RECOVERY / seconds).ceil() as u32,
+            reprime_updates: (REPRIMES / seconds).ceil() as u32,
+            hold_updates: (HOLD / seconds).ceil() as u32,
+            beyond_updates: (BEYOND / seconds).ceil() as u32,
             lost_updates: (LOST / seconds).ceil() as u32,
             sane: target_frames + SANE * period,
             estimate_updates: (ESTIMATE / seconds).ceil() as u32,
@@ -151,7 +203,13 @@ impl Drift {
             slow: 0.0,
             integral: 0.0,
             inside: 0,
+            locked: false,
+            since_reprime: (REPRIMES / seconds).ceil() as u32,
             pinned: 0,
+            held: 0,
+            beyond: false,
+            missed: 0,
+            last_raw: None,
             lost: 0,
             skipped: 0,
             settled: 0,
@@ -176,6 +234,7 @@ impl Drift {
             self.skipped += 1;
             self.lost += 1;
             // The ratio stays where it was for this period, too.
+            self.since_reprime = (self.since_reprime + 1).min(self.reprime_updates);
             if self.pinned > 0 {
                 self.pinned = (self.pinned + 1).min(self.clamped_updates);
             }
@@ -185,6 +244,9 @@ impl Drift {
             return self.ratio;
         }
         self.lost = 0;
+        self.since_reprime = (self.since_reprime + 1).min(self.reprime_updates);
+        let periods = f64::from(self.missed + 1);
+        self.missed = 0;
         let raw = measured_frames - self.target;
         let error = match self.error {
             Some(previous) => {
@@ -194,23 +256,38 @@ impl Drift {
                 if self.settled < self.settle_updates {
                     self.settled += 1;
                 } else {
-                    // The ratio last returned has played for the period
-                    // that just ended and moved the delay by this much.
-                    let offset = (self.ratio - 1.0) - (self.slow - before) / self.period;
+                    // The ratio last returned has played for the periods
+                    // since the last reading and moved the delay by this
+                    // much.
+                    let moved = (self.slow - before) / (periods * self.period);
+                    let offset = (self.ratio - 1.0) - moved;
                     self.updates = (self.updates + 1).min(self.estimate_updates);
                     self.mean += (offset - self.mean) / f64::from(self.updates);
+                    if self.updates >= self.beyond_updates {
+                        // A little within the clamp before it ends, so
+                        // that a card near it does not come and go.
+                        let at = if self.beyond { 0.95 } else { 1.0 };
+                        self.beyond = self.mean.abs() > at * MAX_DRIFT;
+                    }
                 }
                 error
             }
             None => {
-                self.slow = raw;
+                match self.last_raw {
+                    // Primed again: the delay the estimate sees moves by
+                    // the jump, which stays out of the estimate.
+                    Some(last) => self.slow += raw - last,
+                    None => self.slow = raw,
+                }
                 raw
             }
         };
         self.error = Some(error);
+        self.last_raw = Some(raw);
         // An error this large is a lost period or a refill, no clock: the
-        // estimate starts over once the delay is back.
-        if error.abs() > self.period {
+        // estimate starts over once the delay is back. Unless the ratio has
+        // held the clamp for longer than a jump keeps it there.
+        if error.abs() > self.period && self.pinned < self.recovery_updates {
             self.settled = 0;
             self.updates = 0;
         }
@@ -230,16 +307,38 @@ impl Drift {
 
         if wanted.abs() >= MAX_DRIFT {
             self.pinned = (self.pinned + 1).min(self.clamped_updates);
+            self.held = 0;
+        } else if self.held > 0 {
+            // Primed again from the clamp: the ratio is on its way back.
+            self.held -= 1;
+            self.pinned = (self.pinned + 1).min(self.clamped_updates);
         } else {
             self.pinned = 0;
         }
 
         if error.abs() < self.window {
             self.inside = (self.inside + 1).min(self.lock_updates);
+            if self.inside >= self.lock_updates {
+                self.locked = true;
+            }
         } else {
             self.inside = 0;
+            self.locked = false;
         }
         self.ratio
+    }
+
+    /// A period passed without a reading the controller may take, such as
+    /// one taken while the master's push was overdue: the ratio stays, the
+    /// time counts at the clamp and since the last reprime, as it does for
+    /// a reading skipped, and the next reading's change of the delay is
+    /// spread over the periods since the last. Does not allocate.
+    pub fn pass(&mut self) {
+        self.since_reprime = (self.since_reprime + 1).min(self.reprime_updates);
+        self.missed = self.missed.saturating_add(1);
+        if self.pinned > 0 {
+            self.pinned = (self.pinned + 1).min(self.clamped_updates);
+        }
     }
 
     /// The estimate of how far the card runs from the master, in parts per
@@ -258,17 +357,22 @@ impl Drift {
     }
 
     /// Whether the error has stayed under a quarter period for the last
-    /// [`LOCK`] seconds.
+    /// [`LOCK`] seconds without a reprime, and has since, with no two
+    /// reprimes within [`REPRIMES`] seconds.
     pub fn locked(&self) -> bool {
-        self.inside >= self.lock_updates
+        self.locked
     }
 
     /// Whether the card needs more than the clamp allows: the ratio has
-    /// been held at `1 ± MAX_DRIFT` for the last [`CLAMPED`] seconds. A
-    /// step of a period or a refill puts it there for a while, too, but not
-    /// that long, except four periods of 1024 frames, which take 43 s.
+    /// been held at `1 ± MAX_DRIFT` for the last [`CLAMPED`] seconds, or
+    /// [`Drift::ppm`] has averaged [`BEYOND`] seconds and lies beyond it. A
+    /// step of a period or a refill puts the ratio there for a while, too,
+    /// but not that long, except four periods of 1024 frames, which take
+    /// 43 s. A card beyond the clamp that starves every second or two keeps
+    /// the error too small for the ratio to reach the clamp before each
+    /// priming; its estimate says so.
     pub fn clamped(&self) -> bool {
-        self.pinned >= self.clamped_updates
+        self.pinned >= self.clamped_updates || self.beyond
     }
 
     /// Readings skipped as not believable since the controller was made;
@@ -281,12 +385,24 @@ impl Drift {
     /// overflow or an xrun, with the clocks as they were: forgets the
     /// smoothed error, whose next reading starts it afresh, and the run of
     /// readings not believed. Keeps the integral, so the ratio stays where
-    /// the card needs it, and the lock, the clamp and the estimate, which
-    /// pauses for its settling time and then goes on averaging.
+    /// the card needs it, and the estimate, which goes on averaging without
+    /// the jump. The run of readings on target starts over; a lock is kept
+    /// unless the last reprime came within [`REPRIMES`] seconds. A run at
+    /// the clamp is kept for [`HOLD`] seconds while the ratio comes back.
     pub fn reprime(&mut self) {
         self.error = None;
         self.lost = 0;
-        self.settled = 0;
+        self.missed = 0;
+        self.inside = 0;
+        // Primed again before a reading: the same gap, such as a stall
+        // that overflowed the feed.
+        if self.since_reprime > 0 && self.since_reprime < self.reprime_updates {
+            self.locked = false;
+        }
+        self.since_reprime = 0;
+        if self.pinned > 0 {
+            self.held = self.hold_updates;
+        }
     }
 
     /// Forgets the estimate, the error and the lock: back to ratio 1.
@@ -294,7 +410,13 @@ impl Drift {
         self.error = None;
         self.integral = 0.0;
         self.inside = 0;
+        self.locked = false;
+        self.since_reprime = self.reprime_updates;
         self.pinned = 0;
+        self.held = 0;
+        self.beyond = false;
+        self.missed = 0;
+        self.last_raw = None;
         self.lost = 0;
         self.settled = 0;
         self.updates = 0;
@@ -341,6 +463,8 @@ mod tests {
         delay: f64,
         ratio: f64,
         noise: Lcg,
+        /// The reading's jitter, in periods peak to peak.
+        jitter: f64,
     }
 
     impl Path {
@@ -352,6 +476,7 @@ mod tests {
                 delay,
                 ratio: 1.0,
                 noise: Lcg(0x5eed),
+                jitter: 1.0,
             }
         }
 
@@ -359,7 +484,7 @@ mod tests {
         /// time, so the reading lands anywhere within a period of the
         /// true delay depending on where in the master's cycle it falls.
         fn measure(&mut self) -> f64 {
-            self.delay + (self.noise.next() - 0.5) * self.period
+            self.delay + (self.noise.next() - 0.5) * self.jitter * self.period
         }
 
         /// One period of the card: the feed gains what the master writes
@@ -659,6 +784,73 @@ mod tests {
             path.step(&mut drift);
             assert!(drift.locked());
         }
+    }
+
+    #[test]
+    fn ppm_survives_a_reprime() {
+        // The writer reads the path from timestamps, to a few frames.
+        let mut path = Path::new(RATE, PERIOD, 100.0, TARGET);
+        path.jitter = 0.02;
+        let mut drift = Drift::new(TARGET, RATE, PERIOD);
+        for _ in 0..path.periods(180.0) {
+            path.step(&mut drift);
+        }
+        assert!(drift.locked() && drift.estimate_ready());
+        assert!((drift.ppm() - 100.0).abs() < 5.0, "{}", drift.ppm());
+        // The card warms up, and the path starves every 3 s: each time it
+        // is primed onto its target again.
+        path.ppm = 150.0;
+        let every = path.periods(3.0);
+        for n in 0..path.periods(360.0) {
+            if n % every == 0 {
+                path.delay = TARGET;
+                drift.reprime();
+            }
+            path.step(&mut drift);
+            assert!(drift.ppm() != 0.0, "0 ppm at {} s", path.seconds(n));
+            assert!(drift.estimate_ready());
+        }
+        // The estimate went on: it follows the card over its window.
+        assert!((drift.ppm() - 150.0).abs() < 10.0, "{}", drift.ppm());
+    }
+
+    #[test]
+    fn a_reprime_restarts_the_lock_time() {
+        let mut path = Path::new(RATE, PERIOD, 100.0, TARGET);
+        path.jitter = 0.02;
+        let mut drift = Drift::new(TARGET, RATE, PERIOD);
+        // Not locked yet: a reprime 4 s in starts the 5 s over.
+        for _ in 0..path.periods(4.0) {
+            path.step(&mut drift);
+        }
+        assert!(!drift.locked());
+        drift.reprime();
+        for _ in 0..path.periods(4.0) {
+            path.step(&mut drift);
+            assert!(!drift.locked(), "locked within 5 s of a reprime");
+        }
+        for _ in 0..path.periods(30.0) {
+            path.step(&mut drift);
+        }
+        assert!(drift.locked());
+        // Locked, one reprime is a starve and keeps the lock; a second
+        // within 10 s ends it, until 5 s pass without one.
+        drift.reprime();
+        path.step(&mut drift);
+        assert!(drift.locked());
+        for _ in 0..path.periods(6.0) {
+            path.step(&mut drift);
+        }
+        drift.reprime();
+        assert!(!drift.locked());
+        for _ in 0..path.periods(4.5) {
+            path.step(&mut drift);
+            assert!(!drift.locked());
+        }
+        for _ in 0..path.periods(1.0) {
+            path.step(&mut drift);
+        }
+        assert!(drift.locked());
     }
 
     /// Runs two controllers on the same path, one of them also given
