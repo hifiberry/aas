@@ -3112,6 +3112,7 @@ mod tests {
                         (name, Some(Event::OldCapture(old)))
                     }
                     Command::SetAnalogGain(g) => (format!("SetAnalogGain {g}"), None),
+                    Command::SetSourceGain(id, g) => (format!("SetSourceGain {id} {g}"), None),
                     Command::AddTap(t) => (format!("AddTap {}", t.id), None),
                     Command::RemoveTap(id) => (format!("RemoveTap {id}"), None),
                     Command::GrowTaps(t) => ("GrowTaps".into(), Some(Event::OldTaps(t))),

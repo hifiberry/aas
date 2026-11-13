@@ -22,6 +22,58 @@ pub enum NotBitPerfect {
     Routing,
 }
 
+impl NotBitPerfect {
+    /// The reason as the engine publishes it in its counters: 1 and up in
+    /// the order of the declaration, as 0 is bit-perfect.
+    pub fn code(self) -> u8 {
+        match self {
+            NotBitPerfect::Disabled => 1,
+            NotBitPerfect::SeveralSources => 2,
+            NotBitPerfect::Volume => 3,
+            NotBitPerfect::Resampled => 4,
+            NotBitPerfect::Plugin => 5,
+            NotBitPerfect::NoSource => 6,
+            NotBitPerfect::Routing => 7,
+        }
+    }
+
+    /// The decision a code stands for: 0 is bit-perfect, `None` no code
+    /// that `code` gives.
+    pub fn from_code(code: u8) -> Option<Result<(), NotBitPerfect>> {
+        let reason = match code {
+            0 => return Some(Ok(())),
+            1 => NotBitPerfect::Disabled,
+            2 => NotBitPerfect::SeveralSources,
+            3 => NotBitPerfect::Volume,
+            4 => NotBitPerfect::Resampled,
+            5 => NotBitPerfect::Plugin,
+            6 => NotBitPerfect::NoSource,
+            7 => NotBitPerfect::Routing,
+            _ => return None,
+        };
+        Some(Err(reason))
+    }
+
+    /// The reason in words, as the API gives it.
+    pub fn name(self) -> &'static str {
+        match self {
+            NotBitPerfect::Disabled => "disabled",
+            NotBitPerfect::SeveralSources => "several sources",
+            NotBitPerfect::Volume => "volume",
+            NotBitPerfect::Resampled => "resampled",
+            NotBitPerfect::Plugin => "plugin",
+            NotBitPerfect::NoSource => "no source",
+            NotBitPerfect::Routing => "routing",
+        }
+    }
+}
+
+/// The code of a decision, as `NotBitPerfect::code` gives it, 0 for
+/// bit-perfect.
+pub fn code_of(decision: Result<(), NotBitPerfect>) -> u8 {
+    decision.err().map_or(0, NotBitPerfect::code)
+}
+
 /// What the engine knows about the current cycle.
 #[derive(Debug, Clone, Copy)]
 pub struct Situation {
@@ -291,5 +343,37 @@ mod tests {
         assert_eq!(busy(2, true, false), Err(NotBitPerfect::SeveralSources));
         assert_eq!(busy(0, true, false), Err(NotBitPerfect::NoSource));
         assert!(!plugins_apply(BitPerfect::Forced));
+    }
+
+    #[test]
+    fn codes_round_trip() {
+        use NotBitPerfect::*;
+        let all = [
+            Disabled,
+            SeveralSources,
+            Volume,
+            Resampled,
+            Plugin,
+            NoSource,
+            Routing,
+        ];
+        let names = [
+            "disabled",
+            "several sources",
+            "volume",
+            "resampled",
+            "plugin",
+            "no source",
+            "routing",
+        ];
+        for (i, (reason, name)) in all.into_iter().zip(names).enumerate() {
+            // 1 and up in the order of the declaration.
+            assert_eq!(reason.code(), i as u8 + 1);
+            assert_eq!(NotBitPerfect::from_code(reason.code()), Some(Err(reason)));
+            assert_eq!(reason.name(), name);
+        }
+        assert_eq!(NotBitPerfect::from_code(0), Some(Ok(())));
+        assert_eq!(NotBitPerfect::from_code(8), None);
+        assert_eq!(NotBitPerfect::from_code(200), None);
     }
 }
