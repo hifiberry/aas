@@ -1584,7 +1584,9 @@ root with real-time rights, a fresh daemon for each run. `align-check` and the
 `--tone` mode of `bit-check` were built as committed with this section, and
 `dist/test-plugin.sh` ran as committed with it too. The `main` daemon in the
 cost comparison was built from c95432e. `/etc/sysctl.d/90-aas.conf` was
-installed on both boards. The further output was always:
+installed on both boards. The 5000 ppm clamp and the Pi 3's 96 kHz hour failed
+on that build; they were fixed (see Lock and drift and Hours below) and
+measured again on b4fd1a6, built the same way. The further output was always:
 
 ```toml
 [[output]]
@@ -1603,11 +1605,11 @@ own `latency_ms`: 1024 frames per period at 44.1 and 48 kHz and 2048 at
 | Criterion | Pi 3 result | CM5 result | Verdict |
 |---|---|---|---|
 | Lock at shifts of 0, +100, -300 and +1000 ppm, at 44.1 and 96 kHz: time to lock, ppm, delay error after lock | Not run | Locked 5.0 to 6.9 s after each rate change in 17 of 17 runs, and kept it. The daemon's ppm within 3 ppm of the measured drift in 14 runs, 3.4 to 11.6 off in 3. Delay error at a shift of 0 under a frame over the last minute; with a shift set 7 to 28 frames, up to 171 frames while settling | Pass. `snd-aloop`'s shift slows the card: 100010 is -100 ppm |
-| At 5000 ppm the clamp holds and is logged | Not run | **The clamp line never came, in 120 to 300 s each way at 44.1, 48 and 96 kHz.** The overflows or starves were counted. A card 5000 ppm fast was logged as `locked` four times | **Fail** |
+| At 5000 ppm the clamp holds and is logged | Not run | After the fix, 44.1 kHz, 180 s each way: the clamp line 30.6 s (card fast) and 31.7 s (card slow) after the rate change, never `locked`, the ppm at the stop +5069 and -4956, 0 xruns and 0 wake-up gaps on the master. Before it the line never came in 120 to 300 s and a fast card was logged `locked` four times | Pass after the fix |
 | The tone reaches the loopback with the residual of the resampler's test; a swap of that output swaps only there | Not run | -132 to -135 dBFS in `f32` and -132 to -134 dBFS in `f64` at 48 kHz against a moving sine; the swap moved the tone on the loopback only | Pass |
 | Alignment against the converters' delay | Not run | The master 14 to 15 frames after the loopback beyond the converters: +0.32 ms at 44.1 and 48 kHz, +0.15 ms at 96 kHz, steady within a frame | Measured; the method cannot place the frames |
 | One hour at 44.1 kHz, full load, analog input on, loopback output at 100010 | 0 xruns, 0 wake-up gaps, worst gap 6.99 ms against 11.61 ms; the output locked throughout, 0 xruns, starves and overflows | 0 xruns, 0 wake-up gaps, worst gap 1.53 ms against 2.90 ms; the output locked throughout, 0 xruns, starves and overflows | Pass on both |
-| One hour at 96 kHz, the same | 0 xruns, 0 wake-up gaps, worst gap 6.44 ms against 10.67 ms. **The output stayed locked but counted 1527 overflows** | 0 xruns, 0 wake-up gaps, worst gap 1.44 ms against 2.67 ms; the output locked throughout, 0 xruns, starves and overflows | Pass on the CM5. **Fail** on the Pi 3 for the loopback output; the master passes |
+| One hour at 96 kHz, the same | After the fix: 0 xruns, 0 wake-up gaps, worst gap 6.45 ms against 10.67 ms; the output locked 7.2 s after it opened and throughout, 0 xruns, 0 starves, 0 overflows. Before it 1527 overflows | 0 xruns, 0 wake-up gaps, worst gap 1.44 ms against 2.67 ms; the output locked throughout, 0 xruns, starves and overflows | Pass on both after the fix |
 | Cost without a further output against `main`, 48 kHz, 3 runs each | 78.0 against 77.1 µs per cycle in `f32`, +1.2%; 82.4 against 82.1 µs in `f64`, +0.4% | Not run | Pass: within or 0.2 µs above `main`'s spread |
 | Cost with the loopback output | Audio thread +17.1 µs per cycle in `f32`, +11.1 µs in `f64`; the writer 17% of a core in `f32` and 28% in `f64`. One `f64` run counted 1 overflow | Writer 1.0% of a core at 44.1 kHz and 2.3% at 96 kHz, under the hours' load | Measured |
 | `dist/test-plugin.sh` with the capture, the loopback and `ANALOG=1` | Not run | 33 of 34. The failure is the `mpd` case: `mpd` is not installed | Pass, except the case that needs `mpd` |
@@ -1715,25 +1717,47 @@ shift set: the controller follows the card it has. The lock line comes at the
 5 s minimum in nearly every run because the error is inside that window from
 the start; it says the output plays, not that its delay has settled.
 
-**At 5000 ppm the clamp is not logged.** With 100500, the loopback 4974 ppm
-slow and so about 4950 ppm against the master, at 44.1 and 96 kHz for 120 s and
-at 48 kHz for 300 s, the daemon never logged that the card runs more than
-2000 ppm from the master. It counted 36, 43 and 106 overflows, never locked,
-and gave +0.000 ppm at the stop. With 99500, the loopback 5047 ppm fast against
-the master, at 48 kHz for 300 s, it counted 131 starves, logged no clamp, and
-logged `locked` four times, each followed by `lost its lock` 0.6 to 12 s later.
-The plan says such a card is logged once and plays on with its starves or
-overflows counted: they were counted, but the line never came, and the false
-locks were not meant to. The likely cause, from the code: every overflow or
-starve primes the path again, which starts the smoothed error afresh, so the
-ratio the controller asks for drops back under the clamp and the count of
-updates at the clamp starts over; with an overflow every 3 s at 48 kHz it never
-reaches the 30 s that `clamped()` wants; and the ppm estimate, which waits 20 s
-after each priming before it averages, never starts, so it stays at 0. This
-was not changed here.
+**At 5000 ppm the clamp is logged.** The first measurement, on 968e42d, did
+not log it. With 100500, the loopback 4974 ppm slow and so about 4950 ppm
+against the master, at 44.1 and 96 kHz for 120 s and at 48 kHz for 300 s, the
+daemon never logged that the card runs more than 2000 ppm from the master; it
+counted 36, 43 and 106 overflows, never locked and gave +0.000 ppm at the stop.
+With 99500, 5047 ppm fast against the master, at 48 kHz for 300 s, it counted
+131 starves, logged no clamp and logged `locked` four times, each followed by
+`lost its lock` 0.6 to 12 s later. The cause was in the code: every overflow or
+starve primed the path again, which restarted the smoothed error, the count at
+the clamp and the estimate's settling, and kept the lock. The fix (b4fd1a6)
+makes a priming end the lock until 5 s pass without another, keeps the count at
+the clamp and the ppm estimate across it, and also calls a card clamped once
+its estimate has stayed beyond the clamp for 10 s. The runs were repeated at
+44.1 kHz for 180 s each, a fresh daemon with the rate set 99500 (card +5069 ppm
+against the master) and 100500 (-4956 ppm):
 
-The controller's skipped readings are not logged and not counted at the stop,
-so they could not be reported.
+| Shift | Clamp line after the rate change | Starves, overflows | `locked` | Daemon at the stop | Measured against the DAC | Master |
+|---|---|---|---|---|---|---|
+| 99500 | 30.6 s | 62, 0 | never | +5068.6 ppm, not locked | +5079.1 ppm | 0 xruns, 0 wake-up gaps, worst gap 1.49 ms |
+| 100500 | 31.7 s | 0, 39 | never | -4955.6 ppm, not locked | -4954.1 ppm | 0 xruns, 0 wake-up gaps, worst gap 1.78 ms |
+
+Both logged `its card runs more than 2000 ppm from the master, it plays on with
+gaps` once. The daemon's ppm reads the clamp side, within 11 ppm of the
+measurement. The starves and overflows, logged now with the time and the feed's
+fill, came every 2 s for the fast card (the feed held about 1000 of 2329
+frames) and every 5 s for the slow one (2275 to 2315 of 2329); the first ten
+were logged one by one and then one line a minute, with the number since the
+last. The output counted no skipped readings.
+
+To check that normal lock was not broken, 99990 (the loopback +105.4 ppm
+against the system clock and +126.0 ppm against the DAC) was run at 44.1 kHz
+for 180 s: `locked` 5.1 s after the rate change, 0 xruns, 0 wake-up gaps,
+0 starves, 0 overflows on both outputs, and the daemon's ppm +113.2, 12.8 ppm
+below the measured difference. That is outside the 5 ppm of most runs above,
+in the range of the three that were off by 3.4 to 11.6 ppm. The loopback's
+timestamps were 233 µs off a straight line in the run, so its rate over the
+180 s is not firmer than that; the offset between the outputs spread 632 µs,
+28 frames, after the lock.
+
+The controller's skipped readings are now counted in the stop line; none were
+skipped in these runs.
 
 ### The tone through the further output
 
@@ -1857,30 +1881,39 @@ sat at 60 to 88 °C and 496 to 603 MHz, throttled, as in part 1.
 |---|---|---|---|---|---|---|---|
 | 44.1 kHz | 0, 0 | 6.99 / 11.61 ms | 0.69 ms | 256, 0 | locked 5.3 s after it opened, never lost; 0 xruns, 0 wake-up gaps, 0 starves, 0 overflows | 28.2 ms | -102.8 |
 | 96 kHz | 0, 0 | 6.44 / 10.67 ms | 1.16 ms | 256, 0 | locked 6.8 s after it opened, never lost; 0 xruns, 0 wake-up gaps, 0 starves, **1527 overflows** | 28.2 ms | +0.000 |
+| 96 kHz, after the fix | 0, 0 | 6.45 / 10.67 ms | 0.90 ms | 256, 98 | locked 7.2 s after it opened, never lost; 0 xruns, 0 wake-up gaps, 0 starves, 0 overflows, 0 skipped readings | 28.2 ms | -103.7 |
 
 The master passes both hours, within 0.1 ms of part 1's worst gaps; the worst
 cycles, 0.69 and 1.16 ms, are above part 1's 0.65 and 0.76 ms. `aplay` counted
 no underruns. The kernel migrated 131040 pages in the 44.1 kHz hour and
 153525 in the 96 kHz hour.
 
-**The loopback output fails the 96 kHz hour on the Pi 3: 1527 overflows,**
-about one every 2.4 s on average. Each one drops a master period at the feed
-and primes the loopback's path again, a gap in what it plays. The counters do
-not say when they came, but the ppm of +0.000 at the stop says the estimate
-never once got past the 20 s it settles for after the path is primed again,
-so they came through the whole hour, not only at its start. The lock line
-came once and no loss was logged, since priming again keeps the lock. The writer thread used 1603 s of CPU in
-that hour, 44.5% of a core, 9.5 ms per loopback period of 21.3 ms, at
-`SCHED_FIFO` 65 on a board throttled to about 550 MHz; in the 44.1 kHz hour it
-used 738 s, 20.5%, and counted none. Its worst wake-up gap was 28.2 ms in both
-hours, under its buffer of three loopback periods, so the card never ran dry.
-The feed, though, holds only two master periods more than the delay target
-leaves it, at least two loopback periods: a writer that wakes late, or whose
-cycle of 9.5 ms is stretched by the audio thread above it, can find it full.
-That is the likely cause; this run cannot confirm it, and nothing in it points
-at a fault in the code rather than at the feed's size or the writer's cost on
-this board. The audio thread took 259 and 401 µs per cycle in the two hours, under load
-and throttled.
+**The first 96 kHz hour on the Pi 3 failed for the loopback output, on
+968e42d: 1527 overflows,** about one every 2.4 s. Each dropped a master period
+at the feed and primed the loopback's path again, a gap in what it played, and
+the ppm of +0.000 at the stop said the estimate never got past its settling.
+The writer thread used 1603 s of CPU, 44.5% of a core, 9.5 ms per loopback
+period of 21.3 ms, on a board throttled to about 550 MHz; its worst wake-up gap
+was 28.2 ms, under its buffer of three loopback periods. The feed held only
+what the delay target left plus two master periods, and a writer that wakes
+late and then spends 9.5 ms resampling lets the master push more than that
+before it takes. The fix (b4fd1a6) sizes the feed at the target's share plus
+two loopback periods plus two master periods, 5888 frames here against 4352,
+with no change to the delay.
+
+The hour was run again on b4fd1a6 exactly as before: full load, analog input
+on, the loopback at `latency_ms = 48` and shift 100010. **It counted 0
+overflows and 0 starves, the output locked 7.2 s after it opened and stayed
+locked, and the master passed:** 0 xruns, 0 wake-up gaps, worst gap 6.45 ms
+against 10.67 ms. The loopback's worst gap was 28.2 ms and its ppm -103.7, so
+the estimate ran the whole hour, 3.7 ppm from the -100 shift, the Pi 3's DAC
+being near the system clock. The writer used 1597 s of CPU, 44.2% of a core,
+as before the fix, so the feed's size was the cause and the cost is unchanged.
+The audio thread took 386 µs per cycle, 0.90 ms at worst, and the board sat at
+86 to 87 °C and 549 MHz, throttled at its end. The kernel migrated 23378
+pages. The stop line counts 256 frames padded and 98 dropped; the first hour
+dropped none. The analog input went quiet 8 s before the stop, when the player
+ended, and the counters do not say when the 98 were dropped.
 
 ### Processing cost on the Pi 3
 
@@ -1954,11 +1987,9 @@ since no rate lasted the 5 s a lock takes.
   frames.
 - Lock, alignment and the tone were measured on the CM5 only, and with the
   analog input off.
-- The clamp's log line, and a card beyond the clamp counting as unlocked,
-  were not fixed here; see Lock and drift.
-- Starves and overflows are counted, not dated, so whether those of the Pi 3's
-  96 kHz hour and of one cost run came before or after the lock is inferred,
-  not seen. The controller's skipped readings are not reported at all.
+- The clamp was measured again after the fix at 44.1 kHz only, and the hour
+  once; the cost run's overflow and those of the rate changes were not
+  repeated, so the feed's new size is not checked against them.
 - The loopback's rate was measured on an idle board only; under the hours'
   load only the daemon's own estimate of it is known.
 - The cost with a further output was measured at 48 kHz only; the writer's
