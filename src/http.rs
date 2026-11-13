@@ -1,0 +1,376 @@
+//! The HTTP API, on a thread `aas-api` of its own with a single-threaded
+//! `tokio` runtime. It decides nothing: each request becomes a `Call` for
+//! the control thread, sent on a channel with an eventfd that wakes its
+//! poll, and the answer comes back on a one-shot channel. WebSocket
+//! `/events` forwards what the control thread publishes.
+//!
+//! The paths here are without the `/api/aas/v1` that nginx puts in front.
+
+use crate::api::{ApiCall, ApiError, ApiEvent, Call};
+use axum::Router;
+use axum::body::Bytes;
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum::routing::get;
+use serde::de::DeserializeOwned;
+use std::future::{Future, poll_fn};
+use std::io;
+use std::os::fd::{AsRawFd, OwnedFd};
+use std::pin::pin;
+use std::sync::Arc;
+use std::sync::mpsc::Sender;
+use std::task::Poll;
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
+use tokio::sync::broadcast::{self, error::RecvError};
+use tokio::sync::oneshot;
+
+/// How long a request waits for the control thread before it fails.
+const ANSWER_WITHIN: Duration = Duration::from_secs(2);
+
+/// What every handler shares.
+struct Shared {
+    calls: Sender<ApiCall>,
+    /// Written after each call, to wake the control thread's poll.
+    wake: OwnedFd,
+    /// Weak, so that the channel closes when the control thread drops its
+    /// sender, and the thread then ends.
+    events: broadcast::WeakSender<ApiEvent>,
+}
+
+/// Starts the thread `aas-api`, serving on `listener` until the control
+/// thread drops `events`. Calls go out on `calls`, each followed by a
+/// write to the eventfd `wake`.
+pub fn spawn(
+    listener: std::net::TcpListener,
+    calls: Sender<ApiCall>,
+    wake: OwnedFd,
+    events: broadcast::Sender<ApiEvent>,
+) -> io::Result<JoinHandle<()>> {
+    listener.set_nonblocking(true)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()?;
+    // Subscribed here, so that the thread sees the channel close even if
+    // the control thread drops its sender before the thread runs.
+    let mut ended = events.subscribe();
+    let shared = Arc::new(Shared {
+        calls,
+        wake,
+        events: events.downgrade(),
+    });
+    drop(events);
+    thread::Builder::new()
+        .name("aas-api".into())
+        .spawn(move || {
+            runtime.block_on(async move {
+                let listener = match tokio::net::TcpListener::from_std(listener) {
+                    Ok(listener) => listener,
+                    Err(e) => {
+                        eprintln!("aas: API: {e}, playing on without the API");
+                        return;
+                    }
+                };
+                let app = router(shared);
+                tokio::spawn(async move {
+                    if let Err(e) = axum::serve(listener, app).await {
+                        eprintln!("aas: API: {e}");
+                    }
+                });
+                // Every published event passes here too, and is dropped.
+                while !matches!(ended.recv().await, Err(RecvError::Closed)) {}
+            });
+            // Dropping the runtime drops every connection with it, also one
+            // whose handler waits on a peer that does not read.
+            drop(runtime);
+        })
+}
+
+fn router(shared: Arc<Shared>) -> Router {
+    Router::new()
+        .route("/state", get(|s| ask(s, Call::State)))
+        .route("/outputs", get(|s| ask(s, Call::Outputs)))
+        .route("/outputs/{id}", get(get_output).patch(patch_output))
+        .route("/inputs", get(|s| ask(s, Call::Inputs)))
+        .route(
+            "/inputs/analog",
+            get(|s| ask(s, Call::Analog)).patch(patch_analog),
+        )
+        .route(
+            "/inputs/clients/{name}",
+            get(get_client).patch(patch_client),
+        )
+        .route("/matrix", get(|s| ask(s, Call::Matrix)).put(put_matrix))
+        .route("/events", get(events))
+        .fallback(|| async { error(StatusCode::NOT_FOUND, "no such path") })
+        .method_not_allowed_fallback(|| async {
+            error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
+        })
+        .with_state(shared)
+}
+
+/// `{"error": message}` with `status`.
+fn error(status: StatusCode, message: impl Into<String>) -> Response {
+    let body = serde_json::json!({ "error": message.into() });
+    (status, axum::Json(body)).into_response()
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let status = StatusCode::from_u16(self.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        error(status, self.message)
+    }
+}
+
+/// Sends `call` to the control thread and gives its answer. 503 when the
+/// control thread does not answer in time, or has stopped.
+async fn ask(State(shared): State<Arc<Shared>>, call: Call) -> Response {
+    let stopped = || ApiError::unavailable("the control thread has stopped").into_response();
+    let (answer, answered) = oneshot::channel();
+    if shared.calls.send(ApiCall { call, answer }).is_err() {
+        return stopped();
+    }
+    let one = 1u64;
+    // SAFETY: a plain write of 8 bytes to a non-blocking eventfd. One that
+    // fails because the count is full leaves it readable all the same.
+    unsafe {
+        libc::write(
+            shared.wake.as_raw_fd(),
+            (&raw const one).cast(),
+            size_of::<u64>(),
+        )
+    };
+    match tokio::time::timeout(ANSWER_WITHIN, answered).await {
+        Err(_) => {
+            let s = ANSWER_WITHIN.as_secs();
+            ApiError::unavailable(format!("no answer from the control thread in {s} s"))
+                .into_response()
+        }
+        Ok(Err(_)) => stopped(),
+        Ok(Ok(Ok(body))) => axum::Json(body).into_response(),
+        Ok(Ok(Err(e))) => e.into_response(),
+    }
+}
+
+/// Asks the control thread for `call`, or answers with why there is none.
+async fn ask_for(s: State<Arc<Shared>>, call: Result<Call, ApiError>) -> Response {
+    match call {
+        Ok(call) => ask(s, call).await,
+        Err(e) => e.into_response(),
+    }
+}
+
+/// A JSON body, or a 400 with why not: one that does not parse, has a
+/// field of the wrong type or one not known.
+fn parse<T: DeserializeOwned>(body: &Bytes) -> Result<T, ApiError> {
+    serde_json::from_slice(body).map_err(|e| ApiError::bad_request(e.to_string()))
+}
+
+/// An output's id. One that is not a number is not an output either.
+fn output_id(id: &str) -> Result<usize, ApiError> {
+    id.parse()
+        .map_err(|_| ApiError::not_found(format!("no output {id}")))
+}
+
+type PathOf<T> = Result<Path<T>, axum::extract::rejection::PathRejection>;
+
+/// A path parameter, or a 400, as for a name that is not UTF-8.
+fn path<T>(path: PathOf<T>) -> Result<T, ApiError> {
+    match path {
+        Ok(Path(value)) => Ok(value),
+        Err(e) => Err(ApiError::bad_request(e.body_text())),
+    }
+}
+
+async fn get_output(s: State<Arc<Shared>>, id: PathOf<String>) -> Response {
+    let call = path(id).and_then(|id| Ok(Call::Output(output_id(&id)?)));
+    ask_for(s, call).await
+}
+
+async fn patch_output(s: State<Arc<Shared>>, id: PathOf<String>, body: Bytes) -> Response {
+    let call = path(id).and_then(|id| {
+        let id = output_id(&id)?;
+        Ok(Call::PatchOutput(id, parse(&body)?))
+    });
+    ask_for(s, call).await
+}
+
+async fn patch_analog(s: State<Arc<Shared>>, body: Bytes) -> Response {
+    ask_for(s, parse(&body).map(Call::PatchAnalog)).await
+}
+
+async fn get_client(s: State<Arc<Shared>>, name: PathOf<String>) -> Response {
+    ask_for(s, path(name).map(Call::Client)).await
+}
+
+async fn patch_client(s: State<Arc<Shared>>, name: PathOf<String>, body: Bytes) -> Response {
+    let call = path(name).and_then(|name| Ok(Call::PatchClient(name, parse(&body)?)));
+    ask_for(s, call).await
+}
+
+async fn put_matrix(s: State<Arc<Shared>>, body: Bytes) -> Response {
+    ask_for(s, parse(&body).map(Call::PutMatrix)).await
+}
+
+/// WebSocket `/events`. Subscribed before the upgrade is answered, so that
+/// a change made after the handshake is always sent.
+async fn events(
+    State(shared): State<Arc<Shared>>,
+    upgrade: Result<WebSocketUpgrade, axum::extract::ws::rejection::WebSocketUpgradeRejection>,
+) -> Response {
+    let upgrade = match upgrade {
+        Ok(upgrade) => upgrade,
+        Err(e) => return error(e.status(), e.body_text()),
+    };
+    let Some(events) = shared.events.upgrade() else {
+        return ApiError::unavailable("the control thread has stopped").into_response();
+    };
+    let receiver = events.subscribe();
+    drop(events);
+    upgrade.on_upgrade(move |socket| forward(socket, receiver))
+}
+
+/// What a subscriber's task waits for: the next event, or something from
+/// its peer.
+enum Next {
+    Event(Option<ApiEvent>),
+    Peer(Option<Result<Message, axum::Error>>),
+}
+
+/// The next event for a subscriber: a `resync` if it has fallen behind
+/// by more than the channel holds, None once the channel has closed.
+/// Cancel-safe, as `recv` is.
+async fn next_event(events: &mut broadcast::Receiver<ApiEvent>) -> Option<ApiEvent> {
+    match events.recv().await {
+        Ok(event) => Some(event),
+        Err(RecvError::Lagged(_)) => Some(ApiEvent::Resync),
+        Err(RecvError::Closed) => None,
+    }
+}
+
+/// Sends each event to one subscriber as a JSON text message, until either
+/// side closes. A send to a peer that does not read waits in this task
+/// alone; the channel goes on without it, and when the task gets to read
+/// again it has lagged, which it tells the peer with a `resync`.
+async fn forward(mut socket: WebSocket, mut events: broadcast::Receiver<ApiEvent>) {
+    loop {
+        // Both are cancel-safe, so the one that did not finish loses nothing.
+        let next = {
+            let mut event = pin!(next_event(&mut events));
+            let mut peer = pin!(socket.recv());
+            poll_fn(|cx| {
+                if let Poll::Ready(e) = event.as_mut().poll(cx) {
+                    return Poll::Ready(Next::Event(e));
+                }
+                peer.as_mut().poll(cx).map(Next::Peer)
+            })
+            .await
+        };
+        let event = match next {
+            Next::Event(Some(event)) => event,
+            Next::Event(None) => return,
+            Next::Peer(None | Some(Err(_)) | Some(Ok(Message::Close(_)))) => return,
+            Next::Peer(Some(Ok(_))) => continue,
+        };
+        let Ok(text) = serde_json::to_string(&event) else {
+            continue;
+        };
+        if socket.send(Message::Text(text.into())).await.is_err() {
+            return;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rate(rate: u32) -> ApiEvent {
+        ApiEvent::Rate { rate }
+    }
+
+    fn block_on<F: Future>(f: F) -> F::Output {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(f)
+    }
+
+    #[test]
+    fn a_subscriber_that_falls_behind_is_told_to_resync_and_goes_on() {
+        let (events, mut receiver) = broadcast::channel(256);
+        for i in 0..300 {
+            events.send(rate(i)).unwrap();
+        }
+        block_on(async {
+            assert_eq!(next_event(&mut receiver).await, Some(ApiEvent::Resync));
+            // Then the 256 newest, oldest first.
+            assert_eq!(next_event(&mut receiver).await, Some(rate(44)));
+        });
+        drop(events);
+        let rest = block_on(async {
+            let mut n = 0;
+            while next_event(&mut receiver).await.is_some() {
+                n += 1;
+            }
+            n
+        });
+        assert_eq!(rest, 255);
+    }
+
+    /// What the handlers share, with the receiving end of the calls.
+    fn shared() -> (State<Arc<Shared>>, std::sync::mpsc::Receiver<ApiCall>) {
+        let (calls, received) = std::sync::mpsc::channel();
+        let (events, _) = broadcast::channel(1);
+        let shared = Shared {
+            calls,
+            wake: crate::control::eventfd().unwrap(),
+            events: events.downgrade(),
+        };
+        (State(Arc::new(shared)), received)
+    }
+
+    async fn status_and_body(response: Response) -> (StatusCode, serde_json::Value) {
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 4096).await;
+        (status, serde_json::from_slice(&body.unwrap()).unwrap())
+    }
+
+    fn timed_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn a_call_the_control_thread_does_not_answer_in_2_s_is_503() {
+        let (state, received) = shared();
+        let started = std::time::Instant::now();
+        let response = timed_runtime().block_on(ask(state, Call::State));
+        assert!(started.elapsed() >= ANSWER_WITHIN);
+        let (status, body) = timed_runtime().block_on(status_and_body(response));
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body["error"].is_string());
+        // The call did go out, and the eventfd was written.
+        assert!(received.try_recv().is_ok());
+    }
+
+    #[test]
+    fn a_call_to_a_control_thread_that_has_gone_is_503() {
+        let (state, received) = shared();
+        drop(received);
+        let response = timed_runtime().block_on(ask(state, Call::State));
+        let (status, _) = timed_runtime().block_on(status_and_body(response));
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn the_resync_is_sent_as_its_type_alone() {
+        let text = serde_json::to_string(&ApiEvent::Resync).unwrap();
+        assert_eq!(text, r#"{"type":"resync"}"#);
+    }
+}

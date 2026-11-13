@@ -9,6 +9,7 @@ use aas::state;
 use aas::volume::HardwareVolume;
 use aas::volume::OpenVolume;
 use std::ffi::OsString;
+use std::net::{Ipv4Addr, TcpListener};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -204,6 +205,22 @@ fn card_probe(card: Option<String>) -> server::CardProbe {
     })
 }
 
+/// The API's listener on `127.0.0.1:port`. None with port 0, which turns
+/// the API off, and for a port that cannot be bound: that is logged once
+/// and the daemon plays on without the API.
+fn api_listener(port: u16) -> Option<TcpListener> {
+    if port == 0 {
+        return None;
+    }
+    match TcpListener::bind((Ipv4Addr::LOCALHOST, port)) {
+        Ok(listener) => Some(listener),
+        Err(e) => {
+            eprintln!("aas: API port {port}: {e}, playing on without the API");
+            None
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let args = match parse_args(std::env::args_os().skip(1)) {
         Ok(args) => args,
@@ -243,6 +260,7 @@ fn main() -> ExitCode {
         sink,
         probe: Some(card_probe(config.card.clone())),
         further,
+        api: api_listener(config.api_port),
     };
     let hardware = hardware_volume(&config);
     let capture = analog_input(&config);

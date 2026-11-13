@@ -14,6 +14,7 @@ pub mod drift;
 pub mod engine;
 pub mod format;
 pub mod further;
+pub mod http;
 pub mod latency;
 pub mod matrix;
 pub mod output_mix;
