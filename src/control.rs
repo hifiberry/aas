@@ -1263,6 +1263,7 @@ impl Control {
         if let Some(saver) = &self.saver {
             saver.save(State {
                 output_percent: self.volume.percent(),
+                ..State::default()
             });
         }
     }
