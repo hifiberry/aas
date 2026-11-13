@@ -70,6 +70,7 @@ pub struct State {
     /// only the output volume.
     pub version: u32,
     /// The output volume, 0 to 100.
+    #[serde(deserialize_with = "percent")]
     pub output_percent: u8,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub analog: Option<Stored<StoredInput>>,
@@ -92,6 +93,14 @@ impl Default for State {
     }
 }
 
+/// Reads the master volume as a wide integer, so that a value above 255
+/// still parses. Out of range it becomes `u8::MAX`, which `sanitise`
+/// resets, so that the rest of the file loads.
+fn percent<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u8, D::Error> {
+    let n = i64::deserialize(d)?;
+    Ok(u8::try_from(n).unwrap_or(u8::MAX))
+}
+
 fn input_ok(i: &StoredInput) -> bool {
     i.volume_db.is_finite() && (-60.0..=0.0).contains(&i.volume_db)
 }
@@ -106,6 +115,10 @@ impl State {
     fn sanitise(&mut self, path: &Path) {
         let say = |what: &str| eprintln!("aas: {}: {what} out of range, dropped", path.display());
         self.version = 2;
+        if self.output_percent > 100 {
+            say("the master volume");
+            self.output_percent = State::default().output_percent;
+        }
         if let Some(a) = &self.analog {
             if !input_ok(&a.value) || !input_ok(&a.config) {
                 say("the analog input's volume");
@@ -121,7 +134,10 @@ impl State {
         });
         while self.clients.len() > MAX_CLIENTS {
             if let Some(name) = self.clients.keys().next_back().cloned() {
-                say(&format!("client {name:?}, more than {MAX_CLIENTS}:"));
+                eprintln!(
+                    "aas: {}: client {name:?}: more than {MAX_CLIENTS} clients stored, dropped",
+                    path.display()
+                );
                 self.clients.remove(&name);
             }
         }
@@ -147,9 +163,8 @@ impl State {
         }
     }
 
-    /// Reads the file. A missing or unreadable file, or a master volume out
-    /// of range, gives the defaults. Any other entry out of range is
-    /// dropped alone.
+    /// Reads the file. A missing or unreadable file gives the defaults. An
+    /// entry out of range is dropped alone, the master volume included.
     pub fn load(path: &Path) -> State {
         let text = match fs::read_to_string(path) {
             Ok(text) => text,
@@ -160,16 +175,9 @@ impl State {
             }
         };
         match toml::from_str::<State>(&text) {
-            Ok(mut state) if state.output_percent <= 100 => {
+            Ok(mut state) => {
                 state.sanitise(path);
                 state
-            }
-            Ok(_) => {
-                eprintln!(
-                    "aas: {}: volume out of range, starting from defaults",
-                    path.display()
-                );
-                State::default()
             }
             Err(e) => {
                 eprintln!("aas: {}: {e}, starting from defaults", path.display());
@@ -572,5 +580,72 @@ mod tests {
         }
         state.save(&path).unwrap();
         assert_eq!(State::load(&path).clients.len(), MAX_CLIENTS);
+    }
+
+    fn load_text(text: &str) -> State {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        std::fs::write(&path, text).unwrap();
+        State::load(&path)
+    }
+
+    const KEEP: &str = "[clients.keep]\nvolume_db = -3.0\nmuted = false\n";
+
+    #[test]
+    fn a_master_volume_out_of_range_resets_only_itself() {
+        for bad in ["101", "300", "100000", "-1"] {
+            let s = load_text(&format!("output_percent = {bad}\n{KEEP}"));
+            assert_eq!(s.output_percent, 100, "{bad}");
+            assert!(s.clients.contains_key("keep"), "{bad}");
+        }
+    }
+
+    #[test]
+    fn an_analog_volume_out_of_range_is_dropped_alone() {
+        let s = load_text(&format!(
+            "output_percent = 20\n{KEEP}[analog.value]\nvolume_db = 1.0\nmuted = false\n\
+             [analog.config]\nvolume_db = 0.0\nmuted = false\n"
+        ));
+        assert!(s.analog.is_none());
+        assert_eq!(s.output_percent, 20);
+        assert!(s.clients.contains_key("keep"));
+    }
+
+    #[test]
+    fn non_finite_volumes_are_dropped_alone() {
+        for bad in ["nan", "inf", "-inf"] {
+            let s = load_text(&format!(
+                "{KEEP}[clients.bad]\nvolume_db = {bad}\nmuted = false\n\
+                 [outputs.x.volume_db]\nvalue = {bad}\nconfig = 0.0\n\
+                 [outputs.x.idle_delay_s]\nvalue = 3\nconfig = 4\n"
+            ));
+            assert_eq!(s.clients.keys().collect::<Vec<_>>(), ["keep"], "{bad}");
+            assert!(s.outputs["x"].volume_db.is_none(), "{bad}");
+            assert!(s.outputs["x"].idle_delay_s.is_some(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_route_gain_out_of_range_drops_that_matrix_only() {
+        for bad in ["-101.0", "1.0"] {
+            let s = load_text(&format!(
+                "[outputs.x.matrix]\nconfig = []\n\
+                 [[outputs.x.matrix.value]]\nfrom = \"analog\"\nto = 0\ngain_db = {bad}\n\
+                 [outputs.y.matrix]\nconfig = []\n\
+                 [[outputs.y.matrix.value]]\nfrom = \"analog\"\nto = 0\ngain_db = -100.0\n"
+            ));
+            assert!(s.outputs["x"].matrix.is_none(), "{bad}");
+            assert!(s.outputs["y"].matrix.is_some(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn an_invalid_idle_string_is_dropped_alone() {
+        let s = load_text(
+            "[outputs.x.idle]\nvalue = \"sleep\"\nconfig = \"zeros\"\n\
+             [outputs.x.idle_delay_s]\nvalue = 3\nconfig = 4\n",
+        );
+        assert!(s.outputs["x"].idle.is_none());
+        assert!(s.outputs["x"].idle_delay_s.is_some());
     }
 }
