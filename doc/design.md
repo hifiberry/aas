@@ -395,8 +395,11 @@ Idle, failure and DoP with several outputs:
   while closed, and locks again when it opens. A source is what the master's
   rule counts: a running client, or the analog input with signal. The analog
   input being enabled keeps the master open, not a further output.
-- When the master goes off by its idle rule every further output closes too,
-  and every reopen of the master reopens every further card, even at an
+- Each output follows its own idle rule; the owner decided this. When the
+  master goes off, a further output with `idle = "zeros"` stays open and
+  gets silence. Not built yet: today every further output closes with the
+  master (`TODO.md`).
+- Every reopen of the master reopens every further card, even at an
   unchanged rate *(call: parked for the owner)*.
 - A lost master card plays to its timed null sink, which keeps the cycle
   going as it does with one output, and the writers follow it. A lost further

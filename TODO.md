@@ -134,14 +134,19 @@ or `SETTLE_MS` moves into the card table with 0 for the DAC+ ADC.
 Stage 3b part 2 built each of these one way, marked *(call)* in
 `doc/design.md`, "Several outputs". Each needs the owner's yes or no.
 
-### Should further outputs close when the master goes off?
+### Keep further outputs open when the master goes off
 
-When the master goes off by its idle rule, every further output closes too,
-whatever its own `idle` says: a further output with `idle = "zeros"` stops
-with the master. Missing: the decision. If no, first step: let
-`sync_further` in `src/control.rs` keep a further output open while the
-master is off; the further outputs are fed by the master's cycle, so that
-cycle has to keep running with the master's card closed.
+Decided by the owner: each output follows its own `idle` rule. When the
+master goes off by its idle rule, a further output with `idle = "zeros"`
+stays open and keeps getting silence, and one with `idle = "off"` closes
+after its own delay. Built so far the other way: every further output
+closes with the master. Missing: the change. The further outputs are fed by
+the master's cycle, so that cycle has to keep running with the master's card
+closed; a lost master already does this, playing to a timed null sink.
+First step: in `sync_further` in `src/control.rs`, when the master goes off
+while a further output's rule keeps it open, close the master's card but
+run the cycle on the timed null sink, as for a lost master, and open the
+card again when a source starts.
 
 ### Should a reopen of the master reopen every further card?
 
