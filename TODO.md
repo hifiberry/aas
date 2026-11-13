@@ -239,20 +239,6 @@ outputs" in `doc/design.md` and `plan_further` and `hand_over` in
 `src/control.rs`, and write down what a switch must change before planning
 the API.
 
-## A matrix the audio thread took is logged as refused
-
-Found on both test boards in the stage 4 part 1 runs, and in a build without
-ALSA: the first `PUT /matrix` of each run logs `output 1: a matrix of 2
-channels was refused, the one in place stays`, though the capture shows the
-matrix was taken. `OutputMix::set_matrix` in `src/output_mix.rs` swaps the
-new matrix's contents into its `matrix` field, a plain `Matrix`, and returns
-the box it was given; `old_matrix` in `src/control/api.rs` tells a refusal by
-that box's address, so every matrix looks refused. Logged once per output, so
-only the first shows. A real refusal cannot be told apart either. Fix: make
-the field a `Box<Matrix>` so that the boxes swap, or let `Event::OldMatrix`
-say whether it was refused. First step: a test that sends a matrix through a
-real engine and the control thread and checks that no refusal is noted.
-
 ## The analog input from a card other than the master
 
 Only the master's card has the analog input: `place = "analog"` and `detect`

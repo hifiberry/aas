@@ -131,10 +131,6 @@ pub(super) struct OutputMatrix {
     due: Option<(Instant, Box<Matrix>)>,
     /// When the last one was sent.
     sent_at: Option<Instant>,
-    /// The address of the last one sent. The audio thread sends back the
-    /// one it replaced, or this one if it refused it, and only the address
-    /// tells the two apart: both may hold the same gains.
-    sent: Option<usize>,
     /// A refused matrix has been logged.
     refused: bool,
 }
@@ -149,7 +145,6 @@ impl OutputMatrix {
             routes,
             due: None,
             sent_at: None,
-            sent: None,
             refused: false,
         }
     }
@@ -616,7 +611,6 @@ impl Control {
     fn send_matrix(&mut self, index: usize, matrix: Box<Matrix>, now: Instant) {
         let slot = &mut self.matrices[index];
         slot.sent_at = Some(now);
-        slot.sent = Some(std::ptr::from_ref::<Matrix>(&*matrix).addr());
         let engine = self.engine_index(index);
         self.send(vec![Command::SetMatrix(engine, matrix)]);
     }
@@ -635,10 +629,10 @@ impl Control {
 
     /// A matrix the audio thread sent back for output `output`, which is
     /// dropped here. It is the one a `SetMatrix` replaced, or, if that was
-    /// refused, the one it brought. Every put is checked against the
+    /// `refused`, the one it brought. Every put is checked against the
     /// width, so a refusal means the widths kept here are wrong: logged
     /// once.
-    pub(super) fn old_matrix(&mut self, output: usize, matrix: &Matrix) {
+    pub(super) fn old_matrix(&mut self, output: usize, matrix: &Matrix, refused: bool) {
         let index = match output {
             0 => Some(0),
             _ => self
@@ -650,7 +644,7 @@ impl Control {
         let Some(slot) = index.and_then(|i| self.matrices.get_mut(i)) else {
             return;
         };
-        if slot.sent == Some(std::ptr::from_ref(matrix).addr()) && !slot.refused {
+        if refused && !slot.refused {
             slot.refused = true;
             eprintln!(
                 "aas: output {}: a matrix of {} channels was refused, the one in place stays",

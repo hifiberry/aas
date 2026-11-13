@@ -2204,7 +2204,10 @@ in a build without ALSA. The capture shows that the matrix was taken; the line
 is wrong. The audio thread swaps the new matrix's contents into the one in
 place and sends back the box it was given, so the control thread, which tells
 a refusal by the address it sent, takes every accepted matrix for a refused
-one. It is logged once per output, so only the first shows.
+one. It is logged once per output, so only the first shows. This was fixed on
+the branch before the merge: the engine now says in `Event::OldMatrix` whether
+it refused the matrix, and a test sends matrices through the real engine and
+checks that the daemon logs no refusal.
 
 ### What these figures do not show
 

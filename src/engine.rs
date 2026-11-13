@@ -1103,9 +1103,9 @@ pub enum Command {
     /// Replaces the matrix of an output, 0 being the master, each gain
     /// moving to its new value over 10 ms. Answered by `Event::OldMatrix`
     /// with the one it replaced. One of another width than the matrix in
-    /// place is sent back as the `OldMatrix`, and the one in place stays:
-    /// the buffers and the chains are built for its width. So is one for
-    /// an output that is not there.
+    /// place is sent back as the `OldMatrix`, marked refused, and the one
+    /// in place stays: the buffers and the chains are built for its width.
+    /// So is one for an output that is not there.
     SetMatrix(usize, Box<Matrix>),
     /// Puts further output `index`, 1 to 3, in place: its mix, an
     /// `OutputMix` in the engine's processing format, and the feed of its
@@ -1175,8 +1175,8 @@ pub enum Event {
     OldTaps(Vec<Box<Tap>>),
     /// The matrix a `SetMatrix` replaced, or the one it brought if that
     /// was refused, with the output it was for, to be freed off the audio
-    /// thread.
-    OldMatrix(usize, Box<Matrix>),
+    /// thread. The flag says it was refused.
+    OldMatrix(usize, Box<Matrix>, bool),
     /// A further output's mix and feed that `AddOutput` replaced or
     /// refused, or that `RemoveOutput` took out, with the output's index,
     /// to be dropped off the audio thread.
@@ -2089,11 +2089,11 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         let dop = self.table.iter().any(|s| s.dop_claim != 0);
         let ramps = self.open && self.heard() && !dop;
         let ramp = ramps.then(|| (self.rate * FADE_MS / 1000) as usize);
-        let old = match self.output_mix_mut(output) {
+        let (old, refused) = match self.output_mix_mut(output) {
             Some(mix) => mix.set_matrix(matrix, forced, ramp),
-            None => matrix,
+            None => (matrix, true),
         };
-        self.emit(Event::OldMatrix(output, old));
+        self.emit(Event::OldMatrix(output, old, refused));
     }
 
     /// Running sources that are heard this cycle.
@@ -9140,7 +9140,7 @@ mod tests {
     /// The matrices the engine handed back, in order.
     fn old_matrices(events: &[Event]) -> Vec<Matrix> {
         let old = |e: &Event| match e {
-            Event::OldMatrix(_, m) => Some((**m).clone()),
+            Event::OldMatrix(_, m, _) => Some((**m).clone()),
             _ => None,
         };
         events.iter().filter_map(old).collect()
@@ -9292,6 +9292,28 @@ mod tests {
     }
 
     #[test]
+    fn a_matrix_of_the_same_width_is_not_refused() {
+        let mut rig = Rig::<F32>::new(BitPerfect::Auto);
+        rig.send(Command::SetMatrix(0, Box::new(swap_at(0.0))));
+        rig.cycle();
+        let events = rig.events();
+        assert!(matches!(events[..], [Event::OldMatrix(0, _, false)]));
+        assert_eq!(old_matrices(&events), vec![stereo()]);
+        // Nor is it, when it holds the same gains as the one in place.
+        rig.send(Command::SetMatrix(0, Box::new(swap_at(0.0))));
+        rig.cycle();
+        assert!(matches!(rig.events()[..], [Event::OldMatrix(0, _, false)]));
+    }
+
+    #[test]
+    fn a_matrix_for_an_output_not_there_is_refused() {
+        let mut rig = Rig::<F32>::new(BitPerfect::Auto);
+        rig.send(Command::SetMatrix(2, Box::new(stereo())));
+        rig.cycle();
+        assert!(matches!(rig.events()[..], [Event::OldMatrix(2, _, true)]));
+    }
+
+    #[test]
     fn a_matrix_of_another_width_is_sent_back() {
         let mut rig = Rig::<F32>::new(BitPerfect::Auto);
         let mut a = client(1);
@@ -9305,7 +9327,9 @@ mod tests {
         rig.send(Command::SetMatrix(0, Box::new(wider.clone())));
         a.ring.write(&input);
         rig.cycle();
-        assert_eq!(old_matrices(&rig.events()), vec![wider]);
+        let events = rig.events();
+        assert!(matches!(events[..], [Event::OldMatrix(0, _, true)]));
+        assert_eq!(old_matrices(&events), vec![wider]);
         assert_eq!(rig.engine.master.matrix, stereo());
         // Nothing moved: still the copy path, unswapped.
         assert_eq!(rig.last_periods(2), [input.clone(), input].concat());
@@ -10260,7 +10284,7 @@ mod tests {
             .events()
             .iter()
             .filter_map(|e| match e {
-                Event::OldMatrix(output, m) => Some((*output, m.width())),
+                Event::OldMatrix(output, m, _) => Some((*output, m.width())),
                 _ => None,
             })
             .collect();

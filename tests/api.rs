@@ -325,3 +325,58 @@ fn the_api_off_leaves_no_thread() {
         "the daemon did not play without the API"
     );
 }
+
+/// Runs `body` in a child process of this test binary, which runs only
+/// `test`, and gives what the child wrote to stderr, the daemon's log
+/// among it. In the child, where `AAS_CHILD` is set, this runs `body`
+/// and gives None.
+fn in_child(test: &str, body: impl FnOnce()) -> Option<String> {
+    if std::env::var_os("AAS_CHILD").is_some() {
+        body();
+        return None;
+    }
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test, "--nocapture", "--test-threads=1"])
+        .env("AAS_CHILD", "1")
+        .output()
+        .unwrap();
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    );
+    assert!(
+        out.status.success() && stdout.contains("1 passed"),
+        "the child failed:\n{stdout}\n{stderr}"
+    );
+    Some(stderr)
+}
+
+#[test]
+fn a_matrix_put_reaches_the_engine_unrefused() {
+    let log = in_child("a_matrix_put_reaches_the_engine_unrefused", || {
+        let daemon = Daemon::start();
+        let mut client = daemon.playing(16384);
+        running_client(&daemon);
+        let swap = r#"{"outputs": [{"output": 1, "routes": [
+            {"from": "players.left", "to": 2}, {"from": "players.right", "to": 1}]}]}"#;
+        for body in [swap, r#"{"outputs": [{"output": 1, "routes": []}]}"#] {
+            let (status, answer) = daemon.http("PUT", "/matrix", Some(body));
+            assert_eq!(status, 200, "{answer}");
+            // Past the 20 ms between two matrices, and long enough for
+            // the engine to answer and the control thread to read it.
+            let until = Instant::now() + Duration::from_millis(200);
+            while Instant::now() < until {
+                top_up(&mut client);
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+        let (status, matrix) = daemon.get("/matrix");
+        assert_eq!(status, 200);
+        let routes = &matrix["outputs"][0]["routes"];
+        assert_eq!(routes[0]["from"], json!("players.left"), "{matrix}");
+        assert_eq!(routes[0]["to"], json!(1), "{matrix}");
+    });
+    if let Some(log) = log {
+        assert!(!log.contains("refused"), "{log}");
+    }
+}

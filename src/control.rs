@@ -2548,7 +2548,9 @@ impl Control {
                 | Event::OldTaps(_)
                 | Event::OldOutput(..) => {}
                 // Freed here too, once looked at for a refusal.
-                Event::OldMatrix(output, matrix) => self.old_matrix(output, &matrix),
+                Event::OldMatrix(output, matrix, refused) => {
+                    self.old_matrix(output, &matrix, refused);
+                }
                 // The audio thread writes it no more, so a client that
                 // reads it empty after this has all of it. A client that
                 // gave the stream up meanwhile is told nothing it minds.
@@ -3300,13 +3302,15 @@ mod tests {
                     Command::SetMatrix(output, m) => {
                         self.matrices.push((output, (*m).clone()));
                         // The one replaced comes back, or this one if refused.
-                        let back = if self.refuse_matrices {
+                        let refused = self.refuse_matrices;
+                        let back = if refused {
                             m
                         } else {
                             let first = || Box::new(Matrix::default_for(2));
                             self.in_place.insert(output, m).unwrap_or_else(first)
                         };
-                        ("SetMatrix".into(), Some(Event::OldMatrix(output, back)))
+                        let event = Event::OldMatrix(output, back, refused);
+                        ("SetMatrix".into(), Some(event))
                     }
                     Command::AddOutput(index, mix, _feed) => {
                         let mix = mix.downcast::<OutputMix<F32>>().expect("an f32 mix");
