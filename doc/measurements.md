@@ -1756,6 +1756,30 @@ timestamps were 233 µs off a straight line in the run, so its rate over the
 180 s is not firmer than that; the offset between the outputs spread 632 µs,
 28 frames, after the lock.
 
+**On the final build 7c4d2ce** (the clamp hold no longer chains, and jumps
+leave the estimate cleanly) the three runs were repeated on the CM5 test
+board, built and run the same way, with the loopback at `latency_ms = 48` and
+44.1 kHz:
+
+| Shift | Run | Clamp line after the output opened | `locked` | Daemon at the stop | Measured against the DAC | Master |
+|---|---|---|---|---|---|---|
+| 99500 | 180 s | 30.6 s | never | +4434.5 ppm, not locked; 77 starves, 0 overflows | +5051.7 ppm | 0 xruns, 0 wake-up gaps, worst gap 1.78 ms |
+| 100500 | 180 s | 31.7 s | never | -4916.5 ppm, not locked; 0 starves, 47 overflows | -4949.8 ppm | 0 xruns, 0 wake-up gaps, worst gap 1.78 ms |
+| 99990 | 300 s | not logged | 5.1 s after the open, kept | +125.7 ppm, locked; 0 starves, 0 overflows | +128.8 ppm | 0 xruns, 0 wake-up gaps, worst gap 1.77 ms |
+
+The clamp runs behave as on b4fd1a6: one clamp line, no `locked`, and the
+starves and overflows every 2 s and 5 s. The ppm at the stop reads the clamp
+side but was further from the measurement than on b4fd1a6 (617 ppm and 33 ppm
+off, against 10 ppm and 1.5 ppm), and it is a snapshot beyond the clamp, where
+it is not a criterion; the clamp line and the counters are what the
+criterion asks for. In the in-range run the daemon's ppm, read at the stop of
+a 300 s run with the estimate's window long past its 120 s start, was 3.1 ppm
+from the measured difference, inside the 5 ppm; the 180 s run on b4fd1a6 was
+12.8 ppm off. The offset between the outputs spread 790 µs after the lock.
+`align-check` found 179 of 180 chirps in each clamp run and so reported the
+run as incomplete; the chirps are only its dating of the offset and play no
+part in the criteria above.
+
 The controller's skipped readings are now counted in the stop line; none were
 skipped in these runs.
 

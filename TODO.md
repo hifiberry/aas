@@ -237,8 +237,11 @@ beside `align-check`'s offset.
 
 The daemon's ppm, the separate 120 s estimate of a further card's drift, was
 within 3 ppm of the measured drift in 14 of 17 lock runs on the CM5 test
-board and 3.4 to 11.6 ppm off in three. A later in-range run read 12.8 ppm
-off. The aim is 5 ppm. `snd-aloop` with a shift set is not a clean clock, its
+board and 3.4 to 11.6 ppm off in three. A later 180 s in-range run read 12.8
+ppm off; on the final build a 300 s run read 3.1 ppm off. The aim is 5 ppm.
+Beyond the clamp the stop line's ppm is a snapshot and wanders: at +5052 ppm
+measured it read +4434, at -4950 it read -4916; the clamp itself was
+reported both times. `snd-aloop` with a shift set is not a clean clock, its
 timestamps 31 to 313 µs off a straight line, so it is not settled whether the
 estimate or the card is off. Under the hours' load the estimate also read 8
 to 9 ppm further from the master than on an idle board, and the loopback's
