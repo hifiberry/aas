@@ -153,6 +153,10 @@ master. Every other output is resampled adaptively to follow it, so bit-perfect
 applies only on the master output *(call)*. Each output has its own volume, idle
 behaviour and plugin chain *(call)*.
 
+Every output plays in time with the master: a sample leaves every card at the
+same moment. The owner decided this on 2026-11-12. How it is done is in
+[Several outputs](#several-outputs) below.
+
 ### Mixing matrix
 
 A mixing matrix decides which sources reach which outputs, and at what gain. The
@@ -168,11 +172,22 @@ Details *(call)*:
 - Each output has its own mix, followed by its own plugin chain.
 - An entry other than 0 dB or off on the path to the master output stops automatic
   bit-perfect.
-- The sample rate rules are applied to the master output. All outputs run at its
-  rate, so sources routed only to another output still follow those rules.
+- The sample rate rules are applied to the master output. All outputs are
+  mixed at its rate, so sources routed only to another output still follow
+  those rules.
 
-Built so far is one output with a matrix of its own. Several outputs come with
-part 2 of stage 3b. What is decided for the one *(call)*:
+Each output has a matrix of its own. What is decided *(call)*:
+
+- The master's matrix is the `[[matrix]]` tables, a further output's its
+  `[[output.matrix]]` tables, with the same rules. A further output without a
+  matrix plays what the master's default plays: left to channel 1 and right to
+  channel 2, for both sources, at 0 dB.
+- Only the master has the analog input. Its bus reaches a further output
+  through that output's matrix, like any source.
+- Each output mixes from the same buses. With further outputs the players' bus
+  is mixed at unity and every output, the master included, applies its own
+  gain as it mixes, so no output reads a bus another has altered. The direct
+  path below is taken only when there is no further output.
 
 - The matrix has four inputs: `players.left`, `players.right`, `analog.left` and
   `analog.right`. `players` is the sum of all clients after their volumes. A row
@@ -245,6 +260,144 @@ noisier, and another player opening the card at 44.1 kHz silently moves the
 capture clock on the CM5 and clicks on the Pi 3 (`doc/measurements.md`, Stage
 3a, "Idle output with the analog input on").
 
+### Several outputs
+
+Built in part 2 of stage 3b: up to four outputs, the master and at most three
+further outputs, each on a card of its own. No test board has a second card
+with its own clock, so it was tested with `snd-aloop` as the further card
+(`doc/measurements.md`, Stage 3b, part 2).
+
+Decided by the owner on 2026-11-12:
+
+- **Every output plays in time with the master.** Each further output's path
+  is held at one fixed delay, and the master is held back by the same delay
+  through a delay line. With further outputs the master's latency grows by
+  that delay. Without them nothing changes.
+- **The `Master` volume moves all outputs together.** Each further output
+  keeps its own offset to it (see Volume).
+- **While the master plays a DoP stream the other outputs are silent.**
+- **If the master's card is lost, the other outputs keep playing.**
+
+How it works *(call)*:
+
+- The audio thread keeps its one wait, on the master's card. Each cycle it
+  reads the sources once, mixes the master's output, and then each further
+  output from the same buses through that output's matrix, chains and gain.
+  It never waits for a further output, and a further output never stalls it.
+- Each further output's period goes into a wait-free ring, its feed, stamped
+  with the time the cycle woke. A writer thread per further output,
+  `aas-out-N` with N from 2, at `SCHED_FIFO` 65, one below the audio thread,
+  waits for its own card, takes from the feed what one card period needs,
+  resamples it to that card's clock and writes it.
+- A full feed refuses the new period and counts an overflow. An empty one
+  plays zeros and counts a starve. After either, and after a stall longer
+  than the feed lasts, the writer drops what the feed holds and primes the
+  path onto its target again. Old audio is never played twice, nor late.
+- A further card runs at the master's rate if it takes it, else at the
+  nearest rate it takes, the lower of two as near. Its period follows from its
+  own `latency_ms` by the master's rule (see Latency), and it buffers three
+  periods. `latency_ms` is the master's target unless the output sets it.
+  The plan had the master's period in time; a card such as `snd-aloop` cannot
+  run that, so each output got its own.
+- The delay every output is held at, the target, is the longest further
+  path: one master period for the feed, the card's three periods and the
+  resampler's delay, both counted at the master's rate, and a margin of half a
+  master period, at least 2 ms, rounded up to a frame. The margin was added
+  during the work: the writer's measurement needs a quarter to a half of a
+  period, and the first lock overshoots a little. It costs every output that
+  much latency.
+- The master's delay line holds the target less the master's own two periods.
+  It is made at startup as long as any rate needs with the outputs
+  configured, so no valid config needs a cap. Only a rate between the
+  standard ones can need more; the master then plays ahead and a warning is
+  logged once. The fade of a reconfiguration comes after the line, so the
+  line cannot swallow it, and a closing master empties the line.
+- The feed holds what the target leaves to it, two card periods and two
+  master periods, and at least four master periods. The writer takes a whole
+  card period at once, and only after it has resampled: a feed sized by the
+  target alone overflowed every 2.4 s on the Pi 3 test board at 96 kHz, where
+  the writer spent 9.5 ms resampling each period of 21.3 ms. A further output whose
+  `latency_ms` is so much shorter than the master's that the drift could not
+  believe a full feed stops the daemon at startup, with a message naming the
+  output.
+- A card that cannot run its period counts xruns and stays silent. `snd-aloop`
+  needs about 48 ms: at the 4 ms default on the CM5 it counted 4748 xruns and
+  played nothing. Set that output's `latency_ms`. The master's delay
+  follows the slowest output, so one such card makes every output late (see
+  Latency).
+- Without further outputs the master's samples are bit for bit what they
+  were before part 2, in every format, and the audio thread costs what it
+  did: on the Pi 3 at 48 kHz 1.2% more per cycle in `f32` and 0.4% in `f64`,
+  within or just above the spread of the runs. One further output adds
+  17.1 µs per cycle in `f32` and 11.1 µs in `f64` there, 0.2 to 0.3% of a
+  period, besides its writer (see Resampling).
+- No two outputs may name the same card. The names are resolved to the
+  kernel's card index at startup, so an index and an id of one card are
+  caught. A card not there at startup cannot be told and passes. The check
+  runs at startup only.
+
+The drift controller *(call)*:
+
+- It is a PI controller on the path's total delay: the frames in the feed, in
+  the resampler and in the card, counted at the master's rate. The delay is
+  read at one instant, from the card's timestamp and the time of each push,
+  so it carries no period of quantisation; in simulation the ratio moves 4 to
+  8 ppm peak to peak once settled. The proportional part corrects an error
+  over about 2 s, the integral over about 20 s, and the reading is smoothed
+  over 0.5 s.
+- The ratio is clamped to ±2000 ppm. A card beyond that plays on with starves
+  or overflows counted. It is reported once its ratio has held the clamp for
+  30 s without a break, or the drift estimate has stayed beyond ±2000 ppm for
+  10 s, whichever comes first. The second is for a fast card, which starves
+  before its ratio reaches the clamp. Near 1950 ppm, at 44.1 kHz with
+  1024-frame periods, the second can report a card that the ratio still
+  follows; that is accepted.
+- An output counts as locked once its error stays under a quarter of its
+  card's period for 5 s with no priming in between. A locked output keeps its
+  lock over one priming, a starve now and then; a second within 10 s ends it.
+- A priming after a starve, an overflow, a stall or an xrun keeps the
+  integral and the estimate: the clocks under the path are the same, so the
+  ratio stays where the card needs it. The plan reset the controller there;
+  a reset after a priming pinned the clamp for tens of seconds and reported a
+  card in range as clamped. After an open, a reconfiguration, or a card lost
+  or back, the controller starts over.
+- The drift in ppm is a separate, slower estimate, averaged over 120 s, which
+  carries on across primings with the jump kept out. It is reported only once
+  it is ready, so a lock line in the first two minutes carries no ppm.
+- A reading that is not finite, below 0 or more than eight card periods above
+  the target is skipped and counted, never fed to the filters. After 1 s of
+  nothing but skipped readings the controller starts over. A reading taken
+  while the master's next push is overdue is short by frames not pushed yet,
+  which says nothing about the clocks: it is left out, and the ratio holds.
+
+Idle, failure and DoP with several outputs:
+
+- Idle is per output *(call)*. A further output with `idle = "off"` closes
+  its card after its own delay when no source is active, discards its feed
+  while closed, and locks again when it opens. A source is what the master's
+  rule counts: a running client, or the analog input with signal. The analog
+  input being enabled keeps the master open, not a further output.
+- When the master goes off by its idle rule every further output closes too,
+  and every reopen of the master reopens every further card, even at an
+  unchanged rate *(call: parked for the owner)*.
+- A lost master card plays to its timed null sink, which keeps the cycle
+  going as it does with one output, and the writers follow it. A lost further
+  card plays to a null sink of its own and is looked for every second
+  *(call)*. Neither ever stalls the other.
+- An xrun on any card, the master's or a further one, is recovered in place
+  and counted. Only a device that has gone, or one still stuck after
+  a restart, sends an output to its null sink *(call)*.
+- While the master plays a DoP stream, a further output plays silence. The
+  stream never reaches it.
+
+The alignment was measured on the CM5 test board: the master plays 14 to 15
+frames after the loopback, beyond the converters' own delay, at every rate,
+so +0.32 ms at 44.1 and 48 kHz and +0.15 ms at 96 kHz. It stays within a frame
+over a minute. The same count of frames at each rate points at a count
+somewhere in the path, the reading of a card's delay, the DAC's FIFO or
+`snd-aloop`'s pointer, but the method cannot say which. The cause is not
+known (`doc/measurements.md`, Stage 3b, part 2, "Alignment").
+
 ## Sample rate rules
 
 - With one client, the output uses that client's rate.
@@ -263,6 +416,8 @@ Further rules *(call)*:
   remaining client. A client that has left never holds the rate. A client at the
   output rate arriving during the settle time cancels the switch.
 - The settle time is 500 ms.
+- The rules choose the master's rate. A further output's card follows it, or
+  takes the nearest rate it has (see Several outputs).
 - If the card does not support a client's rate, the output uses the nearest
   supported rate and the client is resampled. In a tie, the lower rate wins.
 - A rate at which a plugin chain cannot be built counts as a rate the card does
@@ -353,6 +508,23 @@ fits on a Pi 3 in either format, and so do several resampled streams. `medium`
 costs about two thirds of `high` and is no longer needed to make a Pi 3 fit. The
 Pi 4 is still to be measured.
 
+A further output is resampled adaptively, to follow the master's clock
+*(call)*. Its ratio is not a fixed fraction, so no fixed set of phases exists,
+and this departs on purpose from the rule above: the filter is interpolated
+between the points of a fine table, cubically between 256 phases at `high` and
+linearly between 128 at `medium`, with the same 128 and 64 taps as the clients'
+resampler. It is rubato's asynchronous sinc resampler. It works in `f64` when
+the processing format is `f64`, else in `f32`, and it always runs on a further
+output, also at equal rates. Its ratio moves at most 2000 ppm either way.
+
+Through `snd-aloop` on the CM5 a 997 Hz tone left a residual of -132 to
+-135 dBFS against a sine whose amplitude and phase may move, in `f32` and in
+`f64` alike: the floor is the loopback's clock, not the arithmetic. On the
+Pi 3 at 48 kHz one further output's writer takes 17% of a core in `f32` and
+28% in `f64`, far more than the audio thread's own work; on the CM5 under
+full load 1.0% at 44.1 kHz and 2.3% at 96 kHz. A Pi 3 with three further
+outputs would want half to most of a core for them.
+
 ### Volume and clipping
 
 Input volumes are calculated on this path. So is the output volume on cards
@@ -394,6 +566,13 @@ at startup with a message.
 
 A setting can also turn automatic bit-perfect off for testing *(call)*.
 
+Bit-perfect applies to the master only. The master's copy and DoP paths pass
+through its delay line unaltered. A further output is resampled, so it always
+takes the processing path. In forced bit-perfect a further output keeps its
+volume, its matrix gains and its chains *(call)*; the client and analog
+volumes stay unapplied for every output, since they act on the buses all
+outputs share.
+
 With forced bit-perfect, a second client is mixed in. The output is not
 bit-perfect while they overlap. Volumes that `aas` calculates still have no
 effect, plugins stay bypassed *(call)*, and bit-perfect resumes once one client
@@ -434,7 +613,10 @@ turns it into loud noise. While a DoP stream plays:
 - the output runs at the stream's rate;
 - it has exclusive use of the output. Other clients stay connected, but their
   audio is discarded until the DoP stream stops *(call)*. This is the one exception
-  to mixing, because mixing would produce noise.
+  to mixing, because mixing would produce noise;
+- further outputs play silence. The owner decided this on 2026-11-12. A DoP
+  stream never reaches a further output, whose resampler would turn it into
+  noise.
 
 With a matrix a DoP stream needs pure routing of `players` and chains that keep
 the count *(call)*. On a card of two or more channels the output channels are
@@ -494,8 +676,15 @@ control to that level and calculates the rest itself, so each step is a step on
 every card. The output is then not bit-perfect, at a level where that is not
 heard.
 
-In forced bit-perfect mode `aas` never touches the samples, so the volume stops
-at the control's lowest level. On a card whose
+The `Master` control moves every output together. The owner decided this on
+2026-11-12. Each further output keeps its own offset, `volume_db` in its
+`[[output]]` table, from -60 to 0 dB and 0 by default, so it plays at the
+`Master` level plus its offset. A further output's volume is always
+calculated in software, also in forced bit-perfect; its card's own mixer is
+left alone *(call)*. At 0 a further output is silent.
+
+In forced bit-perfect mode `aas` never touches the master's samples, so the
+volume stops at the control's lowest level. On a card whose
 hardware control has neither a mute switch nor a mute step, 0 then plays at the
 control's lowest level, not silence.
 
@@ -554,6 +743,19 @@ The analog input adds at most one period to the two the output has, because the
 engine keeps at most two periods of captured audio and reads one per cycle
 *(call)*.
 
+With further outputs every output plays as late as the slowest of them needs,
+the master included, since all play in time (see Several outputs). A further
+output's path holds one master period in its feed, three of its card's
+periods, its resampler's delay and a margin of half a master period, at least
+2 ms. Its card's period follows from its own `latency_ms` by the rule above
+*(call)*. With `snd-aloop` at `latency_ms = 48`, the only further card tested,
+the master's latency went from 2.7 to 2.9 ms alone to 68 to 75 ms on the CM5,
+and from 10.7 to 11.6 ms to 73 to 80 ms on the Pi 3; the resampler's share is
+160 to 260 frames (`doc/measurements.md`, Stage 3b, part 2, "The master's
+latency with a further output"). A real second card that runs the master's
+period would cost far less. Without further outputs the master's latency is
+unchanged.
+
 The target counts as met when one hour of playback at 44.1 kHz and at 96 kHz runs
 on the test board with no xruns and no wake-up gap longer than the buffer, on an
 otherwise idle system *(call)*. The xrun count alone is not enough, because ALSA
@@ -584,6 +786,9 @@ The table starts with the two cards the test boards carry,
 Digi as a card without one. It grows as cards are verified. On any other card,
 `enabled = true` logs one line and opens nothing. Whether the card has an ADC is
 decided at startup if the card is there, and otherwise at each open of the output.
+
+Only the master's card has an analog input *(call)*. A further output gets
+the master's input through its matrix, like any source.
 
 The ADC is a built-in source, mixed in like a client and with its own volume.
 The ADC and DAC share the card's clock, so they run at the same rate and the ADC
@@ -773,8 +978,11 @@ Details *(call)*:
   analog input keeps two channels throughout and runs its chain in place, so
   such a plugin there is a config error.
 - `mix` and `output` both belong to the output and run after the matrix, `mix`
-  first *(call)*. They differ only in order, as before. In part 2 of stage 3b a
-  plugin names its card.
+  first *(call)*. They differ only in order, as before. Each output has its
+  own: the master's are the `[[plugin]]` tables, a further output's its
+  `[[output.plugin]]` tables, built for that output's channel count. A further
+  output's chains run at the master's rate, before its resampler. Only the
+  master has `analog` and `detect`.
 - A DoP stream bypasses the `mix` and `output` chains, but when it opens the
   output before they were ever sent they are sent with it, so PCM at that rate
   never plays without them. One that cannot be built at that rate is sent as
@@ -897,6 +1105,17 @@ Details *(call)*:
 - **Buffers:** fill level per client and per output.
 - **Resampling:** which clients and outputs are resampled, and the current
   adaptive ratio and clock drift on outputs other than the master.
+- **Further outputs:** built so far are counters per further output, logged
+  to the journal at the stop: xruns, wake-up gaps, starves, overflows, the
+  drift readings skipped, the drift in ppm and whether it is locked. A line is
+  logged when an output is given a rate, with its period and the delay every
+  output is held at; when it locks, with its ppm once the estimate is ready,
+  and when it loses the lock; when its card goes and comes back; and when its
+  card runs beyond the clamp, at most once a minute. The first ten starves and
+  overflows are logged one by one, with their time and the feed's fill, and
+  then one line a minute with the number since the last. The writer itself
+  never logs; the control thread does. The ratio and drift in `GET /metrics`
+  wait for stage 4.
 - **State:** the current rate, format, active clients and whether output is
   bit-perfect, and if it is not, the reason.
 - **Events:** a log of what changed and why, such as a rate change, a client
@@ -930,6 +1149,10 @@ All of this is *(call)*:
   input goes quiet, the control thread is told, and it tries again every second.
   A suspended or disconnected capture is reported gone.
 - A recorder that stops reading loses only its own audio.
+- With several outputs, a lost master's card does not stop the others, and a
+  lost further card does not stop the master. A lost further card plays to a
+  null sink of its own and is looked for every second, like the master's
+  (see Several outputs).
 - If a chain cannot be built at a rate, the daemon logs it. A rate a plugin
   does not support is not used; a plugin that failed is tried again at the
   next rate decision (see Plugins). It never runs a chain short of its
@@ -980,6 +1203,16 @@ of `players.left`, `players.right`, `analog.left` and `analog.right`, and `to`
 an output channel counted from 1. A route to a channel above the width of the
 matrix is an error, and so is a chain that does not end at `channels`. Both
 stop the daemon at startup.
+
+The flat keys are the master *(call)*. Each further output is an `[[output]]`
+table, at most three, so four outputs. Its keys are `card`, which is
+required, `channels`, `latency_ms`, `idle`, `idle_delay_s` and `volume_db`,
+and its own `[[output.matrix]]` and `[[output.plugin]]` tables, all with the
+rules of the flat ones. `place = "analog"` and `detect` are an error there.
+With any `[[output]]` table the flat `card` is required, and no two outputs may
+name the same card. An error names the output, counting the master as
+output 1. A fourth table is not flat, for the same reason as the others: it
+holds a list.
 
 Volumes and other values changed at runtime are state, not configuration. They
 are kept in a separate state file owned by the daemon and restored at startup

@@ -237,8 +237,10 @@ shorter than the master's, which the drift could not follow, stops the start wit
 an error naming the output. Its own `[[output.matrix]]` and `[[output.plugin]]` tables follow the rules
 of `[[matrix]]` and `[[plugin]]`, except that `place = "analog"` and `detect` are only
 for the master. An output without a matrix plays left to channel 1 and right to
-channel 2 for both sources at 0 dB. An error names the output, counting the master
-as output 1:
+channel 2 for both sources at 0 dB. A further output follows the master's clock
+through a resampler, so it is never bit-perfect, and it is silent while the master
+plays a DoP stream. If the master's card is lost, the others play on. An error
+names the output, counting the master as output 1:
 
 ```toml
 card = "sndrpihifiberry"
