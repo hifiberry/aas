@@ -3,10 +3,6 @@
 > The design, `doc/design.md`, is the authority: where this plan disagrees with it, the
 > design wins.
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development
-> (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps
-> use checkbox (`- [ ]`) syntax for tracking.
-
 **Goal:** The daemon drives up to four cards at once. The card in the flat config is the
 clock master. Every other card plays in time with it, each with its own matrix, plugin
 chains, channel count, volume offset and idle behaviour, and is adaptively resampled to
