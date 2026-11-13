@@ -310,8 +310,18 @@ How it works *(call)*:
   It is made at startup as long as any rate needs with the outputs
   configured, so no valid config needs a cap. Only a rate between the
   standard ones can need more; the master then plays ahead and a warning is
-  logged once. The fade of a reconfiguration comes after the line, so the
-  line cannot swallow it, and a closing master empties the line.
+  logged once. A target shorter than the master's own two periods, possible
+  only below 44.1 kHz or between the standard rates, leaves the line empty:
+  the further outputs then play ahead of the master, and a warning says so
+  once. The fade of a reconfiguration comes after the line, so the line
+  cannot swallow it, and a closing master empties the line.
+- A DoP stream passes through the line unaltered, and what it leaves there
+  when it ends plays out unaltered too. A fade that comes while DoP is still
+  in the line, for a reconfiguration, a close, the shutdown or a change of
+  the delay, zeroes those frames instead of scaling them: a scaled DoP word
+  plays as noise on a DoP DAC, silence does not. The line counts how many of
+  its frames may be DoP, all of it after a DoP period, and counts them down
+  as they leave.
 - The feed holds what the target leaves to it, two card periods and two
   master periods, and at least four master periods. The writer takes a whole
   card period at once, and only after it has resampled, so a feed sized by
@@ -325,6 +335,14 @@ How it works *(call)*:
   Set that output's `latency_ms`. The master's delay
   follows the slowest output, so one such card makes every output late (see
   Latency).
+- The target counts the period and the three periods a further output asked
+  its card for. A card may grant another period, or round the count, and the
+  writer fills the buffer it was granted: a larger one holds the path past
+  its target, and the output starves again and again. The target is not
+  planned from what the card grants. After each open of a further card, and
+  when its card comes back, one warning names the output and gives the
+  period and buffer asked for and granted, in frames and ms, and says to set
+  that output's `latency_ms`.
 - Without further outputs the master's samples are bit for bit what they
   were before part 2, in every format, and the audio thread costs what it
   did: on the Pi 3 at 48 kHz 1.2% more per cycle in `f32` and 0.4% in `f64`,

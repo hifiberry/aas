@@ -200,6 +200,29 @@ Missing: a second real card on a test board, such as a USB DAC. First step:
 fit it, add it as an `[[output]]` with its default `latency_ms`, and repeat
 the lock, alignment and hour runs of that section of `doc/measurements.md`.
 
+## Plan a further output's alignment from the buffer its card grants
+
+The alignment target counts three of the periods a further output asks its
+card for (`card_part` and `align_frames` in `src/control.rs`; the path is
+built from the asked period in `FurtherHandle::reconfigure_holding`,
+`src/further.rs`). `AlsaSink::try_open` in `src/sink_alsa.rs` asks with
+`set_period_size_near` and `set_periods(3, Nearest)`, so a card may grant
+another period or round the count. The writer fills what it was granted; a
+larger buffer holds the path past its target, and the output starves over
+and over. Done: after each open of a further card, and when its card comes
+back, the writer compares `Sink::granted` with what was asked and sends
+`FurtherEvent::Granted`; the control thread logs one warning naming the
+output, asked against granted in frames and ms, and saying to set that
+output's `latency_ms` (`Writer::check_grant`, `event_line`). The remedy is
+still manual. Missing: plan the output's `card_part`, the target and the
+master's delay from the granted buffer, as `set_output_rates` already
+replans when a card's rates change; and a decision whether a grant smaller
+than asked replans too. First step: have the control thread handle
+`FurtherEvent::Granted` by storing the granted period and buffer on the
+`FurtherOutput` and calling `plan_further` with `only` set to that output;
+in the writer tests, a `Sim` with `granted_periods = 4` that runs with no
+starve then shows it works.
+
 ## Choose the clock master at run time
 
 The master is the card of the flat `card` key, fixed until a restart. Stage 4
@@ -440,10 +463,12 @@ them was seen to break playback. Search for the name given.
   unknown-key case of an `[[output]]` table is the test's last assertion and
   checks only `is_err()`, not the message. First step: a test of its own
   that checks the message names the output and the key.
-- `src/engine.rs`: no test shuts the engine down with sound in the delay
-  line. `Command::Shutdown` takes the same path as `CloseOutput`, which
-  `closing_fades_what_the_delay_line_holds` covers. First step: the same test
-  with `Shutdown`.
+- `src/engine.rs`: no test checks the fade of a shutdown with PCM in the
+  delay line. `Command::Shutdown` takes the same path as `CloseOutput`,
+  which `closing_fades_what_the_delay_line_holds` covers;
+  `dop_in_the_delay_line_is_never_scaled` shuts down with DoP and PCM in the
+  line, but checks only that no DoP word is scaled. First step: the close
+  test with `Shutdown`.
 - `tests/server.rs`, `a_lost_further_card_is_looked_for_every_second`: it
   sleeps 3.5 s and accepts 2 to 5 looks, which is slow and depends on the
   host's load. First step: wait for the second look, then check the count
