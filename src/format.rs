@@ -39,9 +39,10 @@ pub fn db_to_gain(db: f32) -> f32 {
     10f32.powf(db / 20.0)
 }
 
-/// One arithmetic format for mixing.
-pub trait Processing {
-    type Acc: Copy;
+/// One arithmetic format for mixing. `'static`, so that an output's mix in
+/// it can travel to the audio thread as `Any`.
+pub trait Processing: 'static {
+    type Acc: Copy + Send;
     /// A gain in the form `accumulate` multiplies by.
     type Gain: Copy;
     fn zero() -> Self::Acc;
@@ -356,6 +357,22 @@ pub fn matrix_add<P: Processing>(
     }
 }
 
+/// Multiplies `acc`, interleaved frames `width` wide, by `ramp`, which
+/// spans all of its frames. A gain of exactly 1.0 leaves it as it is.
+pub fn scale_wide<P: Processing>(acc: &mut [P::Acc], width: usize, ramp: Ramp) {
+    if ramp == Ramp::flat(1.0) {
+        return;
+    }
+    let n = acc.len() / width;
+    for (i, frame) in acc.chunks_exact_mut(width).enumerate() {
+        let g = P::gain(ramp.at(i, n));
+        for a in frame.iter_mut() {
+            let v = std::mem::replace(a, P::zero());
+            P::accumulate_acc(a, v, g);
+        }
+    }
+}
+
 /// Ends a mix of any width by converting to S32, saturating once, here.
 pub fn mix_finish_wide<P: Processing>(acc: &[P::Acc], out: &mut [i32]) {
     debug_assert_eq!(acc.len(), out.len());
@@ -503,6 +520,37 @@ mod tests {
         assert_eq!(out, [[i32::MAX, i32::MAX]]);
         mix::<I32>(&sources[31..], &mut acc, &mut out);
         assert_eq!(out, [[i32::MIN, i32::MIN]]);
+    }
+
+    fn scaled<P: Processing>(values: &[i32], ramp: Ramp) -> Vec<i32> {
+        let mut acc = vec![P::zero(); values.len()];
+        for (a, &v) in acc.iter_mut().zip(values) {
+            P::accumulate(a, v, P::gain(1.0));
+        }
+        scale_wide::<P>(&mut acc, 2, ramp);
+        let mut out = vec![0; values.len()];
+        mix_finish_wide::<P>(&acc, &mut out);
+        out
+    }
+
+    #[test]
+    fn scaling_a_wide_block_follows_the_ramp_and_leaves_it_at_unity() {
+        fn check<P: Processing>() {
+            // Exact in every format.
+            const ODD_EXACT: i32 = 0x1234_5000;
+            let values = [ODD_EXACT, -ODD_EXACT, 1 << 20, -(1 << 20), 4096, 0];
+            assert_eq!(scaled::<P>(&values, Ramp::flat(1.0)), values);
+            let half: Vec<i32> = values.iter().map(|v| v / 2).collect();
+            assert_eq!(scaled::<P>(&values, Ramp::flat(0.5)), half);
+            // Three frames from 1 to 0: 1, 2/3 and 1/3 of each.
+            let ramp = scaled::<P>(&values, Ramp { from: 1.0, to: 0.0 });
+            assert_eq!(ramp[..2], values[..2]);
+            assert!((f64::from(ramp[3]) + f64::from(1 << 20) * 2.0 / 3.0).abs() < 2.0);
+            assert_eq!(ramp[4], 1365);
+        }
+        check::<I32>();
+        check::<F32>();
+        check::<F64>();
     }
 
     #[test]

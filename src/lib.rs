@@ -1,5 +1,6 @@
 //! Alternative audio server.
 
+pub mod adaptive;
 pub mod bitperfect;
 pub mod board;
 pub mod capture;
@@ -8,10 +9,13 @@ pub mod config;
 pub mod control;
 pub mod counters;
 pub mod dop;
+pub mod drift;
 pub mod engine;
 pub mod format;
+pub mod further;
 pub mod latency;
 pub mod matrix;
+pub mod output_mix;
 pub mod plugin;
 pub mod rate;
 pub mod resample;

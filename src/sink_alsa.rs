@@ -61,6 +61,49 @@ pub fn card_driver(text: &str, card: Option<&str>) -> Option<(String, String)> {
     Some((id, driver.to_string()))
 }
 
+/// The index of a card in `/proc/asound/cards` text: one named by index or
+/// by id, or for `None` the one `find_card` takes. None if it is not there.
+pub fn card_index(text: &str, card: Option<&str>) -> Option<u32> {
+    let id = match card {
+        Some(card) => card.to_string(),
+        None => find_card(&parse_card_ids(text))?,
+    };
+    text.lines().find_map(|line| {
+        let index = line.split_whitespace().next()?.parse::<u32>().ok()?;
+        let named = parse_card_ids(line).first() == Some(&id) || index.to_string() == id;
+        named.then_some(index)
+    })
+}
+
+/// Refuses two outputs on the same card, which names compared as text let
+/// through: one by index and one by id, or the master's card found and
+/// named by an output. `cards` are the outputs' cards in order, the master
+/// first, `None` for one to find. A card not there now cannot be told, and
+/// passes.
+pub fn distinct_cards(text: &str, cards: &[Option<String>]) -> Result<(), String> {
+    let name = |card: &Option<String>| match card {
+        Some(card) => format!("card {card}"),
+        None => "the card found".to_string(),
+    };
+    let mut seen: Vec<(usize, u32)> = Vec::new();
+    for (i, card) in cards.iter().enumerate() {
+        let Some(index) = card_index(text, card.as_deref()) else {
+            continue;
+        };
+        if let Some(&(j, _)) = seen.iter().find(|&&(_, other)| other == index) {
+            return Err(format!(
+                "output {} ({}) and output {} ({}) are the same card, {index}",
+                j + 1,
+                name(&cards[j]),
+                i + 1,
+                name(card)
+            ));
+        }
+        seen.push((i, index));
+    }
+    Ok(())
+}
+
 /// The kernel's list of cards now, empty if it cannot be read.
 pub fn cards_text() -> String {
     fs::read_to_string(CARDS).unwrap_or_default()
@@ -127,6 +170,22 @@ pub fn wanted_card_is_among(card: Option<&str>, ids: &[String]) -> bool {
 /// cards, so it belongs on the control thread.
 pub fn card_is_present(card: Option<&str>) -> bool {
     wanted_card_is_among(card, &card_ids())
+}
+
+/// Whether a card's error, `errno`, means its device is gone, rather than
+/// an xrun that a restart cures. `disconnected` is the stream's state;
+/// `recovering` says the error came from the restart after an xrun. Only
+/// a device that has gone (ENODEV, or EBADFD on a disconnected stream), or
+/// a card still stuck after a restart, is gone: an underrun or a suspend,
+/// also one during the restart, stays an xrun, which is counted and
+/// recovered in place.
+pub fn card_is_gone(errno: i32, disconnected: bool, recovering: bool) -> bool {
+    match errno {
+        libc::ENODEV => true,
+        libc::EBADFD => disconnected,
+        libc::ETIMEDOUT => recovering,
+        _ => false,
+    }
 }
 
 /// The sample format the card is opened with, best first.
@@ -370,10 +429,11 @@ mod mixer {
 
 #[cfg(feature = "alsa-output")]
 mod card {
-    use super::{CardFormat, card_device, encode};
+    use super::{CardFormat, card_device, card_is_gone, encode};
+    use crate::counters::monotonic_ns;
     use crate::latency::PERIODS;
     use crate::sink::{Sink, SinkError};
-    use alsa::pcm::{Access, Format, Frames, HwParams, PCM};
+    use alsa::pcm::{Access, Format, Frames, HwParams, PCM, State, TstampType};
     use alsa::{Direction, ValueOr};
 
     /// How long a write waits for room before the card counts as stuck.
@@ -422,6 +482,7 @@ mod card {
         pcm: PCM,
         format: CardFormat,
         channels: usize,
+        rate: u32,
         /// Frames in the card's buffer.
         buffer: u32,
         /// Frames in the card's period.
@@ -505,11 +566,49 @@ mod card {
             Ok(())
         }
 
+        /// The frames queued in the card now. The status gives the delay
+        /// as of its timestamp, the time of the card's last position
+        /// update; while the card runs, the frames played since then are
+        /// taken off, so the delay is read at the moment of the call and
+        /// not at the card's last interrupt. A timestamp that is not on
+        /// CLOCK_MONOTONIC, or older than a period, is not used.
+        fn delay_now(&self) -> alsa::Result<u32> {
+            let status = self.pcm.status()?;
+            let delay = status.get_delay().max(0) as f64;
+            let stamp = status.get_htstamp();
+            // 32 bits on 32-bit ARM, 64 on 64-bit.
+            #[allow(clippy::unnecessary_cast)]
+            let stamp_ns = stamp.tv_sec as i64 * 1_000_000_000 + stamp.tv_nsec as i64;
+            let since_ns = monotonic_ns() as i64 - stamp_ns;
+            let period_ns = self.period as i64 * 1_000_000_000 / i64::from(self.rate);
+            let delay = if status.get_state() == State::Running
+                && stamp_ns > 0
+                && (0..=period_ns).contains(&since_ns)
+            {
+                delay - since_ns as f64 * f64::from(self.rate) / 1e9
+            } else {
+                delay
+            };
+            Ok(delay.max(0.0) as u32)
+        }
+
         /// Restarts the card after an xrun: prepare, then two periods of
         /// zeros, which fill the buffer and so start it.
         fn recover(&self) -> alsa::Result<()> {
             self.pcm.prepare()?;
             self.write_all(&self.zeros)
+        }
+
+        /// Whether the stream's device has been disconnected.
+        fn disconnected(&self) -> bool {
+            self.pcm.state() == State::Disconnected
+        }
+
+        /// Waits a period, after a restart that failed, so that a card that
+        /// fails at every period cannot spin the thread that plays to it.
+        fn rest(&self) {
+            let ns = self.period as u64 * 1_000_000_000 / u64::from(self.rate);
+            std::thread::sleep(std::time::Duration::from_nanos(ns));
         }
     }
 
@@ -538,11 +637,13 @@ mod card {
 
     /// Plays to `hw:<card>` with a fixed number of channels, as S32 if the
     /// card takes it, else S24 in 32 bits, else S16. Two periods are
-    /// buffered and the card starts once both are written.
+    /// buffered, or as many as it is made with, and the card starts once
+    /// all are written.
     pub struct AlsaSink {
         /// The card the config names. None finds one at each open.
         card: Option<String>,
         channels: usize,
+        periods: u32,
         open: Option<Open>,
         rates: Vec<u32>,
         /// The last failure logged, so that a retry every second does not
@@ -554,9 +655,16 @@ mod card {
         /// Looks at the card once for its rates. A card that is missing now
         /// is looked for again at each open.
         pub fn new(card: Option<String>, channels: usize) -> AlsaSink {
+            AlsaSink::buffering(card, channels, PERIODS)
+        }
+
+        /// The same with `periods` periods buffered, as a further output's
+        /// card is.
+        pub fn buffering(card: Option<String>, channels: usize, periods: u32) -> AlsaSink {
             let mut sink = AlsaSink {
                 card,
                 channels,
+                periods,
                 open: None,
                 rates: Vec::new(),
                 last_failure: None,
@@ -634,7 +742,7 @@ mod card {
                     .map_err(|x| e("rate", x))?;
                 hw.set_period_size_near(Frames::from(period), ValueOr::Nearest)
                     .map_err(|x| e("period", x))?;
-                hw.set_periods(PERIODS, ValueOr::Nearest)
+                hw.set_periods(self.periods, ValueOr::Nearest)
                     .map_err(|x| e("periods", x))?;
                 if let Err(x) = pcm.hw_params(&hw) {
                     // Some I2S controllers take a channel count in the
@@ -664,6 +772,15 @@ mod card {
                 // `wait_room` return at once until the difference had played.
                 sw.set_avail_min(Frames::from(period).min(buffer))
                     .map_err(|x| e("avail min", x))?;
+                // Timestamps on CLOCK_MONOTONIC for `delay_now`. A card
+                // without them still plays, its delay read as of its last
+                // position update.
+                if let Err(x) = sw
+                    .set_tstamp_mode(true)
+                    .and_then(|()| sw.set_tstamp_type(TstampType::Monotonic))
+                {
+                    eprintln!("aas: {device}: no monotonic timestamps: {x}");
+                }
                 pcm.sw_params(&sw).map_err(|x| e("apply sw", x))?;
             }
             if card_period != Frames::from(period) {
@@ -681,11 +798,41 @@ mod card {
                 pcm,
                 format,
                 channels: self.channels,
+                rate,
                 buffer: buffer as u32,
                 period: card_period as usize,
                 bytes: vec![0; period as usize * frame_bytes],
                 zeros: vec![0; buffer as usize * frame_bytes],
             })
+        }
+    }
+
+    impl AlsaSink {
+        /// What a failed wait or write comes to: a device that is gone, as
+        /// `card_is_gone` says, is let go of, so that its module can be
+        /// unloaded; anything else is an xrun, recovered here in place. A
+        /// restart that fails, other than for a device gone, is an xrun too,
+        /// and waits a period. alsa::Error holds the positive errno.
+        fn io_failed(&mut self, error: alsa::Error) -> SinkError {
+            let Some(open) = &self.open else {
+                return SinkError::Gone;
+            };
+            let result = if card_is_gone(error.errno(), open.disconnected(), false) {
+                SinkError::Gone
+            } else {
+                match open.recover() {
+                    Ok(()) => SinkError::Xrun,
+                    Err(e) if card_is_gone(e.errno(), open.disconnected(), true) => SinkError::Gone,
+                    Err(_) => {
+                        open.rest();
+                        SinkError::Xrun
+                    }
+                }
+            };
+            if result == SinkError::Gone {
+                self.open = None;
+            }
+            result
         }
     }
 
@@ -714,40 +861,22 @@ mod card {
             let Some(open) = &mut self.open else {
                 return Err(SinkError::Gone);
             };
-            let result = match open.wait_room() {
+            match open.wait_room() {
                 Ok(()) => Ok(()),
-                Err(e) if e.errno() == libc::ENODEV => Err(SinkError::Gone),
-                // The restart fills the buffer, so wait for room again.
-                Err(_) => match open.recover().and_then(|()| open.wait_room()) {
-                    Ok(()) => Err(SinkError::Xrun),
-                    Err(_) => Err(SinkError::Gone),
-                },
-            };
-            if result == Err(SinkError::Gone) {
-                self.open = None;
+                // The restart fills the buffer; the write that follows
+                // waits for room itself.
+                Err(e) => Err(self.io_failed(e)),
             }
-            result
         }
 
         fn write(&mut self, samples: &[i32]) -> Result<(), SinkError> {
             let Some(open) = &mut self.open else {
                 return Err(SinkError::Gone);
             };
-            // alsa::Error holds the positive errno.
-            let result = match open.play(samples) {
+            match open.play(samples) {
                 Ok(()) => Ok(()),
-                Err(e) if e.errno() == libc::ENODEV => Err(SinkError::Gone),
-                // An underrun, a suspend, or anything else a restart may cure.
-                Err(_) => match open.recover() {
-                    Ok(()) => Err(SinkError::Xrun),
-                    Err(_) => Err(SinkError::Gone),
-                },
-            };
-            if result == Err(SinkError::Gone) {
-                // Lets the driver go, so that the module can be unloaded.
-                self.open = None;
+                Err(e) => Err(self.io_failed(e)),
             }
-            result
         }
 
         fn channels(&self) -> usize {
@@ -762,8 +891,29 @@ mod card {
             self.open.as_ref().map_or(0, |open| open.buffer)
         }
 
+        fn delay_now(&mut self) -> Result<u32, SinkError> {
+            let Some(open) = &self.open else {
+                return Err(SinkError::Gone);
+            };
+            match open.delay_now() {
+                Ok(frames) => Ok(frames),
+                Err(e) if e.errno() == libc::ENODEV => {
+                    // Lets the driver go, as a failed write does.
+                    self.open = None;
+                    Err(SinkError::Gone)
+                }
+                // The next write finds what is wrong and recovers.
+                Err(_) => Err(SinkError::Xrun),
+            }
+        }
+
         fn supported_rates(&self) -> Vec<u32> {
             self.rates.clone()
+        }
+
+        fn granted(&self) -> Option<(u32, u32)> {
+            let open = self.open.as_ref()?;
+            Some((open.period as u32, open.buffer))
         }
     }
 }
@@ -1072,6 +1222,61 @@ mod tests {
         " 1 [sndrpihifiberry]: HifiberryDacpAd - snd_rpi_hifiberry_dacplusadc\n",
         "                      snd_rpi_hifiberry_dacplusadc\n",
     );
+
+    #[test]
+    fn only_a_device_that_is_gone_counts_as_gone() {
+        // An underrun or a suspend stays an xrun, also during or after the
+        // restart that follows one.
+        for recovering in [false, true] {
+            for errno in [libc::EPIPE, libc::ESTRPIPE, libc::EINTR, libc::EIO] {
+                assert!(!card_is_gone(errno, false, recovering), "{errno}");
+            }
+            assert!(card_is_gone(libc::ENODEV, false, recovering));
+            // A stream left in a bad state is prepared again, unless its
+            // device was disconnected.
+            assert!(!card_is_gone(libc::EBADFD, false, recovering));
+            assert!(card_is_gone(libc::EBADFD, true, recovering));
+        }
+        // A card that gives no room for half a second is stuck once a
+        // restart has not helped.
+        assert!(!card_is_gone(libc::ETIMEDOUT, false, false));
+        assert!(card_is_gone(libc::ETIMEDOUT, false, true));
+    }
+
+    #[test]
+    fn a_card_is_known_by_its_index_whatever_it_is_named_by() {
+        assert_eq!(card_index(CARDS_TEXT, Some("1")), Some(1));
+        assert_eq!(card_index(CARDS_TEXT, Some("sndrpihifiberry")), Some(1));
+        assert_eq!(card_index(CARDS_TEXT, Some("Headphones")), Some(0));
+        // The one found for the master when it names none.
+        assert_eq!(card_index(CARDS_TEXT, None), Some(1));
+        // A card not there now cannot be told.
+        assert_eq!(card_index(CARDS_TEXT, Some("Loopback")), None);
+        assert_eq!(card_index(CARDS_TEXT, Some("7")), None);
+    }
+
+    #[test]
+    fn two_outputs_on_the_same_card_are_refused_with_both_names() {
+        let named = |cards: &[Option<&str>]| -> Vec<Option<String>> {
+            cards.iter().map(|c| c.map(String::from)).collect()
+        };
+        let both = named(&[Some("1"), Some("sndrpihifiberry")]);
+        let e = distinct_cards(CARDS_TEXT, &both).unwrap_err();
+        assert!(e.contains("output 1 (card 1)"), "{e}");
+        assert!(e.contains("output 2 (card sndrpihifiberry)"), "{e}");
+        // The master's card found, and the same card named by an output.
+        let found = named(&[None, Some("Headphones"), Some("sndrpihifiberry")]);
+        let e = distinct_cards(CARDS_TEXT, &found).unwrap_err();
+        assert!(e.contains("output 1 (the card found)"), "{e}");
+        assert!(e.contains("output 3 (card sndrpihifiberry)"), "{e}");
+        assert_eq!(
+            distinct_cards(CARDS_TEXT, &named(&[None, Some("0")])),
+            Ok(())
+        );
+        // Cards not there now are let through.
+        let absent = named(&[Some("Loopback"), Some("Loopback")]);
+        assert_eq!(distinct_cards(CARDS_TEXT, &absent), Ok(()));
+    }
 
     #[test]
     fn the_driver_is_that_of_the_card_played_to() {

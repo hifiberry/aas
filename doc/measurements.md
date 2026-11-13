@@ -2,8 +2,9 @@
 
 Stage 1 measured what the hardware can do, before the daemon was written.
 [Stage 2](#stage-2) measured the daemon itself, [Stage 3a](#stage-3a) its
-analog input and plugins, and [Stage 3b, part 1](#stage-3b-part-1) the mixing
-matrix and the output's channel count. The probes are in `tools/measure`.
+analog input and plugins, [Stage 3b, part 1](#stage-3b-part-1) the mixing
+matrix and the output's channel count, and [Stage 3b, part 2](#stage-3b-part-2)
+several outputs. The probes are in `tools/measure`.
 The Pi 4 is still to be measured.
 
 ## Boards
@@ -1569,3 +1570,452 @@ channels" once, and not retried every second. See Mixing matrix in
   checked only in that the hour passed.
 - A matrix change at run time was not measured on a board: only the config sets
   a matrix in this stage, and the daemon reads it at its start.
+
+## Stage 3b, part 2
+
+Several outputs: a further output that follows the master's clock through an
+adaptive resampler, held in time with it. Measured on the CM5 test board and on
+the Pi 3 test board, each with its DAC as the master and `snd-aloop` as the
+further output, since neither board has a second card. Each figure names its
+board.
+
+The daemon was built from 968e42d with the `alsa-output` feature and ran as
+root with real-time rights, a fresh daemon for each run. `align-check` and the
+`--tone` mode of `bit-check` were built as committed with this section, and
+`dist/test-plugin.sh` ran as committed with it too. The `main` daemon in the
+cost comparison was built from c95432e. `/etc/sysctl.d/90-aas.conf` was
+installed on both boards. The 5000 ppm clamp and the Pi 3's 96 kHz hour failed
+on that build; they were fixed (see Lock and drift and Hours below) and
+measured again on b4fd1a6, built the same way. The further output was always:
+
+```toml
+[[output]]
+card = "Loopback"
+latency_ms = 48
+```
+
+with the flat `card` naming the DAC, which the master plays at its defaults:
+on the CM5 64 frames at 44.1 and 48 kHz and 128 at 96 kHz, on the Pi 3 256 and
+512. `snd-aloop` cannot run the master's short periods, so the loopback has its
+own `latency_ms`: 1024 frames per period at 44.1 and 48 kHz and 2048 at
+96 kHz, three buffered.
+
+### Summary
+
+| Criterion | Pi 3 result | CM5 result | Verdict |
+|---|---|---|---|
+| Lock at shifts of 0, +100, -300 and +1000 ppm, at 44.1 and 96 kHz: time to lock, ppm, delay error after lock | Not run | Locked 5.0 to 6.9 s after each rate change in 17 of 17 runs, and kept it. The daemon's ppm within 3 ppm of the measured drift in 14 runs, 3.4 to 11.6 off in 3. Delay error at a shift of 0 under a frame over the last minute; with a shift set 7 to 28 frames, up to 171 frames while settling | Pass. `snd-aloop`'s shift slows the card: 100010 is -100 ppm |
+| At 5000 ppm the clamp holds and is logged | Not run | After the fix, 44.1 kHz, 180 s each way: the clamp line 30.6 s (card fast) and 31.7 s (card slow) after the rate change, never `locked`, the ppm at the stop +5069 and -4956, 0 xruns and 0 wake-up gaps on the master. Before it the line never came in 120 to 300 s and a fast card was logged `locked` four times | Pass after the fix |
+| The tone reaches the loopback with the residual of the resampler's test; a swap of that output swaps only there | Not run | -132 to -135 dBFS in `f32` and -132 to -134 dBFS in `f64` at 48 kHz against a moving sine; the swap moved the tone on the loopback only | Pass |
+| Alignment against the converters' delay | Not run | The master 14 to 15 frames after the loopback beyond the converters: +0.32 ms at 44.1 and 48 kHz, +0.15 ms at 96 kHz, steady within a frame | Measured; the method cannot place the frames |
+| One hour at 44.1 kHz, full load, analog input on, loopback output at 100010 | 0 xruns, 0 wake-up gaps, worst gap 6.99 ms against 11.61 ms; the output locked throughout, 0 xruns, starves and overflows | 0 xruns, 0 wake-up gaps, worst gap 1.53 ms against 2.90 ms; the output locked throughout, 0 xruns, starves and overflows | Pass on both |
+| One hour at 96 kHz, the same | After the fix: 0 xruns, 0 wake-up gaps, worst gap 6.45 ms against 10.67 ms; the output locked 7.2 s after it opened and throughout, 0 xruns, 0 starves, 0 overflows. Before it 1527 overflows | 0 xruns, 0 wake-up gaps, worst gap 1.44 ms against 2.67 ms; the output locked throughout, 0 xruns, starves and overflows | Pass on both after the fix |
+| Cost without a further output against `main`, 48 kHz, 3 runs each | 78.0 against 77.1 µs per cycle in `f32`, +1.2%; 82.4 against 82.1 µs in `f64`, +0.4% | Not run | Pass: within or 0.2 µs above `main`'s spread |
+| Cost with the loopback output | Audio thread +17.1 µs per cycle in `f32`, +11.1 µs in `f64`; the writer 17% of a core in `f32` and 28% in `f64`. One `f64` run counted 1 overflow | Writer 1.0% of a core at 44.1 kHz and 2.3% at 96 kHz, under the hours' load | Measured |
+| `dist/test-plugin.sh` with the capture, the loopback and `ANALOG=1` | Not run | 33 of 34. The failure is the `mpd` case: `mpd` is not installed | Pass, except the case that needs `mpd` |
+
+### The master's latency with a further output
+
+Every output plays as late as the slowest needs, so the loopback's 48 ms set
+the master's latency too. The daemon logs the delay it holds every output at,
+from the mix to the card:
+
+| Board, rate | The master alone, two periods | With the loopback output | The master's delay line |
+|---|---|---|---|
+| CM5, 44.1 kHz | 128 frames, 2.90 ms | 3288 frames, 74.6 ms | 3160 frames, 71.7 ms |
+| CM5, 48 kHz | 128 frames, 2.67 ms | 3295 frames, 68.6 ms | 3167 frames, 66.0 ms |
+| CM5, 96 kHz | 256 frames, 2.67 ms | 6527 frames, 68.0 ms | 6271 frames, 65.3 ms |
+| Pi 3, 48 kHz | 512 frames, 10.67 ms | 3519 frames, 73.3 ms | 3007 frames, 62.6 ms |
+| Pi 3, 44.1 kHz | 512 frames, 11.61 ms | 3519 frames, 79.8 ms | 3007 frames, 68.2 ms |
+| Pi 3, 96 kHz | 1024 frames, 10.67 ms | 6975 frames, 72.7 ms | 5951 frames, 62.0 ms |
+
+The delay is one master period for the feed, three loopback periods and the
+resampler's delay, 160 to 260 frames. So with `snd-aloop` as a further output
+the master is about 70 ms late, where it is 3 to 12 ms alone. A real second
+card that runs the master's period would cost far less; none was at hand.
+
+### The loopback's clock
+
+`snd-aloop` has a `PCM Rate Shift 100000` control per cable end; the one of
+device 1, subdevice 0 sets the rate of the cable from `hw:Loopback,0,0` to
+`hw:Loopback,1,0`, both ends together. The control of device 0 changed nothing
+measurable. `align-check` reads the rate of each capture against the system
+clock from its timestamps (see below), so the loopback's rate, the DAC's rate
+and their difference were measured in every run.
+
+**A value above 100000 makes the loopback slower, not faster.** Against the
+system clock, 100010 gave -99.4 to -100.5 ppm, 99970 gave +299.5 ppm, 100100
+gave -998.2 to -999.4 ppm, 100500 gave -4973 and -4974 ppm and 99500
++5027 ppm, apart from the runs off their set rate below.
+So the value sets the card's period, not its rate. The plan's "+100 ppm" for
+100010 is a card 100 ppm slow.
+
+At a shift of 0 the loopback runs on the system clock, within 0.2 ppm, and the
+DAC on the CM5 runs 19.7 to 20.1 ppm slow against it, in every run. So the
+loopback runs about 20 ppm fast against the master before any shift, and
+**the drift the daemon has to follow is the loopback's own rate against the
+system clock plus those 20 ppm**: -80 ppm at 100010, +320 ppm at 99970, -980 ppm
+at 100100. The measured difference of the two captures agrees with that sum to
+within 0.2 ppm in every run. So the measured drift is the set shift plus the
+base drift, with the shift's sign turned.
+
+In four of the 19 runs the loopback ran off its set rate, by 6 to 23 ppm: at
+44.1 kHz at -91.8 ppm for 100010, +16.6 ppm for 100000 and +322.8 ppm for
+99970, and at 96 kHz at +305.3 ppm for 99970. In the run at 100000 its
+timestamps were 221 µs off a straight line, against 1.6 to 3.2 µs in every
+other run at a shift of 0. A repeat of each setting ran true. With any shift
+set, the loopback's timestamps were 31 to 313 µs off a straight line in every
+run, and up to 20 to 90 µs off within any two seconds. So
+`snd-aloop` with a shift is not a clean clock: its rate holds on average and
+wanders around it. The figures below that depend on its timing carry that.
+
+### Lock and drift
+
+On the CM5, at 44.1 and 96 kHz, with the cable's shift at 100000, 100010,
+99970 and 100100 and the analog input off: a fresh daemon per run, and
+`align-check` playing a chirp a second through the plugin for 150 s, which
+moved the master from its start-up rate of 48 kHz to the run's. The time to
+lock is from the line that gives the loopback output its new rate to its
+`locked` line. The daemon's ppm is from its counters at the stop, 150 s later,
+against the loopback-to-DAC difference `align-check` measured. The delay error
+is the spread of the offset between the two outputs (see Alignment) after the
+`locked` line, and over the last 60 s of the run.
+
+| Rate | Shift | Loopback against the system clock, ppm | Loopback against the DAC, ppm | Daemon, ppm | Daemon less measured | Lock after | Offset spread after lock, µs, frames | Last 60 s | Xruns, gaps, starves, overflows |
+|---|---|---|---|---|---|---|---|---|---|
+| 44.1 kHz | 100000 | +16.6 | +36.5 | +31.5 | -5.0 | 5.2 s | 459 µs, 20 | 356 µs, 16 | 0, 0, 0, 0 |
+| 44.1 kHz | 100010 | -100.4 | -80.5 | -82.0 | -1.6 | 5.2 s | 610 µs, 27 | 462 µs, 20 | 0, 0, 0, 0 |
+| 44.1 kHz | 99970 | +322.8 | +342.8 | +342.2 | -0.6 | 5.1 s | 699 µs, 31 | 250 µs, 11 | 0, 0, 0, 0 |
+| 44.1 kHz | 100100 | -998.7 | -978.7 | -976.0 | +2.7 | 5.1 s | 1978 µs, 87 | 498 µs, 22 | 0, 0, 0, 0 |
+| 48 kHz | 100000 | 0.0 | +19.9 | +19.9 | 0.0 | 5.0 s | 67 µs, 3 | 7 µs, 0 | 0, 0, 0, 0 |
+| 96 kHz | 100000 | 0.0 | +20.0 | +20.0 | 0.0 | 6.9 s | 74 µs, 7 | 10 µs, 1 | 0, 0, 0, 0 |
+| 96 kHz | 100010 | -99.4 | -79.5 | -81.1 | -1.7 | 5.1 s | 163 µs, 16 | 72 µs, 7 | 0, 0, 0, 0 |
+| 96 kHz | 99970 | +305.3 | +325.2 | +313.6 | -11.6 | 5.1 s | 771 µs, 74 | 202 µs, 19 | 0, 0, 0, 0 |
+| 96 kHz | 100100 | -998.2 | -978.3 | -980.4 | -2.1 | 5.1 s | 1784 µs, 171 | 287 µs, 28 | 0, 0, 0, 0 |
+
+The table holds a second round of the eight runs, with one at 48 kHz added,
+dated as Alignment describes. A first round, dated by one line through all of
+a card's readings, gave the same lock times and counters, and ppm within the
+same margins. In all 17 runs the output locked once, 5.0 to 6.9 s after the
+rate change, and kept the lock to the end. The lock lines carried no ppm, since
+the estimate needs 120 s. Every run counted 0 xruns and 0 wake-up gaps on both
+outputs, and 0 starves and 0 overflows on the loopback. The daemon's ppm was
+within 3 ppm of the measured drift in 14 of the 17 runs, and 3.4, 5.0 and
+11.6 ppm off in the other three.
+
+The delay error at a shift of 0, with a clean loopback clock, is a few frames:
+the offset spread 63 to 74 µs from the lock to the end, and 7 to 12 µs, under
+a frame, over the last minute. The 44.1 kHz run at 100000 in the table had one
+of the irregular clocks above, and spread 459 and 356 µs; the first round's
+run at the same setting had a clean one and spread 63 and 12 µs. With a shift
+set the error is larger: up to 2.0 ms, 87 frames, after a shift
+of 1000 ppm at 44.1 kHz, while the controller's integral took up the drift
+over its 20 s, and 0.07 to 0.5 ms, 7 to 28 frames, in the last minute. That is
+well inside the lock's window of a quarter of the loopback's period, 256 frames
+at 44.1 kHz and 512 at 96 kHz, and less than `snd-aloop`'s own wander with a
+shift set: the controller follows the card it has. The lock line comes at the
+5 s minimum in nearly every run because the error is inside that window from
+the start; it says the output plays, not that its delay has settled.
+
+**At 5000 ppm the clamp is logged.** The first measurement, on 968e42d, did
+not log it. With 100500, the loopback 4974 ppm slow and so about 4950 ppm
+against the master, at 44.1 and 96 kHz for 120 s and at 48 kHz for 300 s, the
+daemon never logged that the card runs more than 2000 ppm from the master; it
+counted 36, 43 and 106 overflows, never locked and gave +0.000 ppm at the stop.
+With 99500, 5047 ppm fast against the master, at 48 kHz for 300 s, it counted
+131 starves, logged no clamp and logged `locked` four times, each followed by
+`lost its lock` 0.6 to 12 s later. The cause was in the code: every overflow or
+starve primed the path again, which restarted the smoothed error, the count at
+the clamp and the estimate's settling, and kept the lock. The fix (b4fd1a6)
+makes a priming end the lock until 5 s pass without another, keeps the count at
+the clamp and the ppm estimate across it, and also calls a card clamped once
+its estimate has stayed beyond the clamp for 10 s. The runs were repeated at
+44.1 kHz for 180 s each, a fresh daemon with the rate set 99500 (card +5069 ppm
+against the master) and 100500 (-4956 ppm):
+
+| Shift | Clamp line after the rate change | Starves, overflows | `locked` | Daemon at the stop | Measured against the DAC | Master |
+|---|---|---|---|---|---|---|
+| 99500 | 30.6 s | 62, 0 | never | +5068.6 ppm, not locked | +5079.1 ppm | 0 xruns, 0 wake-up gaps, worst gap 1.49 ms |
+| 100500 | 31.7 s | 0, 39 | never | -4955.6 ppm, not locked | -4954.1 ppm | 0 xruns, 0 wake-up gaps, worst gap 1.78 ms |
+
+Both logged `its card runs more than 2000 ppm from the master, it plays on with
+gaps` once. The daemon's ppm reads the clamp side, within 11 ppm of the
+measurement. The starves and overflows, logged now with the time and the feed's
+fill, came every 2 s for the fast card (the feed held about 1000 of 2329
+frames) and every 5 s for the slow one (2275 to 2315 of 2329); the first ten
+were logged one by one and then one line a minute, with the number since the
+last. The output counted no skipped readings.
+
+To check that normal lock was not broken, 99990 (the loopback +105.4 ppm
+against the system clock and +126.0 ppm against the DAC) was run at 44.1 kHz
+for 180 s: `locked` 5.1 s after the rate change, 0 xruns, 0 wake-up gaps,
+0 starves, 0 overflows on both outputs, and the daemon's ppm +113.2, 12.8 ppm
+below the measured difference. That is outside the 5 ppm of most runs above,
+in the range of the three that were off by 3.4 to 11.6 ppm. The loopback's
+timestamps were 233 µs off a straight line in the run, so its rate over the
+180 s is not firmer than that; the offset between the outputs spread 632 µs,
+28 frames, after the lock.
+
+**On the final build 7c4d2ce** (the clamp hold no longer chains, and jumps
+leave the estimate cleanly) the three runs were repeated on the CM5 test
+board, built and run the same way, with the loopback at `latency_ms = 48` and
+44.1 kHz:
+
+| Shift | Run | Clamp line after the output opened | `locked` | Daemon at the stop | Measured against the DAC | Master |
+|---|---|---|---|---|---|---|
+| 99500 | 180 s | 30.6 s | never | +4434.5 ppm, not locked; 77 starves, 0 overflows | +5051.7 ppm | 0 xruns, 0 wake-up gaps, worst gap 1.78 ms |
+| 100500 | 180 s | 31.7 s | never | -4916.5 ppm, not locked; 0 starves, 47 overflows | -4949.8 ppm | 0 xruns, 0 wake-up gaps, worst gap 1.78 ms |
+| 99990 | 300 s | not logged | 5.1 s after the open, kept | +125.7 ppm, locked; 0 starves, 0 overflows | +128.8 ppm | 0 xruns, 0 wake-up gaps, worst gap 1.77 ms |
+
+The clamp runs behave as on b4fd1a6: one clamp line, no `locked`, and the
+starves and overflows every 2 s and 5 s. The ppm at the stop reads the clamp
+side but was further from the measurement than on b4fd1a6 (617 ppm and 33 ppm
+off, against 10 ppm and 1.5 ppm), and it is a snapshot beyond the clamp, where
+it is not a criterion; the clamp line and the counters are what the
+criterion asks for. In the in-range run the daemon's ppm, read at the stop of
+a 300 s run with the estimate's window long past its 120 s start, was 3.1 ppm
+from the measured difference, inside the 5 ppm; the 180 s run on b4fd1a6 was
+12.8 ppm off. The offset between the outputs spread 790 µs after the lock.
+`align-check` found 179 of 180 chirps in each clamp run and so reported the
+run as incomplete; the chirps are only its dating of the offset and play no
+part in the criteria above.
+
+The controller's skipped readings are now counted in the stop line; none were
+skipped in these runs.
+
+### The tone through the further output
+
+The resampled output cannot match the stream sample for sample, so `bit-check
+--tone` plays a 997 Hz tone at -6 dBFS peak, as the resampler's own test does,
+and measures each captured side in windows of 0.1 s from a second after the
+tone starts: what is left once a steady sine, its frequency fitted per window,
+is taken off, and once a sine is taken off whose amplitude and phase may move
+as a cubic over the window. The second also takes off the slow drift of a
+resampler that follows a clock; the first does not. The test asks for less
+than -100 dBFS in `f32` and -110 dBFS in `f64`. The CM5, analog input off, the
+cable's shift at 0, S32 at the client, 10 s per run, the daemon's volume at
+0 dB:
+
+| Config | Format | Rate | Left: steady, worst window | Left: moving, worst window | Right |
+|---|---|---|---|---|---|
+| Default | `f32` | 48 kHz | -117.5, -109.2 dBFS | -134.7, -128.2 dBFS | the same as the left |
+| Default | `f64` | 48 kHz | -114.0, -98.2 dBFS | -131.9, -117.4 dBFS | the same as the left |
+| Swap | `f32` | 48 kHz | -115.3, -101.4 dBFS | -132.0, -117.0 dBFS | exactly zero |
+| Swap | `f64` | 48 kHz | -118.8, -108.6 dBFS | -134.1, -122.5 dBFS | exactly zero |
+| Default | `f32` | 44.1 kHz | -106.5, -98.6 dBFS | -121.1, -117.4 dBFS | the same as the left |
+| Default, again | `f32` | 44.1 kHz | **-51.5, -41.8 dBFS** | -114.9, -100.6 dBFS | the same as the left |
+| Default | `f32` | 96 kHz | -108.3, -101.4 dBFS | -128.5, -113.6 dBFS | the same as the left |
+| Default, again | `f32` | 96 kHz | -109.0, -103.1 dBFS | -133.6, -121.8 dBFS | the same as the left |
+
+All pass against the moving sine, by 15 to 35 dB. Against the steady sine they
+pass on the whole run, but single windows reach -98 dBFS, and the 44.1 kHz run
+gave -51.5 dBFS: that run's loopback clock was one of the irregular ones above,
+and a repeat at 44.1 kHz gave -106.5 dBFS. So the floor is the clock the
+resampler follows, not its arithmetic: `f64` is no better than `f32` here.
+
+The swap is a `[[output.matrix]]` of the further output only, `players.left`
+to 2 and `players.right` to 1, with the master's matrix left at its default.
+With the tone on the left only, the loopback carried it on channel 2 and
+exactly zero on channel 1, and `arecord` on the DAC through the cable at the
+same time read it on the left at -6.1 dBFS, with -121.1 and -122.2 dBFS at
+997 Hz on the right. So the swap applies to that output only. Checked the other
+way round, the swapped output as `1=L,2=R`, `bit-check` found no tone on the
+left and failed, as it should.
+
+`dist/test-plugin.sh` now has the same check as a case,
+`further_output_follows_its_own_matrix`, run when `AAS_TEST_LOOPBACK` names
+the loopback's capture end. On the CM5, with the daemon installed as its unit
+for the run and removed after, `AAS_TEST_CAPTURE=plughw:sndrpihifiberry
+AAS_TEST_LOOPBACK=hw:Loopback,1,0 ANALOG=1` passed 33 of 34 cases; the one
+failure is `mpd_mixer_works`, because `mpd` is not installed. The new case read
+the tone at -20.0 dBFS on the loopback's channel 2 with nothing on channel 1,
+and at -20.1 dBFS on the left through the cable with the right at -72 dBFS.
+
+### Alignment
+
+`align-check` plays a chirp of 2048 frames through the plugin once a second
+and captures the ADC, through the cable from the DAC, and the loopback's other
+end at once, with the cards' timestamps on `CLOCK_MONOTONIC`. It finds the
+chirp in each capture by correlation, to a fraction of a frame, and dates it by
+the card's timestamps within a second either side, at their lower edge, which
+dates a frame by the least delay with which its card's pointer was read. The
+offset is the chirp's time at the ADC less its time at the loopback.
+
+What the offset should be: the daemon holds the master's delay line so that a
+frame leaves the DAC's buffer when it leaves the loopback's. From there it
+reaches the ADC's buffer after the DAC's and the ADC's own delays, and the
+loopback's capture at once. So two outputs in time read the converters'
+delay through the cable, which stage 1 measured on the CM5 with the two
+streams linked: 50 frames at 44.1 and 48 kHz, 52 at 96 kHz. The capture side's
+wait for its reader, 0.69 of a period in [stage 3a](#latency-of-the-analog-path),
+is not in it: a timestamp dates a frame when the card took it, not when it
+was read. The method cannot tell the DAC's delay from the ADC's, or a pointer
+that runs ahead of its card from a daemon that plays late; it gives the sum.
+
+The CM5, the cable's shift at 0, over the last minute of a 150 s run:
+
+| Rate | Offset | Expected, the converters | Measured less expected | Spread |
+|---|---|---|---|---|
+| 44.1 kHz | 1453 µs, 64.1 frames | 1134 µs, 50 frames | +319 µs, +14.1 frames | 12 µs |
+| 48 kHz | 1359 µs, 65.2 frames | 1042 µs, 50 frames | +317 µs, +15.2 frames | 7 µs |
+| 96 kHz | 688 µs, 66.0 frames | 542 µs, 52 frames | +146 µs, +14.0 frames | 10 µs |
+
+**The master plays 14 to 15 frames after the loopback,** at every rate, so
+0.32 ms at 44.1 and 48 kHz and 0.15 ms at 96 kHz. It is the same in frames at
+each rate, which points at a count of frames somewhere in the path: the
+daemon's reading of either card's delay, the DAC's FIFO, or `snd-aloop`'s
+pointer. Which, the method cannot say. It is far below what the lock allows,
+and stays put: under a frame over a minute. The 44.1 kHz figure is from the
+first run, whose loopback clock was clean; the repeat, with the irregular
+clock, gave 1445 µs.
+
+### Hour runs with a further output
+
+The runs of [part 1](#hour-runs-with-a-swap-matrix), made the same way: a
+fresh daemon per run on the DAC with the analog input on at -20 dB, the stage 1
+full load, and the same music from RAM looped into `aplay -t raw` for an hour,
+at 44.1 kHz and at 96 kHz. Added is the loopback output, with the cable's
+shift at 100010, so the loopback ran about 100 ppm slow against the system
+clock. The analog input reaches the loopback through its default matrix. The
+logs were kept in RAM and copied off every two or three minutes, and on the
+CM5 the kernel log was streamed off the board.
+
+On the CM5, 64 frames at 44.1 kHz and 128 at 96 kHz, with the heatsink. It sat
+at 53 to 86 °C and ran between 1.5 and 2.4 GHz.
+
+| Run | Master xruns, wake-up gaps | Master's worst gap / buffer | Worst cycle | Padded, dropped | Loopback output | Its worst gap | Its ppm |
+|---|---|---|---|---|---|---|---|
+| 44.1 kHz | 0, 0 | 1.53 / 2.90 ms | 0.09 ms | 128, 0 | locked 5.2 s after it opened, never lost; 0 xruns, 0 wake-up gaps, 0 starves, 0 overflows | 31.9 ms | -87.8 |
+| 96 kHz | 0, 0 | 1.44 / 2.67 ms | 0.12 ms | 192, 0 | locked 5.1 s after it opened, never lost; 0 xruns, 0 wake-up gaps, 0 starves, 0 overflows | 28.1 ms | -89.4 |
+
+Both pass. `aplay` counted no underruns, the kernel migrated no pages, and the
+kernel log has nothing from the runs; the board did not hang. The master's
+figures are within 0.04 ms of part 1's hours without the further output. The
+writer thread used 36.0 s of CPU in the 44.1 kHz hour and 81.4 s in the 96 kHz
+hour, 1.0% and 2.3% of a core; the audio thread 23.1 and 27.5 µs per cycle.
+The daemon's ppm, -88 and -89, is 8 to 9 ppm further from the master than the
+-80 measured for this shift on an idle board in Lock and drift; the loopback's
+rate was not measured under load, so whether `snd-aloop`'s timer runs slower
+under load or the estimate is off cannot be told.
+
+On the Pi 3, 256 frames at 44.1 kHz and 512 at 96 kHz, without a heatsink. It
+sat at 60 to 88 °C and 496 to 603 MHz, throttled, as in part 1.
+
+| Run | Master xruns, wake-up gaps | Master's worst gap / buffer | Worst cycle | Padded, dropped | Loopback output | Its worst gap | Its ppm |
+|---|---|---|---|---|---|---|---|
+| 44.1 kHz | 0, 0 | 6.99 / 11.61 ms | 0.69 ms | 256, 0 | locked 5.3 s after it opened, never lost; 0 xruns, 0 wake-up gaps, 0 starves, 0 overflows | 28.2 ms | -102.8 |
+| 96 kHz | 0, 0 | 6.44 / 10.67 ms | 1.16 ms | 256, 0 | locked 6.8 s after it opened, never lost; 0 xruns, 0 wake-up gaps, 0 starves, **1527 overflows** | 28.2 ms | +0.000 |
+| 96 kHz, after the fix | 0, 0 | 6.45 / 10.67 ms | 0.90 ms | 256, 98 | locked 7.2 s after it opened, never lost; 0 xruns, 0 wake-up gaps, 0 starves, 0 overflows, 0 skipped readings | 28.2 ms | -103.7 |
+
+The master passes both hours, within 0.1 ms of part 1's worst gaps; the worst
+cycles, 0.69 and 1.16 ms, are above part 1's 0.65 and 0.76 ms. `aplay` counted
+no underruns. The kernel migrated 131040 pages in the 44.1 kHz hour and
+153525 in the 96 kHz hour.
+
+**The first 96 kHz hour on the Pi 3 failed for the loopback output, on
+968e42d: 1527 overflows,** about one every 2.4 s. Each dropped a master period
+at the feed and primed the loopback's path again, a gap in what it played, and
+the ppm of +0.000 at the stop said the estimate never got past its settling.
+The writer thread used 1603 s of CPU, 44.5% of a core, 9.5 ms per loopback
+period of 21.3 ms, on a board throttled to about 550 MHz; its worst wake-up gap
+was 28.2 ms, under its buffer of three loopback periods. The feed held only
+what the delay target left plus two master periods, and a writer that wakes
+late and then spends 9.5 ms resampling lets the master push more than that
+before it takes. The fix (b4fd1a6) sizes the feed at the target's share plus
+two loopback periods plus two master periods, 5888 frames here against 4352,
+with no change to the delay.
+
+The hour was run again on b4fd1a6 exactly as before: full load, analog input
+on, the loopback at `latency_ms = 48` and shift 100010. **It counted 0
+overflows and 0 starves, the output locked 7.2 s after it opened and stayed
+locked, and the master passed:** 0 xruns, 0 wake-up gaps, worst gap 6.45 ms
+against 10.67 ms. The loopback's worst gap was 28.2 ms and its ppm -103.7, so
+the estimate ran the whole hour, 3.7 ppm from the -100 shift, the Pi 3's DAC
+being near the system clock. The writer used 1597 s of CPU, 44.2% of a core,
+as before the fix, so the feed's size was the cause and the cost is unchanged.
+The audio thread took 386 µs per cycle, 0.90 ms at worst, and the board sat at
+86 to 87 °C and 549 MHz, throttled at its end. The kernel migrated 23378
+pages. The stop line counts 256 frames padded and 98 dropped; the first hour
+dropped none. The analog input went quiet 8 s before the stop, when the player
+ended, and the counters do not say when the 98 were dropped.
+
+### Processing cost on the Pi 3
+
+The method of [part 1](#processing-cost-on-the-pi-3): the DAC+ ADC at its
+defaults, 256 frames at 48 kHz, `bit_perfect = "off"`, one `aplay` playing the
+music resampled to 48 kHz from RAM for 10 minutes per run, and the CPU time of
+each thread from `/proc/<pid>/task/<tid>/schedstat` just before the stop.
+Three daemons, alternated, three runs each per format, `f32` first: `main` at
+c95432e, this branch without `[[output]]`, and this branch with the loopback
+output at a shift of 0. `snd-aloop` was loaded for all runs. The board was
+otherwise idle at 54 to 69 °C, at 600 MHz in most readings and 700 MHz to
+1.2 GHz in 138 of 362, as the `ondemand` governor chose.
+
+The audio thread, per cycle:
+
+| Daemon | Format | Mean per cycle, three runs | Mean | Share of a period | Worst cycle, three runs |
+|---|---|---|---|---|---|
+| `main` | `f32` | 77.2, 77.9, 76.3 µs | 77.1 µs | 1.4% | 0.164, 0.198, 0.116 ms |
+| no further output | `f32` | 78.1, 78.1, 77.7 µs | 78.0 µs | 1.5% | 0.156, 0.164, 0.099 ms |
+| the loopback output | `f32` | 95.6, 95.3, 94.4 µs | 95.1 µs | 1.8% | 0.186, 0.248, 0.195 ms |
+| `main` | `f64` | 82.5, 82.2, 81.6 µs | 82.1 µs | 1.5% | 0.164, 0.176, 0.318 ms |
+| no further output | `f64` | 83.5, 82.4, 81.2 µs | 82.4 µs | 1.5% | 0.173, 0.098, 0.170 ms |
+| the loopback output | `f64` | 94.0, 93.2, 93.4 µs | 93.5 µs | 1.8% | 0.364, 0.197, 0.255 ms |
+
+Without a further output this branch costs what `main` costs: 0.9 µs, 1.2%,
+more in `f32`, 0.2 µs above `main`'s highest run, and 0.3 µs more in `f64`,
+inside `main`'s runs. The extra 2.6 to 4.6% a workstation benchmark had shown
+in `f32` does not appear on the Pi 3. With the loopback output the audio thread
+takes 17.1 µs more per cycle in `f32`, 22%, and 11.1 µs more in `f64`, 13%:
+mixing a second output, the push into its feed and the master's delay line.
+That is 0.2 to 0.3% of a period.
+
+The writer thread of the further output, `aas-out-2`, per run of 600 s:
+
+| Format | CPU time, three runs | Share of one core | Per writer cycle of 1024 frames, 21.3 ms |
+|---|---|---|---|
+| `f32` | 102.9, 102.8, 101.1 s | 16.9 to 17.2% | 3.58 to 3.64 ms |
+| `f64` | 166.8, 165.2, 165.0 s | 27.5 to 27.8% | 5.84 to 5.90 ms |
+
+That is the adaptive resampler at `high`, 128 taps with cubic interpolation
+between phases, on two channels, and it is far more than the audio thread's
+own work: on the Pi 3 one further output takes a sixth of a core in `f32` and
+over a quarter in `f64`. The writer is one thread, so it fits; a board with
+three further outputs at 48 kHz would want half to most of a core for them.
+
+Every run counted 0 xruns and 0 wake-up gaps on the master, with a worst gap
+of 5.46 to 5.87 ms against a 10.67 ms buffer, and the loopback output locked,
+at -6.0 to +0.8 ppm, with 0 xruns, 0 wake-up gaps and 0 starves. **One `f64`
+run counted 1 overflow** on the loopback output, on an idle board, while the
+other five counted none. The counters do not say when it came, so whether it
+was before the lock or after cannot be told.
+
+A change of the delay makes the audio thread read the whole delay line once
+to see whether it holds sound, which in silence it reads to the end. To see
+what that costs, the daemon played 3 s of silence at 44.1, 96, 192 and 48 kHz,
+three rounds, so twelve rate changes, each with a new delay of up to 13887
+frames at 192 kHz, twice with the loopback output and twice without. The
+worst cycle was 0.164 and 0.191 ms with it and 0.117 and 0.187 ms without, so
+the read is not visible against the rest of a cycle. The loopback output
+counted 1 and 4 overflows over the twelve rate changes, and did not lock,
+since no rate lasted the 5 s a lock takes.
+
+### What these figures do not show
+
+- No board has a second real card, so the further output is `snd-aloop`, a
+  card with a software clock that wanders when shifted. A real card with a
+  crystal of its own may lock tighter, and may run the master's period, which
+  would bring the master's latency back to a few ms.
+- The offset between the outputs holds the DAC's and ADC's delays together,
+  and anything either card's pointer adds. It cannot place the 14 to 15
+  frames.
+- Lock, alignment and the tone were measured on the CM5 only, and with the
+  analog input off.
+- The clamp was measured again after the fix at 44.1 kHz only, and the hour
+  once; the cost run's overflow and those of the rate changes were not
+  repeated, so the feed's new size is not checked against them.
+- The loopback's rate was measured on an idle board only; under the hours'
+  load only the daemon's own estimate of it is known.
+- The cost with a further output was measured at 48 kHz only; the writer's
+  share at 96 kHz on the Pi 3 is known only from the hour under load, 44.5% of
+  a core at about 550 MHz.

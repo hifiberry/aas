@@ -20,7 +20,7 @@ const MAX_RATIO_CHANGE: f64 = 1.1;
 const SIZED: &str = "the buffers are sized in Stage::new";
 
 /// Taps of the filter for each quality, as `dsp-bench` measured them.
-fn taps(quality: Quality) -> usize {
+pub(crate) fn taps(quality: Quality) -> usize {
     match quality {
         Quality::High => 128,
         Quality::Medium => 64,
@@ -45,6 +45,19 @@ fn parameters(quality: Quality, from: u32, to: u32) -> SincInterpolationParamete
     SincInterpolationParameters::new(taps(quality), WindowFunction::Blackman2)
         .oversampling_factor(phases(from, to))
         .interpolation(SincInterpolationType::Nearest)
+}
+
+/// The filters interpolated between the points of a fine table, which
+/// suits any ratio, also one that moves. The reference for the exact ones,
+/// and the filters of the adaptive resampler.
+pub(crate) fn interpolating(quality: Quality) -> SincInterpolationParameters {
+    let (factor, kind) = match quality {
+        Quality::High => (256, SincInterpolationType::Cubic),
+        Quality::Medium => (128, SincInterpolationType::Linear),
+    };
+    SincInterpolationParameters::new(taps(quality), WindowFunction::Blackman2)
+        .oversampling_factor(factor)
+        .interpolation(kind)
 }
 
 /// The resampler and its buffers, in the precision of `P`.
@@ -115,7 +128,7 @@ where
 }
 
 /// S32 to float, by the exact scaling of the processing format.
-fn to_float<P: Processing>(sample: i32) -> P::Acc {
+pub(crate) fn to_float<P: Processing>(sample: i32) -> P::Acc {
     let mut acc = P::zero();
     P::accumulate(&mut acc, sample, P::gain(1.0));
     acc
@@ -284,18 +297,6 @@ mod tests {
                 [v, -v]
             })
             .collect()
-    }
-
-    /// The filters interpolated between the points of a fine table, which
-    /// suits any ratio. The reference for the exact ones.
-    fn interpolating(quality: Quality) -> SincInterpolationParameters {
-        let (factor, kind) = match quality {
-            Quality::High => (256, SincInterpolationType::Cubic),
-            Quality::Medium => (128, SincInterpolationType::Linear),
-        };
-        SincInterpolationParameters::new(taps(quality), WindowFunction::Blackman2)
-            .oversampling_factor(factor)
-            .interpolation(kind)
     }
 
     #[test]

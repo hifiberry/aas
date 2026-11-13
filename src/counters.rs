@@ -1,6 +1,6 @@
 //! Counters the audio thread keeps for monitoring. All updates are lock free.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering::Relaxed};
 
 /// Totals since the start of the daemon.
 #[derive(Debug, Default)]
@@ -38,6 +38,50 @@ pub struct Counters {
     /// The latency of the analog chain, in frames, in the cycles its output
     /// is used. Recorders see it in their delay too.
     pub analog_latency_frames: AtomicU64,
+}
+
+/// Totals of one further output since the start of the daemon. Its writer
+/// thread keeps them, except `overflows`, which the audio thread counts as
+/// it pushes into the output's feed.
+#[derive(Debug, Default)]
+pub struct OutputCounters {
+    pub xruns: AtomicU64,
+    /// Wake-ups of the writer later than its card's buffer lasts.
+    pub wake_gaps: AtomicU64,
+    pub worst_gap_ns: AtomicU64,
+    /// Card periods played as zeros because the feed held too little.
+    pub starves: AtomicU64,
+    /// Master periods dropped because the feed was full.
+    pub overflows: AtomicU64,
+    /// How far the card runs from the master, in thousandths of a ppm:
+    /// positive for a card that runs fast.
+    pub ppm_milli: AtomicI64,
+    /// Readings of the path's delay its drift controller did not believe.
+    pub skipped: AtomicU64,
+    /// The path's delay has stayed on its target for the lock time.
+    pub locked: AtomicBool,
+}
+
+impl std::fmt::Display for OutputCounters {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let lock = if self.locked.load(Relaxed) {
+            "locked"
+        } else {
+            "not locked"
+        };
+        write!(
+            f,
+            "{} xruns, {} wake gaps, worst gap {:.3} ms, {} starves, {} overflows, \
+             {} drift readings skipped, {:+.3} ppm, {lock}",
+            self.xruns.load(Relaxed),
+            self.wake_gaps.load(Relaxed),
+            self.worst_gap_ns.load(Relaxed) as f64 / 1e6,
+            self.starves.load(Relaxed),
+            self.overflows.load(Relaxed),
+            self.skipped.load(Relaxed),
+            self.ppm_milli.load(Relaxed) as f64 / 1e3,
+        )
+    }
 }
 
 /// Now on CLOCK_MONOTONIC, in ns. The same clock as `/proc/uptime` without
@@ -149,6 +193,25 @@ mod tests {
         c.analog_dropped_frames.fetch_add(7, Relaxed);
         let open = "; analog input open, 5 frames padded, 7 frames dropped";
         assert!(c.to_string().ends_with(open), "{c}");
+    }
+
+    #[test]
+    fn an_output_summary_names_its_counters_ratio_and_lock() {
+        let c = OutputCounters::default();
+        c.xruns.fetch_add(1, Relaxed);
+        c.starves.fetch_add(2, Relaxed);
+        c.overflows.fetch_add(3, Relaxed);
+        c.worst_gap_ns.store(1_500_000, Relaxed);
+        c.ppm_milli.store(-12_345, Relaxed);
+        c.skipped.fetch_add(4, Relaxed);
+        assert_eq!(
+            c.to_string(),
+            "1 xruns, 0 wake gaps, worst gap 1.500 ms, 2 starves, 3 overflows, \
+             4 drift readings skipped, -12.345 ppm, not locked"
+        );
+        c.locked.store(true, Relaxed);
+        c.ppm_milli.store(100_000, Relaxed);
+        assert!(c.to_string().ends_with(", +100.000 ppm, locked"), "{c}");
     }
 
     #[test]

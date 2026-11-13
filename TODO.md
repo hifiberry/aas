@@ -129,6 +129,40 @@ not need the 1 s; the Pro does, for up to 700 ms (`doc/measurements.md`, Stage
 3a). The design keeps 1 s for every card. First step: the owner confirms that,
 or `SETTLE_MS` moves into the card table with 0 for the DAC+ ADC.
 
+## Owner decisions left by stage 3b part 2
+
+Stage 3b part 2 built each of these one way, marked *(call)* in
+`doc/design.md`, "Several outputs". Each needs the owner's yes or no.
+
+### Should further outputs close when the master goes off?
+
+When the master goes off by its idle rule, every further output closes too,
+whatever its own `idle` says: a further output with `idle = "zeros"` stops
+with the master. Missing: the decision. If no, first step: let
+`sync_further` in `src/control.rs` keep a further output open while the
+master is off; the further outputs are fed by the master's cycle, so that
+cycle has to keep running with the master's card closed.
+
+### Should a reopen of the master reopen every further card?
+
+Every reopen of the master, a rate change for example, reopens every further
+card, even one whose rate does not change. Each then primes and locks again,
+about 5 s. Missing: the decision. If no, first step: in `plan_further` in
+`src/control.rs`, give a further output a new configuration only when its own
+rate, period or the target changes, as a change of one card's rates already
+does.
+
+### Should the same card be refused after startup too?
+
+Two outputs naming the same card are refused at startup, by resolving each
+name to the kernel's card index (`distinct_cards` in `src/sink_alsa.rs`). A
+card that is not there at startup cannot be told, and passes, so two
+outputs may later try to play to one card. Missing: the
+decision whether a card found later is checked too. First step: find where
+a further card's search reports a card found, call `distinct_cards` there as
+`src/main.rs` does at startup, and decide what the later of the two outputs
+does then.
+
 ## Let the capture PCM ask for the daemon's rate without a stream
 
 The capture PCM learns the daemon's rate at open by setting up a one-frame
@@ -152,16 +186,109 @@ and ABI version 2, with plugins for any channel count. Still missing:
   declick and notch, at 44.1 to 192 kHz. See "Input processor plugin" in
   `doc/design.md`.
 
-## Stage 3b part 2: several cards
+## A real second card on a board
 
-Part 1 has one output with one matrix and its chains. Missing: several cards,
-one the clock master and the others resampled adaptively to follow it, each
-with its own matrix, `mix` and `output` chains, volume and idle behaviour, and
-a plugin that names its card. Until a second card is on a board, test it with
-`snd-aloop`: that proves the samples and the routing, not the timing of two
-real clocks. First step: read "Output" and "Mixing matrix" in `doc/design.md`,
-then write the plan, starting with how the config names a card per matrix and
-per chain.
+Stage 3b part 2 built several outputs: the master and up to three further
+cards that follow its clock through an adaptive resampler, all held in time
+(`doc/design.md`, "Several outputs"). The only further card tested is
+`snd-aloop` (`doc/measurements.md`, Stage 3b, part 2). Its clock is software
+and wanders when shifted, and it cannot run a period under about 48 ms, so
+every output played about 70 ms late in the tests. That proves the routing,
+the lock, the clamp and the counters, not how closely a card with a crystal
+of its own locks, nor the latency with a card that runs the master's period.
+Missing: a second real card on a test board, such as a USB DAC. First step:
+fit it, add it as an `[[output]]` with its default `latency_ms`, and repeat
+the lock, alignment and hour runs of that section of `doc/measurements.md`.
+
+## Plan a further output's alignment from the buffer its card grants
+
+The alignment target counts three of the periods a further output asks its
+card for (`card_part` and `align_frames` in `src/control.rs`; the path is
+built from the asked period in `FurtherHandle::reconfigure_holding`,
+`src/further.rs`). `AlsaSink::try_open` in `src/sink_alsa.rs` asks with
+`set_period_size_near` and `set_periods(3, Nearest)`, so a card may grant
+another period or round the count. The writer fills what it was granted; a
+larger buffer holds the path past its target, and the output starves over
+and over. Done: after each open of a further card, and when its card comes
+back, the writer compares `Sink::granted` with what was asked and sends
+`FurtherEvent::Granted`; the control thread logs one warning naming the
+output, asked against granted in frames and ms, and saying to set that
+output's `latency_ms` (`Writer::check_grant`, `event_line`). The remedy is
+still manual. Missing: plan the output's `card_part`, the target and the
+master's delay from the granted buffer, as `set_output_rates` already
+replans when a card's rates change; and a decision whether a grant smaller
+than asked replans too. Until then the warning's advice does not fit every
+case: a card that runs the asked period but four periods instead of three
+keeps starving whatever `latency_ms` is set, since the excess stays one
+period. And `Writer::watch_card` (`src/further.rs`) marks the card opened on
+any watch change that ends not gone, so a spurious change could repeat the
+warning; rare, and it goes away with the replan. First step: have the control thread handle
+`FurtherEvent::Granted` by storing the granted period and buffer on the
+`FurtherOutput` and calling `plan_further` with `only` set to that output;
+in the writer tests, a `Sim` with `granted_periods = 4` that runs with no
+starve then shows it works.
+
+## Choose the clock master at run time
+
+The master is the card of the flat `card` key, fixed until a restart. Stage 4
+is to let the API choose it. Missing: what a switch does to the outputs, each
+of which has its own resampler, drift and place in the delay, and whether
+every card reopens for it. First step: read "Several outputs" in
+`doc/design.md` and `plan_further` and `hand_over` in `src/control.rs`, and
+write down what a switch must change before planning the API.
+
+## The analog input from a card other than the master
+
+Only the master's card has the analog input: `place = "analog"` and `detect`
+are refused in an `[[output]]` table, and a further output gets the master's
+input through its matrix. A further card with an ADC runs on its own clock,
+so its capture would need an adaptive resampler into the master's clock, the
+reverse of a further output's writer. Missing: whether it is wanted, then
+its design. First step: the owner's decision; if yes, read the writer in
+`src/further.rs` as the model for a capture that follows the master.
+
+## The master plays 14 to 15 frames late
+
+With `snd-aloop` as the further output the master plays 14 to 15 frames
+after it, beyond the converters' own delay, at 44.1, 48 and 96 kHz on the CM5
+test board: +0.32 ms at 44.1 and 48 kHz, +0.15 ms at 96 kHz, steady within a
+frame. The same count of frames at each rate points at a count somewhere in
+the path: the daemon's reading of either card's delay, the DAC's FIFO, or
+`snd-aloop`'s pointer. `align-check` gives only the sum; how it was measured
+is in `doc/measurements.md`, Stage 3b, part 2, "Alignment". Missing: the
+cause, and then whether to correct for it. First step: repeat the run with
+the master at another period (`latency_ms = 12` on the CM5) to see whether the
+offset follows the period, and log the daemon's reading of each card's delay
+beside `align-check`'s offset.
+
+## The drift estimate on `snd-aloop`
+
+The daemon's ppm, the separate 120 s estimate of a further card's drift, was
+within 3 ppm of the measured drift in 14 of 17 lock runs on the CM5 test
+board and 3.4 to 11.6 ppm off in three. A later 180 s in-range run read 12.8
+ppm off; on the final build a 300 s run read 3.1 ppm off. The aim is 5 ppm.
+Beyond the clamp the stop line's ppm is a snapshot and wanders: at +5052 ppm
+measured it read +4434, at -4950 it read -4916; the clamp itself was
+reported both times. `snd-aloop` with a shift set is not a clean clock, its
+timestamps 31 to 313 µs off a straight line, so it is not settled whether the
+estimate or the card is off. Under the hours' load the estimate also read 8
+to 9 ppm further from the master than on an idle board, and the loopback's
+rate was not measured there. Missing: runs long enough to tell. First step:
+read the latest runs in `doc/measurements.md`, Stage 3b, part 2, "Lock and
+drift"; if the estimate is still off, compare it with `align-check`'s
+measured rate over the same window in longer runs, and on a real second card
+once there is one.
+
+## Pi 3: 98 frames dropped on the analog input at 96 kHz
+
+The Pi 3's 96 kHz hour with a further output, repeated after the feed fix,
+ended with the analog input's counters at 256 frames padded and 98 dropped;
+the first hour dropped none. The input went quiet 8 s before the stop, when
+the player ended, and the counters do not say when the 98 were dropped. Not
+investigated. Missing: when it happens, and whether the further output's
+writer, which took 44% of a core on the throttled board, has a part in it.
+First step: repeat that hour of `doc/measurements.md`, Stage 3b, part 2,
+"Hour runs with a further output", and log the time of each dropped frame.
 
 ## A real card with more than two channels
 
@@ -289,3 +416,69 @@ Search for the name given; line numbers drift.
 - `tools/measure/src/hw.rs`, `open_near`: repeats the daemon's card setup. The
   copy is noted there. Fix: add the same note at `AlsaSink::try_open`, or share
   the code.
+
+## Open minor findings from stage 3b part 2
+
+Found in the stage 3b part 2 reviews and left, each with the reason. None of
+them was seen to break playback. Search for the name given.
+
+- `src/engine.rs`, `holds_sound`: a change of the master's delay reads the
+  delay line once, in silence to its end, to see whether it holds sound. The
+  line is made as long as the config can need: about 27,600 frames, times
+  the channels, for a further output at `latency_ms = 48`. Bounded, and only
+  at a change of the delay. On the Pi 3, twelve rate changes in silence, with
+  delays up to 13887 frames at 192 kHz, showed no longer worst cycle with it
+  (`doc/measurements.md`, Stage 3b, part 2, "Processing cost on the Pi 3").
+  First step, if it ever shows: keep a count of the sound in the line as it
+  is written, and drop the scan.
+- `src/sink_alsa.rs`, `AlsaSink::io_failed`: after an xrun, a restart that
+  succeeds returns at once, with no sleep (the `Ok(()) => SinkError::Xrun`
+  arm). A card that took the restart and failed again at the next wait would
+  be restarted at every cycle. The restart writes the whole buffer of zeros,
+  which the card has to play, so it is paced, and no real case was found.
+  After a restart that fails, the thread sleeps a period (`rest`), which for
+  the master is the audio thread; that is bounded. First step: count
+  restarts in a row in `io_failed` and rest after the second.
+- `src/engine.rs`, the xrun count: when the master's wait finds an underrun,
+  `Engine::wait_room` counts an xrun and `AlsaSink::io_failed` restarts the
+  card; the cycle then goes on to its write, and if that write fails too
+  before the restarted card runs, `render` counts a second. So one underrun
+  may count twice. Cosmetic: the count is too high, never too low. First
+  step: a sink test that fails the wait and then the write once each, and a
+  decision whether the write after a failed wait counts.
+- `src/resample.rs`, `Resampler::delay_frames`: the clients' resampler
+  reports rubato's `output_delay`, about one output frame more than where a
+  step lands, as the adaptive resampler's own measurement found. It matters
+  only for the delay reported to clients. First step: measure it as
+  `Adaptive::delay_frames` was in `src/adaptive.rs` and subtract the frame.
+- `src/drift.rs`, `Drift::update`: a reading skipped as not believable does
+  not add to `missed`, as `Drift::pass` does for a withheld one, so the next
+  reading's change of the delay spans two periods and is taken as one, and
+  the estimate gets that step's slope twice. Negligible while locked, where
+  the slope is near 0, and the estimate averages it out. First step: count
+  the skip in `missed` too, with a test of the estimate across a skip.
+- `src/further.rs`, the drift's readings: with the master and the writer at
+  the same period, and the writer's read just before the master's push, up
+  to about half the readings can be withheld as overdue for minutes. The
+  controller keeps running on the rest. None was seen on the boards. Such
+  readings go to `Drift::pass` and are not in the stop line's skipped count.
+  First step: a simulated run at equal periods with that phase held
+  constant, counting the withheld readings.
+- `src/config.rs`, `an_output_takes_idle_and_channels_by_the_flat_rules`: the
+  unknown-key case of an `[[output]]` table is the test's last assertion and
+  checks only `is_err()`, not the message. First step: a test of its own
+  that checks the message names the output and the key.
+- `src/engine.rs`: no test checks the fade of a shutdown with PCM in the
+  delay line. `Command::Shutdown` takes the same path as `CloseOutput`,
+  which `closing_fades_what_the_delay_line_holds` covers;
+  `dop_in_the_delay_line_is_never_scaled` shuts down with DoP and PCM in the
+  line, but checks only that no DoP word is scaled. First step: the close
+  test with `Shutdown`.
+- `tests/server.rs`, `a_lost_further_card_is_looked_for_every_second`: it
+  sleeps 3.5 s and accepts 2 to 5 looks, which is slow and depends on the
+  host's load. First step: wait for the second look, then check the count
+  within a bound.
+- `src/further.rs`, `a_lost_further_output_never_stalls_the_master`: it runs
+  a real writer thread and allows at most 5 refused pushes over about
+  0.8 s, so it can fail on a loaded host. First step: run it on a test clock,
+  as the writer's other tests do, or widen the bound with a reason.

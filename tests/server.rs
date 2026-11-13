@@ -1,10 +1,10 @@
 //! The daemon end to end: clients on a real socket, the output a `MemorySink`.
 
 use aas::capture::{Capture, CaptureFeed, MemoryCapture};
-use aas::config::{Analog, Config, Idle, PluginConfig, PluginPlace};
+use aas::config::{Analog, Config, Idle, OutputConfig, PluginConfig, PluginPlace};
 use aas::control::OpenCapture;
 use aas::rate::SETTLE;
-use aas::server::{self, CardProbe};
+use aas::server::{self, CardProbe, FurtherSink};
 use aas::sink::{MemorySink, Sink, SinkError, SinkLog};
 use aas::volume::{HardwareVolume, OpenVolume};
 use aas_client::client::Client;
@@ -67,14 +67,39 @@ impl Daemon {
     fn start_probing(config: Config, sink: Box<dyn Sink>, probe: CardProbe) -> Daemon {
         let dir = tempfile::tempdir().unwrap();
         let state = dir.path().join("state.toml");
-        Daemon::start_all(config, sink, dir, state, None, Some(probe), None)
+        Daemon::start_all(
+            config,
+            sink,
+            dir,
+            state,
+            None,
+            Some(probe),
+            None,
+            Vec::new(),
+        )
+    }
+
+    /// A daemon that also plays to `further`, one for each `[[output]]`.
+    fn start_outputs(config: Config, sink: Box<dyn Sink>, further: Vec<FurtherSink>) -> Daemon {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state.toml");
+        Daemon::start_all(config, sink, dir, state, None, None, None, further)
     }
 
     /// A daemon with the capture that `capture` decides on.
     fn start_analog(config: Config, sink: Box<dyn Sink>, capture: CaptureSetup) -> Daemon {
         let dir = tempfile::tempdir().unwrap();
         let state = dir.path().join("state.toml");
-        Daemon::start_all(config, sink, dir, state, None, None, Some(capture))
+        Daemon::start_all(
+            config,
+            sink,
+            dir,
+            state,
+            None,
+            None,
+            Some(capture),
+            Vec::new(),
+        )
     }
 
     fn start_full(
@@ -84,9 +109,10 @@ impl Daemon {
         state: PathBuf,
         hardware: Option<OpenVolume>,
     ) -> Daemon {
-        Daemon::start_all(config, sink, dir, state, hardware, None, None)
+        Daemon::start_all(config, sink, dir, state, hardware, None, None, Vec::new())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn start_all(
         config: Config,
         sink: Box<dyn Sink>,
@@ -95,6 +121,7 @@ impl Daemon {
         hardware: Option<OpenVolume>,
         probe: Option<CardProbe>,
         capture: Option<CaptureSetup>,
+        further: Vec<FurtherSink>,
     ) -> Daemon {
         let path = dir.path().join("aas.sock");
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -102,9 +129,12 @@ impl Daemon {
             let (path, shutdown) = (path.clone(), shutdown.clone());
             thread::spawn(move || {
                 let capture = capture.and_then(|setup| setup(&config));
-                server::run_probing(
-                    config, sink, &path, &state, hardware, probe, capture, shutdown,
-                )
+                let devices = server::Devices {
+                    sink,
+                    probe,
+                    further,
+                };
+                server::run_outputs(config, devices, &path, &state, hardware, capture, shutdown)
             })
         };
         let daemon = Daemon {
@@ -620,6 +650,55 @@ fn a_gone_sink_is_tried_again_only_once_the_card_is_seen() {
     present.store(true, Ordering::Relaxed);
     assert!(wait_for(|| log.frames().contains(&[0x100, 0x100])));
     assert_eq!(last_open(&log), Some((48000, PERIOD)));
+}
+
+#[test]
+fn a_lost_further_card_is_looked_for_every_second() {
+    let (sink, _log) = memory_sink();
+    // A further card buffers three periods.
+    let card = MemorySink::paced_buffering(3);
+    let further = card.log();
+    further.fail(Some(SinkError::Gone));
+    let present = Arc::new(AtomicBool::new(false));
+    let looks = Arc::new(Mutex::new(0u32));
+    let (seen, counted) = (present.clone(), looks.clone());
+    let probe: CardProbe = Box::new(move |_refused: bool| {
+        *counted.lock().unwrap() += 1;
+        seen.load(Ordering::Relaxed)
+    });
+    let output = OutputConfig {
+        card: "Loopback".into(),
+        channels: 2,
+        latency_ms: None,
+        idle: Idle::Zeros,
+        volume_db: 0.0,
+        plugins: Vec::new(),
+        matrix: None,
+    };
+    let config = Config {
+        outputs: vec![output],
+        ..default_config()
+    };
+    let outputs = vec![FurtherSink {
+        sink: Box::new(card),
+        probe: Some(probe),
+    }];
+    let daemon = Daemon::start_outputs(config, sink, outputs);
+    let mut client = daemon.client_at(48000, 1 << 20);
+    write_all(&mut client, &vec![[1 << 24, 1 << 24]; 480000]);
+    client.start().unwrap();
+    wait_played(&client, 4800);
+    // The card would open now, but nothing sees it, so its writer is not
+    // asked to try. It is looked for about once a second meanwhile.
+    further.fail(None);
+    *looks.lock().unwrap() = 0;
+    thread::sleep(Duration::from_millis(3500));
+    assert!(further.opens().is_empty());
+    let looked = *looks.lock().unwrap();
+    assert!((2..=5).contains(&looked), "looked {looked} times in 3.5 s");
+    present.store(true, Ordering::Relaxed);
+    assert!(wait_for(|| further.samples().iter().any(|&s| s != 0)));
+    assert_eq!(further.opens().last(), Some(&(48000, PERIOD)));
 }
 
 #[test]

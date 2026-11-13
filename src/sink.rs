@@ -40,8 +40,20 @@ pub trait Sink: Send {
     fn close(&mut self);
     /// Frames between the sink's input and the listener.
     fn delay_frames(&self) -> u32;
+    /// The frames queued in the device at the moment of the call, as
+    /// precisely as the device tells: a further output measures its path's
+    /// delay with it. Does not allocate.
+    fn delay_now(&mut self) -> Result<u32, SinkError> {
+        Ok(self.delay_frames())
+    }
     /// Rates the device takes. Empty means any.
     fn supported_rates(&self) -> Vec<u32>;
+    /// The period and the buffer, in frames, that the open device runs
+    /// with, if it says: a card may round what it was asked for. `None`
+    /// for a sink that is not a card, or a card that is not open.
+    fn granted(&self) -> Option<(u32, u32)> {
+        None
+    }
     /// True once after a `write` that moved to another device, such as
     /// from no card to a card that is back. Opening it took that write
     /// far longer than the buffer lasts, with nothing audible at stake, so
@@ -77,8 +89,16 @@ impl Sink for Box<dyn Sink> {
         (**self).delay_frames()
     }
 
+    fn delay_now(&mut self) -> Result<u32, SinkError> {
+        (**self).delay_now()
+    }
+
     fn supported_rates(&self) -> Vec<u32> {
         (**self).supported_rates()
+    }
+
+    fn granted(&self) -> Option<(u32, u32)> {
+        (**self).granted()
     }
 
     fn switched(&mut self) -> bool {
@@ -86,17 +106,33 @@ impl Sink for Box<dyn Sink> {
     }
 }
 
-/// Keeps time like a card with two periods buffered: writes queue up, and
-/// `wait_room` returns once the queue has room for one more period.
-#[derive(Default)]
+/// Keeps time like a card with `periods` periods buffered, two by default:
+/// writes queue up, and `wait_room` returns once the queue has room for one
+/// more period.
 struct Pacer {
     rate: u32,
     period: u32,
+    periods: u32,
     /// When the frames written so far have played.
     next: Option<Instant>,
 }
 
+impl Default for Pacer {
+    fn default() -> Pacer {
+        Pacer::buffering(PERIODS)
+    }
+}
+
 impl Pacer {
+    fn buffering(periods: u32) -> Pacer {
+        Pacer {
+            rate: 0,
+            period: 0,
+            periods,
+            next: None,
+        }
+    }
+
     fn start(&mut self, rate: u32, period: u32) {
         self.rate = rate;
         self.period = period;
@@ -111,11 +147,20 @@ impl Pacer {
         let Some(next) = self.next else {
             return;
         };
-        let queue = self.length(u64::from(self.period) * u64::from(PERIODS - 1));
+        let queue = self.length(u64::from(self.period) * u64::from(self.periods - 1));
         let now = Instant::now();
         if let Some(due) = next.checked_sub(queue).filter(|&due| due > now) {
             std::thread::sleep(due - now);
         }
+    }
+
+    /// The frames written that have not played yet.
+    fn queued(&self) -> u32 {
+        let Some(next) = self.next else {
+            return 0;
+        };
+        let left = next.saturating_duration_since(Instant::now());
+        (left.as_nanos() * u128::from(self.rate) / 1_000_000_000) as u32
     }
 
     fn write(&mut self, frames: usize) {
@@ -137,8 +182,14 @@ pub struct NullSink {
 
 impl NullSink {
     pub fn new(channels: usize) -> NullSink {
+        NullSink::buffering(channels, PERIODS)
+    }
+
+    /// A null sink that keeps time like a card with `periods` periods
+    /// buffered.
+    pub fn buffering(channels: usize, periods: u32) -> NullSink {
         NullSink {
-            pacer: Pacer::default(),
+            pacer: Pacer::buffering(periods),
             channels,
         }
     }
@@ -168,6 +219,10 @@ impl Sink for NullSink {
 
     fn delay_frames(&self) -> u32 {
         0
+    }
+
+    fn delay_now(&mut self) -> Result<u32, SinkError> {
+        Ok(self.pacer.queued())
     }
 
     fn supported_rates(&self) -> Vec<u32> {
@@ -217,8 +272,13 @@ impl MemorySink {
 
     /// A stereo sink that takes as long as a card would.
     pub fn paced() -> MemorySink {
+        MemorySink::paced_buffering(PERIODS)
+    }
+
+    /// The same for a card that buffers `periods` periods.
+    pub fn paced_buffering(periods: u32) -> MemorySink {
         MemorySink {
-            pacer: Some(Pacer::default()),
+            pacer: Some(Pacer::buffering(periods)),
             ..MemorySink::default()
         }
     }
@@ -286,6 +346,17 @@ impl Sink for MemorySink {
 
     fn delay_frames(&self) -> u32 {
         self.record().delay
+    }
+
+    /// What a paced sink has queued, else the delay set.
+    fn delay_now(&mut self) -> Result<u32, SinkError> {
+        let record = self.record();
+        if let Some(e) = record.failure {
+            return Err(e);
+        }
+        let delay = record.delay;
+        drop(record);
+        Ok(self.pacer.as_ref().map_or(delay, Pacer::queued))
     }
 
     fn supported_rates(&self) -> Vec<u32> {
@@ -398,6 +469,7 @@ impl CardWatch {
 /// control thread looks for the card, which reads a file and allocates,
 /// and tells the audio thread to try the sink once it is there. The audio
 /// thread only reads a flag meanwhile.
+#[derive(Clone)]
 pub struct CardSearch {
     gone: Arc<AtomicBool>,
     retry: Arc<AtomicBool>,
@@ -475,8 +547,15 @@ pub struct FallbackSink {
 
 impl FallbackSink {
     pub fn new(inner: Box<dyn Sink>) -> FallbackSink {
+        FallbackSink::buffering(inner, PERIODS)
+    }
+
+    /// A fallback whose null sink keeps time like a card with `periods`
+    /// periods buffered, as the inner one does, so that what is queued in
+    /// the sink stays the same when the card goes.
+    pub fn buffering(inner: Box<dyn Sink>, periods: u32) -> FallbackSink {
         FallbackSink {
-            null: NullSink::new(inner.channels()),
+            null: NullSink::buffering(inner.channels(), periods),
             rates: inner.supported_rates(),
             watch: None,
             inner,
@@ -644,8 +723,26 @@ impl Sink for FallbackSink {
         }
     }
 
+    fn delay_now(&mut self) -> Result<u32, SinkError> {
+        if self.live {
+            match self.inner.delay_now() {
+                Err(SinkError::Gone) => self.lost(),
+                result => return result,
+            }
+        }
+        self.null.delay_now()
+    }
+
     fn supported_rates(&self) -> Vec<u32> {
         self.inner.supported_rates()
+    }
+
+    fn granted(&self) -> Option<(u32, u32)> {
+        if self.live {
+            self.inner.granted()
+        } else {
+            None
+        }
     }
 
     fn switched(&mut self) -> bool {
@@ -730,6 +827,44 @@ mod tests {
             sink.write([[0; 2]; 480].as_flattened()).unwrap();
         }
         assert!(start.elapsed() < Duration::from_millis(10));
+    }
+
+    #[test]
+    fn a_sink_reports_its_delay_now_as_its_delay_by_default() {
+        let sink = MemorySink::new();
+        let log = sink.log();
+        let mut sink: Box<dyn Sink> = Box::new(sink);
+        log.set_delay(123);
+        assert_eq!(sink.delay_now(), Ok(123));
+        log.fail(Some(SinkError::Gone));
+        assert_eq!(sink.delay_now(), Err(SinkError::Gone));
+    }
+
+    #[test]
+    fn the_null_sink_reports_what_it_has_queued_now() {
+        let mut sink = NullSink::new(2);
+        sink.open(48000, 480).unwrap();
+        assert_eq!(sink.delay_now(), Ok(0));
+        sink.write([[0; 2]; 480].as_flattened()).unwrap();
+        let queued = sink.delay_now().unwrap();
+        assert!((400..=480).contains(&queued), "{queued}");
+        std::thread::sleep(Duration::from_millis(5));
+        let later = sink.delay_now().unwrap();
+        assert!(later <= queued - 240, "{queued} then {later}");
+    }
+
+    #[test]
+    fn fallback_reads_the_delay_now_of_the_inner_sink_and_hides_its_loss() {
+        let (mut sink, log) = fallback(RETRY);
+        let search = sink.card_search();
+        log.set_delay(77);
+        sink.open(48000, 480).unwrap();
+        assert_eq!(sink.delay_now(), Ok(77));
+        log.fail(Some(SinkError::Gone));
+        // The null sink takes over, with nothing queued yet.
+        assert_eq!(sink.delay_now(), Ok(0));
+        assert!(search.is_gone());
+        assert!(search.clone().is_gone());
     }
 
     #[test]

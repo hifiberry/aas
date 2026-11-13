@@ -223,6 +223,41 @@ is not one of the four names, a `to` that is not a whole number from 1 to 8 and 
 `gain_db` outside -100 to 0 stop the daemon with an error naming the table by its
 position in the file.
 
+Each further card is an `[[output]]` table, up to three, so four outputs with the
+master, whose settings are the flat keys. With any `[[output]]` table the flat `card`
+is required, and no two outputs name the same card. An output takes `card`
+(required), `channels` (1 to 8, 2 by default), `latency_ms`, `idle` and
+`idle_delay_s` as the flat keys do, and `volume_db`, its offset to the `Master`
+volume, from -60 to 0 and 0 by default. Its `latency_ms` is the master's target by
+default; its card's period follows from it by the same rule, and the card buffers
+three periods. A card that cannot run short periods, such as `snd-aloop`, wants a
+longer one, such as 48. Every output, the master included, plays as late as the
+slowest of them needs, so a long `latency_ms` on one output delays all. One much
+shorter than the master's, which the drift could not follow, stops the start with
+an error naming the output. Its own `[[output.matrix]]` and `[[output.plugin]]` tables follow the rules
+of `[[matrix]]` and `[[plugin]]`, except that `place = "analog"` and `detect` are only
+for the master. An output without a matrix plays left to channel 1 and right to
+channel 2 for both sources at 0 dB. A further output follows the master's clock
+through a resampler, so it is never bit-perfect, and it is silent while the master
+plays a DoP stream. If the master's card is lost, the others play on. An error
+names the output, counting the master as output 1:
+
+```toml
+card = "sndrpihifiberry"
+
+[[output]]
+card = "Loopback"
+channels = 2
+latency_ms = 48
+volume_db = -3
+idle = "zeros"
+
+[[output.matrix]]
+from = "players.left"
+to = 1
+gain_db = -6
+```
+
 ### Recording
 
 The `default` device records the analog input, for example:

@@ -1,10 +1,12 @@
 //! Probes that measure what the hardware can do. Not part of the daemon.
 
+pub mod clockfit;
 pub mod correlate;
 pub mod handoff;
 #[cfg(feature = "alsa-probes")]
 pub mod hw;
 pub mod pattern;
+pub mod purity;
 pub mod routing;
 pub mod rt;
 pub mod sample;

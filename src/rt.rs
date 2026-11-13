@@ -5,6 +5,10 @@ use std::io::Error;
 /// The audio thread's SCHED_FIFO priority.
 pub const AUDIO_PRIORITY: i32 = 70;
 
+/// The SCHED_FIFO priority of a further output's writer thread, below the
+/// audio thread, which never waits for it.
+pub const WRITER_PRIORITY: i32 = 65;
+
 /// Lock all current and future pages, so that a page fault cannot delay the
 /// audio thread.
 pub fn lock_memory() -> Result<(), String> {

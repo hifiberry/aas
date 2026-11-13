@@ -11,11 +11,22 @@
 //! that a mixing matrix can be checked: the first channel of each side is
 //! compared with the stream, every other channel it names must be a copy of
 //! it, and every channel it does not name must be zero.
+//!
+//! With `--tone` it plays a 997 Hz tone at -6 dBFS instead, for an output
+//! that is resampled, such as a further output of the daemon, which no
+//! stream reaches sample for sample. Each side the tone is on is measured
+//! for what is left once a sine is taken off, in windows of 0.1 s from one
+//! second after the tone starts (see `measure::purity`): once against a
+//! steady sine whose frequency is fitted to each window, and once against
+//! a sine whose amplitude and phase may move slowly, which also takes off
+//! the drift of a resampler that follows a clock. A side without the tone
+//! must be silent, and the routing is checked as for the stream.
 
 use alsa::pcm::{Access, Format, HwParams, PCM};
 use alsa::{Direction, ValueOr};
 use clap::{Parser, ValueEnum};
 use measure::pattern::{Fault, Pattern, compare, faults};
+use measure::purity;
 use measure::routing::Routing;
 use measure::rt;
 use std::process::ExitCode;
@@ -95,7 +106,32 @@ struct Args {
     expect: String,
     #[arg(long, default_value_t = 1)]
     seed: u64,
+    /// Plays a 997 Hz tone at -6 dBFS instead of the stream, and measures
+    /// its residual instead of comparing samples.
+    #[arg(long)]
+    tone: bool,
+    /// With `--tone`, the sides it is on: `L`, `R` or `LR`. The other side
+    /// plays silence.
+    #[arg(long, default_value = "LR", requires = "tone")]
+    tone_on: String,
+    /// With `--tone`, the most the residual against the moving sine may be,
+    /// in dB below a full-scale sine.
+    #[arg(long, default_value_t = -100.0, requires = "tone")]
+    max_residual_db: f64,
 }
+
+/// The tone of `--tone`, as Task 2's test of the resampler plays it.
+const TONE_HZ: f64 = 997.0;
+const TONE_PEAK: f64 = 0.5;
+/// The residual is measured from this long after the tone starts.
+const TONE_SKIP_S: f64 = 1.0;
+/// And up to this long before it ends.
+const TONE_END_S: f64 = 0.2;
+const TONE_WINDOW_S: f64 = 0.1;
+/// A sample above this part of full scale is the tone, when finding its start.
+const TONE_START_LEVEL: f64 = 0.05;
+/// The degree of the moving sine.
+const MOVING_DEGREE: usize = 3;
 
 fn open(
     device: &str,
@@ -224,6 +260,82 @@ fn write(pcm: &PCM, format: SampleFormat, samples: &[i32]) -> Result<(), String>
     Ok(())
 }
 
+/// The client's frame `k` of the tone, right-aligned as `pattern` gives
+/// its frames.
+fn tone_frame(k: u64, rate: f64, bits: u32, on: [bool; 2]) -> [i32; 2] {
+    let full = f64::from(1u32 << (bits - 1));
+    let v = (TONE_PEAK * (std::f64::consts::TAU * TONE_HZ * k as f64 / rate).sin() * full).round()
+        as i32;
+    [if on[0] { v } else { 0 }, if on[1] { v } else { 0 }]
+}
+
+/// Measures the tone in the capture. Returns whether it passes.
+fn check_tone(args: &Args, on: [bool; 2], captured: &[[i32; 2]], sent: u64) -> bool {
+    let rate = f64::from(args.rate);
+    let side = |c: usize| -> Vec<f64> {
+        captured
+            .iter()
+            .map(|f| f64::from(f[c]) / 2_147_483_648.0)
+            .collect()
+    };
+    let sides = [side(0), side(1)];
+    let lit = if on[0] { 0 } else { 1 };
+    let Some(start) = sides[lit].iter().position(|s| s.abs() > TONE_START_LEVEL) else {
+        println!("tone: not found in the capture");
+        return false;
+    };
+    let from = start + (TONE_SKIP_S * rate) as usize;
+    let to = (start + sent as usize)
+        .saturating_sub((TONE_END_S * rate) as usize)
+        .min(captured.len());
+    if to < from + (TONE_WINDOW_S * rate) as usize {
+        println!("tone: the capture is too short, from {from} to {to}");
+        return false;
+    }
+    let window = (TONE_WINDOW_S * rate) as usize;
+    let mut pass = true;
+    for (c, name) in [(0, "left"), (1, "right")] {
+        let samples = &sides[c][from..to];
+        if !on[c] {
+            let peak = samples.iter().fold(0.0f64, |m, s| m.max(s.abs()));
+            let level = if peak == 0.0 {
+                "exactly zero".to_string()
+            } else {
+                format!("peak {:.1} dBFS", 20.0 * peak.log10())
+            };
+            println!("tone {name}: silent side, {level}");
+            pass &= peak < 1e-7;
+            continue;
+        }
+        let guess = purity::omega(TONE_HZ, rate);
+        let span = purity::omega(1.0, rate);
+        let global = purity::fit_omega(&samples[..samples.len().min(rate as usize)], guess, span);
+        let (mut steady, mut moving) = (Vec::new(), Vec::new());
+        for w in samples.chunks_exact(window) {
+            let own = purity::fit_omega(w, global, purity::omega(0.05, rate));
+            steady.push(purity::residual_dbfs(w, own, 0));
+            moving.push(purity::residual_dbfs(w, global, MOVING_DEGREE));
+        }
+        // The level of the whole: the mean of the windows' powers.
+        let overall = |v: &[f64]| {
+            10.0 * (v.iter().map(|d| 10f64.powf(d / 10.0)).sum::<f64>() / v.len() as f64).log10()
+        };
+        let worst = |v: &[f64]| v.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        println!(
+            "tone {name}: {:.4} Hz, {} windows of {TONE_WINDOW_S} s; residual against a steady \
+             sine {:.1} dBFS, worst window {:.1}; against a moving sine {:.1} dBFS, worst window {:.1}",
+            global / std::f64::consts::TAU * rate,
+            steady.len(),
+            overall(&steady),
+            worst(&steady),
+            overall(&moving),
+            worst(&moving),
+        );
+        pass &= overall(&moving) < args.max_residual_db;
+    }
+    pass
+}
+
 fn run(args: Args) -> Result<bool, String> {
     let routing = Arc::new(Routing::parse(args.channels as usize, &args.expect)?);
     rt::lock_memory()?;
@@ -231,6 +343,13 @@ fn run(args: Args) -> Result<bool, String> {
     let rate = f64::from(args.rate);
     let sent = u64::from(args.seconds) * u64::from(args.rate);
     let pattern = Pattern::new(args.format.bits(), args.seed);
+    let tone_on = [
+        args.tone_on.contains(['L', 'l']),
+        args.tone_on.contains(['R', 'r']),
+    ];
+    if args.tone && !tone_on.contains(&true) {
+        return Err(format!("--tone-on {}: neither L nor R", args.tone_on));
+    }
     let pcm = open(
         &args.device,
         Direction::Playback,
@@ -263,6 +382,9 @@ fn run(args: Args) -> Result<bool, String> {
         block.clear();
         for at in written..end {
             let frame = match at.checked_sub(preroll) {
+                Some(k) if k < sent && args.tone => {
+                    tone_frame(k, rate, args.format.bits(), tone_on)
+                }
                 Some(k) if k < sent => pattern.client_frame(k),
                 _ => [0, 0],
             };
@@ -277,6 +399,26 @@ fn run(args: Args) -> Result<bool, String> {
         .ok_or("the capture never started")?
         .join()
         .map_err(|_| "the capture thread panicked")??;
+    if args.tone {
+        println!(
+            "sent {sent}, captured {}, capture overruns {}",
+            captured.frames.len(),
+            captured.overruns
+        );
+        if *routing != Routing::stereo() {
+            println!(
+                "channels {}, expected {}, frames off the routing {}",
+                args.channels,
+                routing.describe(),
+                captured.off_routing
+            );
+            if let Some((at, frame)) = &captured.first_off_routing {
+                println!("  first off the routing at capture {at}: {frame:?}");
+            }
+        }
+        let pass = check_tone(&args, tone_on, &captured.frames, sent);
+        return Ok(pass && captured.overruns == 0 && captured.off_routing == 0);
+    }
     let found = compare(&pattern, sent, &captured.frames);
     println!(
         "frames compared {}, differing {}, breaks {}",

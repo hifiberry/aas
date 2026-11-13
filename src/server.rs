@@ -3,13 +3,18 @@
 
 use crate::board;
 use crate::cards;
-use crate::config::{BitPerfect, Config, Format};
-use crate::control::{Answer, ConnId, Control, OpenCapture, eventfd};
-use crate::counters::Counters;
+use crate::config::{BitPerfect, Config, Format, PluginPlace};
+use crate::control::{
+    Answer, ConnId, Control, FurtherSetup, OpenCapture, check_alignment, delay_capacity, eventfd,
+    feed_capacity,
+};
+use crate::counters::{Counters, OutputCounters};
 use crate::engine::Engine;
 use crate::format::{F32, F64, I32, Processing};
+use crate::further;
 use crate::matrix::{INPUT_NAMES, Matrix};
-use crate::plugin::build::{Chains, Libraries, matrix_width, widths};
+use crate::plugin::Failure;
+use crate::plugin::build::{Chains, Libraries, build_chain, matrix_width, widths};
 use crate::rate::STANDARD_RATES;
 use crate::rt;
 use crate::sink::{CardSearch, CardWatch, FallbackSink, RETRY, RatesWatch, Sink};
@@ -55,6 +60,21 @@ fn check(rc: isize) -> io::Result<usize> {
 /// card unplugged and plugged in again, or another one, is tried once, and
 /// the refusal is not retried every second.
 pub type CardProbe = Box<dyn FnMut(bool) -> bool + Send>;
+
+/// The card of a further output, and how to look for it while it is gone.
+/// Without a probe it is looked for every second.
+pub struct FurtherSink {
+    pub sink: Box<dyn Sink>,
+    pub probe: Option<CardProbe>,
+}
+
+/// The cards the daemon plays to: the master, how to look for it while it
+/// is gone, and one further card for each `[[output]]` table, in order.
+pub struct Devices {
+    pub sink: Box<dyn Sink>,
+    pub probe: Option<CardProbe>,
+    pub further: Vec<FurtherSink>,
+}
 
 /// Runs the daemon as `run_probing` does, with no probe for the card: the
 /// audio thread then tries a sink that is gone every second by itself.
@@ -107,11 +127,43 @@ pub fn run_probing(
     sink: Box<dyn Sink>,
     socket: &Path,
     state: &Path,
-    mut hardware: Option<OpenVolume>,
+    hardware: Option<OpenVolume>,
     probe: Option<CardProbe>,
     capture: Option<OpenCapture>,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), String> {
+    let devices = Devices {
+        sink,
+        probe,
+        further: Vec::new(),
+    };
+    run_outputs(config, devices, socket, state, hardware, capture, shutdown)
+}
+
+/// Runs the daemon as `run_probing` says, playing to every card of
+/// `devices`. Each further card has its writer thread, started before the
+/// audio thread, and is looked for while it is gone as the master is.
+pub fn run_outputs(
+    config: Config,
+    devices: Devices,
+    socket: &Path,
+    state: &Path,
+    mut hardware: Option<OpenVolume>,
+    capture: Option<OpenCapture>,
+    shutdown: Arc<AtomicBool>,
+) -> Result<(), String> {
+    let Devices {
+        sink,
+        probe,
+        further,
+    } = devices;
+    if further.len() != config.outputs.len() {
+        return Err(format!(
+            "{} [[output]] tables, but {} cards to play them",
+            config.outputs.len(),
+            further.len()
+        ));
+    }
     raise_file_limit();
     let latency_ms = config
         .latency_ms
@@ -134,13 +186,57 @@ pub fn run_probing(
         &mut libraries,
     )?;
     check_forced(&config, &mut libraries)?;
+    let matrices = check_outputs(&config, &further, &mut libraries)?;
+    // Each further output's latency, its own or the master's.
+    let latencies: Vec<f32> = config
+        .outputs
+        .iter()
+        .map(|o| o.latency_ms.unwrap_or(latency_ms))
+        .collect();
+    for (i, &latency) in latencies.iter().enumerate() {
+        check_alignment(latency_ms, i + 2, latency, config.resampling)?;
+    }
     eprintln!("aas: matrix: {}", describe(&matrix));
+    for (i, matrix) in matrices.iter().enumerate() {
+        eprintln!("aas: output {} matrix: {}", i + 2, describe(matrix));
+    }
     let notify = eventfd().map_err(|e| format!("eventfd: {e}"))?;
     let listener = listen(socket).map_err(|e| format!("{}: {e}", socket.display()))?;
     let mut sink = FallbackSink::new(sink);
     let rates = sink.rates_watch();
     let card = sink.card_watch();
     let search = probe.map(|probe| (sink.card_search(), probe));
+    // The writers start before the audio thread, which feeds them.
+    let capacity = feed_capacity(latency_ms, &latencies, config.resampling);
+    let mut setups = Vec::new();
+    let mut searches = Vec::new();
+    let mut watches = Vec::new();
+    let mut output_counters = Vec::new();
+    let tables = config.outputs.iter().zip(matrices).zip(further);
+    for (i, ((output, matrix), card)) in tables.enumerate() {
+        let index = i + 1;
+        let mut card_sink = FallbackSink::buffering(card.sink, further::BUFFERED);
+        let rates = card_sink.supported_rates();
+        watches.push((index, card_sink.rates_watch()));
+        let counters = Arc::new(OutputCounters::default());
+        let channels = output.channels;
+        let (feed, handle) = further::spawn(index, card_sink, capacity, channels, counters.clone());
+        searches.push(FurtherSearch {
+            search: handle.search(),
+            probe: card.probe,
+            wait: ProbeWait::default(),
+        });
+        output_counters.push((index, counters));
+        setups.push(FurtherSetup {
+            index,
+            config: output.clone(),
+            matrix,
+            rates,
+            writer: Box::new(handle),
+            feed,
+            feed_frames: capacity,
+        });
+    }
     let (commands, command_queue) = RingBuffer::new(COMMAND_SLOTS);
     let (event_queue, events) = RingBuffer::new(EVENT_SLOTS);
     let counters = Arc::new(Counters::default());
@@ -148,6 +244,9 @@ pub fn run_probing(
     let mode = config.bit_perfect;
     let wake = notify.as_raw_fd();
     let spawned = thread::Builder::new().name("aas-audio".into());
+    // The master's delay line keeps it in time with further outputs: as
+    // long as the longest target their latencies can make.
+    let delay = delay_capacity(latency_ms, &latencies, config.resampling) as usize;
     let audio = match config.format {
         Format::I32 => {
             let engine = Engine::<I32, _>::new(
@@ -157,6 +256,7 @@ pub fn run_probing(
                 engine_counters,
                 mode,
                 matrix,
+                delay,
             );
             spawned.spawn(move || audio_loop(engine, wake))
         }
@@ -168,6 +268,7 @@ pub fn run_probing(
                 engine_counters,
                 mode,
                 matrix,
+                delay,
             );
             spawned.spawn(move || audio_loop(engine, wake))
         }
@@ -179,6 +280,7 @@ pub fn run_probing(
                 engine_counters,
                 mode,
                 matrix,
+                delay,
             );
             spawned.spawn(move || audio_loop(engine, wake))
         }
@@ -197,6 +299,9 @@ pub fn run_probing(
         audio.thread().clone(),
     );
     control.set_plugins(libraries, chains);
+    for setup in setups {
+        control.add_output(setup);
+    }
     if let Some(open) = capture {
         control.set_analog(open);
     }
@@ -217,6 +322,8 @@ pub fn run_probing(
         search,
         probe_wait: ProbeWait::default(),
         hardware,
+        further_search: searches,
+        further_rates: watches,
     };
     server.control.start(Instant::now());
     let mut gaps_seen = 0;
@@ -235,8 +342,12 @@ pub fn run_probing(
     server.control.shutdown();
     let joined = audio.join();
     eprintln!("aas: stopped: {counters}");
-    // The fds of `notify` must outlive the audio thread.
+    // The fds of `notify` must outlive the audio thread. The writers stop
+    // here too.
     drop(server);
+    for (index, counters) in &output_counters {
+        eprintln!("aas: output {}: {counters}", index + 1);
+    }
     let _ = fs::remove_file(socket);
     match joined {
         Err(_) => Err("the audio thread panicked".to_string()),
@@ -254,6 +365,52 @@ pub fn build_matrix(config: &Config, libraries: &mut Libraries) -> Result<Matrix
         None => Ok(Matrix::default_for(width)),
         Some(routes) => Matrix::from_routes(routes, width),
     }
+}
+
+/// The matrix of each `[[output]]` table, as wide as its plugins make it,
+/// checked as the master's are: a route to a channel above the width, a
+/// plugin that fails at any rate, chains that do not end at the card's
+/// channels, or a card of another channel count stop the start. A plugin
+/// that does not take the default rate does not: the output is silent at
+/// a rate its chains do not build at.
+fn check_outputs(
+    config: &Config,
+    cards: &[FurtherSink],
+    libraries: &mut Libraries,
+) -> Result<Vec<Matrix>, String> {
+    let mut matrices = Vec::new();
+    for (i, (output, card)) in config.outputs.iter().zip(cards).enumerate() {
+        let n = i + 2;
+        let context = |e: String| format!("output {n}: {e}");
+        let channels = output.channels;
+        if card.sink.channels() != channels {
+            let has = card.sink.channels();
+            return Err(context(format!(
+                "{channels} channels, but its sink has {has}"
+            )));
+        }
+        let w =
+            widths(&output.plugins, channels, libraries).map_err(|(_, e)| context(e.message))?;
+        if w.end != channels {
+            return Err(context(format!(
+                "the mix and output chains give {} channels, but the card has {channels}",
+                w.end
+            )));
+        }
+        for (place, width) in [(PluginPlace::Mix, w.mix), (PluginPlace::Output, w.output)] {
+            let (plugins, rate, format) = (&output.plugins, config.default_rate, config.format);
+            match build_chain(plugins, place, rate, format, width, libraries) {
+                Err(e) if e.kind != Failure::Unsupported => return Err(context(e.message)),
+                _ => {}
+            }
+        }
+        let matrix = match &output.matrix {
+            None => Matrix::default_for(w.mix),
+            Some(routes) => Matrix::from_routes(routes, w.mix).map_err(context)?,
+        };
+        matrices.push(matrix);
+    }
+    Ok(matrices)
 }
 
 /// Forced bit-perfect bypasses the `mix` and `output` chains, so it cannot
@@ -356,6 +513,18 @@ struct Server {
     /// Opens the card's volume control, unless the volume is in software
     /// by config.
     hardware: Option<OpenVolume>,
+    /// Looks for each further output's card while it is gone.
+    further_search: Vec<FurtherSearch>,
+    /// The rates of each further output's card, by its index, when they
+    /// change.
+    further_rates: Vec<(usize, RatesWatch)>,
+}
+
+/// The search for a further output's card, as for the master's.
+struct FurtherSearch {
+    search: CardSearch,
+    probe: Option<CardProbe>,
+    wait: ProbeWait,
 }
 
 impl Server {
@@ -400,6 +569,26 @@ impl Server {
             let refused = search.is_refused();
             if self.probe_wait.due(search.is_gone() || refused, now) && probe(refused) {
                 search.retry();
+            }
+        }
+        // A further card without a probe is tried every second while it is
+        // gone, and one that refuses is left alone.
+        for further in &mut self.further_search {
+            let FurtherSearch {
+                search,
+                probe,
+                wait,
+            } = further;
+            let refused = search.is_refused();
+            if wait.due(search.is_gone() || refused, now)
+                && probe.as_mut().map_or(!refused, |probe| probe(refused))
+            {
+                search.retry();
+            }
+        }
+        for (index, watch) in &mut self.further_rates {
+            if let Some(rates) = watch.take() {
+                self.control.set_output_rates(*index, rates, now);
             }
         }
         if fds[1].revents != 0 {

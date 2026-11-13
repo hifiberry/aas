@@ -86,6 +86,41 @@ fn output(config: &Config) -> Box<dyn Sink> {
     Box::new(aas::sink::NullSink::new(config.channels))
 }
 
+/// A card for each `[[output]]` table, buffering `further::BUFFERED`
+/// periods, each looked for while it is gone. Two outputs on one card are
+/// refused, by the card's index, whatever they name it by.
+#[cfg(feature = "alsa-output")]
+fn further_outputs(config: &Config) -> Result<Vec<server::FurtherSink>, String> {
+    use aas::further::BUFFERED;
+    use aas::sink_alsa::{AlsaSink, cards_text, distinct_cards};
+    if config.outputs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut cards = vec![config.card.clone()];
+    cards.extend(config.outputs.iter().map(|o| Some(o.card.clone())));
+    distinct_cards(&cards_text(), &cards)?;
+    let outputs = config.outputs.iter().map(|output| {
+        let card = Some(output.card.clone());
+        server::FurtherSink {
+            sink: Box::new(AlsaSink::buffering(card.clone(), output.channels, BUFFERED)),
+            probe: Some(card_probe(card)),
+        }
+    });
+    Ok(outputs.collect())
+}
+
+#[cfg(not(feature = "alsa-output"))]
+fn further_outputs(config: &Config) -> Result<Vec<server::FurtherSink>, String> {
+    if !config.outputs.is_empty() {
+        eprintln!("aas: warning: built without ALSA, the further outputs go nowhere");
+    }
+    let outputs = config.outputs.iter().map(|output| server::FurtherSink {
+        sink: Box::new(aas::sink::NullSink::new(output.channels)),
+        probe: None,
+    });
+    Ok(outputs.collect())
+}
+
 /// Opens the card's volume control, unless the config asks for software
 /// volume. The server calls it at the start and each time the card comes
 /// back.
@@ -154,11 +189,10 @@ fn analog_input(config: &Config) -> Option<aas::control::OpenCapture> {
     None
 }
 
-/// Looks for the card on the control thread while it is gone, so that the
-/// audio thread tries to open it only once it is there. A build without
-/// ALSA never asks: its output is never gone.
-fn card_probe(config: &Config) -> server::CardProbe {
-    let card = config.card.clone();
+/// Looks for `card` on the control thread while it is gone, so that the
+/// thread that plays to it tries to open it only once it is there. A build
+/// without ALSA never asks: its outputs are never gone.
+fn card_probe(card: Option<String>) -> server::CardProbe {
     let mut list = server::ListChange::default();
     Box::new(move |refused| {
         if refused {
@@ -198,13 +232,22 @@ fn main() -> ExitCode {
     let shutdown = Arc::new(AtomicBool::new(false));
     handle_signals(shutdown.clone());
     let sink = output(&config);
+    let further = match further_outputs(&config) {
+        Ok(further) => further,
+        Err(e) => {
+            eprintln!("aas: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let devices = server::Devices {
+        sink,
+        probe: Some(card_probe(config.card.clone())),
+        further,
+    };
     let hardware = hardware_volume(&config);
-    let probe = Some(card_probe(&config));
     let capture = analog_input(&config);
     let (socket, state) = (&args.socket, &args.state);
-    match server::run_probing(
-        config, sink, socket, state, hardware, probe, capture, shutdown,
-    ) {
+    match server::run_outputs(config, devices, socket, state, hardware, capture, shutdown) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("aas: {e}");

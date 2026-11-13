@@ -48,3 +48,7 @@ required-features = ["alsa-probes"]
 
 [[bin]]
 name = "stall"
+
+[[bin]]
+name = "align-check"
+required-features = ["alsa-probes"]
