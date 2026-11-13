@@ -194,14 +194,64 @@ warning; rare, and it goes away with the replan. First step: have the control th
 in the writer tests, a `Sim` with `granted_periods = 4` that runs with no
 starve then shows it works.
 
-## Choose the clock master at run time
+## Stage 4 part 2: the rest of the API
 
-The master is the card of the flat `card` key, fixed until a restart. Stage 4
-is to let the API choose it. Missing: what a switch does to the outputs, each
-of which has its own resampler, drift and place in the delay, and whether
-every card reopens for it. First step: read "Several outputs" in
-`doc/design.md` and `plan_further` and `hand_over` in `src/control.rs`, and
-write down what a switch must change before planning the API.
+Part 1 is built: the API thread, `GET /state`, outputs, inputs with clients
+known by name, the matrix at run time, the state file for all of them and
+WebSocket `/events`. See "The API in part 1" in `doc/design.md`, the API
+section of `README.md`, and "Stage 4 part 1" in `doc/measurements.md`.
+
+Missing, from the table in "API" in `doc/design.md`: `GET /metrics` (timing,
+dropouts, latency, buffers, and the drift and ratio of further outputs),
+`GET /graph` (JSON or DOT), `GET /plugins` and `PATCH /plugins/{id}`,
+`GET` and `PATCH /settings` (bit-perfect mode, latency target, default rate,
+until the next restart), WebSocket `/levels` (VU levels as binary frames at
+10 Hz), the command line tool on top of the API, the `hifiberry-auth`
+manifest in `/etc/hifiberry/auth.d/` (volume `ok`; plugin, matrix and output
+changes `risky`) and the nginx location at `/api/aas/v1`. The design names
+the routes but not their fields. Decisions needed first: the frame format of
+`/levels` and where the levels are measured, how a plugin parameter reaches
+the audio thread (`set_param` there must not allocate or lock), which
+`/settings` changes reopen the card, and what the command line tool is called.
+First step: write "The API in part 2" in `doc/design.md`, in the form of
+"The API in part 1", and have the owner rule on it.
+
+## Stage 4 part 3: a matrix row and a plugin chain per client
+
+Today every client is summed into the `players` bus before the matrix, and a
+client has only a volume (part 1). Missing: a matrix row of its own per client,
+so that one player can go to other channels than another, and a plugin chain
+per client; `PluginPlace` in `src/config.rs` has no place for one. Needs a
+design first: where the chain runs against the resampler and the client's
+volume, what it costs per client on the Pi 3, how a row and a chain are kept
+for a name across reconnects as the volume is (`patch_client` in
+`src/control/api.rs`), how they go in the state file and the API, and what
+they do to bit-perfect. First step: read "Mixing matrix" and "Clients" in
+`doc/design.md` and write the part's design section.
+
+## Stage 4 part 4: choose the clock master at run time
+
+The master is the card of the flat `card` key, fixed until a restart. Part 4
+is to let the API choose it. It needs a design of its own first: what a switch
+does to the outputs, each of which has its own resampler, drift and place in
+the delay, and whether every card reopens for it. First step: read "Several
+outputs" in `doc/design.md` and `plan_further` and `hand_over` in
+`src/control.rs`, and write down what a switch must change before planning
+the API.
+
+## A matrix the audio thread took is logged as refused
+
+Found on both test boards in the stage 4 part 1 runs, and in a build without
+ALSA: the first `PUT /matrix` of each run logs `output 1: a matrix of 2
+channels was refused, the one in place stays`, though the capture shows the
+matrix was taken. `OutputMix::set_matrix` in `src/output_mix.rs` swaps the
+new matrix's contents into its `matrix` field, a plain `Matrix`, and returns
+the box it was given; `old_matrix` in `src/control/api.rs` tells a refusal by
+that box's address, so every matrix looks refused. Logged once per output, so
+only the first shows. A real refusal cannot be told apart either. Fix: make
+the field a `Box<Matrix>` so that the boxes swap, or let `Event::OldMatrix`
+say whether it was refused. First step: a test that sends a matrix through a
+real engine and the control thread and checks that no refusal is noted.
 
 ## The analog input from a card other than the master
 
@@ -288,15 +338,6 @@ the stage 3b part 1 hour run against 768 in stage 3a. Not looked into; it may
 be chance. Missing: a look at when the padding happens. First step: repeat the
 hour run of `doc/measurements.md`, Stage 3b part 1, at 96 kHz and log the time
 of each padding.
-
-## Matrix changes through the API
-
-Part 1 sends a matrix only from the config. When the API sends it (stage 4),
-two things need a decision. A matrix changed more often than every 10 ms keeps
-a DoP stream that starts meanwhile waiting, since it waits for the fade to end.
-And a change made while a DoP claim at the wrong rate is held applies at once
-under PCM. Neither can happen from the config. First step: read the matrix
-fade in `src/engine.rs` (search for `ramp`) and decide a bound for the wait.
 
 ## Add cards to the ADC table
 

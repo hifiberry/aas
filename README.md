@@ -154,9 +154,9 @@ to = 1
 
 `[analog]` turns on the card's analog input (`enabled`, default `false`) and sets
 its level (`volume_db`, from -60 to 0, default 0). `volume_db` is the level the
-input starts at: once the API can change the input volume (stage 4), that
-volume is kept in the state file like the output volume, and the config gives
-only its value on a fresh install. The input is off unless
+input starts at: a volume set through [the API](#the-api) is kept in the state
+file, and applies while `volume_db` in the config stays as it was. The input is
+off unless
 enabled, and it works only on cards with an ADC that `aas` knows: today the
 DAC+ ADC and the DAC+ ADC Pro. On any other card it logs one line, opens
 nothing, and the output's idle rule applies as configured. While the input
@@ -310,6 +310,90 @@ sudo rm /usr/lib/aarch64-linux-gnu/alsa-lib/libasound_module_*_aas.so
 ```
 
 Then move `/etc/asound.conf.before-aas` back, if there is one.
+
+## The API
+
+The daemon serves an HTTP API with JSON on `127.0.0.1`, port `api_port`, 2718
+by default; `api_port = 0` turns it off. A port that cannot be bound is logged
+once and the daemon plays on without the API. It has no authentication of its
+own: it is meant to sit behind a gateway, at `/api/aas/v1`. The paths below are
+without that prefix.
+
+| Method and path | What it does |
+|---|---|
+| `GET /state` | The rate, the processing format, every output with its card and whether it is `open`, `parked` or `off`, every connected client with its name, rate and whether it runs, and whether the master is bit-perfect, with the reason if not |
+| `GET /outputs`, `GET /outputs/{id}` | Every output, or one |
+| `PATCH /outputs/{id}` | Change an output's volume and idle rule |
+| `GET /inputs` | The analog input, if enabled, every client that plays and every name given a volume |
+| `GET`, `PATCH /inputs/analog` | The analog input's volume and mute |
+| `GET`, `PATCH /inputs/clients/{name}` | A client's volume and mute |
+| `GET`, `PUT /matrix` | Every output's routes |
+| WebSocket `/events` | One JSON object per change |
+
+Outputs are numbered as in the config's error messages: the master is 1, the
+`[[output]]` tables 2 to 4 in file order. Their fields:
+
+- `volume`, the master only: 0 to 100. It is the `Master` control, so a change
+  through either is seen by both.
+- `volume_db`, a further output only: its offset to the master, -60 to 0.
+- `idle`, `"off"` or `"zeros"`, and `idle_delay_s`, with the rules of the
+  config keys: a delay with `zeros` is refused. A change takes effect at the
+  next idle decision; an output that is off stays off until a client plays.
+
+Inputs have `volume_db`, -60 to 0, and `muted`. A client is known by its
+process name, percent-encoded in the path: `/inputs/clients/mpd`. Its volume
+applies to every stream of that name and survives a reconnect, and a name not
+connected can be given one, so a player can be set before it starts. A name
+without a volume plays at 0 dB. At most 64 names are kept. While a client plays
+alone at a volume other than 0 dB the master is not bit-perfect, with the reason
+`Volume`. Every change of an input's volume fades over 10 ms.
+
+`PUT /matrix` takes `{"outputs": [{"output": N, "routes": [...]}]}`, each
+route `{"from": ..., "to": ..., "gain_db": ...}` with the names and rules of a
+`[[matrix]]` table. An output it does not name keeps its matrix, and an empty
+route list is the default matrix. A matrix must have the width of the one in
+place. A change fades over 10 ms, and an output takes at most one matrix every
+20 ms; a later one in between replaces the one waiting.
+
+A field left out of a `PATCH` stays as it is. A body that does not parse or has
+an unknown field is 400, an unknown output or input is 404, and a value out of
+range or a matrix that breaks a rule is 422; nothing is clamped. A call the
+daemon has not answered in 2 s is 503. Each error is `{"error": "..."}`, with
+the message the config would give.
+
+```sh
+curl -s 127.0.0.1:2718/state
+curl -s -X PATCH -d '{"volume": 60}' 127.0.0.1:2718/outputs/1
+curl -s -X PATCH -d '{"volume_db": -6}' 127.0.0.1:2718/inputs/clients/mpd
+curl -s -X PUT 127.0.0.1:2718/matrix -d \
+  '{"outputs": [{"output": 1, "routes": [{"from": "players.left", "to": 2}, {"from": "players.right", "to": 1}]}]}'
+```
+
+The first gives, with nothing playing:
+
+```json
+{"bit_perfect":false,"clients":[],"format":"f32","outputs":[{"card":"","id":1,"state":"open"}],"rate":48000,"reason":"no source"}
+```
+
+and a value out of range is answered like this, with status 422:
+
+```json
+{"error":"volume_db must be from -60 to 0"}
+```
+
+WebSocket `/events` sends a JSON object with a `type` for each change:
+`output` (its volume or offset, idle and state), `input` (`id` is `analog` or
+`clients/<name>`, with `volume_db` and `muted`), `client` (a name `connected`,
+`running`, `stopped` or `gone`), `matrix` (an output's routes) and `rate`. A
+subscriber that falls more than 256 events behind gets `{"type": "resync"}`
+and should read `/state` again; nothing waits for it.
+
+What the API sets is kept in the state file and survives a restart: the
+master's volume, each client's volume and mute, the analog input's, each
+further output's offset and idle rule, and each output's matrix. A stored value
+that has a config key applies only while the config still says what it said
+when the value was stored, so an edit of the config always wins. The API never
+rewrites the config.
 
 ## Writing a plugin
 
