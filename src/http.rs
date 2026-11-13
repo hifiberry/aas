@@ -30,6 +30,15 @@ use tokio::sync::oneshot;
 /// How long a request waits for the control thread before it fails.
 const ANSWER_WITHIN: Duration = Duration::from_secs(2);
 
+/// The largest request body taken. The daemon locks all of its memory, so
+/// what a peer sends must stay small; the largest real body, a matrix of
+/// every route, is a few KiB.
+const MAX_BODY: usize = 64 * 1024;
+
+/// The largest WebSocket message or frame taken from a subscriber, whose
+/// messages are read only to be dropped.
+const MAX_PEER_MESSAGE: usize = 4096;
+
 /// What every handler shares.
 struct Shared {
     calls: Sender<ApiCall>,
@@ -105,6 +114,7 @@ fn router(shared: Arc<Shared>) -> Router {
         )
         .route("/matrix", get(|s| ask(s, Call::Matrix)).put(put_matrix))
         .route("/events", get(events))
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY))
         .fallback(|| async { error(StatusCode::NOT_FOUND, "no such path") })
         .method_not_allowed_fallback(|| async {
             error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
@@ -163,9 +173,26 @@ async fn ask_for(s: State<Arc<Shared>>, call: Result<Call, ApiError>) -> Respons
     }
 }
 
+/// A request body, or why it could not be read: 413 for one over
+/// `MAX_BODY`.
+type BodyOf = Result<Bytes, axum::extract::rejection::BytesRejection>;
+
 /// A JSON body, or a 400 with why not: one that does not parse, has a
-/// field of the wrong type or one not known.
-fn parse<T: DeserializeOwned>(body: &Bytes) -> Result<T, ApiError> {
+/// field of the wrong type or one not known. A body that could not be read
+/// gets the status of why, as JSON like every error.
+fn parse<T: DeserializeOwned>(body: &BodyOf) -> Result<T, ApiError> {
+    let body = match body {
+        Ok(body) => body,
+        Err(e) => {
+            let status = e.status();
+            let message = match status {
+                StatusCode::PAYLOAD_TOO_LARGE => format!("a body has at most {MAX_BODY} bytes"),
+                _ => e.body_text(),
+            };
+            let status = status.as_u16();
+            return Err(ApiError { status, message });
+        }
+    };
     serde_json::from_slice(body).map_err(|e| ApiError::bad_request(e.to_string()))
 }
 
@@ -190,7 +217,7 @@ async fn get_output(s: State<Arc<Shared>>, id: PathOf<String>) -> Response {
     ask_for(s, call).await
 }
 
-async fn patch_output(s: State<Arc<Shared>>, id: PathOf<String>, body: Bytes) -> Response {
+async fn patch_output(s: State<Arc<Shared>>, id: PathOf<String>, body: BodyOf) -> Response {
     let call = path(id).and_then(|id| {
         let id = output_id(&id)?;
         Ok(Call::PatchOutput(id, parse(&body)?))
@@ -198,7 +225,7 @@ async fn patch_output(s: State<Arc<Shared>>, id: PathOf<String>, body: Bytes) ->
     ask_for(s, call).await
 }
 
-async fn patch_analog(s: State<Arc<Shared>>, body: Bytes) -> Response {
+async fn patch_analog(s: State<Arc<Shared>>, body: BodyOf) -> Response {
     ask_for(s, parse(&body).map(Call::PatchAnalog)).await
 }
 
@@ -206,12 +233,12 @@ async fn get_client(s: State<Arc<Shared>>, name: PathOf<String>) -> Response {
     ask_for(s, path(name).map(Call::Client)).await
 }
 
-async fn patch_client(s: State<Arc<Shared>>, name: PathOf<String>, body: Bytes) -> Response {
+async fn patch_client(s: State<Arc<Shared>>, name: PathOf<String>, body: BodyOf) -> Response {
     let call = path(name).and_then(|name| Ok(Call::PatchClient(name, parse(&body)?)));
     ask_for(s, call).await
 }
 
-async fn put_matrix(s: State<Arc<Shared>>, body: Bytes) -> Response {
+async fn put_matrix(s: State<Arc<Shared>>, body: BodyOf) -> Response {
     ask_for(s, parse(&body).map(Call::PutMatrix)).await
 }
 
@@ -230,6 +257,10 @@ async fn events(
     };
     let receiver = events.subscribe();
     drop(events);
+    // A larger message from the peer ends its socket.
+    let upgrade = upgrade
+        .max_message_size(MAX_PEER_MESSAGE)
+        .max_frame_size(MAX_PEER_MESSAGE);
     upgrade.on_upgrade(move |socket| forward(socket, receiver))
 }
 

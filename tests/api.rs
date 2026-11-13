@@ -380,3 +380,53 @@ fn a_matrix_put_reaches_the_engine_unrefused() {
         assert!(!log.contains("refused"), "{log}");
     }
 }
+
+#[test]
+fn a_body_over_64_kib_is_413() {
+    let daemon = Daemon::start();
+    // Valid JSON, padded with spaces past the limit.
+    let body = format!(r#"{{"volume": 50}}{}"#, " ".repeat(64 * 1024));
+    let (status, answer) = daemon.patch("/outputs/1", &body);
+    assert_eq!(status, 413);
+    assert_eq!(answer["error"], json!("a body has at most 65536 bytes"));
+    // Nothing changed, and the daemon answers on.
+    assert_eq!(daemon.get("/outputs/1").1["volume"], json!(100));
+    // One within the limit is taken.
+    let body = format!(r#"{{"volume": 50}}{}"#, " ".repeat(1024));
+    assert_eq!(daemon.patch("/outputs/1", &body).0, 200);
+}
+
+#[test]
+fn a_websocket_message_over_the_limit_closes_that_socket() {
+    let daemon = Daemon::start();
+    let mut socket = subscribe(&daemon);
+    let big = "x".repeat(64 * 1024);
+    socket.send(Message::Text(big.into())).unwrap();
+    // The daemon closes the socket: a close frame, or the connection gone,
+    // but not a read that times out.
+    loop {
+        match socket.read() {
+            Ok(Message::Close(_)) => break,
+            Err(tungstenite::Error::Io(e))
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                panic!("the socket was not closed")
+            }
+            Err(_) => break,
+            Ok(_) => continue,
+        }
+    }
+    // The daemon goes on: it answers, and a new subscriber is told of a
+    // change.
+    assert_eq!(daemon.get("/state").0, 200);
+    let mut other = subscribe(&daemon);
+    assert_eq!(daemon.patch("/outputs/1", r#"{"volume": 50}"#).0, 200);
+    let event: Value = match other.read().unwrap() {
+        Message::Text(text) => serde_json::from_str(&text).unwrap(),
+        other => panic!("not text: {other:?}"),
+    };
+    assert_eq!(event["volume"], json!(50));
+}
