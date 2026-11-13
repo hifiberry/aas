@@ -341,12 +341,14 @@ Outputs are numbered as in the config's error messages: the master is 1, the
   next idle decision; an output that is off stays off until a client plays.
 
 Inputs have `volume_db`, -60 to 0, and `muted`. A client is known by its
-process name, percent-encoded in the path: `/inputs/clients/mpd`. Its volume
-applies to every stream of that name and survives a reconnect, and a name not
-connected can be given one, so a player can be set before it starts. A name
-without a volume plays at 0 dB. At most 64 names are kept. While a client plays
+process name, percent-encoded in the path: `/inputs/clients/mpd`. The kernel
+keeps at most 15 bytes of a process name, so a longer name is refused with 422.
+Its volume applies to every stream of that name and survives a reconnect, and a
+name not connected can be given one, so a player can be set before it starts.
+A name without a volume plays at 0 dB. At most 64 names are kept; one set back
+to 0 dB, unmuted, is no longer kept and frees its place. While a client plays
 alone at a volume other than 0 dB the master is not bit-perfect, with the reason
-`Volume`. Every change of an input's volume fades over 10 ms.
+`"volume"`. Every change of an input's volume fades over 10 ms.
 
 `PUT /matrix` takes `{"outputs": [{"output": N, "routes": [...]}]}`, each
 route `{"from": ..., "to": ..., "gain_db": ...}` with the names and rules of a
@@ -357,9 +359,10 @@ place. A change fades over 10 ms, and an output takes at most one matrix every
 
 A field left out of a `PATCH` stays as it is. A body that does not parse or has
 an unknown field is 400, an unknown output or input is 404, and a value out of
-range or a matrix that breaks a rule is 422; nothing is clamped. A call the
-daemon has not answered in 2 s is 503. Each error is `{"error": "..."}`, with
-the message the config would give.
+range or a matrix that breaks a rule is 422; nothing is clamped. A body over
+64 KiB is 413. A call the daemon has not answered in 2 s is 503; a `PATCH` or
+`PUT` answered so may still have applied, and can safely be sent again. Each
+error is `{"error": "..."}`, with the message the config would give.
 
 ```sh
 curl -s 127.0.0.1:2718/state
@@ -386,7 +389,10 @@ WebSocket `/events` sends a JSON object with a `type` for each change:
 `clients/<name>`, with `volume_db` and `muted`), `client` (a name `connected`,
 `running`, `stopped` or `gone`), `matrix` (an output's routes) and `rate`. A
 subscriber that falls more than 256 events behind gets `{"type": "resync"}`
-and should read `/state` again; nothing waits for it.
+and should read `/state` again; nothing waits for it. Clients are told apart by
+name alone, so with two processes of one name, `gone` for the name means that
+one of them has gone, not that none plays. A message from a subscriber is
+ignored; one over 4 KiB closes its socket.
 
 What the API sets is kept in the state file and survives a restart: the
 master's volume, each client's volume and mute, the analog input's, each

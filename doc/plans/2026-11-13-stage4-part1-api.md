@@ -3,10 +3,6 @@
 > The design, `doc/design.md`, is the authority: where this plan disagrees with it, the
 > design wins.
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development
-> (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps
-> use checkbox (`- [ ]`) syntax for tracking.
-
 **Goal:** The daemon answers HTTP on `127.0.0.1:2718`. Through it a caller reads the
 state, sets each output's volume and idle rule, sets the volume of the analog input
 and of each client by its process name, and replaces each output's matrix. Every
