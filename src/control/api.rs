@@ -2,21 +2,24 @@
 //! client requests, exactly like one. Views are built from what `Control`
 //! holds; nothing waits on the audio thread.
 
-use super::{ConnId, Control, Stream};
+use super::{ConnId, Control, Stream, check_alignment, plugins};
 use crate::api::{
     self, ApiCall, ApiError, ApiEvent, Call, ClientView, InputPatch, InputView, MatrixPut,
     OutputPatch, OutputRoutes, OutputState, OutputView, RouteJson, StateView,
 };
 use crate::api::{
-    AnalogMetrics, LastGap, MasterMetrics, MetricsView, OutputMetrics, StreamMetrics,
+    AnalogMetrics, LastGap, MasterMetrics, MetricsView, OutputMetrics, SettingsPatch, SettingsView,
+    StreamMetrics,
 };
 use crate::bitperfect::NotBitPerfect;
-use crate::config::{self, Config, DEFAULT_IDLE_DELAY_S, Format, Idle, Route};
+use crate::config::{self, BitPerfect, Config, DEFAULT_IDLE_DELAY_S, Format, Idle, Quality, Route};
 use crate::counters::{Counters, OutputCounters};
 use crate::engine::Command;
 use crate::format::db_to_gain;
-use crate::latency::PERIODS;
+use crate::latency::{PERIODS, period_frames};
 use crate::matrix::{Bus, INPUT_NAMES, Matrix};
+use crate::plugin::build::widths;
+use crate::rate::{MAX_RATE, MIN_RATE};
 use crate::state::{MAX_CLIENTS, State, Stored, StoredInput, StoredOutput, StoredRoute};
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -254,6 +257,22 @@ fn route_json(route: &Route) -> RouteJson {
     }
 }
 
+/// A bit-perfect mode as the config writes it.
+fn mode_name(mode: BitPerfect) -> &'static str {
+    match mode {
+        BitPerfect::Auto => "auto",
+        BitPerfect::Forced => "forced",
+        BitPerfect::Off => "off",
+    }
+}
+
+fn quality_name(quality: Quality) -> &'static str {
+    match quality {
+        Quality::High => "high",
+        Quality::Medium => "medium",
+    }
+}
+
 pub(super) fn format_name(format: Format) -> &'static str {
     match format {
         Format::I32 => "i32",
@@ -318,6 +337,8 @@ impl Control {
             Call::Plugins => api::answer(&self.plugin_views()),
             Call::Plugin(id) => self.plugin_answer(&id),
             Call::PatchPlugin(id, patch) => self.patch_plugin(id, patch, now),
+            Call::Settings => api::answer(&self.settings_view()),
+            Call::PatchSettings(patch) => self.patch_settings(patch, now),
         };
         self.publish_changes();
         answer
@@ -976,6 +997,143 @@ impl Control {
         }
     }
 
+    fn settings_view(&self) -> SettingsView {
+        SettingsView {
+            bit_perfect: mode_name(self.bit_perfect).to_string(),
+            latency_ms: self.latency_ms,
+            default_rate: self.default_rate,
+            format: format_name(self.format).to_string(),
+            resampling: quality_name(self.quality).to_string(),
+        }
+    }
+
+    /// Checks every field first, with the config's rules and messages, so
+    /// that a refused patch changes nothing. A change lasts until the next
+    /// restart: nothing of it is stored.
+    fn patch_settings(&mut self, patch: SettingsPatch, now: Instant) -> api::Answer {
+        let mode = match patch.bit_perfect.as_deref() {
+            None => None,
+            Some("auto") => Some(BitPerfect::Auto),
+            Some("forced") => Some(BitPerfect::Forced),
+            Some("off") => Some(BitPerfect::Off),
+            Some(_) => {
+                return Err(ApiError::unprocessable(
+                    "bit_perfect must be \"auto\", \"forced\" or \"off\"",
+                ));
+            }
+        };
+        if mode == Some(BitPerfect::Forced) {
+            self.check_forced()?;
+        }
+        if let Some(ms) = patch.latency_ms {
+            self.check_latency(ms)?;
+        }
+        if patch
+            .default_rate
+            .is_some_and(|rate| !(MIN_RATE..=MAX_RATE).contains(&rate))
+        {
+            let message = format!("default_rate must be from {MIN_RATE} to {MAX_RATE}");
+            return Err(ApiError::unprocessable(message));
+        }
+        let before = self.settings_view();
+        let mut batch = Vec::new();
+        if let Some(mode) = mode.filter(|&m| m != self.bit_perfect) {
+            // The engine takes the mode with no reopen, and the master's
+            // gain as the volume now gives it.
+            self.bit_perfect = mode;
+            self.volume.set_mode(mode);
+            batch.push(Command::SetMode(mode));
+            batch.push(Command::SetGain(0, self.volume.gain()));
+            eprintln!(
+                "aas: bit_perfect = \"{}\" until the next restart",
+                mode_name(mode)
+            );
+        }
+        let mut decide = false;
+        if let Some(ms) = patch.latency_ms.filter(|&ms| ms != self.latency_ms) {
+            self.set_latency(ms);
+            decide = true;
+        }
+        if let Some(rate) = patch.default_rate.filter(|&r| r != self.default_rate) {
+            self.default_rate = rate;
+            self.policy.set_base(rate);
+            self.new_rate_decision();
+            eprintln!("aas: default_rate = {rate} until the next restart");
+            decide = true;
+        }
+        if decide {
+            self.decide(now, false, &mut batch);
+        }
+        self.send(batch);
+        let view = self.settings_view();
+        if view != before {
+            self.publish(view.event());
+        }
+        api::answer(&view)
+    }
+
+    /// Forced bit-perfect bypasses the `mix` and `output` chains, which then
+    /// must keep the channel count, as the config's check at startup says.
+    fn check_forced(&mut self) -> Result<(), ApiError> {
+        let config = plugins::configs(&self.plugins);
+        let w = widths(&config, self.channels, &mut self.libraries)
+            .map_err(|(_, e)| ApiError::unprocessable(e.message))?;
+        if w.changes || w.mix != self.channels {
+            return Err(ApiError::unprocessable(
+                "bit_perfect = \"forced\" needs chains that keep the channel count",
+            ));
+        }
+        Ok(())
+    }
+
+    /// A latency the config takes, no longer than the one the daemon
+    /// started with, which the rings of the clients already playing, the
+    /// feeds and the delay line were sized for, and one every further
+    /// output can be aligned with, as the start checks it.
+    fn check_latency(&self, ms: f32) -> Result<(), ApiError> {
+        if !(ms.is_finite() && ms > 0.0) {
+            return Err(ApiError::unprocessable(
+                "latency_ms must be a positive number",
+            ));
+        }
+        let startup = self.startup_latency_ms;
+        if ms > startup {
+            return Err(ApiError::unprocessable(format!(
+                "latency_ms above the {startup} ms the daemon started with needs a restart"
+            )));
+        }
+        for output in &self.further {
+            let own = if output.own_latency {
+                output.latency_ms
+            } else {
+                ms
+            };
+            check_alignment(ms, output.number(), own, self.quality)
+                .map_err(ApiError::unprocessable)?;
+        }
+        Ok(())
+    }
+
+    /// Takes the latency `ms` from the next open of the outputs on, for
+    /// the master and every further output without one of its own. The
+    /// outputs reopen at once, as for an urgent change of rate, if a period
+    /// changes, and once a DoP stream has ended if one plays.
+    fn set_latency(&mut self, ms: f32) {
+        self.latency_ms = ms;
+        for output in self.further.iter_mut().filter(|o| !o.own_latency) {
+            output.latency_ms = ms;
+        }
+        let master = self
+            .output
+            .is_some_and(|(rate, period)| period_frames(rate, ms) != period);
+        let further = self.further.iter().any(|o| {
+            o.current
+                .is_some_and(|(card, period, _)| period_frames(card, o.latency_ms) != period)
+        });
+        self.latency_due |= master || further;
+        eprintln!("aas: latency_ms = {ms} until the next restart");
+    }
+
     fn state_view(&self) -> StateView {
         let outputs = (0..=self.further.len())
             .filter_map(|index| self.output_view(index))
@@ -1017,13 +1175,13 @@ impl Control {
 #[cfg(test)]
 mod tests {
     use super::super::tests::{
-        FakeEngine, Opener, analog_config, configure, further, has, started, started_with,
-        unstarted_with,
+        FakeEngine, Opener, analog_config, configure, further, has, started, started_at,
+        started_with, unstarted_with,
     };
     use super::super::*;
     use crate::api::{
         ApiCall, ApiError, ApiEvent, Call, InputPatch, MatrixPut, OutputPatch, OutputRoutes,
-        RouteJson,
+        RouteJson, SettingsPatch,
     };
     use crate::bitperfect::NotBitPerfect;
     use crate::config::{self, Idle, Route};
@@ -2475,5 +2633,288 @@ mod tests {
         let (mut control, engine, now) = restored_matrices(&path, None);
         assert!(engine.matrices.is_empty());
         assert_eq!(routes_of(&mut control, 1, now), default_routes());
+    }
+
+    fn settings(control: &mut Control, patch: SettingsPatch, now: Instant) -> crate::api::Answer {
+        control.call(Call::PatchSettings(patch), now)
+    }
+
+    fn mode(name: &str) -> SettingsPatch {
+        SettingsPatch {
+            bit_perfect: Some(name.into()),
+            ..SettingsPatch::default()
+        }
+    }
+
+    fn latency(ms: f32) -> SettingsPatch {
+        SettingsPatch {
+            latency_ms: Some(ms),
+            ..SettingsPatch::default()
+        }
+    }
+
+    fn default_rate(rate: u32) -> SettingsPatch {
+        SettingsPatch {
+            default_rate: Some(rate),
+            ..SettingsPatch::default()
+        }
+    }
+
+    /// Open at a latency of `latency_ms`, with nothing queued.
+    fn open_at(config: &Config, latency_ms: f32) -> (Control, FakeEngine, Instant) {
+        let (mut control, mut engine, now) = started_at(config, None, latency_ms);
+        engine.take(true);
+        control.handle_events(now);
+        engine.take(true);
+        (control, engine, now)
+    }
+
+    #[test]
+    fn settings_give_the_configs_values_with_the_fixed_ones() {
+        let config = Config {
+            default_rate: 44100,
+            format: Format::F64,
+            ..Config::default()
+        };
+        let (mut control, _engine, now) = open_at(&config, 10.0);
+        let view = control.call(Call::Settings, now).unwrap();
+        assert_eq!(
+            view,
+            json!({"bit_perfect": "auto", "latency_ms": 10.0, "default_rate": 44100,
+                   "format": "f64", "resampling": "high"})
+        );
+    }
+
+    #[test]
+    fn a_mode_goes_to_the_engine_with_the_gain_it_now_takes() {
+        let (mut control, mut engine, now) = open(&Config::default(), None);
+        control.call(Call::PatchOutput(1, volume(50)), now).unwrap();
+        engine.take(true);
+        engine.gains.clear();
+        let view = settings(&mut control, mode("forced"), now).unwrap();
+        assert_eq!(view["bit_perfect"], json!("forced"));
+        assert_eq!(engine.take(true), ["SetMode Forced", "SetGain"]);
+        // A software volume has no effect in forced bit-perfect.
+        assert_eq!(engine.gains, [(0, 1.0)]);
+        settings(&mut control, mode("auto"), now).unwrap();
+        assert_eq!(engine.take(true), ["SetMode Auto", "SetGain"]);
+        assert!(close(engine.gains[1].1, db_to_gain(-30.0)));
+        // The same mode again sends nothing.
+        settings(&mut control, mode("auto"), now).unwrap();
+        assert!(engine.take(true).is_empty());
+        let answer = settings(&mut control, mode("always"), now);
+        assert_eq!(
+            message(answer),
+            "bit_perfect must be \"auto\", \"forced\" or \"off\""
+        );
+    }
+
+    #[test]
+    fn forced_with_a_chain_that_changes_channels_is_422() {
+        let config = Config {
+            channels: 4,
+            plugins: vec![config::PluginConfig {
+                place: config::PluginPlace::Output,
+                kind: "widen".into(),
+                path: None,
+                params: Default::default(),
+            }],
+            ..Config::default()
+        };
+        let (mut control, mut engine, now) = open(&config, None);
+        let answer = settings(&mut control, mode("forced"), now);
+        assert_eq!(status(answer.clone()), 422);
+        assert_eq!(
+            message(answer),
+            "bit_perfect = \"forced\" needs chains that keep the channel count"
+        );
+        assert!(engine.take(true).is_empty());
+        let view = control.call(Call::Settings, now).unwrap();
+        assert_eq!(view["bit_perfect"], json!("auto"));
+        // Off needs nothing of the chains.
+        settings(&mut control, mode("off"), now).unwrap();
+        assert_eq!(engine.take(true), ["SetMode Off", "SetGain"]);
+    }
+
+    #[test]
+    fn a_latency_above_the_startup_one_is_422() {
+        let (mut control, mut engine, now) = open_at(&Config::default(), 10.0);
+        let answer = settings(&mut control, latency(12.0), now);
+        assert_eq!(status(answer.clone()), 422);
+        assert_eq!(
+            message(answer),
+            "latency_ms above the 10 ms the daemon started with needs a restart"
+        );
+        for bad in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            let answer = settings(&mut control, latency(bad), now);
+            assert_eq!(
+                message(answer),
+                "latency_ms must be a positive number",
+                "{bad}"
+            );
+        }
+        assert!(engine.take(true).is_empty());
+        let view = settings(&mut control, latency(5.0), now).unwrap();
+        assert_eq!(view["latency_ms"], json!(5.0));
+        // Back up to the startup one is a change like any.
+        assert!(settings(&mut control, latency(10.0), now).is_ok());
+    }
+
+    #[test]
+    fn a_refused_patch_changes_nothing() {
+        let (mut control, mut engine, now) = open_at(&Config::default(), 10.0);
+        let patch = SettingsPatch {
+            bit_perfect: Some("off".into()),
+            latency_ms: Some(12.0),
+            default_rate: Some(44100),
+        };
+        assert_eq!(status(settings(&mut control, patch, now)), 422);
+        assert!(engine.take(true).is_empty());
+        let view = control.call(Call::Settings, now).unwrap();
+        assert_eq!(view["bit_perfect"], json!("auto"));
+        assert_eq!(view["default_rate"], json!(48000));
+    }
+
+    #[test]
+    fn a_lower_latency_reopens_with_the_shorter_period() {
+        let (mut control, mut engine, now) = open_at(&Config::default(), 10.0);
+        play_as(&mut control, 1, "mpd", now);
+        engine.take(true);
+        control.handle_events(now);
+        engine.take(true);
+        assert_eq!(control.output, Some((48000, period_frames(48000, 10.0))));
+        settings(&mut control, latency(5.0), now).unwrap();
+        let seen = engine.take(true);
+        let reopen = format!("Reconfigure 48000 {}", period_frames(48000, 5.0));
+        assert!(has(&seen, &reopen), "{seen:?}");
+        assert_eq!(control.latency_ms, 5.0);
+        // A ring is still sized for the latency the daemon started with,
+        // which the API may set again while it plays.
+        let short = min_buffer_frames(48000, 5.0);
+        assert!(short < min_buffer_frames(48000, 10.0));
+        control.connected(2, "short".into());
+        let hello = Request::Hello {
+            version: proto::VERSION,
+        };
+        control.request(2, Some(hello), now);
+        let answer = control.request(2, Some(configure(48000, short)), now);
+        let code = libc::EINVAL as u32;
+        assert_eq!(answer.reply, Some(Reply::Error { code }));
+        // A latency that keeps the period reopens nothing.
+        control.handle_events(now);
+        engine.take(true);
+        settings(&mut control, latency(4.5), now).unwrap();
+        assert!(!has(&engine.take(true), "Reconfigure"));
+    }
+
+    #[test]
+    fn further_outputs_on_the_masters_latency_follow_it_and_others_keep_theirs() {
+        let (mut own, rates) = further(&[]);
+        own.latency_ms = Some(12.0);
+        let outputs = vec![(own, rates), further(&[])];
+        let (mut control, mut engine, logs, now) = started_with(&Config::default(), outputs);
+        engine.take(true);
+        control.handle_events(now);
+        for log in &logs {
+            assert_eq!(log.take(), ["reconfigure 48000 48000 256", "open true"]);
+        }
+        settings(&mut control, latency(6.0), now).unwrap();
+        let seen = engine.take(true);
+        assert!(has(&seen, "Reconfigure 48000 128"), "{seen:?}");
+        control.handle_events(now);
+        assert_eq!(
+            logs[0].take(),
+            ["open false", "reconfigure 48000 48000 256", "open true"]
+        );
+        assert_eq!(
+            logs[1].take(),
+            ["open false", "reconfigure 48000 48000 128", "open true"]
+        );
+    }
+
+    #[test]
+    fn a_latency_change_waits_during_dop() {
+        let (mut control, mut engine, now) = open_at(&Config::default(), 10.0);
+        play_as(&mut control, 1, "mpd", now);
+        engine.take(true);
+        control.handle_events(now);
+        engine.take(true);
+        let id = control.streams().next().unwrap().id;
+        engine.send(Event::DopStarted(id, 1));
+        control.handle_events(now);
+        engine.take(true);
+        assert_eq!(control.dop_owner, Some(id));
+        settings(&mut control, latency(5.0), now).unwrap();
+        assert!(!has(&engine.take(true), "Reconfigure"));
+        control.tick(now + Duration::from_secs(1));
+        assert!(!has(&engine.take(true), "Reconfigure"));
+        // When DoP ends, the output reopens with the new period.
+        engine.send(Event::DopStopped(id));
+        control.handle_events(now + Duration::from_secs(1));
+        let seen = engine.take(true);
+        let reopen = format!("Reconfigure 48000 {}", period_frames(48000, 5.0));
+        assert!(has(&seen, &reopen), "{seen:?}");
+    }
+
+    #[test]
+    fn a_default_rate_the_config_refuses_is_422() {
+        let (mut control, mut engine, now) = open(&Config::default(), None);
+        for bad in [0, 7999, 384001] {
+            let answer = settings(&mut control, default_rate(bad), now);
+            assert_eq!(status(answer.clone()), 422, "{bad}");
+            assert_eq!(message(answer), "default_rate must be from 8000 to 384000");
+        }
+        assert!(engine.take(true).is_empty());
+        // With no client, the output moves to it, after the settle time
+        // as any change of rate with nothing playing.
+        settings(&mut control, default_rate(44100), now).unwrap();
+        control.tick(now + Duration::from_secs(1));
+        assert!(has(&engine.take(true), "Reconfigure 44100"));
+    }
+
+    #[test]
+    fn settings_are_not_stored() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        let (mut control, _engine, now) = open_at(&Config::default(), 10.0);
+        let output_volume = OutputVolume::new(None, config::BitPerfect::Auto);
+        control.restore(output_volume, path.clone(), &[]);
+        let patch = SettingsPatch {
+            bit_perfect: Some("off".into()),
+            latency_ms: Some(5.0),
+            default_rate: Some(44100),
+        };
+        settings(&mut control, patch, now).unwrap();
+        assert_eq!(control.save_at, None);
+        // A change that is stored saves the file: it has no settings.
+        control.call(Call::PatchOutput(1, volume(40)), now).unwrap();
+        control.shutdown();
+        let text = std::fs::read_to_string(&path).unwrap();
+        for key in ["bit_perfect", "latency", "default_rate"] {
+            assert!(!text.contains(key), "{key} in {text}");
+        }
+    }
+
+    #[test]
+    fn a_change_publishes_a_settings_event() {
+        let (mut control, _engine, now) = open_at(&Config::default(), 10.0);
+        let mut published = subscribe(&mut control);
+        settings(&mut control, latency(5.0), now).unwrap();
+        let seen = events(&mut published);
+        let event = ApiEvent::Settings {
+            bit_perfect: "auto".into(),
+            latency_ms: 5.0,
+            default_rate: 48000,
+        };
+        assert!(seen.contains(&event), "{seen:?}");
+        // No change, no event.
+        settings(&mut control, latency(5.0), now).unwrap();
+        let seen = events(&mut published);
+        assert!(!seen.iter().any(|e| matches!(e, ApiEvent::Settings { .. })));
+        let text = serde_json::to_string(&event).unwrap();
+        assert_eq!(
+            text,
+            r#"{"type":"settings","bit_perfect":"auto","latency_ms":5.0,"default_rate":48000}"#
+        );
     }
 }

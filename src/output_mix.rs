@@ -449,6 +449,20 @@ impl<P: Processing> OutputMix<P> {
         self.unmute_left > 0
     }
 
+    /// The output fades in over 10 ms at `rate` from its next mix, as after
+    /// a mute; the copy path waits for the end of it.
+    pub(crate) fn fade_in(&mut self, rate: u32) {
+        self.unmute_left = (rate * FADE_MS / 1000) as usize;
+    }
+
+    /// Takes the routes of the matrix in place as forced bit-perfect does,
+    /// or as they are, at once: the gains jump to their new values.
+    pub(crate) fn set_forced(&mut self, forced: bool) {
+        self.gains = gains_of(&self.matrix, forced);
+        self.routes = Routes::of(&self.matrix, &self.gains, forced, self.channels);
+        self.finish_ramp();
+    }
+
     /// The output was opened at `rate`. A fade in still due is counted in
     /// frames of the old rate: it starts again, a whole 10 ms at this one.
     pub(crate) fn reopened(&mut self, rate: u32) {

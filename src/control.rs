@@ -13,7 +13,7 @@ mod plugins;
 use crate::adaptive::{Adaptive, MAX_DRIFT};
 use crate::api::ApiEvent;
 use crate::capture::{Capture, OpenError};
-use crate::config::{Config, Format, Idle, OutputConfig, PluginPlace, Quality};
+use crate::config::{BitPerfect, Config, Format, Idle, OutputConfig, PluginPlace, Quality};
 use crate::counters::{Counters, OutputCounters};
 use crate::dop;
 use crate::drift::SANE;
@@ -561,6 +561,9 @@ struct FurtherOutput {
     channels: usize,
     /// Its own latency target, or the master's.
     latency_ms: f32,
+    /// The config gives it a `latency_ms` of its own, which a change of the
+    /// master's leaves as it is.
+    own_latency: bool,
     /// Its card's part of the path as its writer was last given it.
     current: Option<(u32, u32, f64)>,
     idle: Idle,
@@ -808,6 +811,16 @@ struct AnalogInput {
 
 pub struct Control {
     latency_ms: f32,
+    /// The latency the daemon started with, which the rings, the feeds and
+    /// the delay line were sized for: the API may not go above it.
+    startup_latency_ms: f32,
+    /// A change of `latency_ms` waits for the outputs to reopen at it.
+    latency_due: bool,
+    /// The bit-perfect mode, as the config sets it or the API since.
+    bit_perfect: BitPerfect,
+    /// The rate the output takes with no client, as the config sets it or
+    /// the API since.
+    default_rate: u32,
     quality: Quality,
     format: Format,
     /// The master's idle rule, and what the config says.
@@ -940,6 +953,10 @@ impl Control {
         let plugins = plugins::entries(1, &config.plugins, &mut libraries);
         Control {
             latency_ms,
+            startup_latency_ms: latency_ms,
+            latency_due: false,
+            bit_perfect: config.bit_perfect,
+            default_rate: config.default_rate,
             quality: config.resampling,
             format: config.format,
             idle: config.idle,
@@ -1016,6 +1033,7 @@ impl Control {
             card: config.card,
             channels: config.channels,
             latency_ms,
+            own_latency: config.latency_ms.is_some(),
             current: None,
             idle: config.idle,
             config_idle: config.idle,
@@ -1403,9 +1421,13 @@ impl Control {
     ) -> Answer {
         // The client converts its format; the ring is always S32 stereo.
         let _ = format;
+        // Sized for the latency the daemon started with, the longest the
+        // API can set, so that a ring fits every period the output takes
+        // while it plays.
+        let latency_ms = self.startup_latency_ms;
         if !(MIN_RATE..=MAX_RATE).contains(&rate)
             || channels == 0
-            || buffer_frames < min_buffer_frames(rate, self.latency_ms)
+            || buffer_frames < min_buffer_frames(rate, latency_ms)
         {
             return Answer::error(libc::EINVAL);
         }
@@ -1420,7 +1442,7 @@ impl Control {
             }
             self.remove_recorder(old, &mut batch);
         }
-        let capacity = buffer_frames.max(min_ring_frames(rate, self.latency_ms));
+        let capacity = buffer_frames.max(min_ring_frames(rate, latency_ms));
         let made = Ring::create(capacity).and_then(|(ring, memfd)| {
             let view = HeaderView::map(memfd.as_fd())?;
             let wake = eventfd()?;
@@ -1649,7 +1671,8 @@ impl Control {
             Some((rate, _)) => rate,
             None => self.policy.current(),
         };
-        let least = RECORDER_PERIODS * period_frames(rate, self.latency_ms);
+        // As a stream's ring, for the latency the daemon started with.
+        let least = RECORDER_PERIODS * period_frames(rate, self.startup_latency_ms);
         let capacity = buffer_frames.max(least);
         let mut batch = Vec::new();
         if let Some(old) = self.conns.get_mut(&conn).and_then(|c| c.stream.take()) {
@@ -1923,18 +1946,22 @@ impl Control {
             self.sync_resamplers(batch);
             return;
         };
+        // A new latency reopens at once, as an urgent change of rate does,
+        // but not under a DoP stream, which a reopen would cut.
+        let latency = self.latency_due && self.dop_owner.is_none();
         let reopen = match self.output {
             None => running,
-            Some((rate, _)) if rate == want => {
+            Some((rate, _)) if rate == want && !latency => {
                 self.switch_at = None;
                 false
             }
+            Some((rate, _)) if rate == want => true,
             Some(_) => {
                 let due = self.switch_at.is_some_and(|at| now >= at);
-                if !urgent && !due {
+                if !urgent && !due && !latency {
                     self.switch_at.get_or_insert(now + SETTLE);
                 }
-                urgent || due
+                urgent || due || latency
             }
         };
         if reopen {
@@ -2174,6 +2201,9 @@ impl Control {
         };
         let period = period_frames(rate, self.latency_ms);
         eprintln!("aas: output at {rate} Hz, {period} frames per period");
+        // The master takes its latency here, the further outputs in
+        // `plan_further`.
+        self.latency_due = false;
         // The cycle ran on the timer at this rate, and the further outputs
         // played on: the card opens under them, and they go on as they are.
         let resumed = self.parked.take() == Some((rate, period));
@@ -3373,6 +3403,7 @@ mod tests {
                     }
                     Command::RemoveOutput(index) => (format!("RemoveOutput {index}"), None),
                     Command::SetDelay(frames) => (format!("SetDelay {frames}"), None),
+                    Command::SetMode(mode) => (format!("SetMode {mode:?}"), None),
                     Command::Shutdown => ("Shutdown".into(), None),
                 };
                 seen.push(name);
@@ -3394,10 +3425,19 @@ mod tests {
         config: &Config,
         opener: Option<&Opener>,
     ) -> (Control, FakeEngine, Instant) {
+        started_at(config, opener, 12.0)
+    }
+
+    /// The same, the daemon started with a latency of `latency_ms`.
+    pub(super) fn started_at(
+        config: &Config,
+        opener: Option<&Opener>,
+        latency_ms: f32,
+    ) -> (Control, FakeEngine, Instant) {
         let (commands, engine_commands) = rtrb::RingBuffer::new(256);
         let (engine_events, events) = rtrb::RingBuffer::new(256);
         let audio = std::thread::current();
-        let mut control = Control::new(config, 12.0, Vec::new(), commands, events, audio);
+        let mut control = Control::new(config, latency_ms, Vec::new(), commands, events, audio);
         if let Some(opener) = opener {
             control.set_analog(opener.open());
         }

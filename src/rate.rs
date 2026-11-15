@@ -32,6 +32,8 @@ pub struct RatePolicy {
     dop_supported: Option<Vec<u32>>,
     /// The rate set by the ordinary rules, ignoring DoP.
     base: u32,
+    /// A new default rate set while clients play, for when the last stops.
+    next_base: Option<u32>,
     clients: Vec<Active>,
     dop: Option<ClientId>,
     /// When a switch to the remaining client's rate is due.
@@ -44,6 +46,7 @@ impl RatePolicy {
             supported,
             dop_supported: None,
             base: default_rate,
+            next_base: None,
             clients: Vec::new(),
             dop: None,
             switch_at: None,
@@ -111,7 +114,8 @@ impl RatePolicy {
             return;
         }
         if self.clients.is_empty() {
-            self.base = self.nearest(output);
+            let base = self.next_base.take().unwrap_or(output);
+            self.base = self.nearest(base);
             self.switch_at = None;
             return;
         }
@@ -119,6 +123,18 @@ impl RatePolicy {
             self.switch_at.get_or_insert(now + SETTLE);
         } else {
             self.switch_at = None;
+        }
+    }
+
+    /// A new default rate, the one the output takes with no client. It
+    /// applies at once while no client plays, else when the last one
+    /// stops, in place of the rate the card runs at then.
+    pub fn set_base(&mut self, rate: u32) {
+        if self.clients.is_empty() {
+            self.next_base = None;
+            self.base = self.nearest(rate);
+        } else {
+            self.next_base = Some(rate);
         }
     }
 
@@ -213,6 +229,27 @@ mod tests {
         let mut p = policy();
         assert_eq!(p.current(), 48000);
         p.client_started(1, 44100, T0);
+        assert_eq!(p.current(), 44100);
+    }
+
+    #[test]
+    fn a_new_base_applies_with_no_client() {
+        let mut p = policy();
+        p.set_base(44100);
+        assert_eq!(p.current(), 44100);
+        // Taken to the nearest rate the card takes, as a client's is.
+        p.set_base(88200);
+        assert_eq!(p.current(), 96000);
+        // Not while a client plays: when the last one stops, the card
+        // takes the new base rather than keep the client's rate.
+        p.client_started(1, 192000, T0);
+        p.set_base(48000);
+        assert_eq!(p.current(), 192000);
+        p.client_stopped(1, T0 + ms(10));
+        assert_eq!(p.current(), 48000);
+        // Once applied, the card keeps a client's rate again.
+        p.client_started(1, 44100, T0 + ms(20));
+        p.client_stopped(1, T0 + ms(30));
         assert_eq!(p.current(), 44100);
     }
 

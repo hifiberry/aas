@@ -1138,6 +1138,13 @@ pub enum Command {
     /// While a DoP stream holds the output it changes at once, as a reopen
     /// would cut the stream.
     SetDelay(u32),
+    /// The bit-perfect mode, with no reopen. While something is heard and
+    /// no DoP stream has a claim, the cycle before it fades every output
+    /// out over its period, as before a reopen, and the cycle after it
+    /// fades them in over 10 ms: a jump of the level, or of the plugins
+    /// going in or out, is never heard. In forced bit-perfect the master's
+    /// routes are taken at 0 dB, as `SetMatrix` takes them.
+    SetMode(BitPerfect),
     Shutdown,
 }
 
@@ -1381,6 +1388,19 @@ impl DelayLine {
     }
 }
 
+/// Whether a period fades to silence ahead of the commands queued, and
+/// for what.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FadeOut {
+    No,
+    /// A reopen or a close: what leaves the delay line fades too, since
+    /// the close empties it.
+    Reopen,
+    /// A change of the bit-perfect mode: the fade goes into the line, and
+    /// the audio fades in again after it.
+    Mode,
+}
+
 /// Runs the cycles of one output.
 pub struct Engine<P: Processing, S: Sink> {
     sink: S,
@@ -1529,9 +1549,14 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         let waited = self.wait_room();
         let mut start = Instant::now();
         self.woke_ns = self.wake_stamp();
-        let result = if self.open && !self.faded && self.fade_queued() {
+        let ahead = if self.open && !self.faded {
+            self.fade_queued()
+        } else {
+            FadeOut::No
+        };
+        let result = if ahead != FadeOut::No {
             self.faded = true;
-            self.render(true, start)
+            self.render(ahead, start)
         } else {
             self.drain_commands();
             let reopening = self.reopen.is_some();
@@ -1545,7 +1570,7 @@ impl<P: Processing, S: Sink> Engine<P, S> {
                         self.woke_ns = self.wake_stamp();
                     }
                     if self.open {
-                        self.render(false, start)
+                        self.render(FadeOut::No, start)
                     } else {
                         Ok(())
                     }
@@ -1640,24 +1665,36 @@ impl<P: Processing, S: Sink> Engine<P, S> {
     /// period fades to silence first: a reconfigure, or a close or the
     /// shutdown while the delay line still holds sound. Without the line a
     /// close comes when nothing plays, and cuts at once as it always did.
-    /// Looks through the queue without taking anything from it.
-    fn fade_queued(&mut self) -> bool {
+    /// Looks through the queue without taking anything from it. A change
+    /// of the bit-perfect mode while something is heard fades too, though
+    /// not the delay line: the mode changes what enters it, and the fade
+    /// goes through it with the audio.
+    fn fade_queued(&mut self) -> FadeOut {
         let waiting = self.commands.slots();
         let Ok(chunk) = self.commands.read_chunk(waiting) else {
-            return false;
+            return FadeOut::No;
         };
         let (first, second) = chunk.as_slices();
-        let (mut reconfigure, mut close) = (false, false);
+        let (mut reconfigure, mut close, mut mode) = (false, false, false);
         for command in first.iter().chain(second) {
             match command {
                 Command::Reconfigure { .. } => reconfigure = true,
                 Command::CloseOutput | Command::ParkOutput { .. } | Command::Shutdown => {
                     close = true;
                 }
+                Command::SetMode(m) => mode |= *m != self.mode,
                 _ => {}
             }
         }
-        reconfigure || close && self.delay.holds_sound()
+        // A DoP stream is never faded; a change of mode leaves it as it is.
+        let dop = self.table.iter().any(|s| s.dop_claim != 0);
+        if reconfigure || close && self.delay.holds_sound() {
+            FadeOut::Reopen
+        } else if mode && self.heard() && !dop {
+            FadeOut::Mode
+        } else {
+            FadeOut::No
+        }
     }
 
     /// Stops early when the backlog is nearly full, which leaves the rest of
@@ -1776,6 +1813,7 @@ impl<P: Processing, S: Sink> Engine<P, S> {
                 let faded = self.open && !dop && sound;
                 self.delay.set(frames, faded.then_some(fade));
             }
+            Command::SetMode(mode) => self.set_mode(mode),
             Command::Shutdown => {
                 self.cancel_reopen();
                 self.close();
@@ -2112,6 +2150,25 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         self.emit(Event::OldMatrix(output, old, refused));
     }
 
+    /// Changes the bit-perfect mode, as `Command::SetMode` says. A period
+    /// faded out ahead of it, so every output fades in from its next mix.
+    /// The master's routes are taken again for the mode. Plugins that come
+    /// back from being bypassed are reset before they run, as after any
+    /// period that did not pass them.
+    fn set_mode(&mut self, mode: BitPerfect) {
+        if mode == self.mode {
+            return;
+        }
+        self.mode = mode;
+        self.master.set_forced(mode == BitPerfect::Forced);
+        if std::mem::take(&mut self.faded) {
+            let rate = self.rate;
+            for mix in self.mixes_mut() {
+                mix.fade_in(rate);
+            }
+        }
+    }
+
     /// Running sources that are heard this cycle.
     fn audible(&self) -> impl Iterator<Item = &Source> {
         let (rate, routed) = (self.rate, self.master.dop_routing.is_some());
@@ -2119,13 +2176,15 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         sources.filter(move |s| s.running && !s.muted(rate, routed) && s.plays)
     }
 
-    /// Plays one period. `fade_out` takes the level down to zero over it.
+    /// Plays one period. A fade out takes the level down to zero over it,
+    /// as `FadeOut` says.
     ///
     /// The cycle has waited for room on the card before this and only now
     /// reads the clients, so what it reads is written at once and waits
     /// behind no more than the card's buffer. The cycle is timed from
     /// `start`, the end of that wait.
-    fn render(&mut self, fade_out: bool, start: Instant) -> Result<(), SinkError> {
+    fn render(&mut self, fade: FadeOut, start: Instant) -> Result<(), SinkError> {
+        let fade_out = fade != FadeOut::No;
         self.master.route_dop();
         let store = &mut self.store;
         let plugins = plugins_apply(self.mode);
@@ -2176,7 +2235,7 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         }
         // The fade before a reopen or a close was played into the line,
         // which the close empties: it fades what leaves the line instead.
-        if fade_out && owner.is_none() && self.delay.frames > 0 {
+        if fade == FadeOut::Reopen && owner.is_none() && self.delay.frames > 0 {
             self.delay.fade_out(samples);
         }
         let before_write = Instant::now();
@@ -3298,6 +3357,78 @@ mod tests {
         rig.send(Command::SetGain(0, 0.1));
         rig.cycle();
         assert_eq!(rig.last_periods(1), frames(1234, PERIOD));
+    }
+
+    #[test]
+    fn set_mode_off_stops_the_copy_path() {
+        let mut rig = Rig::<F32>::new(BitPerfect::Auto);
+        let published = |rig: &Rig<F32>| rig.counters.bit_perfect.load(Relaxed);
+        let mut a = client(1);
+        rig.add(&mut a);
+        let input = frames(ODD, PERIOD);
+        a.ring.write(&input);
+        rig.cycle();
+        assert_eq!(published(&rig), 0);
+        assert_eq!(rig.last_periods(1), input);
+        rig.send(Command::SetMode(BitPerfect::Off));
+        let engine = &mut rig.engine;
+        assert_no_alloc(|| {
+            for _ in 0..4 {
+                a.ring.write(&input);
+                engine.cycle().unwrap();
+            }
+        });
+        assert_eq!(published(&rig), NotBitPerfect::Disabled.code());
+        // The mix path: an `f32` mix cannot carry all 32 bits.
+        assert_ne!(rig.last_periods(1), input);
+        // Back to automatic, the copy path plays again once the fade in
+        // of 10 ms is over.
+        rig.send(Command::SetMode(BitPerfect::Auto));
+        for _ in 0..12 {
+            a.ring.write(&input);
+            rig.cycle();
+        }
+        assert_eq!(published(&rig), 0);
+        assert_eq!(rig.last_periods(1), input);
+    }
+
+    #[test]
+    fn a_mode_change_while_heard_dips_through_silence() {
+        let mut rig = Rig::<I32>::new(BitPerfect::Auto);
+        let mut a = client(1);
+        a.source.as_mut().unwrap().gain = 0.5;
+        rig.add(&mut a);
+        let level = 1 << 24;
+        for _ in 0..4 {
+            a.ring.write(&frames(level, PERIOD));
+            rig.cycle();
+        }
+        assert_eq!(rig.last_periods(1), frames(level / 2, PERIOD));
+        // Forced: the source's gain no longer applies, and the level
+        // doubles, through a fade out and a fade in rather than a jump.
+        rig.send(Command::SetMode(BitPerfect::Forced));
+        for _ in 0..30 {
+            a.ring.write(&frames(level, PERIOD));
+            rig.cycle();
+        }
+        let played = rig.last_periods(30);
+        let steps = played.windows(2).map(|w| (w[1][0] - w[0][0]).abs());
+        let largest = steps.max().unwrap();
+        assert!(largest < level / 32, "a step of {largest}");
+        assert!(played.iter().any(|f| f[0].abs() < level / 32));
+        assert_eq!(played.last(), Some(&[level, -level]));
+    }
+
+    #[test]
+    fn a_mode_change_with_nothing_heard_applies_at_once() {
+        let mut rig = Rig::<F32>::new(BitPerfect::Off);
+        rig.send(Command::SetMode(BitPerfect::Auto));
+        rig.cycle();
+        let mut a = client(1);
+        rig.add(&mut a);
+        a.ring.write(&frames(ODD, PERIOD));
+        rig.cycle();
+        assert_eq!(rig.last_periods(1), frames(ODD, PERIOD));
     }
 
     /// 1 kHz at `from` through the engine at 48 kHz, as measured at the sink.

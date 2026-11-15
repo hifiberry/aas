@@ -563,3 +563,47 @@ fn graph_as_dot() {
     let (status, _) = daemon.get("/graph?format=svg");
     assert_eq!(status, 400);
 }
+
+#[test]
+fn lowering_the_latency_while_playing() {
+    let daemon = Daemon::start();
+    let mut client = daemon.playing(16384);
+    running_client(&daemon);
+    let period = |daemon: &Daemon| daemon.get("/metrics").1["master"]["period_frames"].clone();
+    assert_eq!(period(&daemon), json!(64));
+    let (status, settings) = daemon.get("/settings");
+    assert_eq!(status, 200);
+    assert_eq!(
+        settings,
+        json!({"bit_perfect": "auto", "latency_ms": LATENCY_MS, "default_rate": 48000,
+               "format": "f32", "resampling": "high"})
+    );
+    let before = client.underruns();
+    let half = format!(r#"{{"latency_ms": {}}}"#, LATENCY_MS / 2.0);
+    let (status, body) = daemon.patch("/settings", &half);
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["latency_ms"], json!(LATENCY_MS / 2.0));
+    // 2 ms: two periods of 32 frames, the shortest there is.
+    assert!(wait_for(|| {
+        top_up(&mut client);
+        period(&daemon) == json!(32)
+    }));
+    let until = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < until {
+        top_up(&mut client);
+        thread::sleep(Duration::from_millis(5));
+    }
+    let underruns = client.underruns() - before;
+    assert!(underruns <= 2, "{underruns} underruns");
+    // What cannot change at run time is refused, and changes nothing.
+    let (status, body) = daemon.patch("/settings", r#"{"format": "f64"}"#);
+    assert_eq!(status, 422);
+    assert_eq!(body["error"], json!("format changes only in the config"));
+    let (status, body) = daemon.patch("/settings", r#"{"latency_ms": 8}"#);
+    assert_eq!(status, 422);
+    assert_eq!(
+        body["error"],
+        json!("latency_ms above the 4 ms the daemon started with needs a restart")
+    );
+    assert_eq!(period(&daemon), json!(32));
+}

@@ -34,6 +34,45 @@ pub enum Call {
     Plugins,
     Plugin(PluginId),
     PatchPlugin(PluginId, PluginPatch),
+    /// `GET /settings`.
+    Settings,
+    PatchSettings(SettingsPatch),
+}
+
+/// The body of `PATCH /settings`. A field left out stays as it is. A
+/// change lasts until the next restart.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SettingsPatch {
+    /// `"auto"`, `"forced"` or `"off"`.
+    pub bit_perfect: Option<String>,
+    pub latency_ms: Option<f32>,
+    pub default_rate: Option<u32>,
+}
+
+/// The settings of the config that cannot change while the daemon runs,
+/// which a body of `PATCH /settings` may not name.
+pub const FIXED_SETTINGS: [&str; 2] = ["format", "resampling"];
+
+/// `GET /settings`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SettingsView {
+    pub bit_perfect: String,
+    pub latency_ms: f32,
+    pub default_rate: u32,
+    /// The processing format, which is the engine's type.
+    pub format: String,
+    pub resampling: String,
+}
+
+impl SettingsView {
+    pub fn event(&self) -> ApiEvent {
+        ApiEvent::Settings {
+            bit_perfect: self.bit_perfect.clone(),
+            latency_ms: self.latency_ms,
+            default_rate: self.default_rate,
+        }
+    }
 }
 
 /// A plugin: its output, numbered as in `/outputs`, its place, and its
@@ -286,6 +325,12 @@ pub enum ApiEvent {
         id: String,
         enabled: bool,
         params: BTreeMap<String, f64>,
+    },
+    /// The settings `PATCH /settings` changes, after a change.
+    Settings {
+        bit_perfect: String,
+        latency_ms: f32,
+        default_rate: u32,
     },
     /// The subscriber fell behind and should read `/state` again.
     Resync,

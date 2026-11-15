@@ -8,7 +8,7 @@
 
 mod conns;
 
-use crate::api::{ApiCall, ApiError, ApiEvent, Call, PluginId};
+use crate::api::{ApiCall, ApiError, ApiEvent, Call, FIXED_SETTINGS, PluginId, SettingsPatch};
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -133,6 +133,10 @@ fn router(shared: Arc<Shared>) -> Router {
         .route(
             "/plugins/{output}/{place}/{index}",
             get(get_plugin).patch(patch_plugin),
+        )
+        .route(
+            "/settings",
+            get(|s| ask(s, Call::Settings)).patch(patch_settings),
         )
         .route("/events", get(events))
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY))
@@ -317,6 +321,22 @@ async fn patch_plugin(s: State<Arc<Shared>>, id: PluginPath, body: BodyOf) -> Re
     ask_for(s, call).await
 }
 
+/// The body of `PATCH /settings`. A setting the config alone changes is
+/// 422, as a value the config would refuse is; any other unknown field is
+/// 400, as in every body.
+fn settings_patch(body: &BodyOf) -> Result<SettingsPatch, ApiError> {
+    let value: serde_json::Value = parse(body)?;
+    if let Some(key) = FIXED_SETTINGS.iter().find(|k| value.get(**k).is_some()) {
+        let message = format!("{key} changes only in the config");
+        return Err(ApiError::unprocessable(message));
+    }
+    serde_json::from_value(value).map_err(|e| ApiError::bad_request(e.to_string()))
+}
+
+async fn patch_settings(s: State<Arc<Shared>>, body: BodyOf) -> Response {
+    ask_for(s, settings_patch(&body).map(Call::PatchSettings)).await
+}
+
 async fn put_matrix(s: State<Arc<Shared>>, body: BodyOf) -> Response {
     ask_for(s, parse(&body).map(Call::PutMatrix)).await
 }
@@ -493,6 +513,21 @@ mod tests {
         let response = timed_runtime().block_on(ask(state, Call::State));
         let (status, _) = timed_runtime().block_on(status_and_body(response));
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn a_setting_the_config_alone_changes_is_422() {
+        let body = |text: &str| -> BodyOf { Ok(Bytes::from(text.to_string())) };
+        for key in ["format", "resampling"] {
+            let text = format!(r#"{{"latency_ms": 4, "{key}": "f64"}}"#);
+            let e = settings_patch(&body(&text)).unwrap_err();
+            assert_eq!(e.status, 422, "{key}");
+            assert_eq!(e.message, format!("{key} changes only in the config"));
+        }
+        let e = settings_patch(&body(r#"{"latency": 4}"#)).unwrap_err();
+        assert_eq!(e.status, 400);
+        let patch = settings_patch(&body(r#"{"bit_perfect": "off"}"#)).unwrap();
+        assert_eq!(patch.bit_perfect.as_deref(), Some("off"));
     }
 
     #[test]

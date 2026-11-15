@@ -330,6 +330,7 @@ without that prefix.
 | `GET`, `PUT /matrix` | Every output's routes |
 | `GET /plugins`, `GET /plugins/{output}/{place}/{index}` | Every plugin, or one |
 | `PATCH /plugins/{output}/{place}/{index}` | Change a plugin's values, or enable or disable it |
+| `GET`, `PATCH /settings` | The bit-perfect mode, the latency target and the default rate, until the next restart |
 | WebSocket `/events` | One JSON object per change |
 
 Outputs are numbered as in the config's error messages: the master is 1, the
@@ -377,6 +378,21 @@ over and its latency counts as 0; enabling or disabling fades over 10 ms, and a
 plugin enabled again starts from silence, with no old tail. `detect` cannot be
 disabled, nor can a plugin whose channel counts differ: both are 422.
 
+`GET /settings` gives `bit_perfect`, `latency_ms` and `default_rate`, which
+`PATCH` changes with the values and messages of the config keys, and `format`
+and `resampling`, which change only in the config: naming either in a `PATCH`
+is 422. A change lasts until the next restart; it is not kept in the state file.
+A new `bit_perfect` applies at once, with no reopen: while something plays, the
+output fades out over a period and in again over 10 ms. `forced` is 422 while a
+chain changes the channel count, as in the config. A new `latency_ms` reopens
+every output with its new period, as a change of rate does, and waits for a DoP
+stream to end; a further output with its own `latency_ms` keeps it. A latency
+above the one the daemon started with is 422, since the clients' rings, the
+further outputs' feeds and the master's delay line were sized for that one; a
+client that connects later still gets a ring for it, and needs a buffer as long.
+A new `default_rate` applies when no client plays: at once, or when the last
+one stops, in place of the rate the card ran at.
+
 A field left out of a `PATCH` stays as it is. A body that does not parse or has
 an unknown field is 400, an unknown output or input is 404, and a value out of
 range or a matrix that breaks a rule is 422; nothing is clamped. A body over
@@ -391,6 +407,7 @@ curl -s 127.0.0.1:2718/state
 curl -s -X PATCH -d '{"volume": 60}' 127.0.0.1:2718/outputs/1
 curl -s -X PATCH -d '{"params": {"balance": 0.2}}' 127.0.0.1:2718/plugins/1/output/0
 curl -s -X PATCH -d '{"volume_db": -6}' 127.0.0.1:2718/inputs/clients/mpd
+curl -s -X PATCH -d '{"bit_perfect": "forced"}' 127.0.0.1:2718/settings
 curl -s -X PUT 127.0.0.1:2718/matrix -d \
   '{"outputs": [{"output": 1, "routes": [{"from": "players.left", "to": 2}, {"from": "players.right", "to": 1}]}]}'
 ```
@@ -410,8 +427,9 @@ and a value out of range is answered like this, with status 422:
 WebSocket `/events` sends a JSON object with a `type` for each change:
 `output` (its volume or offset, idle and state), `input` (`id` is `analog` or
 `clients/<name>`, with `volume_db` and `muted`), `client` (a name `connected`,
-`running`, `stopped` or `gone`), `matrix` (an output's routes), `rate` and
-`plugin` (its `id`, whether it is `enabled`, and its `params` by name). A
+`running`, `stopped` or `gone`), `matrix` (an output's routes), `rate`,
+`plugin` (its `id`, whether it is `enabled`, and its `params` by name) and
+`settings` (`bit_perfect`, `latency_ms` and `default_rate`). A
 subscriber that falls more than 256 events behind gets `{"type": "resync"}`
 and should read `/state` again; nothing waits for it. Clients are told apart by
 name alone, so with two processes of one name, `gone` for the name means that
@@ -428,7 +446,7 @@ place, the position and the plugin's type and path, and apply only while the
 config has that plugin there. A stored value
 that has a config key applies only while the config still says what it said
 when the value was stored, so an edit of the config always wins. The API never
-rewrites the config.
+rewrites the config, and what `/settings` changes is not kept.
 
 ## Writing a plugin
 

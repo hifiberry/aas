@@ -73,6 +73,12 @@ impl OutputVolume {
         }
     }
 
+    /// Takes the bit-perfect mode again, as `new` does: in forced
+    /// bit-perfect a gain the engine would apply has no effect.
+    pub fn set_mode(&mut self, bit_perfect: BitPerfect) {
+        self.forced = bit_perfect == BitPerfect::Forced;
+    }
+
     /// Sets the volume, from 0 to 100. More than 100 counts as 100. In
     /// hardware mode this writes to the card's mixer.
     pub fn set(&mut self, percent: u8) {
