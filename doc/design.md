@@ -1291,8 +1291,9 @@ and 2717.
 - HTTP with JSON, plus WebSocket, built with `axum` and `tokio`.
 - It binds to `127.0.0.1` on one new port and sits behind nginx at `/api/aas/v1`.
 - `aas` implements no authentication. `hifiberry-auth` handles it at the gateway. A
-  manifest in `/etc/hifiberry/auth.d/` marks volume as `ok`, and plugin, matrix and
-  output changes as `risky`.
+  manifest in `/etc/hifiberry/auth.d/` marks every audio change as `ok`, as the
+  HiFiBerry OS security model classes audio and DSP, and only `/settings` as
+  `risky`.
 - It runs inside the daemon on a normal thread. Changes reach the audio thread
   through a lock-free queue, so an API call cannot cause a dropout.
 - The command line tool uses the same API.
@@ -1408,6 +1409,163 @@ All of this is *(call)*:
   rate and whether it runs, and whether the master is bit-perfect and, if not,
   the reason. The engine publishes its bit-perfect decision through its
   counters, without a lock, when it changes.
+
+### The API in part 2
+
+All of this is *(call)*. Paths are as the daemon sees them; nginx puts
+`/api/aas/v1` in front.
+
+- **Who reads what.** Everything but `/levels` is answered by the control
+  thread, as in part 1, from what it holds and from counters the audio and
+  writer threads publish without locks. `/levels` is read by the API thread
+  itself from atomics the audio thread publishes, so ten frames a second never
+  wake the control thread.
+- **`GET /metrics`.** Values since the daemon started, never reset:
+  - The master: cycles, the average and worst cycle time and the buffer time
+    they are measured against, xruns, wake gaps, the worst gap, and the time
+    and length of the last gap. The average needs a new running sum of cycle
+    times beside the worst.
+  - Each further output: xruns, wake gaps, the worst gap, starves, overflows,
+    skipped drift readings, the drift in ppm, whether it is locked, and its
+    resampler's ratio. The writer publishes the ratio, as it does the drift,
+    since a ratio derived from the drift is wrong when the card's rate is not
+    the master's. The control thread is given each output's counters, which
+    today only the stop log reads.
+  - Each output's latency: its period, the frames its card holds, and for the
+    master the delay line it is held at.
+  - Each connected stream, by name: its rate, whether it is resampled, its
+    underruns, its ring's fill and size, and its latency, the header's
+    `output_delay_frames`.
+  - The analog input: open or not, padded and dropped frames, its latency.
+  - Each plugin, by its id (below): its average and worst time per cycle. The
+    chain reads the clock around each plugin it runs and adds to atomics the
+    control thread shares with it. That is two clock reads per plugin per
+    cycle, a few hundred nanoseconds on the Pi 3. The control thread creates
+    them once per plugin id and hands the same ones to every rebuild of that
+    chain, so a rate change does not reset them *(builder's call)*. Whether a
+    plugin is neutral, and its latency, are published the same way, since the
+    plugins themselves live on the audio thread.
+- **`GET /graph`.** The processing graph as the control thread holds it:
+  sources (each connected client by name, the analog input with its chain),
+  the buses, and per output its matrix, its volume, its `mix` and `output`
+  chains in order, the master's delay line and the card. Each node gives its
+  rate, channels, format and latency; a plugin gives its id, its time per
+  cycle and whether the chain converts its format for it. JSON by default,
+  Graphviz DOT with `?format=dot`, as `text/vnd.graphviz`.
+- **Plugin ids.** A plugin is `{output}/{place}/{index}`: the output's number
+  as in part 1, the place `analog`, `mix` or `output`, and its position in
+  that chain from 0. So the paths are `/plugins/1/mix/0`, a departure from the
+  table's `/plugins/{id}`: each part of the id is a segment the auth manifest
+  can match.
+- **`GET /plugins`.** Every plugin of every output, in chain order: its id,
+  type (`detect`, `balance` or `library`, with the library's path and the name
+  its descriptor gives), whether it is enabled, whether it is neutral now,
+  and its parameters with name, unit, type, range, default, the names of an
+  enumeration's values, and the value it has. `GET /plugins/{output}/{place}/{index}`
+  gives one.
+- **`PATCH /plugins/{output}/{place}/{index}`.** `{"params": {"name": value},
+  "enabled": bool}`, either or both. A value is checked against its parameter
+  like the config's: out of range, not a whole number for an integer, or an
+  unknown name is 422, never clamped. A text parameter is 422: it changes only
+  in the config, since setting one builds a new chain. A value goes to the
+  audio thread as the engine's existing `SetParam`, which runs the plugin's
+  `set_param` between blocks, without allocating. The control thread keeps the
+  value in its copy of the plugin's config, and sets it in every chain it
+  holds ready for another rate, so a rebuild at a rate change keeps it. A
+  plugin smooths its own parameter changes, as `gain` does.
+- **Enabled.** A disabled plugin is passed over by its chain and counts as
+  neutral. Enabling and disabling crossfade over 10 ms between the plugin's
+  input and its output, with one more buffer per chain that holds a plugin,
+  allocated when it is built. A plugin that is enabled again is `reset` first,
+  so it plays no old tail. `detect` cannot be disabled, since the analog input
+  needs it, nor can a plugin whose channel counts differ, since its chain
+  would not fit: both are 422.
+- **Plugins in the state file.** Each plugin's values and whether it is
+  enabled are kept, keyed by the output's card, the place, the position, and
+  the plugin's type and path. A stored value applies only while the config
+  still has that plugin there, and the config's value for that parameter is
+  the one stored with it, as for every value in part 1. So an edit of the
+  config wins. A plugin is enabled unless the state file says otherwise. A
+  disabled plugin's latency counts as 0.
+- **`GET` and `PATCH /settings`.** `bit_perfect`, `latency_ms` and
+  `default_rate`, with `format` and `resampling` given but not changeable,
+  since the format is the engine's type. A change lasts until the next
+  restart: it is not stored, and the config is never rewritten.
+  - `bit_perfect` goes to the engine as a new command, with no reopen.
+    `forced` is refused with 422 while a chain changes the channel count, as
+    the config refuses it. The control thread takes the volume mode again as
+    at startup.
+  - `latency_ms` takes effect as a rate change does, and waits during DoP as
+    one does: every output reopens
+    with the new period and further outputs are aligned again; one with its
+    own `latency_ms` keeps it. A latency above the one the daemon started with
+    is 422: the rings of clients already playing, the feeds and the delay line
+    were sized for that one, and a longer one needs a restart.
+  - `default_rate` takes one of the rates the config takes. It applies at the
+    next rate decision with no client, as the config's does.
+  - Each change sends a `settings` event on `/events`.
+- **`/levels`.** WebSocket, a binary frame every 100 ms per subscriber. Each
+  frame is one meter after another: a byte for the meter (1 to 4 the output,
+  16 the analog input), a byte for its channels n, then per channel a byte
+  each for RMS and peak, then a byte with a bit per channel that clipped.
+  RMS and peak run from 0 at -60 dBFS or less to 255 at 0 dBFS, as the
+  `vu-meter` service's bytes do, so the web UI's meter needs only the new
+  framing.
+  - An output is measured after its chains, in the processing format, before
+    the card's conversion: what the card plays. A sample at or above full
+    scale is a clip. During DoP an output reads as silence, since its samples
+    are not PCM. The analog input is measured as captured, before its chain,
+    which is what setting its volume needs.
+  - A meter whose newest window is older than two windows reads as silence:
+    an output closed or parked for idle, or an analog input with no capture
+    open, runs no cycles, and its last level must not stay on the meter
+    *(builder's call)*. Every frame carries every meter, so its layout does
+    not change while the daemon runs.
+  - The audio thread sums squares and keeps the peak per channel over windows
+    of a tenth of a second of its own frames, and publishes each finished
+    window into atomics with a counter. A reader takes the newest window, so
+    nothing resets between the threads and no window is half read. Metering
+    always runs, as all monitoring does.
+  - A subscriber that does not read loses frames, never delays one for
+    others. It is pinged as on `/events`, so the idle close spares it.
+- **The auth manifest.** `dist/auth.d/aas.json`, installed to
+  `/etc/hifiberry/auth.d/aas.json`, `match_prefix` `/api/aas/v1`, default tier
+  `risky`. The HiFiBerry OS security model classes audio and DSP (volume, EQ,
+  routing, the graph) as everyday music use, so every audio change is `ok`:
+  every `GET`, so `/events` and `/levels` too, `PATCH /outputs/*`, `PATCH
+  /inputs/**`, `PUT /matrix` and `PATCH /plugins/**`. `PATCH /settings` is
+  `risky`, since it changes how the daemon runs, not what plays; so is
+  anything not listed. This departs from the first version of this design,
+  which had plugin, matrix and output changes `risky` *(owner's call)*. `hifiberry-auth` reads its manifests only at
+  startup, so the install restarts it when it runs.
+- **The nginx location.** `dist/nginx/hifiberry-aas.nginx`, installed to
+  `/etc/nginx/hifiberry-api.d/`, after the `vu-meter` service's: `location
+  /api/aas/v1/` with `proxy_pass http://127.0.0.1:2718/`, which strips the
+  prefix, and the WebSocket upgrade headers. The install runs `nginx -t` and
+  reloads nginx when it runs. The file names port 2718; the install warns
+  when the config sets another `api_port` *(builder's call)*.
+- **The install.** `dist/install-api.sh` installs both and does the restart
+  and reload, as `dist/install-plugin.sh` does for the ALSA plugin. The
+  Debian package, the web UI and the removal of `pw-api` and `vu-meter` are
+  not part of this stage.
+- **The command line tool.** `aasctl`, a second binary of this crate,
+  without new dependencies but `tungstenite`, which tests already use, for the
+  WebSockets. HTTP is plain HTTP/1.1 over a `TcpStream` to `127.0.0.1`, since
+  every request is local and small. Arguments are parsed by hand, as `aas`
+  parses its own. The port is 2718, or `--port`, or the `api_port` of the
+  config given with `--config`.
+  - `state`, `metrics`, `graph [--dot]`, `outputs`, `inputs`, `matrix`,
+    `plugins`, `settings` print what the matching `GET` gives, as indented
+    JSON, or DOT.
+  - `output N volume V`, `output N volume-db X`, `output N idle off|zeros
+    [DELAY]`, `analog volume-db X`, `analog mute|unmute`, `client NAME
+    volume-db X`, `client NAME mute|unmute`, `plugin ID set NAME=VALUE...`,
+    `plugin ID enable|disable`, `settings KEY=VALUE...` and `matrix put FILE`
+    send the matching change and print the answer.
+  - `events` prints each event as a line of JSON until stopped. `levels`
+    prints each frame as a line of dBFS per meter and channel.
+  - An error answer prints its message on stderr and exits 1; a usage error
+    exits 2.
 
 ## Testing
 

@@ -207,8 +207,8 @@ dropouts, latency, buffers, and the drift and ratio of further outputs),
 `GET` and `PATCH /settings` (bit-perfect mode, latency target, default rate,
 until the next restart), WebSocket `/levels` (VU levels as binary frames at
 10 Hz), the command line tool on top of the API, the `hifiberry-auth`
-manifest in `/etc/hifiberry/auth.d/` (volume `ok`; plugin, matrix and output
-changes `risky`) and the nginx location at `/api/aas/v1`. The design names
+manifest in `/etc/hifiberry/auth.d/` (every audio change `ok`, `/settings`
+`risky`) and the nginx location at `/api/aas/v1`. The design names
 the routes but not their fields. Decisions needed first: the frame format of
 `/levels` and where the levels are measured, how a plugin parameter reaches
 the audio thread (`set_param` there must not allocate or lock), which
