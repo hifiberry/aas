@@ -303,10 +303,12 @@ the 20-byte request and 8-byte reply and need no version change:
   gain the API knows. A client's gain is also sent to its connection as a
   `ClientVolumeChanged` notice whenever it changes, so one subscription covers
   changes from the API and from other streams of the same process.
-- The client library also exposes `GetVolume`, `SetVolume`, and volume and client
-  volume subscriptions with notices taken aside while a reply is awaited, as the
-  ALSA control plugin already does by hand. One subscription serves every
-  PulseAudio subscriber.
+- `GetOutputRate`, so the sink object reports the rate the daemon currently
+  plays at, including zero while it is off.
+- The client library also exposes `GetVolume`, `SetVolume`, `GetClientVolume`,
+  `SetClientVolume`, `GetOutputRate` and notice polling, with notices taken
+  aside while a reply is awaited, as the ALSA control plugin already does by
+  hand. One subscription serves every PulseAudio subscriber.
 
 ### Later
 
