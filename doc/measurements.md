@@ -2103,6 +2103,34 @@ The SD runs' worst cycles were not kept.
   is not explained by it: the SD system did not come up with the overlay
   removed either.
 
+### The same series with compaction kept off locked pages
+
+The network-boot series was repeated with `dist/90-aas.conf` installed on the
+network root, so `vm.compact_unevictable_allowed` was 0, and otherwise the
+same: the same kernel, the main build, each driver booted once. Under load
+the board again reached 80 to 82 °C at its soft temperature limit.
+
+| Run | `dwc_otg`, compaction on | `dwc_otg`, off | `dwc2`, on | `dwc2`, off |
+|---|---|---|---|---|
+| 12 ms, idle | 5.96 ms, 0 gaps, 0.23 ms | 6.06 ms, 0 gaps, 0.21 ms | 6.07 ms, 0 gaps, 0.33 ms | 6.00 ms, 0 gaps, 0.21 ms |
+| 12 ms, load | 8.96 ms, 0 gaps, 1.67 ms | 9.90 ms, 0 gaps, 2.39 ms | 8.73 ms, 0 gaps, 1.16 ms | 9.84 ms, 0 gaps, 1.85 ms |
+| 6 ms, idle | 3.14 ms, 0 gaps, 0.29 ms | 3.16 ms, 0 gaps, 0.27 ms | 3.11 ms, 0 gaps, 0.20 ms | 3.12 ms, 0 gaps, 0.23 ms |
+| 6 ms, load | 7.91 ms, 8 gaps, 2.93 ms | 8.41 ms, 7 gaps, 2.14 ms | 6.05 ms, 3 gaps, 1.47 ms | 6.94 ms, 7 gaps, 2.50 ms |
+| 6 ms, load, analog | 6.86 ms, 10 gaps, 4.20 ms | 7.07 ms, 6 gaps, 2.56 ms | 6.30 ms, 3 gaps, 1.52 ms | 6.42 ms, 3 gaps, 1.62 ms |
+
+No run counted an xrun.
+
+- Keeping compaction off locked pages changed nothing that matters: the gaps
+  at 6 ms under load are still there, and at 12 ms under load the worst gaps
+  were about 1 ms longer, not shorter. Compaction is not what stalls the
+  audio thread here.
+- `dwc2`'s lead at 6 ms under load did not repeat: 7 gaps this time against
+  3, as many as `dwc_otg`. With one 10-minute run each, the two drivers are
+  within what one session differs from the next.
+- So the cause is the network-boot load itself, the NFS writes through the
+  USB Ethernet: on the SD system the same load left 0 gaps at 6 ms with
+  `dwc_otg`. 12 ms keeps 2 ms of margin under it with either driver.
+
 ## Stage 4 part 1: the API under load
 
 Whether the HTTP API disturbs playback, and whether a change it makes clicks.
