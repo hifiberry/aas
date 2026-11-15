@@ -7,10 +7,15 @@ use super::Control;
 use super::api::format_name;
 use crate::config::PluginPlace;
 use crate::latency::PERIODS;
+use crate::plugin::Channels;
 use crate::plugin::chain::conversion;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::sync::atomic::Ordering::Relaxed;
+
+/// The width of the players bus and of the analog input and bus.
+const PLAYER_CHANNELS: usize = 2;
+const ANALOG_CHANNELS: usize = 2;
 
 /// Nodes and edges, in the order they are made.
 #[derive(Default)]
@@ -69,7 +74,11 @@ impl Control {
         }
         for (name, (client_rate, latency)) in &clients {
             let id = format!("client/{name}");
-            let extra = json!({"rate": client_rate, "latency_frames": latency});
+            let extra = json!({
+                "rate": client_rate,
+                "channels": PLAYER_CHANNELS,
+                "latency_frames": latency
+            });
             g.node(&id, "client", name, extra);
             g.edge(&id, "bus/players");
         }
@@ -77,18 +86,18 @@ impl Control {
             "bus/players",
             "bus",
             "players",
-            with_rate(json!({"format": format})),
+            with_rate(json!({"format": format, "channels": PLAYER_CHANNELS})),
         );
 
         // The analog input, its chain and its bus.
         if self.analog.is_some() {
             let latency = self.counters.analog_latency_frames.load(Relaxed);
-            let extra = json!({"latency_frames": latency});
+            let extra = json!({"channels": ANALOG_CHANNELS, "latency_frames": latency});
             g.node("analog", "analog", "analog input", with_rate(extra));
             let mut path = vec!["analog".to_string()];
             for entry in self.entries_of(0) {
                 if entry.config.place == PluginPlace::Analog {
-                    path.push(self.plugin_node(&mut g, entry));
+                    path.push(self.plugin_node(&mut g, entry, ANALOG_CHANNELS));
                 }
             }
             path.push("bus/analog".into());
@@ -96,7 +105,7 @@ impl Control {
                 "bus/analog",
                 "bus",
                 "analog",
-                with_rate(json!({"format": format})),
+                with_rate(json!({"format": format, "channels": ANALOG_CHANNELS})),
             );
             g.path(&path);
         }
@@ -107,8 +116,18 @@ impl Control {
         json!({"nodes": g.nodes, "edges": g.edges})
     }
 
-    /// A plugin's node, and its id.
-    fn plugin_node(&self, g: &mut Graph, entry: &super::plugins::PluginEntry) -> String {
+    /// A plugin's node, and its id. `width` is the channel count that
+    /// reaches the plugin; the node's `channels` is the count it gives.
+    fn plugin_node(
+        &self,
+        g: &mut Graph,
+        entry: &super::plugins::PluginEntry,
+        width: usize,
+    ) -> String {
+        let channels = match entry.channels {
+            Channels::Fixed { output, .. } => output,
+            Channels::Any => width,
+        };
         let id = format!("out/{}", entry.id);
         let mut plugin = json!({
             "id": entry.id.to_string(),
@@ -123,6 +142,8 @@ impl Control {
             plugin["converts_to"] = json!(format_name(to));
         }
         let extra = self.with_rate(json!({"format": format_name(self.format),
+            "channels": channels,
+            "enabled": entry.enabled,
             "latency_frames": entry.stats.latency_frames.load(Relaxed),
             "plugin": plugin}));
         g.node(&id, "plugin", &entry.name, extra);
@@ -154,13 +175,17 @@ impl Control {
             &volume,
             "volume",
             "volume",
-            extra(json!({"format": format})),
+            extra(json!({"format": format, "channels": width})),
         );
         let mut path = vec![matrix, volume];
         let entries = self.entries_of(index);
+        let mut at = width;
         for place in [PluginPlace::Mix, PluginPlace::Output] {
             for entry in entries.iter().filter(|e| e.config.place == place) {
-                path.push(self.plugin_node(g, entry));
+                path.push(self.plugin_node(g, entry, at));
+                if let Channels::Fixed { output, .. } = entry.channels {
+                    at = output;
+                }
             }
         }
         let (card_rate, channels, period) = match index {
@@ -182,12 +207,14 @@ impl Control {
         if index == 0 {
             let delay = format!("out/{n}/delay");
             let latency = self.delay.unwrap_or(0);
-            let node = json!({"latency_frames": latency});
+            let node = json!({"format": format, "channels": channels, "latency_frames": latency});
             g.node(&delay, "delay", "delay", extra(node));
             path.push(delay);
         }
         let card = format!("out/{n}/card");
-        let mut node = json!({"channels": channels});
+        // The card's own sample format is not known here: this is the
+        // processing format the card is fed.
+        let mut node = json!({"channels": channels, "format": format});
         if let Some(rate) = card_rate {
             node["rate"] = json!(rate);
         }
@@ -202,7 +229,8 @@ impl Control {
     }
 }
 
-/// A DOT string, quoted.
+/// A DOT string, quoted. Labels are plain text: the nodes are boxes, not
+/// records, so `{ } | < >` in a name mean nothing to Graphviz.
 fn quoted(text: &str) -> String {
     let escaped = text.replace('\\', "\\\\").replace('"', "\\\"");
     format!("\"{}\"", escaped.replace('\n', "\\n"))
@@ -237,9 +265,8 @@ pub fn to_dot(graph: &Value) -> String {
         }
         let kind = node["kind"].as_str().unwrap_or_default();
         let shape = match kind {
-            "client" | "analog" | "card" => "box",
             "bus" => "ellipse",
-            _ => "record",
+            _ => "box",
         };
         dot.push_str(&format!(
             "  {} [label={}, shape={shape}];\n",
@@ -422,5 +449,41 @@ mod tests {
         for id in ids(&g) {
             assert!(dot.contains(&format!("\"{id}\"")), "{id}");
         }
+    }
+
+    fn node<'a>(graph: &'a Value, id: &str) -> &'a Value {
+        let nodes = graph["nodes"].as_array().unwrap();
+        nodes.iter().find(|n| n["id"] == id).unwrap()
+    }
+
+    #[test]
+    fn every_node_gives_its_channels_and_format() {
+        let config = Config {
+            plugins: vec![plugin(PluginPlace::Mix, "balance")],
+            ..Config::default()
+        };
+        let (mut control, _engine, now) = started(&config, None);
+        play(&mut control, 1, 48000, now);
+        let g = graph(&mut control, now);
+        for node in g["nodes"].as_array().unwrap() {
+            let id = node["id"].as_str().unwrap();
+            assert!(node["channels"].as_u64().unwrap() >= 1, "{id}");
+            if node["kind"] != "client" {
+                assert_eq!(node["format"], "f32", "{id}");
+            }
+        }
+        assert_eq!(node(&g, "out/1/mix/0")["channels"], 2);
+        assert_eq!(node(&g, "out/1/mix/0")["enabled"], true);
+        assert_eq!(node(&g, "out/1/volume")["channels"], 2);
+        assert_eq!(node(&g, "out/1/card")["format"], "f32");
+    }
+
+    #[test]
+    fn dot_survives_record_characters_in_a_name() {
+        let g = json!({"nodes": [{"id": "client/a{b|c}<d>", "kind": "client",
+            "label": "a{b|c}<d>"}], "edges": []});
+        let dot = to_dot(&g);
+        assert!(dot.contains("label=\"a{b|c}<d>\", shape=box"), "{dot}");
+        assert!(!dot.contains("record"));
     }
 }

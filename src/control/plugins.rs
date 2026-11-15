@@ -36,6 +36,8 @@ pub(super) struct PluginEntry {
     pub changes_count: bool,
     /// The formats it takes, which decide whether a chain converts for it.
     pub formats: Formats,
+    /// The channel counts it takes and gives.
+    pub channels: Channels,
     pub enabled: bool,
     /// Shared with every chain built for it, so a rebuild keeps them.
     pub stats: Arc<PluginStats>,
@@ -180,6 +182,7 @@ pub(super) fn entries(
                 params,
                 changes_count,
                 formats,
+                channels,
                 enabled: true,
                 stats: Arc::new(stats),
             }
