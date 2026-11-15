@@ -34,6 +34,7 @@ built for them now.
 - Network audio, including AES67
 - USB audio gadget
 - Porting `speakereq` to a native plugin
+- Recording through the PulseAudio endpoint
 
 For some time HiFiBerry OS ships both audio servers, PipeWire and `aas`, and the
 user selects which one runs *(owner's call)*. So the first shipped version is an
@@ -111,7 +112,7 @@ A client can always connect, in every mode. No client is ever refused.
 
 Clients playing at the same time are mixed together.
 
-A client counts as **active** while its ALSA stream is running *(call)*. A client
+A client counts as **active** while its stream is running *(call)*. A client
 that is open but stopped, prepared or paused does not count, so a paused player
 cannot hold the rate. A running client that is writing digital silence does
 count. When a paused player resumes after the rate has changed, it is resampled.
@@ -145,9 +146,173 @@ A prepare keeps the stream. The plugin asks the daemon to reset it. The audio
 thread stops the stream, empties its ring and its resampler, and the daemon
 answers when that is done. The ring and the poll descriptors stay the same.
 
-A player that does not use ALSA `default` today is reconfigured to use it *(call)*.
-A direct `hw:` open cannot work while the daemon owns the card, and no PulseAudio
-endpoint is planned.
+A player that uses ALSA but not `default` is reconfigured to use it *(call)*. A
+direct `hw:` open cannot work while the daemon owns the card. A player that cannot
+use ALSA at all uses the PulseAudio endpoint described next *(call)*.
+
+## PulseAudio clients
+
+Some players cannot output through ALSA and use the PulseAudio API instead. That
+is also how most players that advertise PipeWire support emit audio: they link
+`libpulse` and rely on `pipewire-pulse`, not the native PipeWire protocol. Since
+`aas` replaces PipeWire, it serves those clients the PulseAudio native protocol
+itself, and PipeWire is neither required nor started *(call)*. This is the form
+"PipeWire support" takes under `aas`.
+
+Playback is in this stage. Recording, and with it source objects, comes later
+*(call)*.
+
+The front end runs inside the daemon, one thread per PulseAudio connection. Each
+playback stream is a client of the daemon over its own connection to the client
+protocol, exactly as the ALSA plugin is *(call)*. Mixing, resampling, plugins,
+bit-perfect, the API and the state file are therefore the same code path for ALSA
+and PulseAudio clients, and a PulseAudio stream is a client like any other.
+
+### Discovery and access
+
+- The socket is the client protocol socket's directory plus `pulse`, which is
+  `/run/aas/pulse` in production, so a test daemon on another socket gets a
+  PulseAudio socket beside it instead of colliding. It is mode 0660 and group
+  `audio`, like the client protocol's socket. The flat config key `pulse_socket`
+  moves it or, empty, turns the endpoint off *(call)*.
+- `dist/` carries a `/etc/pulse/client.conf` with
+  `default-server = unix:/run/aas/pulse` and `autospawn = no`, so libpulse finds
+  the server and does not try to start a real PulseAudio *(call)*. The switch to
+  `aas` installs it, as it installs the ALSA `default`: while PipeWire runs,
+  PipeWire's own `pipewire-pulse` discovery stays, and switching back restores
+  it. An existing file that is not this one is kept aside, as `/etc/asound.conf`
+  is.
+- `AUTH` is answered for protocol version 35, the version PulseAudio 17 speaks,
+  and its cookie is ignored. SHM, the shared-ringbuffer channel and memfd pools
+  are declined; audio travels over the socket. The socket's permission is the
+  gate, as the daemon's API has no authentication either *(call)*.
+- `SET_CLIENT_NAME` is stored, and the connection's peer credentials give the
+  client's process. That process becomes the `aas` client name, so
+  `GET /inputs` shows a player by its own name and its per-client gain applies to
+  it. This is the same identity rule as the ALSA plugin *(call)*.
+
+### Commands
+
+The server advertises protocol 35 and implements this playback subset:
+
+| Group | Commands |
+|---|---|
+| Handshake | `AUTH`, `SET_CLIENT_NAME`, `EXIT` |
+| Introspection | `GET_SERVER_INFO`, `GET_SINK_INFO`, `GET_SINK_INFO_LIST`, `GET_SINK_INPUT_INFO`, `GET_SINK_INPUT_INFO_LIST`, `GET_CLIENT_INFO`, `GET_CLIENT_INFO_LIST`, `GET_CARD_INFO_LIST`, `GET_MODULE_INFO_LIST`, `GET_SAMPLE_INFO_LIST`, `GET_SOURCE_INFO_LIST`, `STAT`, `LOOKUP_SINK` |
+| Streams | `CREATE_PLAYBACK_STREAM`, `DELETE_PLAYBACK_STREAM`, `DRAIN_PLAYBACK_STREAM`, `CORK_PLAYBACK_STREAM`, `FLUSH_PLAYBACK_STREAM`, `TRIGGER_PLAYBACK_STREAM`, `PREBUF_PLAYBACK_STREAM`, `SET_PLAYBACK_STREAM_BUFFER_ATTR`, `SET_PLAYBACK_STREAM_NAME`, `UPDATE_PLAYBACK_STREAM_PROPLIST`, `REMOVE_PLAYBACK_STREAM_PROPLIST`, `GET_PLAYBACK_LATENCY` |
+| Volume | `SET_SINK_VOLUME`, `SET_SINK_MUTE`, `SET_SINK_INPUT_VOLUME`, `SET_SINK_INPUT_MUTE`, `SET_DEFAULT_SINK` |
+| Notifications | `SUBSCRIBE`, and the server-to-client `REQUEST`, `STARTED`, `SUBSCRIBE_EVENT`, `PLAYBACK_STREAM_KILLED`, `UNDERFLOW`, `PLAYBACK_BUFFER_ATTR_CHANGED` |
+
+Every other command, including record streams, modules, moves, suspends and
+extensions, is answered with `PA_COMMAND_ERROR` and `PA_ERR_NOTSUPPORTED`, and
+the connection stays usable *(call)*. A command that cannot be carried out for
+this stream, such as a buffer it cannot honour, is refused the same way rather
+than applied halfway.
+
+### Streams
+
+A playback stream is negotiated with the client:
+
+- Formats are S16, S24, S24 in a 32-bit container, S32 and float, little endian.
+  Mono and stereo are accepted; more than two channels is refused rather than
+  folded down. Rates are 8 kHz to 384 kHz. Anything else gets an error *(call)*.
+- The ring holds the client's `tlength`, when it gives one, clamped to what
+  `aas` needs at the stream's rate and to `pulse_buffer_ms`. Without a
+  `tlength`, `pulse_buffer_ms` is the value. `maxlength` does not make the ring
+  larger *(call)*.
+- The stream starts as the client asks: corked if it said so, otherwise at
+  once. `prebuf` and a trigger timestamp are advisory, because the card cannot
+  promise an exact start later *(call)*.
+- Free ring space produces a `REQUEST` for that many whole frames, with one
+  outstanding at a time and no request above 64 KiB, so a large buffer is filled
+  over several requests and a small one is not overrun. The memblock that answers
+  it is written with the same conversion the ALSA plugin uses; nothing is
+  allocated on the audio thread *(call)*.
+- `write_index` counts the frames the client has handed over. `read_index` and
+  the sink latency come from the ring's hardware position and delay, so
+  `GET_PLAYBACK_LATENCY` and a sink input's reported latency are the real path,
+  not a guess *(call)*.
+- `DRAIN_PLAYBACK_STREAM` waits for the ring to play out; `CORK` stops and
+  starts; `FLUSH` stops and empties the ring; `DELETE` stops the stream and ends
+  its daemon connection. A new request cancels a drain, as the client protocol
+  says.
+- A new underrun in the daemon's counter sends `UNDERFLOW`. A daemon connection
+  that ends sends `PLAYBACK_STREAM_KILLED` *(call)*.
+
+### Objects and events
+
+- One sink, named `aas`, with the output's current rate and stereo channels, its
+  volume from the output volume and its state RUNNING while a stream plays and
+  IDLE otherwise. It is never suspended *(call)*.
+- One sink input per stream, named from the stream's media name, whose volume and
+  mute are the per-client gain. One client object per PulseAudio connection.
+- Card, module, sample and source lists are empty. The card is `aas`'s to own, and
+  a client that lists them sees nothing rather than a graph *(call)*.
+- Subscriptions receive NEW, CHANGE and REMOVE for clients, sink inputs and the
+  sink. Output volume changes made through ALSA, the API or another PulseAudio
+  client are sent on as sink volume events, and changes to a client's gain,
+  from the API or another stream of the same process, as sink-input volume
+  events *(call)*.
+- Mute has no separate bit in `aas`. The front end remembers the percent from
+  before a mute, sets the output volume to 0 while muted, and restores it on
+  unmute. A volume change made elsewhere while muted clears the remembered
+  percent *(call)*.
+
+### Volume
+
+The sink volume and the output volume are one number: a PulseAudio channel at
+`x` reports `round(x / PA_VOLUME_NORM * 100)`, and setting it takes the channel
+average back to a percent. `pactl`, `GET /outputs/1` and `amixer` therefore agree
+*(call)*. The percent is `aas`'s own curve, not PulseAudio's perceptual one, so
+the slider, the API and the card always show the same number.
+
+A stream's volume is its client's gain: PulseAudio's linear volume becomes dB
+(`20 log10`), clamped to the -60 dB floor of a client volume, and stored where
+`PATCH /inputs/clients/{name}` reads and writes it *(call)*. Because clients are
+identified by process name, streams of the same process share one gain, as they
+already do for ALSA clients. Mute is the client's mute bit.
+
+Bit-perfect is unchanged. A PulseAudio stream at 0 dB with the output at 100 can
+still be copied untouched when it is the only client at the output rate; any
+gain breaks it exactly as for ALSA *(call)*.
+
+### Configuration and failure
+
+`pulse_socket`, a path, defaults to the client protocol socket's directory plus
+`pulse`; the empty string turns the endpoint off. `pulse_buffer_ms`, 200 by
+default and 20 to 2000, is the default and the cap for a stream's buffer. Both
+are validated at startup like every other key, and `pulse_buffer_ms` with the
+endpoint off is an error *(call)*.
+
+A socket that cannot be bound or created is logged once and the daemon plays on
+without the PulseAudio endpoint, as it does without the API. The socket is
+unlinked at start and at shutdown, and the listener's threads are joined when the
+daemon stops *(call)*.
+
+A malformed packet gets an error and closes that connection. One client's malformed
+packet never affects another connection or the audio thread.
+
+### Client protocol additions
+
+The front end uses the existing client protocol, with these additions that keep
+the 20-byte request and 8-byte reply and need no version change:
+
+- `Identify { pid }`, sent before `Configure`, so the daemon reads the player's
+  process name for a connection it did not accept from that process itself.
+- `GetClientVolume` and `SetClientVolume`, so a stream's volume is the client
+  gain the API knows. A client's gain is also sent to its connection as a
+  `ClientVolumeChanged` notice whenever it changes, so one subscription covers
+  changes from the API and from other streams of the same process.
+- The client library also exposes `GetVolume`, `SetVolume`, and volume and client
+  volume subscriptions with notices taken aside while a reply is awaited, as the
+  ALSA control plugin already does by hand. One subscription serves every
+  PulseAudio subscriber.
+
+### Later
+
+Recording and `parec`, SHM, the shared-ringbuffer channel and memfd pools, TCP
+and network PulseAudio, loadable modules, moving or suspending streams,
+per-channel volume, and the native PipeWire protocol or a `libpipewire` shim.
 
 ## Output
 
@@ -1588,6 +1753,16 @@ All of this is *(call)*. Paths are as the daemon sees them; nginx puts
 Testing uses the test boards, not a VM *(call)*. Both boards can load
 `snd-aloop` and may be reinstalled, so a VM would add a step and prove nothing
 more. Logic is tested on any machine with a null sink.
+
+The PulseAudio endpoint is tested the same way: a raw protocol client in the
+tests performs the handshake, introspection, a playback stream, cork, flush,
+drain, delete and volume changes against a daemon on a temporary socket, while
+the test checks that the API reports the same clients, volumes and rates. The
+codec is tested on captured packets, including a read split across packet
+boundaries and a malformed packet. On the boards, `pactl info`, `paplay` and
+`mpv --ao=pulse` play, and one PulseAudio stream plays together with one ALSA
+stream *(call)*. `pulseaudio-utils` and `mpv` are added to the board tests'
+dependencies.
 
 The main test board is a Compute Module 5 with a DAC+ ADC Pro and a heatsink, and
 it may be reinstalled freely. It needs the `hifiberry-dacplusadcpro,slave` overlay
