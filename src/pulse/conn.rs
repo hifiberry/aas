@@ -745,6 +745,10 @@ impl Conn {
     }
 
     fn send_packet(&mut self, payload: Vec<u8>) {
+        if self.out.len() > 1 << 20 {
+            self.done = true;
+            return;
+        }
         self.out
             .extend(Encoder.packet(wire::INVALID_INDEX, &payload));
     }

@@ -449,3 +449,66 @@ fn a_volume_change_made_elsewhere_reaches_a_subscriber() {
         break;
     }
 }
+
+#[test]
+fn a_malformed_packet_closes_only_its_connection() {
+    let daemon = Daemon::start();
+    let mut broken = RawPulse::connect(&daemon.pulse_socket());
+    let mut head = [0u8; 20];
+    head[..4].copy_from_slice(&u32::MAX.to_be_bytes());
+    head[4..8].copy_from_slice(&u32::MAX.to_be_bytes());
+    broken.stream.write_all(&head).unwrap();
+
+    let mut other = RawPulse::connect(&daemon.pulse_socket());
+    other.auth();
+    other.set_name("still here");
+    let (command, _, _) = other.command(wire::STAT, &[]);
+    assert_eq!(command, wire::REPLY);
+}
+
+#[test]
+fn a_pulse_and_an_alsa_client_play_together() {
+    let daemon = Daemon::start();
+    let mut alsa = daemon.playing(16384);
+    let mut pulse = RawPulse::connect(&daemon.pulse_socket());
+    pulse.auth();
+    pulse.set_name("pulse player");
+    let (stream, _) = pulse.create_stream(48_000, wire::FORMAT_S16LE, 2, 40);
+    let (_, length) = pulse.request();
+    pulse.send_memblock(stream, &vec![0u8; length]);
+    let (_, state) = daemon.get("/state");
+    assert_eq!(state["rate"], serde_json::json!(48_000));
+    assert!(
+        state["clients"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|client| client["running"] == serde_json::json!(true)),
+        "a client runs: {state}"
+    );
+    let mut body = Builder::new();
+    body.u32(stream);
+    let (command, _, _) = pulse.command(wire::DELETE_PLAYBACK_STREAM, &body.into_vec());
+    assert_eq!(command, wire::REPLY);
+    // The ALSA client keeps playing.
+    top_up(&mut alsa);
+    let (_, state) = daemon.get("/state");
+    assert_eq!(state["rate"], serde_json::json!(48_000));
+}
+
+#[test]
+fn a_client_killed_mid_stream_does_not_block_the_daemon() {
+    let daemon = Daemon::start();
+    let mut first = RawPulse::connect(&daemon.pulse_socket());
+    first.auth();
+    first.set_name("one");
+    let _ = first.create_stream(48_000, wire::FORMAT_S16LE, 2, 40);
+    drop(first);
+
+    let mut second = RawPulse::connect(&daemon.pulse_socket());
+    second.auth();
+    second.set_name("two");
+    let (stream, _) = second.create_stream(48_000, wire::FORMAT_S16LE, 2, 40);
+    let (asked, _) = second.request();
+    assert_eq!(asked, stream);
+}
