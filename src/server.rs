@@ -361,6 +361,13 @@ pub fn run_outputs(
     server.control.start(Instant::now());
     // After the start, so that no call reaches an output the engine does
     // not have yet.
+    let pulse = match crate::pulse::spawn(&config, socket, shutdown.clone()) {
+        Ok(pulse) => pulse,
+        Err(e) => {
+            eprintln!("aas: pulse: {e}, playing on without it");
+            None
+        }
+    };
     let api_thread = api.and_then(|listener| server.start_api(listener, levels));
     let mut gaps_seen = 0;
     // The audio thread only ends on its own if it panicked. The daemon then
@@ -376,6 +383,9 @@ pub fn run_outputs(
     }
     let died = audio.is_finished();
     server.control.shutdown();
+    if let Some(pulse) = pulse {
+        pulse.stop();
+    }
     let joined = audio.join();
     eprintln!("aas: stopped: {counters}");
     // The fds of `notify` must outlive the audio thread. The writers stop
@@ -1010,7 +1020,7 @@ fn listen(path: &Path) -> io::Result<OwnedFd> {
     Ok(fd)
 }
 
-fn set_audio_group(path: &Path) {
+pub(crate) fn set_audio_group(path: &Path) {
     let Some(gid) = group_id("audio") else {
         eprintln!("aas: no group audio, the socket keeps its group");
         return;

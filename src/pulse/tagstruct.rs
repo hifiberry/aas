@@ -146,6 +146,11 @@ impl<'a> Reader<'a> {
         self.pos >= self.data.len()
     }
 
+    /// How far the reader has read, for a body that follows a header.
+    pub fn position(&self) -> usize {
+        self.pos
+    }
+
     fn take(&mut self, n: usize) -> Option<&'a [u8]> {
         let end = self.pos.checked_add(n)?;
         let out = self.data.get(self.pos..end)?;
