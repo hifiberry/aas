@@ -312,8 +312,8 @@ impl<P: Processing> OutputMix<P> {
     }
 
     /// Replaces the matrix with one of the same width and returns the one
-    /// it replaced, or returns `matrix` itself, refused, if its width is
-    /// another. `forced` takes the gains as `bus_gains` does. Each gain
+    /// it replaced, or returns `matrix` itself if its width is another,
+    /// with whether it was refused. `forced` takes the gains as `bus_gains` does. Each gain
     /// moves to its new value over `ramp` frames, from where it is, also
     /// during another ramp; with `None`, or when no gain moves, the change
     /// applies at once. The engine's `set_matrix` says when it ramps.
@@ -322,8 +322,9 @@ impl<P: Processing> OutputMix<P> {
         mut matrix: Box<Matrix>,
         forced: bool,
         ramp: Option<usize>,
-    ) -> Box<Matrix> {
-        if matrix.width() == self.matrix.width() {
+    ) -> (Box<Matrix>, bool) {
+        let refused = matrix.width() != self.matrix.width();
+        if !refused {
             let gains = gains_of(&matrix, forced);
             let from = if self.ramp_left > 0 {
                 self.ramp_from
@@ -342,7 +343,7 @@ impl<P: Processing> OutputMix<P> {
                 _ => self.finish_ramp(),
             }
         }
-        matrix
+        (matrix, refused)
     }
 
     /// A change of matrix ramps.
@@ -602,5 +603,22 @@ impl<P: Processing> OutputMix<P> {
             unmute(samples, channels, &mut self.unmute_left, fade);
         }
         chains_ran
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::format::F32;
+
+    #[test]
+    fn set_matrix_says_whether_it_refused() {
+        let mut mix = OutputMix::<F32>::new(Matrix::default_for(2), 2, false, 64);
+        let (_, refused) = mix.set_matrix(Box::new(Matrix::default_for(2)), false, None);
+        assert!(!refused);
+        let (back, refused) = mix.set_matrix(Box::new(Matrix::default_for(4)), false, None);
+        assert!(refused);
+        assert_eq!(back.width(), 4);
+        assert_eq!(mix.matrix.width(), 2);
     }
 }

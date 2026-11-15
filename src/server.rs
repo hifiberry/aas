@@ -1,6 +1,7 @@
 //! The daemon's socket and threads. The control thread runs here, polling
 //! the listener, the clients, the audio thread's events and a 50 ms timer.
 
+use crate::api::{ApiCall, ApiEvent};
 use crate::board;
 use crate::cards;
 use crate::config::{BitPerfect, Config, Format, PluginPlace};
@@ -12,6 +13,7 @@ use crate::counters::{Counters, OutputCounters};
 use crate::engine::Engine;
 use crate::format::{F32, F64, I32, Processing};
 use crate::further;
+use crate::http;
 use crate::matrix::{INPUT_NAMES, Matrix};
 use crate::plugin::Failure;
 use crate::plugin::build::{Chains, Libraries, build_chain, matrix_width, widths};
@@ -26,14 +28,17 @@ use std::collections::BTreeMap;
 use std::ffi::CString;
 use std::fs;
 use std::io;
+use std::net::TcpListener;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
+use std::sync::mpsc::{self, Receiver};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+use tokio::sync::broadcast;
 
 /// How often the control thread looks at the clock with nothing else to do.
 const TICK_MS: i32 = 50;
@@ -44,6 +49,9 @@ const PARK: Duration = Duration::from_millis(100);
 const ACCEPT_PAUSE: Duration = Duration::from_millis(250);
 const COMMAND_SLOTS: usize = 4096;
 const EVENT_SLOTS: usize = 1024;
+/// The events of the API a subscriber may fall behind by before it is told
+/// to read `/state` again.
+const API_EVENTS: usize = 256;
 
 fn check(rc: isize) -> io::Result<usize> {
     if rc < 0 {
@@ -70,10 +78,12 @@ pub struct FurtherSink {
 
 /// The cards the daemon plays to: the master, how to look for it while it
 /// is gone, and one further card for each `[[output]]` table, in order.
+/// With `api`, the HTTP API serves on that listener; without, it is off.
 pub struct Devices {
     pub sink: Box<dyn Sink>,
     pub probe: Option<CardProbe>,
     pub further: Vec<FurtherSink>,
+    pub api: Option<TcpListener>,
 }
 
 /// Runs the daemon as `run_probing` does, with no probe for the card: the
@@ -136,6 +146,7 @@ pub fn run_probing(
         sink,
         probe,
         further: Vec::new(),
+        api: None,
     };
     run_outputs(config, devices, socket, state, hardware, capture, shutdown)
 }
@@ -156,6 +167,7 @@ pub fn run_outputs(
         sink,
         probe,
         further,
+        api,
     } = devices;
     if further.len() != config.outputs.len() {
         return Err(format!(
@@ -177,6 +189,7 @@ pub fn run_outputs(
     };
     let mut libraries = Libraries::default();
     let matrix = build_matrix(&config, &mut libraries)?;
+    let master_width = matrix.width();
     let chains = Chains::build_for_start(
         &config.plugins,
         config.default_rate,
@@ -305,9 +318,14 @@ pub fn run_outputs(
     if let Some(open) = capture {
         control.set_analog(open);
     }
+    control.set_counters(counters.clone());
+    control.set_matrix_width(master_width);
     let found = hardware.as_mut().and_then(|open| open());
     let volume = OutputVolume::new(found, config.bit_perfect);
-    control.restore_volume(volume, state.to_path_buf());
+    let master = config.card.clone().unwrap_or_default();
+    let further_cards = config.outputs.iter().map(|o| o.card.clone());
+    let cards: Vec<String> = std::iter::once(master).chain(further_cards).collect();
+    control.restore(volume, state.to_path_buf(), &cards);
     let mut server = Server {
         listener,
         notify,
@@ -324,8 +342,12 @@ pub fn run_outputs(
         hardware,
         further_search: searches,
         further_rates: watches,
+        api: None,
     };
     server.control.start(Instant::now());
+    // After the start, so that no call reaches an output the engine does
+    // not have yet.
+    let api_thread = api.and_then(|listener| server.start_api(listener));
     let mut gaps_seen = 0;
     // The audio thread only ends on its own if it panicked. The daemon then
     // stops with an error, so that systemd restarts it, rather than taking
@@ -343,8 +365,12 @@ pub fn run_outputs(
     let joined = audio.join();
     eprintln!("aas: stopped: {counters}");
     // The fds of `notify` must outlive the audio thread. The writers stop
-    // here too.
+    // here too, and the API thread once the control thread's events are
+    // dropped with it.
     drop(server);
+    if let Some(thread) = api_thread {
+        let _ = thread.join();
+    }
     for (index, counters) in &output_counters {
         eprintln!("aas: output {}: {counters}", index + 1);
     }
@@ -518,6 +544,8 @@ struct Server {
     /// The rates of each further output's card, by its index, when they
     /// change.
     further_rates: Vec<(usize, RatesWatch)>,
+    /// The calls of the API thread, and the eventfd it wakes the poll with.
+    api: Option<(Receiver<ApiCall>, OwnedFd)>,
 }
 
 /// The search for a further output's card, as for the master's.
@@ -527,7 +555,50 @@ struct FurtherSearch {
     wait: ProbeWait,
 }
 
+/// How long the poll waits, in ms: a tick, or less when a matrix is due
+/// before it, so that the 20 ms between two matrices is not stretched to
+/// a tick. Rounded up, so that the poll does not wake just before.
+fn poll_timeout(due: Option<Instant>, now: Instant) -> i32 {
+    match due {
+        None => TICK_MS,
+        Some(at) => {
+            let wait = at.saturating_duration_since(now).as_micros().div_ceil(1000);
+            i32::try_from(wait).unwrap_or(TICK_MS).min(TICK_MS)
+        }
+    }
+}
+
 impl Server {
+    /// Starts the API thread on `listener`, with the control thread
+    /// publishing its events. A failure is logged and the daemon plays on
+    /// without the API.
+    fn start_api(&mut self, listener: TcpListener) -> Option<JoinHandle<()>> {
+        let started = (|| {
+            let address = listener.local_addr()?;
+            let wake = eventfd()?;
+            let (calls, received) = mpsc::channel();
+            let (events, _) = broadcast::channel::<ApiEvent>(API_EVENTS);
+            let thread = http::spawn(listener, calls, wake.try_clone()?, events.clone())?;
+            self.control.set_api(events);
+            self.api = Some((received, wake));
+            eprintln!("aas: API on {address}");
+            io::Result::Ok(thread)
+        })();
+        started
+            .map_err(|e| eprintln!("aas: API: {e}, playing on without the API"))
+            .ok()
+    }
+
+    /// Answers every call the API thread has sent.
+    fn answer_calls(&mut self, now: Instant) {
+        let Some((received, _)) = &self.api else {
+            return;
+        };
+        while let Ok(call) = received.try_recv() {
+            self.control.answer(call, now);
+        }
+    }
+
     /// Waits for something to do, or the timer, and does it.
     fn step(&mut self) {
         let poll_in = |fd: RawFd| libc::pollfd {
@@ -543,11 +614,17 @@ impl Server {
             Some(_) => -1,
             None => self.listener.as_raw_fd(),
         };
-        let mut fds = vec![poll_in(listener), poll_in(self.notify.as_raw_fd())];
+        let api = self.api.as_ref().map_or(-1, |(_, wake)| wake.as_raw_fd());
+        let mut fds = vec![
+            poll_in(listener),
+            poll_in(self.notify.as_raw_fd()),
+            poll_in(api),
+        ];
         let ids: Vec<ConnId> = self.conns.keys().copied().collect();
         fds.extend(self.conns.values().map(|fd| poll_in(fd.as_raw_fd())));
+        let timeout = poll_timeout(self.control.next_due(), Instant::now());
         // SAFETY: fds is a valid array of its length.
-        let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, TICK_MS) };
+        let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
         if rc < 0 {
             // Only EINTR is expected; the next step polls again.
             return;
@@ -597,10 +674,16 @@ impl Server {
             unsafe { libc::read(fds[1].fd, (&raw mut count).cast(), size_of::<u64>()) };
         }
         self.control.handle_events(now);
+        if fds[2].revents != 0 {
+            let mut count = 0u64;
+            // SAFETY: as for `notify` above.
+            unsafe { libc::read(fds[2].fd, (&raw mut count).cast(), size_of::<u64>()) };
+        }
+        self.answer_calls(now);
         if fds[0].revents != 0 {
             self.accept_all();
         }
-        for (conn, pfd) in ids.into_iter().zip(&fds[2..]) {
+        for (conn, pfd) in ids.into_iter().zip(&fds[3..]) {
             if pfd.revents != 0 {
                 self.serve(conn, now);
             }
@@ -666,9 +749,9 @@ impl Server {
             }
             let conn = self.next_conn;
             self.next_conn += 1;
-            let name = peer_name(&fd);
+            let (name, label) = peer_name(&fd);
             self.conns.insert(conn, fd);
-            self.control.connected(conn, name);
+            self.control.connected_as(conn, name, label);
         }
     }
 
@@ -856,8 +939,11 @@ fn notice_is_due(fd: &OwnedFd) -> bool {
     !matches!(unread_bytes(fd), Some(unread) if unread > 0)
 }
 
-/// The client's process name, from its credentials, for the log.
-fn peer_name(fd: &OwnedFd) -> String {
+/// The client's process name, from its credentials, and its label for the
+/// log, the name with the pid. A client whose name cannot be read has an
+/// empty name, which no API path can give, so no volume is ever set for
+/// it and it plays at 0 dB.
+fn peer_name(fd: &OwnedFd) -> (String, String) {
     // SAFETY: an all-zero ucred is valid, and getsockopt fills at most len.
     let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
     let mut len = size_of::<libc::ucred>() as libc::socklen_t;
@@ -871,11 +957,12 @@ fn peer_name(fd: &OwnedFd) -> String {
         )
     };
     if rc < 0 {
-        return "a client".into();
+        return (String::new(), "a client".into());
     }
     let comm = fs::read_to_string(format!("/proc/{}/comm", cred.pid));
     let name = comm.map(|c| c.trim_end().to_string()).unwrap_or_default();
-    format!("{name} ({})", cred.pid)
+    let label = format!("{name} ({})", cred.pid);
+    (name, label)
 }
 
 /// A listening seqpacket socket at `path`, readable and writable by its
@@ -979,6 +1066,17 @@ mod tests {
         let n = unsafe { libc::recv(theirs.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0) };
         assert!(n > 0);
         assert!(notice_is_due(&ours));
+    }
+
+    #[test]
+    fn the_poll_wakes_for_a_matrix_due_before_the_tick() {
+        let now = Instant::now();
+        assert_eq!(poll_timeout(None, now), TICK_MS);
+        let ms = |n| Some(now + Duration::from_millis(n));
+        assert_eq!(poll_timeout(ms(20), now), 20);
+        assert_eq!(poll_timeout(ms(200), now), TICK_MS);
+        assert_eq!(poll_timeout(Some(now + Duration::from_micros(1)), now), 1);
+        assert_eq!(poll_timeout(Some(now), now + Duration::from_millis(5)), 0);
     }
 
     #[test]

@@ -133,6 +133,7 @@ impl Daemon {
                     sink,
                     probe,
                     further,
+                    api: None,
                 };
                 server::run_outputs(config, devices, &path, &state, hardware, capture, shutdown)
             })

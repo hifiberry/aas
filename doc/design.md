@@ -1318,6 +1318,87 @@ file and survive a reboot. Changes through `/settings` last until the next resta
 A config edit is the permanent way to change them, and the API never rewrites the
 config *(call)*.
 
+### Stage 4 in parts
+
+Stage 4 is built in parts, as stage 3b was *(call)*:
+
+1. **Part 1:** the API thread, `GET /state`, outputs, inputs with clients known by
+   name and a volume each, the matrix at run time, the state file for all of
+   them, and WebSocket `/events`.
+2. **Part 2:** `GET /metrics` (with the drift and ratio of further outputs),
+   `GET /graph`, `/plugins`, `/settings`, WebSocket `/levels`, the command line
+   tool, the `hifiberry-auth` manifest and the nginx location.
+3. **Part 3:** a matrix row and a plugin chain per client.
+4. **Part 4:** choosing the clock master at run time. It needs a design of its
+   own first: what a switch does to each output's resampler, drift and place in
+   the delay, and whether every card reopens.
+
+### The API in part 1
+
+All of this is *(call)*:
+
+- **Port and thread.** `api_port` in the config, a flat key, 2718 by default;
+  0 turns the API off. A thread `aas-api` runs a single-threaded `tokio`
+  runtime. A port that cannot be bound is logged once and the daemon plays on
+  without the API.
+- **One owner of decisions.** The API thread decides nothing. Each call goes to
+  the control thread as a message, with an eventfd that wakes its poll, and the
+  answer comes back on a one-shot channel. So a call is handled between client
+  requests, exactly like one, and the audio thread is reached only through the
+  queue it has today. A call not answered in 2 s fails with 503.
+- **Ids.** Outputs are numbered as in error messages: the master is 1, the
+  `[[output]]` tables 2 to 4 in file order. Inputs are `/inputs/analog` and
+  `/inputs/clients/{name}`, where the name is the client's process name,
+  percent-encoded. `GET /inputs` lists both kinds. This splits the table's
+  `/inputs/{id}`, so that a process called `analog` is still a client.
+- **Output fields.** The master has `volume`, 0 to 100: the `Master` control,
+  so a change through either is seen by both, and its subscribers are told.
+  A further output has `volume_db`, its offset. Each output has `idle` and
+  `idle_delay_s`, with the config's rules: a delay with `zeros` is refused. An
+  idle change takes effect at the next idle decision; an output that is off
+  stays off until a client plays.
+- **Input fields.** Each input has `volume_db`, from -60 to 0, and `muted`. A
+  client's volume applies to every stream of that process name, and survives a
+  reconnect. A name without a stored volume plays at 0 dB. A name not connected
+  can be given a volume, so a player can be set before it starts. At most 64
+  names are stored; a 65th is refused. A volume of a client that plays alone
+  and is not at 0 dB stops automatic bit-perfect, with the reason `Volume`, as
+  the output volume does today.
+- **Fades.** A change of an input's volume fades over 10 ms, like the output's.
+  The analog input's volume now fades too, where it applied at once.
+- **Matrix.** `GET /matrix` gives every output's routes. `PUT /matrix` takes
+  `{"outputs": [{"output": N, "routes": [...]}]}`, with the config's route rules;
+  an output it does not name keeps its matrix, and an empty route list is the
+  default matrix, as `matrix = []` is. A matrix of another width than the one in
+  place is refused, since the buffers and chains are built for that width. The
+  control thread sends an output at most one matrix every 20 ms; a later one in
+  between replaces the one waiting. So a DoP stream that starts waits for at most
+  one 10 ms fade. A change while a DoP claim at the wrong rate is held applies at
+  once under PCM; that is accepted.
+- **Errors.** A body that does not parse, or has an unknown field, is 400. An
+  unknown output or input is 404. A value out of range, or a matrix that breaks
+  a rule, is 422. Each error is `{"error": "<the message the config would
+  give>"}`.
+- **The state file.** It keeps the master's volume, the analog input's volume
+  and mute, each client's, each further output's offset and idle, and each
+  output's matrix. Outputs are keyed by their card, so reordering the
+  `[[output]]` tables loses nothing. A stored value that has a config key
+  applies only while that config key still says what it said when the value was
+  stored: the file keeps both. So an edit of the config always wins, and a
+  config left alone keeps what the API set. The master's volume and the
+  clients' volumes have no config key and are always restored. A value for a
+  card no longer in the config is kept, unused.
+- **Events.** WebSocket `/events` sends one JSON object per change:
+  `output` (volume, offset, idle, open, parked or off), `input` (volume, mute),
+  `client` (connected, running, stopped, gone), `matrix` (an output's routes)
+  and `rate`. A subscriber that falls behind by more than 256 events gets
+  `{"type": "resync"}` and should read `/state` again; nothing waits for it.
+- **`GET /state`.** The rate, the processing format, every output with its card
+  and whether it is open, parked or off, every connected client with its name,
+  rate and whether it runs, and whether the master is bit-perfect and, if not,
+  the reason. The engine publishes its bit-perfect decision through its
+  counters, without a lock, when it changes.
+
 ## Testing
 
 Testing uses the test boards, not a VM *(call)*. Both boards can load

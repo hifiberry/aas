@@ -10,7 +10,7 @@
 //! own [`OutputMix`]. A further output's period goes into its [`Feed`]; the
 //! master's goes through its delay line to the card.
 
-use crate::bitperfect::{Situation, decide, plugins_apply, volumes_apply};
+use crate::bitperfect::{NotBitPerfect, Situation, code_of, decide, plugins_apply, volumes_apply};
 use crate::capture::Capture;
 use crate::config::{BitPerfect, MAX_OUTPUTS};
 use crate::counters::Counters;
@@ -78,8 +78,11 @@ pub struct Source {
     pub rate: u32,
     /// Boxed so that swapping one moves a pointer and frees nothing.
     pub resampler: Option<Box<Resampler>>,
+    /// The gain the source plays at, or moves to while `glide` runs. Set
+    /// here before `Add`, it applies from the first frame.
     pub gain: f32,
     pub running: bool,
+    glide: Glide,
     stream: Stream,
     /// Frames that may be read from the ring this cycle.
     ready: usize,
@@ -137,6 +140,7 @@ impl Source {
             resampler: None,
             gain: 1.0,
             running: false,
+            glide: Glide::STILL,
             stream: Stream::Unknown,
             ready: 0,
             seen: 0,
@@ -467,7 +471,9 @@ struct Analog<P: Processing> {
     chain_idle: bool,
     /// The chain's latency, in the cycles its output is used, else 0.
     latency: u32,
+    /// The gain the input plays at, or moves to while `glide` runs.
     gain: f32,
+    glide: Glide,
     /// This cycle's period goes into the mix, unless DoP has the output.
     audible: bool,
     /// What `Event::InputSignal` last said.
@@ -492,6 +498,7 @@ impl<P: Processing> Analog<P> {
             chain_idle: false,
             latency: 0,
             gain: 1.0,
+            glide: Glide::STILL,
             audible: false,
             audible_reported: false,
         }
@@ -633,13 +640,15 @@ impl<P: Processing> Analog<P> {
         true
     }
 
-    /// Adds this cycle's period at `level` to the mix, along the fade.
-    fn mix(&self, fade: Fade, level: f32, acc: &mut [[P::Acc; 2]]) {
+    /// Adds this cycle's period to the mix along the fade, at a level that
+    /// moves as `level` does.
+    fn mix(&self, fade: Fade, level: Fade, acc: &mut [[P::Acc; 2]]) {
         let period = acc.len();
+        let (buf, processed, faded) = (&self.buf, &self.processed, &self.faded);
         match self.plays {
-            Plays::Captured => fade.add(&self.buf[..period], level, acc, mix_add::<P>),
-            Plays::Processed => fade.add(&self.processed[..period], level, acc, mix_add_acc::<P>),
-            Plays::Faded => fade.add(&self.faded[..period], level, acc, mix_add_acc::<P>),
+            Plays::Captured => fade.add_moving(&buf[..period], level, acc, mix_add::<P>),
+            Plays::Processed => fade.add_moving(&processed[..period], level, acc, mix_add_acc::<P>),
+            Plays::Faded => fade.add_moving(&faded[..period], level, acc, mix_add_acc::<P>),
         }
     }
 }
@@ -844,41 +853,141 @@ fn place_routed(frames: &[[i32; 2]], routing: &Routing, channels: usize, out: &m
     }
 }
 
-/// How the output gain moves over one period.
+/// How a gain moves over one period: the output's, or an input's.
 #[derive(Clone, Copy)]
 struct Fade {
     from: f32,
     to: f32,
     /// Frames from the start over which the gain goes from `from` to `to`.
     frames: usize,
-    /// Down to zero over the whole period, before a reopen.
+    /// Down to zero over the whole period, before a reopen. Only the
+    /// output's gain does this.
     out: bool,
 }
 
 impl Fade {
-    /// Adds `samples` at `level` to the mix, along the fade.
-    fn mix<P: Processing>(self, samples: &[[i32; 2]], level: f32, acc: &mut [[P::Acc; 2]]) {
-        self.add(samples, level, acc, mix_add::<P>);
+    /// A gain that stays at `gain`.
+    fn flat(gain: f32) -> Fade {
+        Fade {
+            from: gain,
+            to: gain,
+            frames: 0,
+            out: false,
+        }
     }
 
-    /// Adds `samples` with `add`, which takes a ramp over all of its `acc`.
-    fn add<T, A>(self, samples: &[T], level: f32, acc: &mut [A], add: fn(&[T], Ramp, &mut [A])) {
+    /// The gain at `frame` of the period, leaving `out` aside.
+    fn at(self, frame: usize) -> f32 {
+        if frame >= self.frames {
+            self.to
+        } else {
+            self.from + (self.to - self.from) * (frame as f32 / self.frames as f32)
+        }
+    }
+
+    /// Adds `samples` with `add`, which takes a ramp over all of its `acc`,
+    /// along the fade, at a level that moves as `level` does.
+    ///
+    /// The period is cut where either gain stops moving, and each piece
+    /// ramps between the products of the two at its ends. With one of
+    /// them still, that is exactly its line; with both moving, the curve
+    /// between is drawn as a straight line, which is off by a small part
+    /// of a 10 ms fade.
+    fn add_moving<T, A>(
+        self,
+        samples: &[T],
+        level: Fade,
+        acc: &mut [A],
+        add: fn(&[T], Ramp, &mut [A]),
+    ) {
         if self.out {
             let ramp = Ramp {
-                from: self.from * level,
+                from: self.from * level.from,
                 to: 0.0,
             };
             add(samples, ramp, acc);
             return;
         }
-        let (fading, steady) = samples.split_at(self.frames);
-        let (acc_fading, acc_steady) = acc.split_at_mut(self.frames);
-        let ramp = Ramp {
-            from: self.from * level,
-            to: self.to * level,
+        let n = acc.len();
+        let first = self.frames.min(level.frames).min(n);
+        let second = self.frames.max(level.frames).min(n);
+        let gain = |frame| self.at(frame) * level.at(frame);
+        let mut start = 0;
+        for end in [first, second, n] {
+            if end > start {
+                let ramp = Ramp {
+                    from: gain(start),
+                    to: gain(end),
+                };
+                add(&samples[start..end], ramp, &mut acc[start..end]);
+                start = end;
+            }
+        }
+    }
+}
+
+/// An input's gain on its way to a new value: a source's or the analog
+/// input's. The gain it moves to is kept beside it.
+#[derive(Clone, Copy)]
+struct Glide {
+    /// Where the gain stands while it moves.
+    level: f32,
+    /// Frames until it reaches the gain it moves to.
+    left: usize,
+}
+
+impl Glide {
+    /// Not moving.
+    const STILL: Glide = Glide {
+        level: 0.0,
+        left: 0,
+    };
+
+    /// Where the gain stands, `gain` being the one it moves to.
+    fn now(self, gain: f32) -> f32 {
+        if self.left > 0 { self.level } else { gain }
+    }
+
+    fn moving(self) -> bool {
+        self.left > 0
+    }
+
+    /// Starts from where the gain stands towards `to`, over `frames`, or
+    /// moves it there at once with `None`. `gain` is the one it moved to.
+    fn start(&mut self, gain: f32, to: f32, frames: Option<usize>) {
+        self.level = self.now(gain);
+        self.left = frames.unwrap_or(0);
+        if self.level == to {
+            self.left = 0;
+        }
+    }
+
+    /// This cycle's part of the move towards `gain`, over a period of
+    /// `period` frames.
+    fn step(self, gain: f32, period: usize) -> Fade {
+        let frames = self.left.min(period);
+        let to = if frames == self.left {
+            gain
+        } else {
+            self.level + (gain - self.level) * (frames as f32 / self.left as f32)
         };
-        add(fading, ramp, acc_fading);
-        add(steady, Ramp::flat(self.to * level), acc_steady);
+        Fade {
+            from: self.now(gain),
+            to,
+            frames,
+            out: false,
+        }
+    }
+
+    /// Moves on by a cycle's part, as `step` gave it.
+    fn advance(&mut self, step: Fade) {
+        self.level = step.to;
+        self.left -= step.frames;
+    }
+
+    /// Ends the move: the gain is where it was going.
+    fn finish(&mut self) {
+        self.left = 0;
     }
 }
 
@@ -975,8 +1084,13 @@ pub enum Command {
     /// `CaptureFailed` that arrives before the `OldCapture` belongs to the
     /// capture this command replaced.
     SetCapture(Option<Box<dyn Capture>>),
-    /// The gain of the analog input. Applies at once, as a source's does.
+    /// The gain of the analog input. Fades over 10 ms from where it is,
+    /// as a source's does.
     SetAnalogGain(f32),
+    /// The gain of a source. Fades over 10 ms from where it is, also
+    /// during another fade, and applies at once while the source is not
+    /// heard. One for a source that is not there is ignored.
+    SetSourceGain(ClientId, f32),
     /// A capture stream. Refused with `Event::DroppedTap` if the table is
     /// full. `SetRunning` and `Flush` find it by its id; a flushed tap is
     /// stopped, and its ring is left for the client to empty.
@@ -989,9 +1103,9 @@ pub enum Command {
     /// Replaces the matrix of an output, 0 being the master, each gain
     /// moving to its new value over 10 ms. Answered by `Event::OldMatrix`
     /// with the one it replaced. One of another width than the matrix in
-    /// place is sent back as the `OldMatrix`, and the one in place stays:
-    /// the buffers and the chains are built for its width. So is one for
-    /// an output that is not there.
+    /// place is sent back as the `OldMatrix`, marked refused, and the one
+    /// in place stays: the buffers and the chains are built for its width.
+    /// So is one for an output that is not there.
     SetMatrix(usize, Box<Matrix>),
     /// Puts further output `index`, 1 to 3, in place: its mix, an
     /// `OutputMix` in the engine's processing format, and the feed of its
@@ -1061,8 +1175,8 @@ pub enum Event {
     OldTaps(Vec<Box<Tap>>),
     /// The matrix a `SetMatrix` replaced, or the one it brought if that
     /// was refused, with the output it was for, to be freed off the audio
-    /// thread.
-    OldMatrix(usize, Box<Matrix>),
+    /// thread. The flag says it was refused.
+    OldMatrix(usize, Box<Matrix>, bool),
     /// A further output's mix and feed that `AddOutput` replaced or
     /// refused, or that `RemoveOutput` took out, with the output's index,
     /// to be dropped off the audio thread.
@@ -1337,7 +1451,7 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         let frames = MAX_PERIOD as usize;
         let channels = sink.channels();
         let forced = mode == BitPerfect::Forced;
-        Engine {
+        let engine = Engine {
             sink,
             commands,
             events,
@@ -1370,7 +1484,10 @@ impl<P: Processing, S: Sink> Engine<P, S> {
             stopped: false,
             last_start: None,
             claims: 0,
-        }
+        };
+        // Nothing plays yet, which is not bit-perfect.
+        engine.publish(decide(&engine.situation()));
+        engine
     }
 
     /// True while there is no open sink and no parked cycle. `cycle` then
@@ -1610,7 +1727,8 @@ impl<P: Processing, S: Sink> Engine<P, S> {
                 let old = self.analog.replace(capture);
                 self.emit(Event::OldCapture(old));
             }
-            Command::SetAnalogGain(gain) => self.analog.gain = gain,
+            Command::SetAnalogGain(gain) => self.set_analog_gain(gain),
+            Command::SetSourceGain(id, gain) => self.set_source_gain(id, gain),
             Command::AddTap(tap) => {
                 if let Some(refused) = self.taps.add(tap) {
                     self.emit(Event::DroppedTap(refused));
@@ -1902,12 +2020,41 @@ impl<P: Processing, S: Sink> Engine<P, S> {
     /// Otherwise it applies at once, so that a stream starting in the same
     /// cycle as the change plays at the new level from its first frame.
     fn set_gain(&mut self, output: usize, gain: f32) {
-        let fade = (self.open && self.heard()).then(|| (self.rate * FADE_MS / 1000) as usize);
+        let fade = (self.open && self.heard()).then(|| self.fade_frames());
         let Some(mix) = self.output_mix_mut(output) else {
             return;
         };
         if gain != mix.target_gain {
             mix.set_gain(gain, fade);
+        }
+    }
+
+    /// The frames of a fade, while the output is open.
+    fn fade_frames(&self) -> usize {
+        (self.rate * FADE_MS / 1000) as usize
+    }
+
+    /// Sets a source's gain, as `Command::SetSourceGain` says. Like the
+    /// output's, a change fades only while the source is heard.
+    fn set_source_gain(&mut self, id: ClientId, gain: f32) {
+        let heard = self.open && self.audible().any(|s| s.id == id);
+        let fade = heard.then(|| self.fade_frames());
+        if let Some(source) = self.find(id)
+            && gain != source.gain
+        {
+            source.glide.start(source.gain, gain, fade);
+            source.gain = gain;
+        }
+    }
+
+    /// Sets the analog input's gain, as `Command::SetAnalogGain` says.
+    fn set_analog_gain(&mut self, gain: f32) {
+        let heard = self.open && self.analog.audible;
+        let fade = heard.then(|| self.fade_frames());
+        let analog = &mut self.analog;
+        if gain != analog.gain {
+            analog.glide.start(analog.gain, gain, fade);
+            analog.gain = gain;
         }
     }
 
@@ -1942,11 +2089,11 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         let dop = self.table.iter().any(|s| s.dop_claim != 0);
         let ramps = self.open && self.heard() && !dop;
         let ramp = ramps.then(|| (self.rate * FADE_MS / 1000) as usize);
-        let old = match self.output_mix_mut(output) {
+        let (old, refused) = match self.output_mix_mut(output) {
             Some(mix) => mix.set_matrix(matrix, forced, ramp),
-            None => matrix,
+            None => (matrix, true),
         };
-        self.emit(Event::OldMatrix(output, old));
+        self.emit(Event::OldMatrix(output, old, refused));
     }
 
     /// Running sources that are heard this cycle.
@@ -2154,8 +2301,8 @@ impl<P: Processing, S: Sink> Engine<P, S> {
             active,
             software_volume_at_0db: self.master.gain == 1.0
                 && self.master.target_gain == 1.0
-                && audible().all(|s| s.gain == 1.0)
-                && (!analog || self.analog.gain == 1.0),
+                && audible().all(|s| s.gain == 1.0 && !s.glide.moving())
+                && (!analog || self.analog.gain == 1.0 && !self.analog.glide.moving()),
             resampled: audible().any(|s| s.resampler.is_some()),
             plugins_neutral: self.master.neutral() && (!analog || self.analog.chain.neutral()),
             routing_pure: !self.master.ramping()
@@ -2176,11 +2323,13 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         let fading = self.analog.audible && self.analog.plays != Plays::Captured;
         // Nor is a fade in after a mute for a chain at another rate over.
         let unmuting = self.master.unmuting();
+        let decision = decide(&self.situation());
+        self.publish(decision);
         let copy_routing = if !fade_out
             && !fading
             && !unmuting
             && self.master.copy_allowed()
-            && decide(&self.situation()).is_ok()
+            && decision.is_ok()
         {
             self.copy_routing()
         } else {
@@ -2215,6 +2364,8 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         if !copy {
             mix_clear::<P>(players);
         }
+        // An input's gain moves on in the cycles it is mixed in. Where it
+        // is not, there is nothing to fade and it is where it was going.
         for source in self.table.iter_mut().filter(|s| s.running) {
             if source.held > 0 {
                 let held = &self.counters.held_frames;
@@ -2222,30 +2373,38 @@ impl<P: Processing, S: Sink> Engine<P, S> {
             }
             if source.muted(rate, routed) {
                 source.discard(period, rate);
+                source.glide.finish();
             } else if !source.plays {
                 source.note_shortfall(0, 1);
+                source.glide.finish();
             } else if copy {
                 source.read_raw(out);
+                source.glide.finish();
             } else {
                 source.read_resampled(scratch);
-                let level = if volumes { source.gain } else { 1.0 };
-                fade.mix::<P>(scratch, level, players);
+                let step = source.glide.step(source.gain, period);
+                let level = if volumes { step } else { Fade::flat(1.0) };
+                fade.add_moving(scratch, level, players, mix_add::<P>);
+                source.glide.advance(step);
             }
         }
         let analog_bus = &mut self.analog_bus[..period];
-        if self.analog.audible {
-            if copy {
-                // Only with a neutral chain, so `buf` holds the period.
-                out.copy_from_slice(&self.analog.buf[..period]);
+        if !self.analog.audible {
+            self.analog.glide.finish();
+        } else if copy {
+            // Only with a neutral chain, so `buf` holds the period.
+            out.copy_from_slice(&self.analog.buf[..period]);
+            self.analog.glide.finish();
+        } else {
+            let step = self.analog.glide.step(self.analog.gain, period);
+            let level = if volumes { step } else { Fade::flat(1.0) };
+            if direct {
+                self.analog.mix(fade, level, players);
             } else {
-                let level = if volumes { self.analog.gain } else { 1.0 };
-                if direct {
-                    self.analog.mix(fade, level, players);
-                } else {
-                    mix_clear::<P>(analog_bus);
-                    self.analog.mix(fade, level, analog_bus);
-                }
+                mix_clear::<P>(analog_bus);
+                self.analog.mix(fade, level, analog_bus);
             }
+            self.analog.glide.advance(step);
         }
         if feeding {
             return self.mix_outputs(copy_routing, fade_step);
@@ -2261,6 +2420,16 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         let chains_ran = self.master.mix(players, analog, samples, rate, plugins);
         self.master.step_fade(fade_step);
         chains_ran
+    }
+
+    /// Publishes the bit-perfect decision in the counters, when it is not
+    /// the one there already.
+    fn publish(&self, decision: Result<(), NotBitPerfect>) {
+        let code = code_of(decision);
+        let published = &self.counters.bit_perfect;
+        if published.load(Ordering::Relaxed) != code {
+            published.store(code, Ordering::Relaxed);
+        }
     }
 
     /// The rest of `play_pcm` with further outputs: the buses, at unity,
@@ -2969,6 +3138,123 @@ mod tests {
         }
         assert_ne!(rig.last_periods(11)[0], [ODD, -ODD]);
         assert_eq!(rig.last_periods(1), frames(ODD, PERIOD));
+    }
+
+    /// Checks frames of a constant 0.5 of full scale, from the first one
+    /// after a change of an input's gain from 1.0 to 0.25: they start at
+    /// 0.5, end at 0.125 480 frames on, 10 ms at 48 kHz, and move in even
+    /// steps in between.
+    fn check_input_fade(got: &[[i32; 2]]) {
+        let v = |f: [i32; 2]| f64::from(f[0]) / 2f64.powi(31);
+        assert!((v(got[0]) - 0.5).abs() < 1e-6, "first frame {}", v(got[0]));
+        for (i, f) in got.iter().enumerate().skip(480) {
+            assert!((v(*f) - 0.125).abs() < 1e-6, "frame {i}: {}", v(*f));
+        }
+        for (i, pair) in got.windows(2).enumerate() {
+            let step = (v(pair[1]) - v(pair[0])).abs();
+            assert!(step <= 0.375 / 480.0 + 1e-6, "frame {i}: step of {step}");
+        }
+    }
+
+    #[test]
+    fn a_source_gain_change_fades_over_10_ms() {
+        let mut rig = Rig::<F64>::new(BitPerfect::Auto);
+        let mut a = client(1);
+        rig.add(&mut a);
+        a.ring.write(&frames(1 << 30, 11 * PERIOD));
+        // The source is heard before the change, so the change fades.
+        rig.cycle();
+        rig.send(Command::SetSourceGain(1, 0.25));
+        for _ in 0..10 {
+            rig.cycle();
+        }
+        check_input_fade(&rig.last_periods(10));
+    }
+
+    #[test]
+    fn a_source_gain_change_before_it_is_heard_applies_at_once() {
+        let mut rig = Rig::<F64>::new(BitPerfect::Auto);
+        let mut a = client(1);
+        rig.add(&mut a);
+        rig.send(Command::SetSourceGain(1, 0.25));
+        // One for a source that is not there is ignored.
+        rig.send(Command::SetSourceGain(7, 0.5));
+        a.ring.write(&frames(1 << 30, PERIOD));
+        rig.cycle();
+        assert_eq!(rig.last_periods(1), frames(1 << 28, PERIOD));
+    }
+
+    #[test]
+    fn a_fading_source_gain_is_not_bit_perfect() {
+        let mut rig = Rig::<F32>::new(BitPerfect::Auto);
+        let mut a = client(1);
+        rig.add(&mut a);
+        a.ring.write(&frames(ODD, 30 * PERIOD));
+        rig.cycle();
+        assert_eq!(decide(&rig.engine.situation()), Ok(()));
+        rig.send(Command::SetSourceGain(1, 0.5));
+        for _ in 0..10 {
+            rig.cycle();
+        }
+        rig.send(Command::SetSourceGain(1, 1.0));
+        rig.cycle();
+        // Back at the gain of 0 dB, but not there yet.
+        assert_eq!(rig.engine.table[0].gain, 1.0);
+        assert_eq!(decide(&rig.engine.situation()), Err(NotBitPerfect::Volume));
+        for _ in 0..10 {
+            rig.cycle();
+        }
+        assert_eq!(decide(&rig.engine.situation()), Ok(()));
+        assert_eq!(rig.last_periods(1), frames(ODD, PERIOD));
+    }
+
+    #[test]
+    fn set_source_gain_does_not_allocate() {
+        let (mut rig, feed) = with_capture::<F32>(BitPerfect::Auto);
+        let mut a = client(1);
+        rig.add(&mut a);
+        let input = frames(1 << 24, PERIOD);
+        a.ring.write(&input);
+        feed.push(&input);
+        rig.cycle();
+        rig.events();
+        rig.send(Command::SetSourceGain(1, 0.5));
+        rig.send(Command::SetSourceGain(9, 0.5));
+        rig.send(Command::SetAnalogGain(0.5));
+        let engine = &mut rig.engine;
+        let commands = &mut rig.commands;
+        assert_no_alloc(|| {
+            for round in 0..40 {
+                a.ring.write(&input);
+                feed.push(&input);
+                if round == 20 {
+                    // A change during another's fade, and one back to 0 dB.
+                    let _ = commands.push(Command::SetSourceGain(1, 1.0));
+                    let _ = commands.push(Command::SetAnalogGain(1.0));
+                }
+                if round == 22 {
+                    let _ = commands.push(Command::SetSourceGain(1, 0.25));
+                }
+                engine.cycle().unwrap();
+            }
+        });
+        assert!(rig.log.frames().iter().any(|f| f[0] != 0));
+    }
+
+    #[test]
+    fn the_bit_perfect_decision_is_published() {
+        let mut rig = Rig::<F32>::new(BitPerfect::Auto);
+        let published = |rig: &Rig<F32>| rig.counters.bit_perfect.load(Relaxed);
+        // Nothing has played yet.
+        assert_eq!(published(&rig), NotBitPerfect::NoSource.code());
+        let mut a = client(1);
+        rig.add(&mut a);
+        a.ring.write(&frames(ODD, 4 * PERIOD));
+        rig.cycle();
+        assert_eq!(published(&rig), 0);
+        rig.send(Command::SetSourceGain(1, 0.5));
+        rig.cycle();
+        assert_eq!(published(&rig), NotBitPerfect::Volume.code());
     }
 
     #[test]
@@ -6628,6 +6914,43 @@ mod tests {
     }
 
     #[test]
+    fn the_analog_gain_fades_over_10_ms() {
+        let (mut rig, feed) = with_capture::<F64>(BitPerfect::Auto);
+        let input = frames(1 << 30, PERIOD);
+        // The input is heard before the change, so the change fades.
+        feed.push(&input);
+        rig.cycle();
+        rig.send(Command::SetAnalogGain(0.25));
+        for _ in 0..10 {
+            feed.push(&input);
+            rig.cycle();
+        }
+        check_input_fade(&rig.last_periods(10));
+    }
+
+    #[test]
+    fn a_fading_analog_gain_is_not_bit_perfect() {
+        let (mut rig, feed) = with_capture::<F32>(BitPerfect::Auto);
+        let input = frames(ODD, PERIOD);
+        feed.push(&input);
+        rig.cycle();
+        assert_eq!(decide(&rig.engine.situation()), Ok(()));
+        rig.send(Command::SetAnalogGain(0.5));
+        feed.push(&input);
+        rig.cycle();
+        rig.send(Command::SetAnalogGain(1.0));
+        feed.push(&input);
+        rig.cycle();
+        assert_eq!(decide(&rig.engine.situation()), Err(NotBitPerfect::Volume));
+        for _ in 0..10 {
+            feed.push(&input);
+            rig.cycle();
+        }
+        assert_eq!(decide(&rig.engine.situation()), Ok(()));
+        assert_eq!(rig.last_periods(1), input);
+    }
+
+    #[test]
     fn the_analog_input_is_mixed_with_a_client() {
         let (mut rig, feed) = with_capture::<I32>(BitPerfect::Auto);
         let mut a = client(1);
@@ -7793,9 +8116,10 @@ mod tests {
             analog_chain.process(block.reborrow());
             P::from_block(block, processed.as_flattened_mut());
             let mut acc = vec![[P::zero(); 2]; n];
-            fade.add(a, ga, &mut acc, mix_add::<P>);
-            fade.add(b, gb, &mut acc, mix_add::<P>);
-            fade.add(&processed, gin, &mut acc, mix_add_acc::<P>);
+            let flat = Fade::flat;
+            fade.add_moving(a, flat(ga), &mut acc, mix_add::<P>);
+            fade.add_moving(b, flat(gb), &mut acc, mix_add::<P>);
+            fade.add_moving(&processed, flat(gin), &mut acc, mix_add_acc::<P>);
             let mut mix = chain_of::<P>(vec![times(1.5)]);
             let mut output = chain_of::<P>(vec![plus(-12_345)]);
             let mut block = P::to_block(acc.as_flattened_mut(), 2, &mut store);
@@ -8816,7 +9140,7 @@ mod tests {
     /// The matrices the engine handed back, in order.
     fn old_matrices(events: &[Event]) -> Vec<Matrix> {
         let old = |e: &Event| match e {
-            Event::OldMatrix(_, m) => Some((**m).clone()),
+            Event::OldMatrix(_, m, _) => Some((**m).clone()),
             _ => None,
         };
         events.iter().filter_map(old).collect()
@@ -8968,6 +9292,28 @@ mod tests {
     }
 
     #[test]
+    fn a_matrix_of_the_same_width_is_not_refused() {
+        let mut rig = Rig::<F32>::new(BitPerfect::Auto);
+        rig.send(Command::SetMatrix(0, Box::new(swap_at(0.0))));
+        rig.cycle();
+        let events = rig.events();
+        assert!(matches!(events[..], [Event::OldMatrix(0, _, false)]));
+        assert_eq!(old_matrices(&events), vec![stereo()]);
+        // Nor is it, when it holds the same gains as the one in place.
+        rig.send(Command::SetMatrix(0, Box::new(swap_at(0.0))));
+        rig.cycle();
+        assert!(matches!(rig.events()[..], [Event::OldMatrix(0, _, false)]));
+    }
+
+    #[test]
+    fn a_matrix_for_an_output_not_there_is_refused() {
+        let mut rig = Rig::<F32>::new(BitPerfect::Auto);
+        rig.send(Command::SetMatrix(2, Box::new(stereo())));
+        rig.cycle();
+        assert!(matches!(rig.events()[..], [Event::OldMatrix(2, _, true)]));
+    }
+
+    #[test]
     fn a_matrix_of_another_width_is_sent_back() {
         let mut rig = Rig::<F32>::new(BitPerfect::Auto);
         let mut a = client(1);
@@ -8981,7 +9327,9 @@ mod tests {
         rig.send(Command::SetMatrix(0, Box::new(wider.clone())));
         a.ring.write(&input);
         rig.cycle();
-        assert_eq!(old_matrices(&rig.events()), vec![wider]);
+        let events = rig.events();
+        assert!(matches!(events[..], [Event::OldMatrix(0, _, true)]));
+        assert_eq!(old_matrices(&events), vec![wider]);
         assert_eq!(rig.engine.master.matrix, stereo());
         // Nothing moved: still the copy path, unswapped.
         assert_eq!(rig.last_periods(2), [input.clone(), input].concat());
@@ -9936,7 +10284,7 @@ mod tests {
             .events()
             .iter()
             .filter_map(|e| match e {
-                Event::OldMatrix(output, m) => Some((*output, m.width())),
+                Event::OldMatrix(output, m, _) => Some((*output, m.width())),
                 _ => None,
             })
             .collect();

@@ -3,8 +3,9 @@
 Stage 1 measured what the hardware can do, before the daemon was written.
 [Stage 2](#stage-2) measured the daemon itself, [Stage 3a](#stage-3a) its
 analog input and plugins, [Stage 3b, part 1](#stage-3b-part-1) the mixing
-matrix and the output's channel count, and [Stage 3b, part 2](#stage-3b-part-2)
-several outputs. The probes are in `tools/measure`.
+matrix and the output's channel count, [Stage 3b, part 2](#stage-3b-part-2)
+several outputs, and [Stage 4 part 1](#stage-4-part-1-the-api-under-load) the
+HTTP API. The probes are in `tools/measure`.
 The Pi 4 is still to be measured.
 
 ## Boards
@@ -2101,3 +2102,118 @@ The SD runs' worst cycles were not kept.
   failure of the board's SD system to come up after the overlay was added
   is not explained by it: the SD system did not come up with the overlay
   removed either.
+
+## Stage 4 part 1: the API under load
+
+Whether the HTTP API disturbs playback, and whether a change it makes clicks.
+Measured on the CM5 test board and on the Pi 3 test board.
+
+The daemon was built from 2a43c02 with the `alsa-output` feature and ran as
+root with real-time rights, a fresh daemon for each run, with this config:
+
+```toml
+card = "sndrpihifiberry"
+bit_perfect = "off"
+```
+
+So the mix ran in both runs of a pair, and only the API calls differ. Each
+board played at its default latency: on the CM5 64 frames per period, 128
+buffered (2.67 ms), on the Pi 3 256 and 512 (10.67 ms). One `aplay` played a
+997 Hz sine at 48 kHz, S16, through the `aas` ALSA plugin. Nothing else ran:
+no load, no analog input. `/etc/sysctl.d/90-aas.conf` was installed on both
+boards. The logs were kept in RAM, and on the CM5 the kernel log was streamed
+off the board.
+
+### Ten minutes with and without calls
+
+Each pair is 600 s of the player, once with nothing else, and once with a
+script on the board that made 10 calls a second for the 600 s, each on a new
+connection, in turn:
+
+- `PATCH /outputs/1` with `{"volume": ...}`, the master, between 100 and 95.
+  That is the card's `Digital` control on both boards, so each call wrote the
+  card's mixer.
+- `PATCH /inputs/clients/aplay` with `{"volume_db": ...}`, stepping through
+  0, -3, -6 and -12 dB.
+- `PUT /matrix` with output 1 swapped left for right, then the default matrix.
+
+so 2000 of each. One WebSocket on `/events` was held open throughout and read
+2 KB at a time with a 0.5 s pause between reads.
+
+| Board, run | Xruns | Wake-up gaps | Worst gap / buffer | Worst cycle | API calls, not 200 | Call time, median / 99% / worst |
+|---|---|---|---|---|---|---|
+| CM5, without calls | 0 | 0 | 1.39 / 2.67 ms | 0.024 ms | | |
+| CM5, with calls | 0 | 0 | 1.50 / 2.67 ms | 0.053 ms | 6000, 0 | 0.4 / 2.1 / 4.1 ms |
+| Pi 3, without calls | 0 | 0 | 5.48 / 10.67 ms | 0.185 ms | | |
+| Pi 3, with calls | 0 | 0 | 5.53 / 10.67 ms | 0.278 ms | 6000, 0 | 3.5 / 6.3 / 7.7 ms |
+
+Both boards pass: no xrun and no wake-up gap with the calls, and every call
+answered 200. On the CM5 the worst gap rose by 0.11 ms, to 56% of the buffer,
+and the worst cycle from 0.024 to 0.053 ms: with the calls the audio thread
+fades a client's volume and a matrix, each about three times a second, where
+without them it only mixes. On the Pi 3 the worst gap rose by 0.05 ms and the
+worst cycle from 0.185 to 0.278 ms, 2.6% of the buffer. A call took 3.5 ms in
+the median and 7.7 ms at worst there. The `/events` socket got an event for
+each call, about 6000, and no `resync`: read this slowly it still kept up.
+`aplay` reported no underrun in any run, and the kernel log of the CM5 has
+nothing from the runs.
+
+### A volume and a matrix change through the cable
+
+No one could listen at the board, so the click test was made by capture, not
+by ear. On the CM5 the daemon ran with the config's defaults (`card` only,
+`bit_perfect = "auto"`), and `aplay` played a steady 997 Hz sine, at -6 dBFS
+on the left and -12 dBFS on the right, so that a swap of the channels is a
+change of level on each. The card's ADC recorded its DAC through the loopback
+cable, `arecord` on `hw:sndrpihifiberry` at 48 kHz, S32, for 40 s. During the
+recording the API set the client's volume from 0 to -12 dB and back, twice,
+3 s apart, and then swapped the master's matrix and set it back, twice, 3 s
+apart. The first change also left bit-perfect, since a client at -12 dB is
+not. Every change was answered 200 and is in the capture at its time.
+
+For each change the capture was searched from 0.5 s before to 0.8 s after it,
+and for five quiet seconds without a change, for the largest step between two
+samples, and for the largest RMS above 3 kHz in 5 ms windows, which is where a
+click shows and a 997 Hz tone at any level does not:
+
+| Window | Largest step, L / R | Above 3 kHz, worst 5 ms, L / R |
+|---|---|---|
+| Quiet, five seconds | 0.0648 / 0.0328 | -95.2 / -95.3 dBFS |
+| Client 0 to -12 dB | 0.0648 / 0.0328 | -82.3 / -87.9 dBFS |
+| Client -12 to 0 dB | 0.0648 / 0.0328 | -83.4 / -88.8 dBFS |
+| Client 0 to -12 dB | 0.0647 / 0.0328 | -83.3 / -88.9 dBFS |
+| Client -12 to 0 dB | 0.0648 / 0.0328 | -87.0 / -91.5 dBFS |
+| Matrix swapped | 0.0647 / 0.0656 | -90.8 / -90.3 dBFS |
+| Matrix back | 0.0647 / 0.0656 | -89.9 / -90.3 dBFS |
+| Matrix swapped | 0.0648 / 0.0656 | -90.3 / -90.4 dBFS |
+| Matrix back | 0.0648 / 0.0656 | -90.0 / -90.2 dBFS |
+
+Full scale is 1. The largest step never exceeds the tone's own: a 997 Hz sine
+of the captured 0.496 moves at most 0.0647 between two samples at 48 kHz, and
+the right channel's 0.0656 after a swap is the left's louder tone arriving
+there. A hard 0 to -12 dB jump at the tone's peak would be a step of 0.371,
+almost six times as large. Above 3 kHz the changes rise from -95 dBFS to -82
+to -91 dBFS, 76 dB or more below the tone. A computed 10 ms linear fade of the
+same tone gives -82.5 to -89.4 dBFS by this measure, depending on where the
+fade starts against the windows, and a computed hard jump -36 dBFS. So what
+shows is the fade itself. **No click was seen in the capture.**
+
+The daemon logged `output 1: a matrix of 2 channels was refused, the one in
+place stays` at the first `PUT /matrix` of every run, on both boards and also
+in a build without ALSA. The capture shows that the matrix was taken; the line
+is wrong. The audio thread swaps the new matrix's contents into the one in
+place and sends back the box it was given, so the control thread, which tells
+a refusal by the address it sent, takes every accepted matrix for a refused
+one. It is logged once per output, so only the first shows. This was fixed on
+the branch before the merge: the engine now says in `Event::OldMatrix` whether
+it refused the matrix, and a test sends matrices through the real engine and
+checks that the daemon logs no refusal.
+
+### What these figures do not show
+
+- The runs were without load and without the analog input, at 48 kHz only, and
+  for ten minutes, not an hour.
+- The click test was on the CM5 only, and judged from a capture, not by ear.
+- The calls came from the board itself, each on a new connection, not through
+  nginx, and only one `/events` subscriber was open. A subscriber that stops
+  reading was tested only off the board.

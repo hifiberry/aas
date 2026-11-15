@@ -1,6 +1,6 @@
 //! Counters the audio thread keeps for monitoring. All updates are lock free.
 
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64, Ordering::Relaxed};
 
 /// Totals since the start of the daemon.
 #[derive(Debug, Default)]
@@ -38,6 +38,11 @@ pub struct Counters {
     /// The latency of the analog chain, in frames, in the cycles its output
     /// is used. Recorders see it in their delay too.
     pub analog_latency_frames: AtomicU64,
+    /// The master's bit-perfect decision in the latest cycle that played
+    /// PCM, or, before the first, with nothing playing: 0 when bit-perfect,
+    /// else the reason's `NotBitPerfect::code`. The audio thread writes it
+    /// only when it changes.
+    pub bit_perfect: AtomicU8,
 }
 
 /// Totals of one further output since the start of the daemon. Its writer

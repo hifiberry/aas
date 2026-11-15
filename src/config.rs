@@ -184,7 +184,12 @@ pub struct Config {
     /// The further outputs, in the order of the file. The flat keys are the
     /// master, output 1.
     pub outputs: Vec<OutputConfig>,
+    /// The port the API listens on, on 127.0.0.1. 0 turns the API off.
+    pub api_port: u16,
 }
+
+/// The port of the API unless the config names another.
+pub const DEFAULT_API_PORT: u16 = 2718;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -224,6 +229,7 @@ struct Raw {
     plugin: Option<Vec<toml::Table>>,
     matrix: Option<Vec<RawRoute>>,
     output: Option<Vec<RawOutput>>,
+    api_port: Option<toml::Value>,
 }
 
 #[derive(Deserialize)]
@@ -238,25 +244,12 @@ struct RawRoute {
 fn route_from_table(n: usize, raw: RawRoute) -> Result<Route, String> {
     let from = match raw.from {
         None => return Err(format!("matrix {n}: from is missing")),
-        Some(toml::Value::String(name)) => INPUT_NAMES
-            .iter()
-            .position(|known| *known == name)
-            .ok_or_else(|| {
-                format!(
-                    "matrix {n}: from \"{name}\" must be one of {}",
-                    INPUT_NAMES.map(|known| format!("\"{known}\"")).join(", ")
-                )
-            })?,
+        Some(toml::Value::String(name)) => name,
         Some(_) => return Err(format!("matrix {n}: from must be a string")),
     };
     let to = match raw.to {
         None => return Err(format!("matrix {n}: to is missing")),
-        Some(toml::Value::Integer(v)) if (1..=MAX_CHANNELS as i64).contains(&v) => v as usize,
-        Some(toml::Value::Integer(_)) => {
-            return Err(format!(
-                "matrix {n}: to must be a channel from 1 to {MAX_CHANNELS}"
-            ));
-        }
+        Some(toml::Value::Integer(v)) => v,
         Some(_) => return Err(format!("matrix {n}: to must be a whole number")),
     };
     let gain_db = match raw.gain_db {
@@ -265,12 +258,34 @@ fn route_from_table(n: usize, raw: RawRoute) -> Result<Route, String> {
         Some(toml::Value::Float(v)) => v,
         Some(_) => return Err(format!("matrix {n}: gain_db must be a number")),
     };
+    route_from_parts(n, &from, to, gain_db)
+}
+
+/// Checks a route given by its parts, as a `[[matrix]]` table or the API
+/// gives it. `n` is its position, from 1. A table and the API give the
+/// same messages.
+pub fn route_from_parts(n: usize, from: &str, to: i64, gain_db: f64) -> Result<Route, String> {
+    let from = INPUT_NAMES
+        .iter()
+        .position(|known| *known == from)
+        .ok_or_else(|| {
+            format!(
+                "matrix {n}: from \"{from}\" must be one of {}",
+                INPUT_NAMES.map(|known| format!("\"{known}\"")).join(", ")
+            )
+        })?;
+    if !(1..=MAX_CHANNELS as i64).contains(&to) {
+        return Err(format!(
+            "matrix {n}: to must be a channel from 1 to {MAX_CHANNELS}"
+        ));
+    }
+    // Not finite is out of range too.
     if !(-100.0..=0.0).contains(&gain_db) {
         return Err(format!("matrix {n}: gain_db must be from -100 to 0"));
     }
     Ok(Route {
         from,
-        to,
+        to: to as usize,
         gain_db: gain_db as f32,
     })
 }
@@ -345,7 +360,8 @@ fn plugin_from_table(n: usize, mut table: toml::Table) -> Result<PluginConfig, S
     })
 }
 
-const DEFAULT_IDLE_DELAY_S: u32 = 60;
+/// The delay of `idle = "off"` without `idle_delay_s`.
+pub const DEFAULT_IDLE_DELAY_S: u32 = 60;
 
 impl Default for Config {
     fn default() -> Config {
@@ -366,6 +382,7 @@ impl Default for Config {
             plugins: Vec::new(),
             matrix: None,
             outputs: Vec::new(),
+            api_port: DEFAULT_API_PORT,
         }
     }
 }
@@ -526,6 +543,18 @@ impl Config {
                 path.display()
             ));
         }
+        let api_port = match raw.api_port {
+            None => d.api_port,
+            Some(toml::Value::Integer(port)) if (0..=i64::from(u16::MAX)).contains(&port) => {
+                port as u16
+            }
+            Some(_) => {
+                return Err(format!(
+                    "{}: api_port must be from 0 to 65535",
+                    path.display()
+                ));
+            }
+        };
         let mut outputs: Vec<OutputConfig> = Vec::new();
         for (i, table) in raw_outputs.into_iter().enumerate() {
             let n = i + 2;
@@ -561,6 +590,7 @@ impl Config {
             plugins,
             matrix,
             outputs,
+            api_port,
         })
     }
 }
@@ -589,6 +619,49 @@ mod tests {
         assert_eq!(c.latency_ms, None);
         assert_eq!(c.volume_control, None);
         assert_eq!(c.volume_mode, None);
+    }
+
+    #[test]
+    fn api_port_defaults_to_2718() {
+        assert_eq!(load_str("").unwrap().api_port, 2718);
+        assert_eq!(Config::default().api_port, 2718);
+        assert_eq!(load_str("api_port = 8080\n").unwrap().api_port, 8080);
+    }
+
+    #[test]
+    fn api_port_0_turns_it_off() {
+        assert_eq!(load_str("api_port = 0\n").unwrap().api_port, 0);
+    }
+
+    #[test]
+    fn api_port_70000_is_an_error() {
+        let e = err("api_port = 70000\n");
+        assert!(e.contains("api_port must be from 0 to 65535"), "{e}");
+        assert!(err("api_port = -1\n").contains("api_port"));
+        assert!(err("api_port = \"2718\"\n").contains("api_port"));
+    }
+
+    #[test]
+    fn a_route_from_parts_gives_the_messages_of_a_table() {
+        let route = route_from_parts(1, "players.right", 2, -6.0).unwrap();
+        assert_eq!(
+            route,
+            Route {
+                from: 1,
+                to: 2,
+                gain_db: -6.0
+            }
+        );
+        let e = route_from_parts(3, "players.middle", 1, 0.0).unwrap_err();
+        assert!(
+            e.starts_with("matrix 3: from \"players.middle\" must be one of"),
+            "{e}"
+        );
+        let e = route_from_parts(2, "players.left", 0, 0.0).unwrap_err();
+        assert_eq!(e, "matrix 2: to must be a channel from 1 to 8");
+        let e = route_from_parts(2, "players.left", 1, 0.5).unwrap_err();
+        assert_eq!(e, "matrix 2: gain_db must be from -100 to 0");
+        assert!(route_from_parts(2, "players.left", 1, f64::NAN).is_err());
     }
 
     #[test]

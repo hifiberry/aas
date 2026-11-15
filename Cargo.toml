@@ -46,11 +46,14 @@ alsa-output = ["dep:alsa"]
 aas-client = { version = "0.1.0", path = "crates/aas-client" }
 aas-plugin = { version = "0.1.0", path = "crates/aas-plugin" }
 alsa = { version = "0.12.1", optional = true }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "ws", "tokio"] }
 audioadapter-buffers = "4"
 libc = "0.2"
 rtrb = "0.4"
 rubato = "4"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", default-features = false, features = ["rt", "net", "sync", "time"] }
 toml = "1"
 
 [dev-dependencies]
@@ -58,6 +61,8 @@ toml = "1"
 # in release builds, which the audio thread is.
 assert_no_alloc = { version = "1", default-features = false }
 tempfile = "3"
+# Only its re-exported blocking client, to talk to `/events`.
+tokio-tungstenite = "0.29"
 
 # One codegen unit and link-time optimisation across the crates, so the ring
 # functions of aas-client are inlined into the audio thread's cycle.
