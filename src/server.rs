@@ -319,6 +319,7 @@ pub fn run_outputs(
         control.set_analog(open);
     }
     control.set_counters(counters.clone());
+    control.set_output_counters(output_counters.iter().map(|(_, c)| c.clone()).collect());
     control.set_matrix_width(master_width);
     let found = hardware.as_mut().and_then(|open| open());
     let volume = OutputVolume::new(found, config.bit_perfect);

@@ -10,7 +10,11 @@ pub struct Counters {
     pub wake_gaps: AtomicU64,
     pub worst_gap_ns: AtomicU64,
     pub worst_cycle_ns: AtomicU64,
+    /// The sum of every cycle's time, for the average.
+    pub cycle_ns_total: AtomicU64,
     pub cycles: AtomicU64,
+    /// How long the buffer lasts, as the latest cycle measured against it.
+    pub buffer_ns: AtomicU64,
     /// Frames held back a cycle because they might be DoP, counted in every
     /// cycle that holds them in a stream under way. They play later. A
     /// client that keeps less than a period and 16 frames in its ring can
@@ -65,6 +69,9 @@ pub struct OutputCounters {
     pub skipped: AtomicU64,
     /// The path's delay has stayed on its target for the lock time.
     pub locked: AtomicBool,
+    /// `f64::to_bits` of the resampler's ratio, card frames per master
+    /// frame, as the writer last ran it. 0 before the first.
+    pub ratio_bits: AtomicU64,
 }
 
 /// What a chain publishes about one of its plugins. The control thread
@@ -126,6 +133,8 @@ impl Counters {
         self.cycles.fetch_add(1, Relaxed);
         self.worst_gap_ns.fetch_max(gap_ns, Relaxed);
         self.worst_cycle_ns.fetch_max(cycle_ns, Relaxed);
+        self.cycle_ns_total.fetch_add(cycle_ns, Relaxed);
+        self.buffer_ns.store(buffer_ns, Relaxed);
         if gap_ns > buffer_ns {
             self.last_gap_ns.store(gap_ns, Relaxed);
             self.last_gap_at_ns.store(monotonic_ns(), Relaxed);
@@ -234,6 +243,16 @@ mod tests {
         c.locked.store(true, Relaxed);
         c.ppm_milli.store(100_000, Relaxed);
         assert!(c.to_string().ends_with(", +100.000 ppm, locked"), "{c}");
+    }
+
+    #[test]
+    fn the_average_comes_from_the_sum() {
+        let c = Counters::default();
+        c.on_cycle(500, 100, 1_000);
+        c.on_cycle(500, 300, 1_000);
+        assert_eq!(c.cycle_ns_total.load(Relaxed), 400);
+        assert_eq!(c.cycles.load(Relaxed), 2);
+        assert_eq!(c.buffer_ns.load(Relaxed), 1_000);
     }
 
     #[test]

@@ -11,7 +11,7 @@ use crate::adaptive::{Adaptive, MAX_DRIFT};
 use crate::api::ApiEvent;
 use crate::capture::{Capture, OpenError};
 use crate::config::{Config, Format, Idle, OutputConfig, PluginConfig, PluginPlace, Quality};
-use crate::counters::Counters;
+use crate::counters::{Counters, OutputCounters};
 use crate::dop;
 use crate::drift::SANE;
 use crate::engine::{Command, Event, INITIAL_SOURCES, INITIAL_TAPS, Source, Tap, Target};
@@ -913,6 +913,8 @@ pub struct Control {
     published: Option<api::Published>,
     /// The audio thread's counters, for its bit-perfect decision.
     counters: Arc<Counters>,
+    /// The further outputs' counters, index = engine output index - 1.
+    output_counters: Vec<Arc<OutputCounters>>,
     /// Each output's matrix, by engine index: the master first.
     matrices: Vec<api::OutputMatrix>,
 }
@@ -985,6 +987,7 @@ impl Control {
             api: None,
             published: None,
             counters: Arc::new(Counters::default()),
+            output_counters: Vec::new(),
             matrices: vec![api::OutputMatrix::new(
                 config.channels,
                 config.matrix.as_deref(),

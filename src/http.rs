@@ -126,6 +126,7 @@ fn router(shared: Arc<Shared>) -> Router {
             "/inputs/clients/{name}",
             get(get_client).patch(patch_client),
         )
+        .route("/metrics", get(|s| ask(s, Call::Metrics)))
         .route("/matrix", get(|s| ask(s, Call::Matrix)).put(put_matrix))
         .route("/events", get(events))
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY))

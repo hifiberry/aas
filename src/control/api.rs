@@ -7,11 +7,15 @@ use crate::api::{
     self, ApiCall, ApiError, ApiEvent, Call, ClientView, InputPatch, InputView, MatrixPut,
     OutputPatch, OutputRoutes, OutputState, OutputView, RouteJson, StateView,
 };
+use crate::api::{
+    AnalogMetrics, LastGap, MasterMetrics, MetricsView, OutputMetrics, PluginMetrics, StreamMetrics,
+};
 use crate::bitperfect::NotBitPerfect;
 use crate::config::{self, Config, DEFAULT_IDLE_DELAY_S, Format, Idle, Route};
-use crate::counters::Counters;
+use crate::counters::{Counters, OutputCounters};
 use crate::engine::Command;
 use crate::format::db_to_gain;
+use crate::latency::PERIODS;
 use crate::matrix::{Bus, INPUT_NAMES, Matrix};
 use crate::state::{MAX_CLIENTS, State, Stored, StoredInput, StoredOutput, StoredRoute};
 use std::collections::BTreeSet;
@@ -272,6 +276,12 @@ impl Control {
         self.counters = counters;
     }
 
+    /// The further outputs' counters, in the order of the config, for
+    /// `GET /metrics`.
+    pub fn set_output_counters(&mut self, counters: Vec<Arc<OutputCounters>>) {
+        self.output_counters = counters;
+    }
+
     /// Handles one call of the API and gives its answer.
     pub fn call(&mut self, call: Call, now: Instant) -> api::Answer {
         let answer = match call {
@@ -303,6 +313,7 @@ impl Control {
             Call::PatchClient(name, patch) => self.patch_client(name, patch, now),
             Call::Matrix => api::answer(&self.matrix_view()),
             Call::PutMatrix(put) => self.put_matrix(put, now),
+            Call::Metrics => api::answer(&self.metrics_view()),
         };
         self.publish_changes();
         answer
@@ -870,6 +881,102 @@ impl Control {
         NotBitPerfect::from_code(code).unwrap_or(Err(NotBitPerfect::NoSource))
     }
 
+    /// Each plugin's time per cycle, by id. The control thread holds no
+    /// per-plugin stats yet; this is where they are read.
+    fn plugin_metrics(&self) -> Vec<PluginMetrics> {
+        Vec::new()
+    }
+
+    fn master_metrics(&self) -> MasterMetrics {
+        let c = &self.counters;
+        let load = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed);
+        let cycles = load(&c.cycles);
+        let gap = load(&c.last_gap_ns);
+        let period = self.output.or(self.parked).map_or(0, |(_, period)| period);
+        MasterMetrics {
+            cycles,
+            cycle_ns_avg: load(&c.cycle_ns_total).checked_div(cycles).unwrap_or(0),
+            cycle_ns_worst: load(&c.worst_cycle_ns),
+            buffer_ns: load(&c.buffer_ns),
+            xruns: load(&c.xruns),
+            wake_gaps: load(&c.wake_gaps),
+            worst_gap_ns: load(&c.worst_gap_ns),
+            last_gap: (gap > 0).then(|| LastGap {
+                ns: gap,
+                at_ns: load(&c.last_gap_at_ns),
+            }),
+            period_frames: period,
+            card_frames: period * PERIODS,
+            delay_frames: self.delay.unwrap_or(0),
+        }
+    }
+
+    fn output_metrics(&self) -> Vec<OutputMetrics> {
+        let mut views = Vec::new();
+        for (i, output) in self.further.iter().enumerate() {
+            let Some(c) = self.output_counters.get(i) else {
+                continue;
+            };
+            let load = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed);
+            let bits = load(&c.ratio_bits);
+            views.push(OutputMetrics {
+                id: output.index + 1,
+                card: output.card.clone(),
+                xruns: load(&c.xruns),
+                wake_gaps: load(&c.wake_gaps),
+                worst_gap_ns: load(&c.worst_gap_ns),
+                starves: load(&c.starves),
+                overflows: load(&c.overflows),
+                skipped: load(&c.skipped),
+                ppm: c.ppm_milli.load(Ordering::Relaxed) as f64 / 1e3,
+                locked: c.locked.load(Ordering::Relaxed),
+                ratio: (bits != 0).then(|| f64::from_bits(bits)),
+                period_frames: output.current.map_or(0, |(_, period, _)| period),
+            });
+        }
+        views
+    }
+
+    fn stream_metrics(&self) -> Vec<StreamMetrics> {
+        let streams = self
+            .conns
+            .values()
+            .filter_map(|c| c.stream.as_ref().map(|s| (c, s)));
+        streams
+            .map(|(conn, stream)| {
+                let header = stream.view.header();
+                let written = header.write_pos.load(Ordering::Acquire);
+                let read = header.read_pos.load(Ordering::Acquire);
+                StreamMetrics {
+                    name: conn.name.clone(),
+                    rate: stream.rate,
+                    resampled: stream.resampler.is_some(),
+                    underruns: header.underruns.load(Ordering::Relaxed),
+                    fill_frames: written.saturating_sub(read),
+                    capacity_frames: stream.capacity,
+                    latency_frames: header.output_delay_frames.load(Ordering::Relaxed),
+                }
+            })
+            .collect()
+    }
+
+    fn metrics_view(&self) -> MetricsView {
+        let c = &self.counters;
+        let analog = self.analog.as_ref().map(|_| AnalogMetrics {
+            open: c.analog_open.load(Ordering::Relaxed) == 1,
+            padded_frames: c.analog_padded_frames.load(Ordering::Relaxed),
+            dropped_frames: c.analog_dropped_frames.load(Ordering::Relaxed),
+            latency_frames: c.analog_latency_frames.load(Ordering::Relaxed) as u32,
+        });
+        MetricsView {
+            master: self.master_metrics(),
+            outputs: self.output_metrics(),
+            streams: self.stream_metrics(),
+            analog,
+            plugins: self.plugin_metrics(),
+        }
+    }
+
     fn state_view(&self) -> StateView {
         let outputs = (0..=self.further.len())
             .filter_map(|index| self.output_view(index))
@@ -999,6 +1106,26 @@ mod tests {
         assert_eq!(answer.reply, Some(Reply::Configured { rate: 0 }));
         let start = control.request(conn, Some(Request::Start), now);
         assert_eq!(start.reply, Some(Reply::Ok));
+    }
+
+    #[test]
+    fn metrics_list_every_output_and_stream() {
+        let (mut control, _engine, _logs, now) =
+            started_with(&Config::default(), vec![further(&[])]);
+        control.set_output_counters(vec![Arc::new(OutputCounters::default())]);
+        play_as(&mut control, 1, "mpd", now);
+        let view = control.call(Call::Metrics, now).unwrap();
+        assert_eq!(view["outputs"][0]["id"], json!(2));
+        assert_eq!(view["outputs"][0]["card"], json!("Loopback"));
+        assert_eq!(view["outputs"][0]["ratio"], json!(null));
+        assert_eq!(view["streams"].as_array().unwrap().len(), 1);
+        assert_eq!(view["streams"][0]["name"], json!("mpd"));
+        assert_eq!(view["streams"][0]["rate"], json!(48000));
+        assert_eq!(view["analog"], json!(null));
+        assert_eq!(view["plugins"], json!([]));
+        assert_eq!(view["master"]["cycles"], json!(0));
+        assert_eq!(view["master"]["cycle_ns_avg"], json!(0));
+        assert_eq!(view["master"]["last_gap"], json!(null));
     }
 
     /// A started control thread whose master is open, with nothing queued.

@@ -907,6 +907,10 @@ impl Writer {
         self.counters
             .ppm_milli
             .store((ppm * 1e3).round() as i64, Relaxed);
+        // The ratio the resampler runs at is relative to the rates' own;
+        // card frames per master frame is it over the scale.
+        let ratio = self.ratio / path.scale();
+        self.counters.ratio_bits.store(ratio.to_bits(), Relaxed);
         let skipped = self.skipped + drift.skipped();
         self.counters.skipped.store(skipped, Relaxed);
         if locked != self.locked {
@@ -1873,6 +1877,17 @@ mod tests {
                 .any(|e| matches!(e, FurtherEvent::Locked { .. })),
             "{events:?}"
         );
+    }
+
+    #[test]
+    fn the_writer_publishes_its_ratio() {
+        let mut rig = Rig::new(Sim::new(48_000, 128, 48_000, 128));
+        assert_eq!(rig.counters.ratio_bits.load(Relaxed), 0);
+        rig.world().source = Source::Dc(1 << 20);
+        rig.run_until(1.0);
+        let published = f64::from_bits(rig.counters.ratio_bits.load(Relaxed));
+        assert_eq!(published, rig.writer.ratio());
+        assert!(published != 0.0);
     }
 
     #[test]

@@ -451,3 +451,29 @@ fn a_websocket_message_over_the_limit_closes_that_socket() {
     };
     assert_eq!(event["volume"], json!(50));
 }
+
+#[test]
+fn get_metrics_counts_cycles() {
+    let daemon = Daemon::start();
+    let mut client = daemon.playing(16384);
+    running_client(&daemon);
+    let cycles = |daemon: &Daemon| {
+        daemon.get("/metrics").1["master"]["cycles"]
+            .as_u64()
+            .unwrap()
+    };
+    let first = cycles(&daemon);
+    thread::sleep(Duration::from_millis(100));
+    top_up(&mut client);
+    let (status, metrics) = daemon.get("/metrics");
+    assert_eq!(status, 200);
+    assert!(metrics["master"]["cycles"].as_u64().unwrap() > first);
+    let master = &metrics["master"];
+    assert!(master["cycle_ns_avg"].as_u64() <= master["cycle_ns_worst"].as_u64());
+    assert!(master["buffer_ns"].as_u64().unwrap() > 0);
+    assert_eq!(master["period_frames"], json!(64));
+    let streams = metrics["streams"].as_array().unwrap();
+    assert_eq!(streams.len(), 1);
+    assert_eq!(streams[0]["rate"], json!(48000));
+    assert_eq!(metrics["analog"], json!(null));
+}

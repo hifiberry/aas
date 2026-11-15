@@ -24,6 +24,8 @@ pub enum Call {
     PatchClient(String, InputPatch),
     Matrix,
     PutMatrix(MatrixPut),
+    /// `GET /metrics`.
+    Metrics,
 }
 
 /// A call and where its answer goes.
@@ -252,6 +254,84 @@ pub struct StateView {
     pub bit_perfect: bool,
     /// Why the master is not bit-perfect; None when it is.
     pub reason: Option<String>,
+}
+
+/// `GET /metrics`: values since the daemon started, never reset.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MetricsView {
+    pub master: MasterMetrics,
+    pub outputs: Vec<OutputMetrics>,
+    pub streams: Vec<StreamMetrics>,
+    /// None without an analog input.
+    pub analog: Option<AnalogMetrics>,
+    pub plugins: Vec<PluginMetrics>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MasterMetrics {
+    pub cycles: u64,
+    pub cycle_ns_avg: u64,
+    pub cycle_ns_worst: u64,
+    pub buffer_ns: u64,
+    pub xruns: u64,
+    pub wake_gaps: u64,
+    pub worst_gap_ns: u64,
+    pub last_gap: Option<LastGap>,
+    pub period_frames: u32,
+    pub card_frames: u32,
+    pub delay_frames: u32,
+}
+
+/// The latest wake-up gap longer than the buffer, and when it ended on
+/// CLOCK_MONOTONIC.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct LastGap {
+    pub ns: u64,
+    pub at_ns: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct OutputMetrics {
+    pub id: usize,
+    pub card: String,
+    pub xruns: u64,
+    pub wake_gaps: u64,
+    pub worst_gap_ns: u64,
+    pub starves: u64,
+    pub overflows: u64,
+    pub skipped: u64,
+    pub ppm: f64,
+    pub locked: bool,
+    /// Card frames per master frame; None before the writer has run.
+    pub ratio: Option<f64>,
+    pub period_frames: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct StreamMetrics {
+    pub name: String,
+    pub rate: u32,
+    pub resampled: bool,
+    pub underruns: u64,
+    pub fill_frames: u64,
+    pub capacity_frames: usize,
+    pub latency_frames: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct AnalogMetrics {
+    pub open: bool,
+    pub padded_frames: u64,
+    pub dropped_frames: u64,
+    pub latency_frames: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PluginMetrics {
+    pub id: String,
+    pub runs: u64,
+    pub ns_avg: u64,
+    pub ns_worst: u64,
 }
 
 /// The answer to a call whose view serialises, which every view does.
