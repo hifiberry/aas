@@ -1011,6 +1011,15 @@ impl Control {
     /// that a refused patch changes nothing. A change lasts until the next
     /// restart: nothing of it is stored.
     fn patch_settings(&mut self, patch: SettingsPatch, now: Instant) -> api::Answer {
+        for (key, given, now) in [
+            ("format", &patch.format, format_name(self.format)),
+            ("resampling", &patch.resampling, quality_name(self.quality)),
+        ] {
+            if given.as_deref().is_some_and(|g| g != now) {
+                let message = format!("{key} changes only in the config");
+                return Err(ApiError::unprocessable(message));
+            }
+        }
         let mode = match patch.bit_perfect.as_deref() {
             None => None,
             Some("auto") => Some(BitPerfect::Auto),
@@ -2686,6 +2695,29 @@ mod tests {
     }
 
     #[test]
+    fn a_fixed_setting_is_accepted_as_it_is_and_refused_otherwise() {
+        let (mut control, _engine, now) = open_at(&Config::default(), 10.0);
+        // The whole of GET /settings can be sent back, edited.
+        let mut body = control.call(Call::Settings, now).unwrap();
+        body["latency_ms"] = json!(8.0);
+        let patch: SettingsPatch = serde_json::from_value(body).unwrap();
+        let view = settings(&mut control, patch, now).unwrap();
+        assert_eq!(view["latency_ms"], json!(8.0));
+        for (key, other) in [("format", "f64"), ("resampling", "fast")] {
+            let patch: SettingsPatch = serde_json::from_value(json!({
+                "latency_ms": 6.0, key: other
+            }))
+            .unwrap();
+            let e = settings(&mut control, patch, now).unwrap_err();
+            assert_eq!(e.status, 422, "{key}");
+            assert_eq!(e.message, format!("{key} changes only in the config"));
+        }
+        // The refused patches changed nothing.
+        let view = control.call(Call::Settings, now).unwrap();
+        assert_eq!(view["latency_ms"], json!(8.0));
+    }
+
+    #[test]
     fn a_mode_goes_to_the_engine_with_the_gain_it_now_takes() {
         let (mut control, mut engine, now) = open(&Config::default(), None);
         control.call(Call::PatchOutput(1, volume(50)), now).unwrap();
@@ -2767,6 +2799,7 @@ mod tests {
             bit_perfect: Some("off".into()),
             latency_ms: Some(12.0),
             default_rate: Some(44100),
+            ..SettingsPatch::default()
         };
         assert_eq!(status(settings(&mut control, patch, now)), 422);
         assert!(engine.take(true).is_empty());
@@ -2883,6 +2916,7 @@ mod tests {
             bit_perfect: Some("off".into()),
             latency_ms: Some(5.0),
             default_rate: Some(44100),
+            ..SettingsPatch::default()
         };
         settings(&mut control, patch, now).unwrap();
         assert_eq!(control.save_at, None);

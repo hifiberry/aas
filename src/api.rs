@@ -48,11 +48,13 @@ pub struct SettingsPatch {
     pub bit_perfect: Option<String>,
     pub latency_ms: Option<f32>,
     pub default_rate: Option<u32>,
+    /// The settings of the config that cannot change while the daemon
+    /// runs. Naming one is accepted when it is the value it has, so that
+    /// the whole of `GET /settings` can be sent back, and 422 when it is
+    /// another.
+    pub format: Option<String>,
+    pub resampling: Option<String>,
 }
-
-/// The settings of the config that cannot change while the daemon runs,
-/// which a body of `PATCH /settings` may not name.
-pub const FIXED_SETTINGS: [&str; 2] = ["format", "resampling"];
 
 /// `GET /settings`.
 #[derive(Debug, Clone, PartialEq, Serialize)]
