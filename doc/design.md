@@ -1360,10 +1360,12 @@ All of this is *(call)*:
 - **Input fields.** Each input has `volume_db`, from -60 to 0, and `muted`. A
   client's volume applies to every stream of that process name, and survives a
   reconnect. A name without a stored volume plays at 0 dB. A name not connected
-  can be given a volume, so a player can be set before it starts. At most 64
-  names are stored; a 65th is refused. A volume of a client that plays alone
-  and is not at 0 dB stops automatic bit-perfect, with the reason `Volume`, as
-  the output volume does today.
+  can be given a volume, so a player can be set before it starts. The kernel
+  keeps at most 15 bytes of a process name, so a longer name is refused with
+  422. At most 64 names are stored; a 65th is refused. A name set back to 0 dB,
+  unmuted, is no longer stored and frees its place. A volume of a client that
+  plays alone and is not at 0 dB stops automatic bit-perfect, with the reason
+  `"volume"`, as the output volume does today.
 - **Fades.** A change of an input's volume fades over 10 ms, like the output's.
   The analog input's volume now fades too, where it applied at once.
 - **Matrix.** `GET /matrix` gives every output's routes. `PUT /matrix` takes
@@ -1377,8 +1379,16 @@ All of this is *(call)*:
   once under PCM; that is accepted.
 - **Errors.** A body that does not parse, or has an unknown field, is 400. An
   unknown output or input is 404. A value out of range, or a matrix that breaks
-  a rule, is 422. Each error is `{"error": "<the message the config would
-  give>"}`.
+  a rule, is 422. A body over 64 KiB is 413. Each error is `{"error": "<the
+  message the config would give>"}`. A call answered 503 is not applied if the
+  control thread had not yet taken it; one it had taken may have applied, so a
+  503 for a `PATCH` or `PUT` means "send it again", which is safe.
+- **Connections.** The daemon locks all of its memory, so what a peer can make
+  it hold stays small. At most 32 connections are open at once; one more is
+  answered 503 and closed. A connection whose peer sends nothing for 30 s is
+  closed, so that connections left open cannot fill the 32. A subscriber to
+  `/events` is sent a ping every 10 s, and its pong keeps a quiet socket open.
+  A message from a subscriber, or a frame, over 4 KiB closes its socket.
 - **The state file.** It keeps the master's volume, the analog input's volume
   and mute, each client's, each further output's offset and idle, and each
   output's matrix. Outputs are keyed by their card, so reordering the
