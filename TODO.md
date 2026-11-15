@@ -194,27 +194,43 @@ warning; rare, and it goes away with the replan. First step: have the control th
 in the writer tests, a `Sim` with `granted_periods = 4` that runs with no
 starve then shows it works.
 
-## Stage 4 part 2: the rest of the API
+## The web UI, the Debian package and removing `pw-api` and `vu-meter`
 
-Part 1 is built: the API thread, `GET /state`, outputs, inputs with clients
-known by name, the matrix at run time, the state file for all of them and
-WebSocket `/events`. See "The API in part 1" in `doc/design.md`, the API
-section of `README.md`, and "Stage 4 part 1" in `doc/measurements.md`.
+The API is built: both parts of stage 4's API, `aasctl`, the `hifiberry-auth`
+manifest and the nginx location with their install script
+(`dist/install-api.sh`). See "The API in part 1" and "The API in part 2" in
+`doc/design.md`, the API section of `README.md`, and "Stage 4 part 1" and
+"Stage 4 part 2" in `doc/measurements.md`. What the design leaves for later:
 
-Missing, from the table in "API" in `doc/design.md`: `GET /metrics` (timing,
-dropouts, latency, buffers, and the drift and ratio of further outputs),
-`GET /graph` (JSON or DOT), `GET /plugins` and `PATCH /plugins/{id}`,
-`GET` and `PATCH /settings` (bit-perfect mode, latency target, default rate,
-until the next restart), WebSocket `/levels` (VU levels as binary frames at
-10 Hz), the command line tool on top of the API, the `hifiberry-auth`
-manifest in `/etc/hifiberry/auth.d/` (every audio change `ok`, `/settings`
-`risky`) and the nginx location at `/api/aas/v1`. The design names
-the routes but not their fields. Decisions needed first: the frame format of
-`/levels` and where the levels are measured, how a plugin parameter reaches
-the audio thread (`set_param` there must not allocate or lock), which
-`/settings` changes reopen the card, and what the command line tool is called.
-First step: write "The API in part 2" in `doc/design.md`, in the form of
-"The API in part 1", and have the owner rule on it.
+- The web UI still talks to `/api/pipewire` and the `vu-meter` service. It has
+  to move to `/api/aas/v1`, and its meter to the `/levels` framing: one meter
+  after another, each with its id, its channel count, RMS and peak per channel
+  and a byte of clip bits. The level bytes are the `vu-meter` service's, so
+  only the framing changes.
+- A Debian package for the daemon, `aasctl`, the ALSA plugin, the systemd
+  unit, `dist/90-aas.conf` and the two API files. It has to restart
+  `hifiberry-auth` and reload nginx as `dist/install-api.sh` does.
+- Removing `pw-api` and `vu-meter`, which frees ports 2716 and 2717, once the
+  web UI no longer needs them.
+
+The web UI and the services live in the HiFiBerry OS repositories, not here.
+Missing: a plan for the order, since the web UI can move only once the
+package installs the daemon. First step: list every call the web UI makes to
+`/api/pipewire` and `/api/vu-meter` and map each to its `/api/aas/v1` route.
+
+## Smooth the `balance` plugin's changes
+
+A new `balance` value clicks: on the CM5 test board, through the loopback
+cable, a change from 0 to 0.5 and back stepped the left channel by up to
+0.186 between two samples, above 3 kHz -38 dBFS against -95 dBFS without a
+change (`doc/measurements.md`, "Stage 4 part 2", "A plugin's change and its
+enabling through the cable"). The design says a plugin smooths its own
+parameter changes, as `gain` does; `Balance::set_param` in
+`src/plugin/balance.rs` takes the value for the next block at once.
+Enabling and disabling fade and do not click. First step: ramp the two
+gains in `process` over 10 ms towards the ones `set_param` set, without
+allocating, keep `neutral` false until the ramp ends at 0, and capture the
+same change again.
 
 ## Stage 4 part 3: a matrix row and a plugin chain per client
 

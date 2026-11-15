@@ -473,6 +473,39 @@ that has a config key applies only while the config still says what it said
 when the value was stored, so an edit of the config always wins. The API never
 rewrites the config, and what `/settings` changes is not kept.
 
+### Behind nginx and hifiberry-auth
+
+On HiFiBerry OS the web UI reaches the API through nginx at `/api/aas/v1`, and
+`hifiberry-auth` decides at the gateway which calls need the device password.
+Two files in `dist/` set that up:
+
+- `dist/nginx/hifiberry-aas.nginx`, the location `/api/aas/v1/`, which passes
+  a request to `127.0.0.1:2718` without the prefix and lets `/events` and
+  `/levels` upgrade to WebSockets. It goes to `/etc/nginx/hifiberry-api.d/`.
+- `dist/auth.d/aas.json`, the manifest for `hifiberry-auth`. Every `GET`, so
+  `/events` and `/levels` too, `PATCH /outputs/{id}`, `PATCH /inputs/...`,
+  `PUT /matrix` and `PATCH /plugins/...` are `ok`, everyday music use that
+  needs no password. `PATCH /settings` is `risky`, since it changes how the
+  daemon runs, and so is anything else. It goes to `/etc/hifiberry/auth.d/`.
+
+`dist/install-api.sh` installs both. Run it from the repository root as a
+user that may sudo:
+
+```sh
+dist/install-api.sh
+```
+
+It checks the nginx config with `nginx -t` and reloads nginx, and restarts
+`hifiberry-auth`, which reads its manifests only when it starts; each only if
+it is running. The location names port 2718. When `/etc/aas/aas.toml` sets another
+`api_port`, the script says so, and the `proxy_pass` line has to be changed to
+match. To remove them:
+
+```sh
+sudo rm /etc/nginx/hifiberry-api.d/hifiberry-aas.nginx /etc/hifiberry/auth.d/aas.json
+sudo systemctl reload nginx; sudo systemctl restart hifiberry-auth
+```
+
 ### aasctl
 
 `aasctl` is the command line tool on top of the API, a second binary of this

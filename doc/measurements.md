@@ -2245,3 +2245,151 @@ checks that the daemon logs no refusal.
 - The calls came from the board itself, each on a new connection, not through
   nginx, and only one `/events` subscriber was open. A subscriber that stops
   reading was tested only off the board.
+
+## Stage 4 part 2: metering, timing and plugins under load
+
+Whether the levels, the timing and a plugin changed through the API disturb
+playback, whether a plugin's change or its enabling clicks, and what a client
+sees when `/settings` lowers the latency. Measured on the CM5 test board and
+on the Pi 3 test board.
+
+The daemon was built from e5ff182 with the `alsa-output` feature and ran as
+root with real-time rights, a fresh daemon for each run, as in part 1, with
+the `balance` plugin on the master's output chain:
+
+```toml
+card = "sndrpihifiberry"
+bit_perfect = "off"
+
+[[plugin]]
+type = "balance"
+place = "output"
+```
+
+Everything else is as in part 1: default latency (CM5 64 frames per period,
+128 buffered, 2.67 ms; Pi 3 256 and 512, 10.67 ms), one `aplay` playing a
+997 Hz sine at -12 dBFS, 48 kHz, S16, through the `aas` ALSA plugin, no other
+load, no analog input, `/etc/sysctl.d/90-aas.conf` installed, logs in RAM,
+and on the CM5 the kernel log streamed off the board.
+
+### Ten minutes with and without the part 2 calls
+
+Each pair is 600 s of the player, once with nothing else, and once with a
+script on the board that, for the 600 s:
+
+- held a WebSocket on `/levels` open and read every frame,
+- sent `GET /metrics` every second,
+- sent `PATCH /plugins/1/output/0` with `{"params": {"balance": ...}}` every
+  second, half a second after the `GET`, between 0.25 and -0.25, so the
+  plugin worked on every block. In the run without calls it stayed at 0,
+  where it is neutral and returns at once.
+
+Each call was on a new connection, so 600 of each.
+
+| Board, run | Xruns | Wake-up gaps | Worst gap / buffer | Worst cycle | API calls, not 200 | `GET /metrics`, median / 99% / worst | `PATCH /plugins`, median / 99% / worst |
+|---|---|---|---|---|---|---|---|
+| CM5, without calls | 0 | 0 | 1.37 / 2.67 ms | 0.011 ms | | | |
+| CM5, with calls | 0 | 0 | 1.39 / 2.67 ms | 0.016 ms | 1200, 0 | 0.5 / 0.5 / 0.8 ms | 0.5 / 0.6 / 0.6 ms |
+| Pi 3, without calls | 0 | 0 | 5.43 / 10.67 ms | 0.214 ms | | | |
+| Pi 3, with calls | 0 | 0 | 5.54 / 10.67 ms | 0.200 ms | 1200, 0 | 2.8 / 3.3 / 14.4 ms | 3.1 / 3.6 / 3.7 ms |
+
+Against part 1's runs with calls, the worst gap is the same within 0.1 ms on
+both boards (CM5 1.50 ms then, 1.39 ms now; Pi 3 5.53 and 5.54 ms), and the
+worst cycle is lower (CM5 0.053 then, 0.016 ms now; Pi 3 0.278 and 0.200 ms).
+Part 1's calls started a volume or matrix fade ten times a second, these a
+plugin change once a second. Both boards pass: no xrun, no
+wake-up gap, every call answered 200, and `aplay` reported no underrun. The
+CM5's kernel log has nothing from the runs.
+
+The `balance` plugin's own timing, from the last `GET /metrics` of each run,
+per block of one period:
+
+| Board, run | Blocks | `ns_avg` | `ns_worst` |
+|---|---|---|---|
+| CM5, without calls (neutral) | 456012 | 61 | 4630 |
+| CM5, with calls | 456766 | 156 | 5037 |
+| Pi 3, without calls (neutral) | 114055 | 328 | 33385 |
+| Pi 3, with calls | 114236 | 2325 | 143281 |
+
+At work the plugin takes 0.16 µs per 64 frames on the CM5 and 2.3 µs per 256
+frames on the Pi 3, on average. Its worst block on the Pi 3, 0.143 ms, is the
+largest share of that run's worst cycle, 0.200 ms, and 1.3% of the buffer.
+A neutral plugin is still counted as run, and its time is the call alone.
+
+The `/levels` subscriber got 6015 frames in each run with calls, one every
+100 ms, the longest wait between two 100.5 ms on the CM5 and 100.9 ms on the
+Pi 3, none over 200 ms. It answered 60 pings, one each 10 s, and was not
+closed. Each frame was the master alone, `[1, 2, rms, peak, rms, peak, clip]`.
+The tone read 191 RMS and 204 peak, -15.1 and -12.0 dBFS, which is the
+sine's -15.05 dBFS RMS and -12.04 dBFS peak, and down to 180, -17.6 dBFS, on
+the side `balance` turned down by 0.25, which is 2.5 dB. Nothing clipped.
+
+### A plugin's change and its enabling through the cable
+
+On the CM5, with the setup of part 1's click test: `aplay` played the 997 Hz
+sine at -6 dBFS on the left and -12 dBFS on the right, and the card's ADC
+recorded its DAC through the loopback cable for 40 s, with the config above.
+During the recording the API set `balance` to 0.5, which halves the left
+channel, then disabled and enabled the plugin twice, 3 s apart, then set
+`balance` back to 0. Every call was answered 200. The capture was searched as
+in part 1:
+
+| Window | Largest step, L / R | Above 3 kHz, worst 5 ms, L / R |
+|---|---|---|
+| Quiet, five seconds | 0.0648 / 0.0328 | -94.9 / -94.9 dBFS |
+| `balance` 0 to 0.5 | 0.1857 / 0.0328 | -37.8 / -95.6 dBFS |
+| Disabled | 0.0648 / 0.0328 | -86.0 / -95.5 dBFS |
+| Enabled | 0.0648 / 0.0328 | -85.7 / -95.6 dBFS |
+| Disabled | 0.0648 / 0.0328 | -85.8 / -95.5 dBFS |
+| Enabled | 0.0648 / 0.0328 | -85.2 / -95.5 dBFS |
+| `balance` 0.5 to 0 | 0.1827 / 0.0328 | -37.7 / -95.5 dBFS |
+
+Enabling and disabling do not click: the largest step stays the tone's own,
+0.0647, and above 3 kHz the change reaches -85 to -86 dBFS, where part 1's
+10 ms volume fades reached -82 to -91 dBFS. **A change of the `balance`
+value clicks.** The left channel jumps by up to 0.186 between two samples,
+almost three times the tone's step, and above 3 kHz it reaches -38 dBFS, close
+to part 1's computed hard jump, -36 dBFS. The built-in `balance` takes a new
+value at the next block and applies it to the whole block at once, where the
+design says that a plugin smooths its own changes, as `gain` does. In the ten
+minute runs that was a click every second, which the counters do not show.
+
+### Lowering the latency while a client plays
+
+The daemon started with a `latency_ms` above the board's default, `aplay`
+played the tone as above, and `PATCH /settings` changed `latency_ms` 6 s
+apart: on the CM5 from 12 to 4, 2 and back to 12, on the Pi 3 from 24 to 12,
+6 and back to 24. A last `PATCH` asked for more than the start (20 on the CM5,
+30 on the Pi 3).
+
+Every change was answered 200 at once, the period followed it in the next
+`GET /metrics` (CM5 from 256 to 64, 32 and 256 frames; Pi 3 from 512 to 256,
+128 and 512),
+and the last was 422 `latency_ms above the 12 ms the daemon started with needs
+a restart` (24 ms on the Pi 3), leaving the latency as it was. Neither board
+had an xrun or a wake-up gap.
+
+The client saw nothing. `aplay` reported no error and no underrun, its stream
+in `/metrics` had no underrun, and its `latency_frames` followed the card's
+buffer. Its own buffer, 24000 frames, is far longer than any of these.
+
+The card did not: each change reopens it, as a change of rate does. The daemon
+logged the card open again 9 to 16 ms after the change on the CM5 and 23 to
+40 ms after it on the Pi 3. On the CM5 the capture through the cable has a
+hole of 7 to 8 ms of silence at each change, cut without a fade: the tone
+stops and starts at once, with steps of up to 0.29 and above 3 kHz
+-33 to -45 dBFS, against -95 dBFS without a change. So a latency change is heard as a short dropout with a
+click, as a rate change is.
+
+### What these figures do not show
+
+- The runs were without load and without the analog input, at 48 kHz only,
+  ten minutes each, with one plugin, so `/metrics` listed one.
+- The click and latency tests were on the CM5 only, judged from a capture.
+  On the Pi 3 the latency test has the logs and the counters, not the sound.
+- The calls came from the board itself, not through nginx. The nginx location
+  was checked off the board: `nginx -t` passed with it included in a server
+  block, and through it `GET /state`, a `PATCH /plugins` and 25 s of
+  `/levels`, with its pings, reached a daemon built without ALSA, with the
+  prefix stripped. `hifiberry-auth` was not run; the manifest is checked by
+  a test against the security model's matching rules.
