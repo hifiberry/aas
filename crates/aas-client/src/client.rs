@@ -9,6 +9,7 @@
 use crate::convert::{ClientFormat, to_stereo_s32};
 use crate::proto::{self, Reply, Request};
 use crate::ring::Ring;
+use std::collections::VecDeque;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
@@ -97,6 +98,10 @@ pub struct Client {
     timeout: Duration,
     /// A request failed on the socket, so replies are out of step.
     lost: bool,
+    /// Notices read while a reply was awaited.
+    notices: VecDeque<Reply>,
+    /// A reply read while no request awaited it, for `poll_drain`.
+    pending_reply: Option<Reply>,
 }
 
 impl Client {
@@ -139,6 +144,8 @@ impl Client {
             drain_deadline: None,
             timeout,
             lost: false,
+            notices: VecDeque::new(),
+            pending_reply: None,
         };
         let hello = Request::Hello {
             version: proto::VERSION,
@@ -261,14 +268,141 @@ impl Client {
     fn exchange(&mut self, request: &Request) -> io::Result<(Reply, Vec<OwnedFd>)> {
         self.send(request)?;
         if self.drain_pending {
-            self.receive()?;
+            self.receive_reply()?;
             self.drain_done();
         }
-        self.receive()
+        self.receive_reply()
+    }
+
+    /// Reads the next reply, keeping notices aside for `poll_notice`.
+    fn receive_reply(&mut self) -> io::Result<(Reply, Vec<OwnedFd>)> {
+        if let Some(reply) = self.pending_reply.take() {
+            return Ok((reply, Vec::new()));
+        }
+        loop {
+            let (reply, fds) = self.receive()?;
+            if is_notice(&reply) {
+                self.notices.push_back(reply);
+                continue;
+            }
+            return Ok((reply, fds));
+        }
+    }
+
+    /// As `receive_reply`, but does not wait with `flags` set to
+    /// `MSG_DONTWAIT`.
+    fn receive_reply_flags(&mut self, flags: libc::c_int) -> io::Result<Option<(Reply, Vec<OwnedFd>)>> {
+        if let Some(reply) = self.pending_reply.take() {
+            return Ok(Some((reply, Vec::new())));
+        }
+        loop {
+            match self.receive_flags(flags)? {
+                None => return Ok(None),
+                Some((reply, _)) if is_notice(&reply) => self.notices.push_back(reply),
+                found => return Ok(found),
+            }
+        }
     }
 
     fn stream(&self) -> io::Result<&Stream> {
         self.stream.as_ref().ok_or_else(not_configured)
+    }
+
+    /// Names this connection after the process `pid` of a player the
+    /// daemon did not accept the socket from itself.
+    pub fn identify(&mut self, pid: u32) -> io::Result<()> {
+        self.call(&Request::Identify { pid }).map(drop)
+    }
+
+    /// This client's gain in millidB and whether it is muted.
+    pub fn client_volume(&mut self) -> io::Result<(i32, bool)> {
+        match self.call(&Request::GetClientVolume)?.0 {
+            Reply::ClientVolume { db_millis, muted } => Ok((db_millis, muted)),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unexpected reply to a client volume",
+            )),
+        }
+    }
+
+    /// Sets the gain of every stream of this client, from -60 to 0 dB.
+    pub fn set_client_volume(&mut self, db_millis: i32, muted: bool) -> io::Result<()> {
+        self.call(&Request::SetClientVolume { db_millis, muted })
+            .map(drop)
+    }
+
+    /// The rate the daemon's output currently runs at, zero while off.
+    pub fn output_rate(&mut self) -> io::Result<u32> {
+        match self.call(&Request::GetOutputRate)?.0 {
+            Reply::OutputRate { rate } => Ok(rate),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unexpected reply to an output rate",
+            )),
+        }
+    }
+
+    /// The output volume, from 0 to 100.
+    pub fn volume(&mut self) -> io::Result<u8> {
+        match self.call(&Request::GetVolume)?.0 {
+            Reply::Volume { percent } => Ok(percent),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unexpected reply to a volume",
+            )),
+        }
+    }
+
+    /// Sets the output volume, from 0 to 100.
+    pub fn set_volume(&mut self, percent: u8) -> io::Result<()> {
+        self.call(&Request::SetVolume { percent }).map(drop)
+    }
+
+    /// Subscribes to output volume changes and returns the current volume.
+    pub fn subscribe_volume(&mut self) -> io::Result<u8> {
+        match self.call(&Request::SubscribeVolume)?.0 {
+            Reply::Volume { percent } => Ok(percent),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unexpected reply to a subscription",
+            )),
+        }
+    }
+
+    /// The next notice, if one is waiting. Never waits, and never takes a
+    /// reply that belongs to a request.
+    pub fn poll_notice(&mut self) -> io::Result<Option<Reply>> {
+        if let Some(notice) = self.notices.pop_front() {
+            return Ok(Some(notice));
+        }
+        if self.lost {
+            return Err(daemon_gone());
+        }
+        let Some((reply, _)) = self.receive_flags(libc::MSG_DONTWAIT)? else {
+            return Ok(None);
+        };
+        if is_notice(&reply) {
+            return Ok(Some(reply));
+        }
+        if self.drain_pending {
+            self.pending_reply = Some(reply);
+            return Ok(None);
+        }
+        self.lost = true;
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "a reply with no request",
+        ))
+    }
+
+    /// Frames the ring has room for now.
+    pub fn free_frames(&self) -> io::Result<usize> {
+        Ok(self.stream()?.ring.free())
+    }
+
+    /// Frames the ring holds.
+    pub fn capacity_frames(&self) -> io::Result<usize> {
+        Ok(self.stream()?.ring.capacity())
     }
 
     /// Sets up a stream. Replaces any stream set up before, which must be
@@ -435,7 +569,7 @@ impl Client {
         if !self.drain_pending {
             return Ok(true);
         }
-        let reply = match self.receive_flags(libc::MSG_DONTWAIT) {
+        let reply = match self.receive_reply_flags(libc::MSG_DONTWAIT) {
             Ok(None) if self.drain_overdue() => Err(daemon_gone()),
             Ok(None) => return Ok(false),
             other => other,
@@ -605,6 +739,14 @@ impl Client {
     }
 }
 
+/// Whether a reply is a notification rather than an answer to a request.
+fn is_notice(reply: &Reply) -> bool {
+    matches!(
+        reply,
+        Reply::VolumeChanged { .. } | Reply::ClientVolumeChanged { .. }
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -740,6 +882,40 @@ mod tests {
 
         let (path, daemon) = fake_daemon(|conn| greet(&conn));
         assert!(Client::connect(&path).is_ok());
+        daemon.join().unwrap();
+    }
+
+    #[test]
+    fn a_client_volume_notice_does_not_steal_the_reply() {
+        let (path, daemon) = fake_daemon(|conn| {
+            greet(&conn);
+            assert_eq!(request(&conn), Some(Request::Identify { pid: 42 }));
+            answer(&conn, Reply::Ok, &[]);
+            assert_eq!(request(&conn), Some(Request::GetClientVolume));
+            let notice = Reply::ClientVolumeChanged {
+                db_millis: -6000,
+                muted: false,
+            };
+            answer(&conn, notice, &[]);
+            let volume = Reply::ClientVolume {
+                db_millis: -6000,
+                muted: false,
+            };
+            answer(&conn, volume, &[]);
+            assert_eq!(request(&conn), Some(Request::GetOutputRate));
+            answer(&conn, Reply::OutputRate { rate: 44100 }, &[]);
+        });
+        let mut client = Client::connect_with(&path, SHORT).unwrap();
+        client.identify(42).unwrap();
+        assert_eq!(client.client_volume().unwrap(), (-6000, false));
+        match client.poll_notice().unwrap() {
+            Some(Reply::ClientVolumeChanged { db_millis, muted }) => {
+                assert_eq!((db_millis, muted), (-6000, false));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(client.poll_notice().unwrap(), None);
+        assert_eq!(client.output_rate().unwrap(), 44100);
         daemon.join().unwrap();
     }
 

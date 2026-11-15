@@ -43,6 +43,11 @@ impl Daemon {
         Daemon::start_with(Some(listener), plugins)
     }
 
+    /// The PulseAudio socket the daemon serves beside its own.
+    pub fn pulse_socket(&self) -> PathBuf {
+        self.path.parent().unwrap().join("pulse")
+    }
+
     pub fn start_with(api: Option<TcpListener>, plugins: Vec<PluginConfig>) -> Daemon {
         Daemon::start_idle(api, plugins, Idle::Off { delay_s: 60 })
     }
@@ -82,6 +87,10 @@ impl Daemon {
         assert!(
             wait_for(|| daemon.path.exists()),
             "the socket never appeared"
+        );
+        assert!(
+            wait_for(|| daemon.pulse_socket().exists()),
+            "the PulseAudio socket never appeared"
         );
         daemon
     }

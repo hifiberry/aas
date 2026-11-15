@@ -576,3 +576,26 @@ Decision for the owner: keep the fixed rule and document the limit, or use
 `max(200 ms, 2 periods)`, which needs the period where `STALE_NS` is read.
 First step: read where `STALE_NS` is used in `src/levels.rs` and see whether
 the period is at hand there.
+
+## PulseAudio: what is left
+
+The playback endpoint is built: `src/pulse/` serves protocol 35 on
+`/run/aas/pulse`, translates each stream onto a client connection and maps its
+volume onto the output volume and the client gain. See "PulseAudio clients" in
+`doc/design.md` and the board script `dist/test-pulse.sh`. Parked:
+
+- Recording: `CREATE_RECORD_STREAM`, `parec`, source objects and the analog
+  input as a source. The design says later; the endpoint answers these with
+  `PA_ERR_NOTSUPPORTED` now.
+- Native `libpipewire` clients. They do not use the PulseAudio API, so they
+  need the native PipeWire protocol or a `libpipewire` shim. Neither is
+  planned; players that link `pw_stream` stay on PipeWire until one exists.
+- Per-channel volume. `aas` has one output volume and one gain per client, so
+  a stereo cvolume is averaged; a player that wants independent channels does
+  not get them.
+- SHM, the shared-ringbuffer channel, memfd pools, loadable modules, moving and
+  suspending streams. All are declined or answered with an error.
+- A board measurement of `pulse_buffer_ms`: 200 ms works with `paplay`, `mpv`
+  and a browser, but which players need more, and what latency they see, is
+  not measured. First step: run `dist/test-pulse.sh` with the endpoint on a
+  board and record `pactl list sink-inputs` latencies per player.

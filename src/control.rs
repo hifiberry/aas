@@ -1359,6 +1359,83 @@ impl Control {
                 }
                 self.volume_reply()
             }
+            Request::Identify { pid } => self.identify(conn, pid),
+            Request::GetClientVolume => self.client_volume_reply(conn),
+            Request::SetClientVolume { db_millis, muted } => {
+                self.set_client_volume(conn, db_millis, muted, now)
+            }
+            Request::GetOutputRate => Answer::reply(Reply::OutputRate {
+                rate: self.cycle_rate().unwrap_or(0),
+            }),
+        }
+    }
+
+    /// Names a connection after the process `pid`, which a daemon-side
+    /// adapter learned from the player's own socket. Refused once the
+    /// connection plays, so a stream is never moved between clients.
+    fn identify(&mut self, conn: ConnId, pid: u32) -> Answer {
+        if pid == 0 {
+            return Answer::error(libc::EINVAL);
+        }
+        let Some(name) = process_name(pid) else {
+            return Answer::error(libc::EINVAL);
+        };
+        let Some(state) = self.conns.get(&conn) else {
+            return Answer::fatal(libc::ENOTCONN);
+        };
+        if state.stream.is_some() || state.recorder.is_some() {
+            return Answer::error(libc::EINVAL);
+        }
+        let old = state.name.clone();
+        let new = name.clone();
+        let label = format!("{name} ({pid})");
+        if let Some(state) = self.conns.get_mut(&conn) {
+            state.name = name;
+            state.label = label.clone();
+        }
+        eprintln!("aas: {label} connected");
+        self.publish(ApiEvent::Client {
+            name: old,
+            change: "disconnected".into(),
+        });
+        self.publish(ApiEvent::Client {
+            name: new,
+            change: "connected".into(),
+        });
+        Answer::reply(Reply::Ok)
+    }
+
+    fn client_volume_reply(&self, conn: ConnId) -> Answer {
+        let Some(state) = self.conns.get(&conn) else {
+            return Answer::fatal(libc::ENOTCONN);
+        };
+        let input = self.client_input(&state.name);
+        Answer::reply(Reply::ClientVolume {
+            db_millis: (input.volume_db * 1000.0).round() as i32,
+            muted: input.muted,
+        })
+    }
+
+    fn set_client_volume(
+        &mut self,
+        conn: ConnId,
+        db_millis: i32,
+        muted: bool,
+        now: Instant,
+    ) -> Answer {
+        if !(-60_000..=0).contains(&db_millis) {
+            return Answer::error(libc::EINVAL);
+        }
+        let Some(name) = self.conns.get(&conn).map(|c| c.name.clone()) else {
+            return Answer::fatal(libc::ENOTCONN);
+        };
+        let patch = crate::api::InputPatch {
+            volume_db: Some(db_millis as f32 / 1000.0),
+            muted: Some(muted),
+        };
+        match self.set_client_input(name, patch, now) {
+            Ok(_) => Answer::reply(Reply::Ok),
+            Err(_) => Answer::error(libc::EINVAL),
         }
     }
 
@@ -2794,6 +2871,13 @@ pub(crate) fn eventfd() -> io::Result<OwnedFd> {
         return Err(io::Error::last_os_error());
     }
     Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+}
+
+/// The process name the kernel keeps for `pid`, for a connection the
+/// daemon did not receive from that process itself.
+fn process_name(pid: u32) -> Option<String> {
+    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+    Some(comm.trim_end().to_string())
 }
 
 #[cfg(test)]

@@ -10,7 +10,8 @@ Raspberry Pi.
 
 ## Parts
 
-- `aas`, the daemon, in `src/`.
+- `aas`, the daemon, in `src/`, with the PulseAudio endpoint in
+  `src/pulse/`.
 - `crates/aas-client`, the client side of the shared ring and the socket
   protocol.
 - `crates/aas-alsa`, the ALSA PCM and control plugin, one library.
@@ -71,6 +72,7 @@ sudo sysctl --system
 sudo systemctl daemon-reload
 sudo systemctl enable --now aas
 sh dist/install-plugin.sh
+sh dist/install-pulse.sh
 ```
 
 `dist/90-aas.conf` sets `vm.compact_unevictable_allowed = 0`, system-wide, so
@@ -95,6 +97,14 @@ not this one is kept as `/etc/asound.conf.before-aas`. After that:
   `Master`, 0 to 100. Plain `amixer` shows only `Master`. The card's own
   controls are reached with `amixer -c <card>`.
 
+`dist/install-pulse.sh` installs `/etc/pulse/client.conf` with
+`default-server = unix:/run/aas/pulse` and `autospawn = no`, so players that
+use the PulseAudio API reach the daemon as well. See
+[PulseAudio clients](#pulseaudio-clients). This is part of the switch to `aas`:
+while PipeWire runs, its own `pipewire-pulse` discovery stays, and switching
+back restores it. An existing `/etc/pulse/client.conf` that is not this one is
+kept as `/etc/pulse/client.conf.before-aas`.
+
 The daemon reads `/etc/aas/aas.toml` if it exists. Every key is optional.
 Without the file the daemon finds the card itself and picks the latency for the
 board. An unknown key or a bad value stops the daemon with an error. The volume
@@ -114,6 +124,8 @@ is kept in `/var/lib/aas/state.toml`.
 | `volume_control` | a mixer control name | the first of `Digital`, `Master`, `PCM` | The card's control that carries the volume. |
 | `default_rate` | 8000 to 384000 | 48000 | The rate the output opens at before the first client plays. |
 | `api_port` | 0 to 65535 | 2718 | The port of the HTTP API, on 127.0.0.1. 0 turns the API off. |
+| `pulse_socket` | a path, or `""` | the client socket's directory plus `pulse` | The PulseAudio native-protocol socket. An empty value turns the endpoint off. |
+| `pulse_buffer_ms` | 20 to 2000 | 200 | The default and the cap for a PulseAudio stream's buffer. An error with the endpoint off. |
 
 Three tables set up the analog input, the audio plugins and the mixing matrix.
 
@@ -534,6 +546,33 @@ RMS and peak of every channel in dBFS with one decimal, `-inf` below -60 and
 `CLIP` where the channel clipped. An error answer prints its message on stderr
 and exits 1, as does a daemon that cannot be reached; a usage error exits 2.
 
+## PulseAudio clients
+
+Some players cannot output through ALSA and use the PulseAudio API instead.
+That is also how most players that advertise PipeWire support emit audio: they
+link `libpulse` and rely on `pipewire-pulse`, not the native PipeWire protocol.
+`aas` serves them the PulseAudio native protocol itself, on a Unix socket at
+`/run/aas/pulse`, mode 0660 and group `audio`. PipeWire is neither required nor
+started.
+
+Every playback stream is a client of the daemon, like an ALSA client: it is
+mixed, resampled, processed by the same plugins and counted by the same API.
+The client's process name is its name in the API, and its stream volume is the
+per-client gain (`-6 dB` is 50 percent of the linear volume). The sink volume
+is the output volume: `pactl set-sink-volume`, `GET /outputs/1` and `amixer`
+show the same number.
+
+The endpoint advertises protocol version 35 and implements playback
+introspection and control. Recording and `parec`, SHM, loadable modules,
+moving or suspending streams and the native PipeWire protocol are not
+implemented; those commands get a PulseAudio error and the connection stays
+usable. A client that cannot be served is told why, alone: one malformed
+connection never affects another one or the audio thread.
+
+`pactl info`, `paplay` and `mpv --ao=pulse` are the usual checks. On a board,
+`sh dist/test-pulse.sh` runs them and compares a `pactl` volume change with
+`aasctl outputs`.
+
 ## Writing a plugin
 
 A plugin is a shared library built against `crates/aas-plugin`, which describes
@@ -619,6 +658,10 @@ catch the panic with `std::panic::catch_unwind`. The crate's documentation
   sample format plays and checks the tone's level and purity, and with
   `ANALOG=1` the cases of the analog input run too.
 - `cargo test -p aas-alsa` on the board, for the plugin's own tests.
+- `cargo test --test pulse` on any machine, for the endpoint against a daemon
+  with a null sink, and `sh dist/test-pulse.sh` on the board, with the unit
+  running and `/etc/pulse/client.conf` installed. It needs `pactl`, `paplay`,
+  `mpv`, `aasctl` and `python3`, and prints PASS or FAIL for each case.
 - `bit-check` proves that what a player sends reaches the card unchanged. Load
   `snd-aloop`, set `card = "Loopback"` and `latency_ms = 48` in the daemon's
   config, then run for example

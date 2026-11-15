@@ -75,6 +75,21 @@ pub enum Request {
     /// Stops the stream and empties its ring. Answered by `Ok` once the
     /// ring is empty, so what is written after the reply is kept.
     Reset,
+    /// Names the connection for a daemon-side adapter that did not accept
+    /// it from the player itself. Sent before `Configure`.
+    Identify {
+        pid: u32,
+    },
+    /// Answered by `ClientVolume`.
+    GetClientVolume,
+    /// The gain of every stream of this connection's client, from -60 to 0
+    /// dB. Answered by `Ok`, or an error outside that range.
+    SetClientVolume {
+        db_millis: i32,
+        muted: bool,
+    },
+    /// Answered by `OutputRate`.
+    GetOutputRate,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -100,6 +115,20 @@ pub enum Reply {
     Hello {
         version: u32,
     },
+    /// The reply to `GetClientVolume`.
+    ClientVolume {
+        db_millis: i32,
+        muted: bool,
+    },
+    /// Not a reply: this client's gain changed.
+    ClientVolumeChanged {
+        db_millis: i32,
+        muted: bool,
+    },
+    /// The reply to `GetOutputRate`, zero while the output is off.
+    OutputRate {
+        rate: u32,
+    },
 }
 
 fn format_code(f: ClientFormat) -> u32 {
@@ -109,6 +138,7 @@ fn format_code(f: ClientFormat) -> u32 {
         ClientFormat::S24Packed => 2,
         ClientFormat::S32 => 3,
         ClientFormat::Float => 4,
+        ClientFormat::S24In32 => 5,
     }
 }
 
@@ -119,8 +149,27 @@ fn format_from_code(c: u32) -> Option<ClientFormat> {
         2 => ClientFormat::S24Packed,
         3 => ClientFormat::S32,
         4 => ClientFormat::Float,
+        5 => ClientFormat::S24In32,
         _ => return None,
     })
+}
+
+/// The lowest client gain, in millidB.
+const CLIENT_DB_MIN: i32 = -60_000;
+
+/// A client volume in one word: the millidB offset from `CLIENT_DB_MIN`
+/// below bit 17, and mute above it. An out-of-range value keeps its high
+/// bits, so decoding refuses it rather than silently clamping it.
+fn client_volume_word(db_millis: i32, muted: bool) -> u32 {
+    let db = db_millis.wrapping_sub(CLIENT_DB_MIN) as u32;
+    db | (u32::from(muted) << 17)
+}
+
+fn client_volume_from_word(word: u32) -> Option<(i32, bool)> {
+    if word & !((1 << 18) - 1) != 0 || (word & 0x1_ffff) > 60_000 {
+        return None;
+    }
+    Some(((word & 0x1_ffff) as i32 + CLIENT_DB_MIN, word & (1 << 17) != 0))
 }
 
 fn pack(tag: u32, args: [u32; 4]) -> [u8; REQUEST_LEN] {
@@ -157,6 +206,12 @@ pub fn encode_request(r: &Request) -> [u8; REQUEST_LEN] {
         Request::SetVolume { percent } => pack(7, [percent as u32, 0, 0, 0]),
         Request::SubscribeVolume => pack(8, [0; 4]),
         Request::Reset => pack(9, [0; 4]),
+        Request::Identify { pid } => pack(10, [pid, 0, 0, 0]),
+        Request::GetClientVolume => pack(11, [0; 4]),
+        Request::SetClientVolume { db_millis, muted } => {
+            pack(12, [db_millis as u32, u32::from(muted), 0, 0])
+        }
+        Request::GetOutputRate => pack(13, [0; 4]),
     }
 }
 
@@ -186,6 +241,19 @@ pub fn decode_request(b: &[u8]) -> Option<Request> {
         },
         8 => Request::SubscribeVolume,
         9 => Request::Reset,
+        10 => Request::Identify {
+            pid: Some(word(b, 1)).filter(|&pid| pid != 0)?,
+        },
+        11 => Request::GetClientVolume,
+        12 => Request::SetClientVolume {
+            db_millis: word(b, 1) as i32,
+            muted: match word(b, 2) {
+                0 => false,
+                1 => true,
+                _ => return None,
+            },
+        },
+        13 => Request::GetOutputRate,
         _ => return None,
     })
 }
@@ -198,6 +266,11 @@ pub fn encode_reply(r: &Reply) -> [u8; REPLY_LEN] {
         Reply::Error { code } => (4, code),
         Reply::VolumeChanged { percent } => (5, percent as u32),
         Reply::Hello { version } => (6, version),
+        Reply::ClientVolume { db_millis, muted } => (7, client_volume_word(db_millis, muted)),
+        Reply::ClientVolumeChanged { db_millis, muted } => {
+            (8, client_volume_word(db_millis, muted))
+        }
+        Reply::OutputRate { rate } => (9, rate),
     };
     let mut out = [0u8; REPLY_LEN];
     out[..4].copy_from_slice(&tag.to_le_bytes());
@@ -224,6 +297,15 @@ pub fn decode_reply(b: &[u8]) -> Option<Reply> {
         6 => Reply::Hello {
             version: word(b, 1),
         },
+        7 => {
+            let (db_millis, muted) = client_volume_from_word(word(b, 1))?;
+            Reply::ClientVolume { db_millis, muted }
+        }
+        8 => {
+            let (db_millis, muted) = client_volume_from_word(word(b, 1))?;
+            Reply::ClientVolumeChanged { db_millis, muted }
+        }
+        9 => Reply::OutputRate { rate: word(b, 1) },
         _ => return None,
     })
 }
@@ -347,13 +429,59 @@ mod tests {
         );
         let reply = encode_reply(&Reply::Ok);
         assert_eq!(decode_reply(&reply[..REPLY_LEN - 1]), None);
-        assert_eq!(decode_reply(&[9, 0, 0, 0, 0, 0, 0, 0]), None);
+        assert_eq!(decode_reply(&[20, 0, 0, 0, 0, 0, 0, 0]), None);
         // A notification is told apart from a reply by its tag.
         assert_ne!(
             encode_reply(&Reply::VolumeChanged { percent: 40 }),
             encode_reply(&Reply::Volume { percent: 40 })
         );
         assert_eq!(decode_reply(&[5, 0, 0, 0, 0, 1, 0, 0]), None);
+    }
+
+    #[test]
+    fn identify_and_client_volume_round_trip() {
+        let requests = [
+            Request::Identify { pid: 4321 },
+            Request::GetClientVolume,
+            Request::SetClientVolume {
+                db_millis: -6000,
+                muted: true,
+            },
+            Request::GetOutputRate,
+        ];
+        for r in requests {
+            assert_eq!(decode_request(&encode_request(&r)), Some(r));
+        }
+    }
+
+    #[test]
+    fn client_volume_replies_round_trip() {
+        for (db, muted) in [(0, false), (-6000, true), (-60000, false), (-1, true)] {
+            let r = Reply::ClientVolume {
+                db_millis: db,
+                muted,
+            };
+            assert_eq!(decode_reply(&encode_reply(&r)), Some(r));
+            let r = Reply::ClientVolumeChanged {
+                db_millis: db,
+                muted,
+            };
+            assert_eq!(decode_reply(&encode_reply(&r)), Some(r));
+        }
+    }
+
+    #[test]
+    fn a_client_volume_outside_the_range_does_not_decode() {
+        let bad = Reply::ClientVolume {
+            db_millis: -60001,
+            muted: false,
+        };
+        assert_eq!(decode_reply(&encode_reply(&bad)), None);
+        let bad = Reply::ClientVolume {
+            db_millis: 1,
+            muted: false,
+        };
+        assert_eq!(decode_reply(&encode_reply(&bad)), None);
     }
 
     #[test]
