@@ -1073,8 +1073,15 @@ pub enum Command {
     SetParam {
         target: Target,
         plugin: u8,
-        index: u8,
+        index: u16,
         value: f64,
+    },
+    /// Enables or disables one plugin in a chain, crossfading over 10 ms.
+    /// One that is not there, or whose counts differ, is ignored.
+    SetEnabled {
+        target: Target,
+        plugin: u8,
+        enabled: bool,
     },
     /// Replaces the capture the analog input reads. Answered by
     /// `Event::OldCapture`, also when there was none, so that every one is
@@ -1717,6 +1724,15 @@ impl<P: Processing, S: Sink> Engine<P, S> {
             } => {
                 if let Some(chain) = self.chain(target) {
                     chain.set_param(plugin.into(), index.into(), value);
+                }
+            }
+            Command::SetEnabled {
+                target,
+                plugin,
+                enabled,
+            } => {
+                if let Some(chain) = self.chain(target) {
+                    chain.set_enabled(plugin.into(), enabled);
                 }
             }
             Command::SetCapture(capture) => {
@@ -6583,6 +6599,39 @@ mod tests {
             });
         }
         rig.cycle();
+        assert_eq!(rig.last_periods(1), frames(2000, PERIOD));
+        assert!(rig.events().is_empty());
+    }
+
+    #[test]
+    fn set_enabled_reaches_the_chain() {
+        let mut rig = Rig::<F64>::new(BitPerfect::Auto);
+        let mut a = client(1);
+        rig.add(&mut a);
+        set_chain(&mut rig, Place::Mix, vec![times(2.0)]);
+        a.ring.write(&frames(1000, PERIOD));
+        rig.cycle();
+        assert_eq!(rig.last_periods(1), frames(2000, PERIOD));
+        rig.events();
+        let enable = |plugin, enabled| Command::SetEnabled {
+            target: Target::master(Place::Mix),
+            plugin,
+            enabled,
+        };
+        rig.send(enable(0, false));
+        // An unknown plugin is ignored.
+        rig.send(enable(3, false));
+        // The fade lasts 480 frames for a chain that names no rate.
+        for _ in 0..480usize.div_ceil(PERIOD) + 1 {
+            a.ring.write(&frames(1000, PERIOD));
+            rig.cycle();
+        }
+        assert_eq!(rig.last_periods(1), frames(1000, PERIOD));
+        rig.send(enable(0, true));
+        for _ in 0..480usize.div_ceil(PERIOD) + 1 {
+            a.ring.write(&frames(1000, PERIOD));
+            rig.cycle();
+        }
         assert_eq!(rig.last_periods(1), frames(2000, PERIOD));
         assert!(rig.events().is_empty());
     }

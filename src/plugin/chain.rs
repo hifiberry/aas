@@ -6,8 +6,11 @@
 
 use super::{Block, Channels, Formats, Plugin, Samples, Status};
 use crate::config::Format;
+use crate::counters::{PluginStats, monotonic_ns};
 use crate::format::BlockStore;
 use crate::matrix::MAX_CHANNELS;
+use std::sync::Arc;
+use std::sync::atomic::Ordering::Relaxed;
 
 /// Plugins in the order they run, with what each needs converted.
 pub struct Chain {
@@ -21,6 +24,11 @@ pub struct Chain {
     store: BlockStore,
     /// The same, for the output of a plugin whose counts differ.
     store_out: BlockStore,
+    /// A copy of a fading plugin's input, sized as `store`.
+    dry: BlockStore,
+    /// For each plugin, whether it is enabled, where its fade is and what
+    /// it publishes.
+    states: Vec<State>,
     /// The blocks a change of the channel count leaves the audio in, one
     /// after the other. Empty without a plugin whose counts differ.
     wide: [BlockStore; 2],
@@ -70,7 +78,13 @@ impl Chain {
             true => BlockStore::new(max_frames, widest),
             false => BlockStore::new(0, 1),
         };
+        let states = plugins.iter().map(|_| State::default()).collect();
         Ok(Chain {
+            dry: match plugins.is_empty() {
+                true => BlockStore::new(0, 1),
+                false => BlockStore::new(max_frames, widest),
+            },
+            states,
             plugins,
             convert,
             format,
@@ -96,6 +110,19 @@ impl Chain {
         self
     }
 
+    /// The same chain, publishing to `stats`, one for each plugin in order.
+    /// Panics on another number. Done on the control thread.
+    pub fn with_stats(mut self, stats: Vec<Arc<PluginStats>>) -> Chain {
+        assert_eq!(stats.len(), self.plugins.len(), "one stats per plugin");
+        for (state, stats) in self.states.iter_mut().zip(stats) {
+            state.stats = Some(stats);
+        }
+        for i in 0..self.plugins.len() {
+            self.publish(i);
+        }
+        self
+    }
+
     /// The rate the chain was built for, None if it names none.
     pub fn rate(&self) -> Option<u32> {
         self.rate
@@ -117,6 +144,8 @@ impl Chain {
             format: Format::I32,
             store: BlockStore::new(0, 1),
             store_out: BlockStore::new(0, 1),
+            dry: BlockStore::new(0, 1),
+            states: Vec::new(),
             wide: [BlockStore::new(0, 1), BlockStore::new(0, 1)],
             counts: Vec::new(),
             changes: false,
@@ -178,11 +207,16 @@ impl Chain {
             "a block longer than the chain takes"
         );
         let mut status = Status::default();
+        let fade = self.fade_frames();
         // Where the audio is: the caller's block, or one of `wide`.
         let mut at = None;
         let mut width = channels;
-        for ((plugin, convert), &(cin, cout)) in
-            self.plugins.iter_mut().zip(&self.convert).zip(&self.counts)
+        for (((plugin, convert), &(cin, cout)), state) in self
+            .plugins
+            .iter_mut()
+            .zip(&self.convert)
+            .zip(&self.counts)
+            .zip(&mut self.states)
         {
             let plugin = plugin.as_mut();
             let (in_len, out_len) = (frames * cin, frames * cout);
@@ -191,10 +225,8 @@ impl Chain {
                     None => &mut *input,
                     Some(i) => &mut S::buffer(&mut self.wide[i])[..in_len],
                 };
-                match *convert {
-                    None => plugin.process(S::block(data, cin)),
-                    Some(to) => converted(plugin, data, cin, to, &mut self.store),
-                }
+                let stores = (&mut self.store, &mut self.dry);
+                stage(plugin, *convert, data, cin, stores, state, fade)
             } else {
                 let (first, second) = self.wide.split_at_mut(1);
                 let (first, second) = (&mut first[0], &mut second[0]);
@@ -209,7 +241,7 @@ impl Chain {
                         &mut S::buffer(first)[..out_len],
                     ),
                 };
-                let s = match *convert {
+                let s = timed(state.stats.as_deref(), || match *convert {
                     None => plugin.process_into(S::block(src, cin), S::block(dst, cout)),
                     Some(to) => converted_into(
                         plugin,
@@ -218,7 +250,7 @@ impl Chain {
                         to,
                         (&mut self.store, &mut self.store_out),
                     ),
-                };
+                });
                 at = Some(usize::from(at == Some(0)));
                 s
             };
@@ -238,23 +270,41 @@ impl Chain {
     /// frames long (a longer block panics). For a chain that keeps the
     /// channel count: one that changes it panics, so use `run`.
     /// `no_signal` is set if any plugin reported it.
-    pub fn process(&mut self, mut block: Block<'_>) -> Status {
+    pub fn process(&mut self, block: Block<'_>) -> Status {
         assert!(
             !self.changes_channels(),
             "a chain that changes the channel count is run with `run`"
         );
         debug_assert!(self.plugins.is_empty() || block.format() == self.format);
         debug_assert!(self.channels_in == 0 || block.channels == self.channels_in);
+        let channels = block.channels;
+        match block.samples {
+            Samples::I32(d) => self.process_as(d, channels),
+            Samples::F32(d) => self.process_as(d, channels),
+            Samples::F64(d) => self.process_as(d, channels),
+        }
+    }
+
+    /// `process` on samples of type `S`.
+    fn process_as<S: Sample>(&mut self, data: &mut [S], channels: usize) -> Status {
+        let fade = self.fade_frames();
         let mut status = Status::default();
-        for (plugin, convert) in self.plugins.iter_mut().zip(&self.convert) {
-            let plugin = plugin.as_mut();
-            let channels = block.channels;
-            let s = match (*convert, &mut block.samples) {
-                (None, _) => plugin.process(block.reborrow()),
-                (Some(to), Samples::I32(d)) => converted(plugin, d, channels, to, &mut self.store),
-                (Some(to), Samples::F32(d)) => converted(plugin, d, channels, to, &mut self.store),
-                (Some(to), Samples::F64(d)) => converted(plugin, d, channels, to, &mut self.store),
-            };
+        for ((plugin, convert), state) in self
+            .plugins
+            .iter_mut()
+            .zip(&self.convert)
+            .zip(&mut self.states)
+        {
+            let stores = (&mut self.store, &mut self.dry);
+            let s = stage(
+                plugin.as_mut(),
+                *convert,
+                data,
+                channels,
+                stores,
+                state,
+                fade,
+            );
             status.no_signal |= s.no_signal;
             status.changed |= s.changed;
         }
@@ -288,17 +338,20 @@ impl Chain {
         }
     }
 
-    /// True if every plugin is neutral, and so for an empty chain. Never
-    /// true for a chain that changes the channel count.
+    /// True if every enabled plugin is neutral and no fade runs, and so for
+    /// an empty chain. Never true for a chain that changes the channel
+    /// count.
     pub fn neutral(&self) -> bool {
-        !self.changes_channels() && self.plugins.iter().all(|p| p.neutral())
+        let fade = self.fade_frames();
+        !self.changes_channels()
+            && (self.plugins.iter().zip(&self.states)).all(|(p, s)| s.neutral(p.as_ref(), fade))
     }
 
-    /// The delay of all plugins together.
+    /// The delay of the enabled plugins together.
     pub fn latency_frames(&self) -> u32 {
-        self.plugins
-            .iter()
-            .fold(0u32, |sum, p| sum.saturating_add(p.latency_frames()))
+        (self.plugins.iter().zip(&self.states))
+            .filter(|(_, s)| s.enabled)
+            .fold(0u32, |sum, (p, _)| sum.saturating_add(p.latency_frames()))
     }
 
     /// Sets parameter `index` of plugin `plugin`. An unknown plugin or
@@ -308,8 +361,162 @@ impl Chain {
             && index < p.params().len()
         {
             p.set_param(index, value);
+            self.publish(plugin);
         }
     }
+
+    /// Enables or disables plugin `plugin`, crossfading over 10 ms between
+    /// its input and its output. A disabled plugin is passed over once its
+    /// fade has ended, and one enabled from there is reset first, so it
+    /// plays no old tail. An unknown plugin, or one whose counts differ, is
+    /// ignored. Does not allocate.
+    pub fn set_enabled(&mut self, plugin: usize, enabled: bool) {
+        let fade = self.fade_frames();
+        let (Some(p), Some(state), Some(&(cin, cout))) = (
+            self.plugins.get_mut(plugin),
+            self.states.get_mut(plugin),
+            self.counts.get(plugin),
+        ) else {
+            return;
+        };
+        if cin != cout || state.enabled == enabled {
+            return;
+        }
+        if enabled && state.dry == fade {
+            p.reset();
+        }
+        state.enabled = enabled;
+        self.publish(plugin);
+    }
+
+    /// Whether plugin `plugin` is enabled, false for an unknown one. True
+    /// from `set_enabled(plugin, true)` on, also while it fades in.
+    pub fn enabled(&self, plugin: usize) -> bool {
+        self.states.get(plugin).is_some_and(|s| s.enabled)
+    }
+
+    /// The frames a fade lasts: 10 ms at the chain's rate, 480 for a chain
+    /// that names none.
+    fn fade_frames(&self) -> u32 {
+        self.rate.map_or(480, |r| (r / 100).max(1))
+    }
+
+    /// Writes what plugin `plugin` publishes, if it has stats.
+    fn publish(&self, plugin: usize) {
+        let fade = self.fade_frames();
+        publish(self.plugins[plugin].as_ref(), &self.states[plugin], fade);
+    }
+}
+
+/// What a chain keeps for each plugin besides the plugin.
+#[derive(Debug)]
+struct State {
+    enabled: bool,
+    /// How far the fade toward the plugin's input has come, in frames: 0
+    /// is its output alone, the fade's length its input alone.
+    dry: u32,
+    stats: Option<Arc<PluginStats>>,
+}
+
+impl Default for State {
+    fn default() -> State {
+        State {
+            enabled: true,
+            dry: 0,
+            stats: None,
+        }
+    }
+}
+
+impl State {
+    /// Where the fade of `fade` frames goes.
+    fn target(&self, fade: u32) -> u32 {
+        if self.enabled { 0 } else { fade }
+    }
+
+    /// Neutral as the chain counts it: no fade runs, and the plugin is
+    /// disabled or neutral itself.
+    fn neutral(&self, plugin: &dyn Plugin, fade: u32) -> bool {
+        self.dry == self.target(fade) && (!self.enabled || plugin.neutral())
+    }
+}
+
+/// Writes whether `plugin` is neutral and its latency to its stats, if it
+/// has them.
+fn publish(plugin: &dyn Plugin, state: &State, fade: u32) {
+    if let Some(stats) = &state.stats {
+        stats.neutral.store(state.neutral(plugin, fade), Relaxed);
+        let latency = if state.enabled {
+            plugin.latency_frames()
+        } else {
+            0
+        };
+        stats.latency_frames.store(latency, Relaxed);
+    }
+}
+
+/// Runs `run`, and if there are `stats`, counts it there with the time it
+/// took.
+fn timed(stats: Option<&PluginStats>, run: impl FnOnce() -> Status) -> Status {
+    let Some(stats) = stats else {
+        return run();
+    };
+    let start = monotonic_ns();
+    let status = run();
+    let ns = monotonic_ns().saturating_sub(start);
+    stats.runs.fetch_add(1, Relaxed);
+    stats.total_ns.fetch_add(ns, Relaxed);
+    stats.worst_ns.fetch_max(ns, Relaxed);
+    status
+}
+
+/// Runs a plugin whose counts are the same on `data` in place, converted
+/// if `convert` names a format, timed, and crossfaded with its input while
+/// a fade of `fade` frames runs. A disabled plugin whose fade has ended is
+/// passed over.
+fn stage<S: Sample>(
+    plugin: &mut dyn Plugin,
+    convert: Option<Format>,
+    data: &mut [S],
+    channels: usize,
+    (store, dry): (&mut BlockStore, &mut BlockStore),
+    state: &mut State,
+    fade: u32,
+) -> Status {
+    let target = state.target(fade);
+    if !state.enabled && state.dry == target {
+        return Status::default();
+    }
+    let fading = state.dry != target;
+    if fading {
+        S::buffer(dry)[..data.len()].copy_from_slice(data);
+    }
+    let status = timed(state.stats.as_deref(), || match convert {
+        None => plugin.process(S::block(data, channels)),
+        Some(to) => converted(plugin, data, channels, to, store),
+    });
+    if fading {
+        let input = &S::buffer(dry)[..data.len()];
+        for (out, input) in data
+            .chunks_exact_mut(channels)
+            .zip(input.chunks_exact(channels))
+        {
+            // The share of the plugin's output.
+            let g = 1.0 - f64::from(state.dry) / f64::from(fade);
+            for (o, i) in out.iter_mut().zip(input) {
+                *o = S::from_unit(i.to_unit() * (1.0 - g) + o.to_unit() * g);
+            }
+            match state.dry.cmp(&target) {
+                std::cmp::Ordering::Less => state.dry += 1,
+                std::cmp::Ordering::Greater => state.dry -= 1,
+                std::cmp::Ordering::Equal => {}
+            }
+        }
+        if state.dry == target {
+            publish(plugin, state, fade);
+        }
+    }
+    status
 }
 
 /// Why plugins do not fit a channel count: the index of the plugin, if one
@@ -515,6 +722,7 @@ mod tests {
     use crate::format::{F32, F64, I32, Processing};
     use crate::plugin::{Param, ParamKind};
     use assert_no_alloc::assert_no_alloc;
+    use std::sync::atomic::Ordering::Relaxed;
     use std::sync::{Arc, Mutex};
 
     const FULL: f64 = 2_147_483_648.0;
@@ -535,6 +743,8 @@ mod tests {
         params: Vec<Param>,
         value: f64,
         neutral: bool,
+        /// Neutral only at this value, if given.
+        neutral_at: Option<f64>,
         latency: u32,
         no_signal: bool,
         seen: Option<Seen>,
@@ -555,6 +765,7 @@ mod tests {
                 }],
                 value,
                 neutral: true,
+                neutral_at: None,
                 latency: 0,
                 no_signal: false,
                 seen: None,
@@ -610,7 +821,7 @@ mod tests {
         }
 
         fn neutral(&self) -> bool {
-            self.neutral
+            self.neutral && self.neutral_at.is_none_or(|v| v == self.value)
         }
 
         fn latency_frames(&self) -> u32 {
@@ -1281,6 +1492,258 @@ mod tests {
                 -(1 << 30)
             ]
         );
+    }
+
+    fn stats(n: usize) -> Vec<Arc<PluginStats>> {
+        (0..n).map(|_| Arc::default()).collect()
+    }
+
+    /// Runs `chain` on `frames` frames of two channels, every sample `v`,
+    /// and gives the left channel back.
+    fn run_frames(chain: &mut Chain, v: f64, frames: usize) -> Vec<f64> {
+        let mut d = vec![[v, v]; frames];
+        chain.process(Block {
+            channels: 2,
+            samples: Samples::F64(d.as_flattened_mut()),
+        });
+        d.iter().map(|f| f[0]).collect()
+    }
+
+    /// A chain at 48 kHz for blocks of up to 1024 frames.
+    fn chain_at_48k(plugins: Vec<Box<dyn Plugin>>) -> Chain {
+        Chain::new(plugins, Format::F64, 1024, 2)
+            .unwrap()
+            .for_rate(48_000)
+    }
+
+    #[test]
+    fn stats_count_each_block() {
+        let s = stats(2);
+        let mut c = chain(vec![mul(2.0), mul(0.5)], Format::F64).with_stats(s.clone());
+        for _ in 0..10 {
+            run_f64(&mut c, 0.25);
+        }
+        for s in &s {
+            let (runs, total, worst) = (
+                s.runs.load(Relaxed),
+                s.total_ns.load(Relaxed),
+                s.worst_ns.load(Relaxed),
+            );
+            assert_eq!(runs, 10);
+            assert!(total > 0);
+            assert!(worst >= total / 10, "{worst} {total}");
+        }
+    }
+
+    #[test]
+    #[should_panic]
+    fn stats_for_another_number_of_plugins_panic() {
+        let _ = chain(vec![mul(2.0)], Format::F64).with_stats(stats(2));
+    }
+
+    #[test]
+    fn a_disabled_plugin_fades_out_over_10_ms() {
+        let mut c = chain_at_48k(vec![mul(0.5).boxed()]);
+        assert_eq!(run_frames(&mut c, 1.0, 100), vec![0.5; 100]);
+        c.set_enabled(0, false);
+        assert!(!c.enabled(0));
+        let mut out = Vec::new();
+        for _ in 0..3 {
+            out.extend(run_frames(&mut c, 1.0, 200));
+        }
+        assert_eq!(out[0], 0.5);
+        assert!((out[480] - 1.0).abs() < 1e-6, "{}", out[480]);
+        for w in out.windows(2) {
+            assert!((w[1] - w[0]).abs() <= 0.5 / 480.0 + 1e-6, "{w:?}");
+        }
+        assert_eq!(&out[481..], vec![1.0; 600 - 481]);
+        assert_eq!(run_frames(&mut c, 0.75, 100), vec![0.75; 100]);
+        // And back in.
+        c.set_enabled(0, true);
+        let out = run_frames(&mut c, 1.0, 600);
+        assert_eq!(out[0], 1.0);
+        assert!((out[480] - 0.5).abs() < 1e-6, "{}", out[480]);
+        assert_eq!(&out[481..], vec![0.5; 600 - 481]);
+    }
+
+    #[test]
+    fn a_plugin_whose_counts_differ_is_not_disabled_nor_an_unknown_one() {
+        let mut c = Chain::new(vec![wide()], Format::F32, 16, 2).unwrap();
+        c.set_enabled(0, false);
+        c.set_enabled(1, false);
+        assert!(c.enabled(0));
+        assert!(!c.enabled(1));
+        let mut d = [1.0f32, 2.0];
+        let (block, _) = c.run(Block {
+            channels: 2,
+            samples: Samples::F32(&mut d),
+        });
+        assert_eq!(block.channels, 4);
+    }
+
+    #[test]
+    fn a_plugin_beside_one_that_widens_fades_too() {
+        let plugins: Vec<Box<dyn Plugin>> = vec![mul(0.5).boxed(), wide()];
+        let mut c = Chain::new(plugins, Format::F64, 1024, 2)
+            .unwrap()
+            .for_rate(48_000);
+        c.set_enabled(0, false);
+        let mut d = vec![1.0f64; 2 * 600];
+        let (block, _) = c.run(Block {
+            channels: 2,
+            samples: Samples::F64(&mut d),
+        });
+        let Samples::F64(out) = block.samples else {
+            panic!("not f64")
+        };
+        assert_eq!(out[0], 0.5);
+        assert!((out[4 * 480] - 1.0).abs() < 1e-6);
+        assert_eq!(out[4 * 599], 1.0);
+    }
+
+    /// Two channels, each delayed by `DELAY` frames.
+    struct Delay {
+        line: Vec<f64>,
+        at: usize,
+    }
+
+    const DELAY: usize = 64;
+
+    impl Plugin for Delay {
+        fn name(&self) -> &str {
+            "delay"
+        }
+
+        fn formats(&self) -> Formats {
+            formats(false, false, true)
+        }
+
+        fn params(&self) -> &[Param] {
+            &[]
+        }
+
+        fn set_param(&mut self, _: usize, _: f64) {}
+
+        fn neutral(&self) -> bool {
+            false
+        }
+
+        fn latency_frames(&self) -> u32 {
+            DELAY as u32
+        }
+
+        fn process(&mut self, block: Block<'_>) -> Status {
+            let Samples::F64(d) = block.samples else {
+                panic!("not f64")
+            };
+            for s in d.iter_mut() {
+                std::mem::swap(s, &mut self.line[self.at]);
+                self.at = (self.at + 1) % self.line.len();
+            }
+            Status::default()
+        }
+
+        fn reset(&mut self) {
+            self.line.fill(0.0);
+        }
+    }
+
+    fn delay() -> Box<dyn Plugin> {
+        Box::new(Delay {
+            line: vec![0.0; 2 * DELAY],
+            at: 0,
+        })
+    }
+
+    #[test]
+    fn enabling_resets_first() {
+        let mut c = chain_at_48k(vec![delay()]);
+        // The line fills with 1.0 and keeps it through the fade.
+        run_frames(&mut c, 1.0, 600);
+        c.set_enabled(0, false);
+        assert_eq!(c.latency_frames(), 0);
+        run_frames(&mut c, 1.0, 600);
+        assert_eq!(run_frames(&mut c, 0.0, 600), vec![0.0; 600]);
+        c.set_enabled(0, true);
+        assert_eq!(c.latency_frames(), DELAY as u32);
+        assert_eq!(run_frames(&mut c, 0.0, 1000), vec![0.0; 1000]);
+    }
+
+    #[test]
+    fn a_disabled_plugin_is_neutral() {
+        let mut busy = mul(2.0);
+        busy.neutral = false;
+        let mut c = chain_at_48k(vec![busy.boxed()]);
+        assert!(!c.neutral());
+        c.set_enabled(0, false);
+        assert!(!c.neutral());
+        run_frames(&mut c, 1.0, 400);
+        assert!(!c.neutral());
+        run_frames(&mut c, 1.0, 400);
+        assert!(c.neutral());
+        // And a neutral one mid-fade is not.
+        c.set_enabled(0, true);
+        assert!(!c.neutral());
+        let mut c = chain_at_48k(vec![mul(1.0).boxed()]);
+        c.set_enabled(0, false);
+        assert!(!c.neutral());
+        run_frames(&mut c, 1.0, 500);
+        assert!(c.neutral());
+    }
+
+    #[test]
+    fn stats_publish_neutral_and_latency() {
+        let mut t = mul(1.0);
+        t.neutral_at = Some(1.0);
+        t.latency = 7;
+        let s = stats(1);
+        let mut c = chain_at_48k(vec![t.boxed()]).with_stats(s.clone());
+        assert!(s[0].neutral.load(Relaxed));
+        assert_eq!(s[0].latency_frames.load(Relaxed), 7);
+        c.set_param(0, 0, 2.0);
+        assert!(!s[0].neutral.load(Relaxed));
+        c.set_param(0, 0, 1.0);
+        assert!(s[0].neutral.load(Relaxed));
+        c.set_param(0, 0, 2.0);
+        c.set_enabled(0, false);
+        assert_eq!(s[0].latency_frames.load(Relaxed), 0);
+        assert!(!s[0].neutral.load(Relaxed));
+        run_frames(&mut c, 1.0, 500);
+        assert!(s[0].neutral.load(Relaxed));
+        c.set_enabled(0, true);
+        assert_eq!(s[0].latency_frames.load(Relaxed), 7);
+        assert!(!s[0].neutral.load(Relaxed));
+    }
+
+    #[test]
+    fn set_enabled_does_not_allocate() {
+        let mut c = chain_at_48k(vec![delay(), mul(0.5).boxed()]).with_stats(stats(2));
+        assert_no_alloc(|| {
+            c.set_enabled(0, false);
+            c.set_enabled(1, false);
+            c.set_enabled(0, true);
+            c.set_enabled(5, true);
+            assert!(c.enabled(0) && !c.enabled(1));
+        });
+    }
+
+    #[test]
+    fn timed_processing_does_not_allocate() {
+        let mut c = chain_at_48k(vec![
+            delay(),
+            mul(0.5).only(formats(false, true, false)).boxed(),
+        ])
+        .with_stats(stats(2));
+        let mut d = vec![0.25f64; 2 * 256];
+        c.set_enabled(1, false);
+        assert_no_alloc(|| {
+            for _ in 0..4 {
+                c.process(Block {
+                    channels: 2,
+                    samples: Samples::F64(&mut d),
+                });
+            }
+        });
     }
 
     #[test]

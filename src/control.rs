@@ -3291,6 +3291,7 @@ mod tests {
                         (name, Some(Event::OldChain(target.output, chain)))
                     }
                     Command::SetParam { .. } => ("SetParam".into(), None),
+                    Command::SetEnabled { .. } => ("SetEnabled".into(), None),
                     Command::SetCapture(c) => {
                         let old = std::mem::replace(&mut self.capture, c);
                         let name = format!("SetCapture {}", self.capture.is_some());

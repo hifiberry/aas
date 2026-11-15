@@ -1,6 +1,6 @@
 //! Counters the audio thread keeps for monitoring. All updates are lock free.
 
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU32, AtomicU64, Ordering::Relaxed};
 
 /// Totals since the start of the daemon.
 #[derive(Debug, Default)]
@@ -65,6 +65,23 @@ pub struct OutputCounters {
     pub skipped: AtomicU64,
     /// The path's delay has stayed on its target for the lock time.
     pub locked: AtomicBool,
+}
+
+/// What a chain publishes about one of its plugins. The control thread
+/// creates one per plugin and hands the same one to every rebuild of its
+/// chain, so a rate change does not reset it.
+#[derive(Debug, Default)]
+pub struct PluginStats {
+    /// Blocks the plugin processed.
+    pub runs: AtomicU64,
+    pub total_ns: AtomicU64,
+    pub worst_ns: AtomicU64,
+    /// Whether the plugin is neutral now, as its chain counts it: a
+    /// disabled one is once its fade has ended. Written whenever it may
+    /// have changed.
+    pub neutral: AtomicBool,
+    /// Its latency, 0 while it is disabled.
+    pub latency_frames: AtomicU32,
 }
 
 impl std::fmt::Display for OutputCounters {
