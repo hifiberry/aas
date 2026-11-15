@@ -491,11 +491,14 @@ fn stage<S: Sample>(
     if fading {
         S::buffer(dry)[..data.len()].copy_from_slice(data);
     }
-    let status = timed(state.stats.as_deref(), || match convert {
+    let mut status = timed(state.stats.as_deref(), || match convert {
         None => plugin.process(S::block(data, channels)),
         Some(to) => converted(plugin, data, channels, to, store),
     });
     if fading {
+        // The chain may be neutral again by the end of the block, but this
+        // block was crossfaded, so it must be played as processed.
+        status.changed = true;
         let input = &S::buffer(dry)[..data.len()];
         for (out, input) in data
             .chunks_exact_mut(channels)
@@ -1564,6 +1567,29 @@ mod tests {
         assert_eq!(out[0], 1.0);
         assert!((out[480] - 0.5).abs() < 1e-6, "{}", out[480]);
         assert_eq!(&out[481..], vec![0.5; 600 - 481]);
+    }
+
+    #[test]
+    fn a_block_with_a_fade_in_it_is_changed() {
+        let mut c = chain_at_48k(vec![mul(1.0).boxed()]);
+        let run = |c: &mut Chain, frames: usize| {
+            let mut d = vec![[1.0f64; 2]; frames];
+            c.process(Block {
+                channels: 2,
+                samples: Samples::F64(d.as_flattened_mut()),
+            })
+            .changed
+        };
+        assert!(!run(&mut c, 100));
+        c.set_enabled(0, false);
+        // One block holds the whole fade, and the chain is neutral after it.
+        assert!(run(&mut c, 600));
+        assert!(c.neutral());
+        assert!(!run(&mut c, 100));
+        c.set_enabled(0, true);
+        assert!(run(&mut c, 200));
+        assert!(run(&mut c, 400));
+        assert!(!run(&mut c, 100));
     }
 
     #[test]

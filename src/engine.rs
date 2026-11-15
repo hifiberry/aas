@@ -6845,6 +6845,12 @@ mod tests {
             index: 0,
             value: 0.25,
         });
+        // The adder adds nothing, so its fade out is not heard.
+        rig.send(Command::SetEnabled {
+            target: Target::master(Place::Mix),
+            plugin: 0,
+            enabled: false,
+        });
         rig.send(Command::SetChain(
             Target::master(Place::Output),
             chain_of::<P>(vec![times(3.0).only(other).latency(8)]),
