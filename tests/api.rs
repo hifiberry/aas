@@ -484,3 +484,109 @@ fn an_idle_master_reads_zeros() {
         assert_eq!(frame, [1, 2, 0, 0, 0, 0, 0]);
     }
 }
+
+/// Whether a manifest path pattern matches a path remainder, as the
+/// HiFiBerry OS security model matches them: `*` is exactly one segment,
+/// `**` the rest of the path, also nothing, and only last.
+fn glob_matches(pattern: &str, path: &str) -> bool {
+    let pattern: Vec<&str> = pattern.trim_start_matches('/').split('/').collect();
+    let path: Vec<&str> = path
+        .trim_start_matches('/')
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect();
+    for (i, part) in pattern.iter().enumerate() {
+        match *part {
+            "**" => {
+                assert_eq!(i, pattern.len() - 1, "** not last in {pattern:?}");
+                return true;
+            }
+            "*" if i < path.len() => {}
+            _ if i < path.len() && path[i] == *part => {}
+            _ => return false,
+        }
+    }
+    pattern.len() == path.len()
+}
+
+/// The tier of a browser-facing request under a manifest: the first rule
+/// whose method and path match, else the default.
+fn tier(manifest: &Value, method: &str, path: &str) -> String {
+    let prefix = manifest["match_prefix"].as_str().unwrap();
+    let rest = path.strip_prefix(prefix).expect("not under the prefix");
+    for rule in manifest["rules"].as_array().unwrap() {
+        let methods = rule["methods"].as_array().unwrap();
+        let method_hit = methods.iter().any(|m| m == "*" || m == method);
+        let path_hit = rule["paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| glob_matches(p.as_str().unwrap(), rest));
+        if method_hit && path_hit {
+            return rule["tier"].as_str().unwrap().to_string();
+        }
+    }
+    manifest["default_tier"].as_str().unwrap().to_string()
+}
+
+#[test]
+fn the_manifest_marks_only_settings_risky() {
+    let file = concat!(env!("CARGO_MANIFEST_DIR"), "/dist/auth.d/aas.json");
+    let manifest: Value = serde_json::from_str(&std::fs::read_to_string(file).unwrap()).unwrap();
+    assert_eq!(manifest["service"], json!("aas"));
+    assert_eq!(manifest["match_prefix"], json!("/api/aas/v1"));
+    assert_eq!(manifest["default_tier"], json!("risky"));
+    // Every route of the API, as the browser sees it.
+    let gets = [
+        "/state",
+        "/outputs",
+        "/outputs/1",
+        "/outputs/2",
+        "/inputs",
+        "/inputs/analog",
+        "/inputs/clients/mpd",
+        "/graph",
+        "/graph?format=dot",
+        "/metrics",
+        "/matrix",
+        "/plugins",
+        "/plugins/1/mix/0",
+        "/plugins/2/output/1",
+        "/settings",
+        "/events",
+        "/levels",
+    ];
+    for path in gets {
+        let path = path.split('?').next().unwrap();
+        let full = format!("/api/aas/v1{path}");
+        assert_eq!(tier(&manifest, "GET", &full), "ok", "GET {path}");
+    }
+    let ok_changes = [
+        ("PATCH", "/outputs/1"),
+        ("PATCH", "/outputs/2"),
+        ("PATCH", "/inputs/analog"),
+        ("PATCH", "/inputs/clients/mpd"),
+        ("PATCH", "/plugins/1/mix/0"),
+        ("PATCH", "/plugins/1/analog/2"),
+        ("PUT", "/matrix"),
+    ];
+    for (method, path) in ok_changes {
+        let full = format!("/api/aas/v1{path}");
+        assert_eq!(tier(&manifest, method, &full), "ok", "{method} {path}");
+    }
+    let risky = [
+        ("PATCH", "/settings"),
+        ("PUT", "/settings"),
+        ("PATCH", "/outputs"),
+        ("PATCH", "/outputs/1/extra"),
+        ("PATCH", "/matrix"),
+        ("POST", "/matrix"),
+        ("PUT", "/plugins/1/mix/0"),
+        ("DELETE", "/state"),
+        ("POST", "/anything/else"),
+    ];
+    for (method, path) in risky {
+        let full = format!("/api/aas/v1{path}");
+        assert_eq!(tier(&manifest, method, &full), "risky", "{method} {path}");
+    }
+}

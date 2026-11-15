@@ -1,0 +1,28 @@
+# The aas API, installed to /etc/nginx/hifiberry-api.d/ and included in the
+# main server block. The trailing slash of proxy_pass strips the prefix, so
+# /api/aas/v1/state reaches the daemon as /state. The port is the daemon's
+# default api_port.
+
+location /api/aas/v1/ {
+    proxy_pass http://127.0.0.1:2718/;
+
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+
+    # WebSocket support, for /events and /levels
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+
+    proxy_request_buffering off;
+    proxy_buffering off;
+    proxy_redirect off;
+
+    # The daemon pings a WebSocket every 10 s, so a quiet /events or /levels
+    # stays well inside the read timeout.
+    proxy_connect_timeout 60s;
+    proxy_send_timeout 60s;
+    proxy_read_timeout 60s;
+}
