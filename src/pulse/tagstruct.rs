@@ -101,12 +101,17 @@ impl Builder {
         self.out.extend_from_slice(&value.to_be_bytes());
     }
 
+    /// A proplist of text values. PulseAudio stores a text value with its
+    /// terminating NUL and counts it in the length, so this does too;
+    /// otherwise a client reads the value as binary.
     pub fn proplist(&mut self, props: &[(String, String)]) {
         self.out.push(PROPLIST);
         for (key, value) in props {
+            let mut bytes = value.as_bytes().to_vec();
+            bytes.push(0);
             self.string(key);
-            self.u32(value.len() as u32);
-            self.arbitrary(value.as_bytes());
+            self.u32(bytes.len() as u32);
+            self.arbitrary(&bytes);
         }
         self.null_string();
     }
@@ -279,6 +284,9 @@ impl<'a> Reader<'a> {
             if value.len() != length {
                 return None;
             }
+            // A text value arrives with its terminating NUL, which is not
+            // part of the text: kept, it would be sent back inside a string.
+            let value = value.strip_suffix(&[0]).unwrap_or(value);
             props.push((
                 key.to_string(),
                 String::from_utf8_lossy(value).into_owned(),
@@ -291,6 +299,11 @@ impl<'a> Reader<'a> {
         let encoding = self.u8()?;
         let props = self.proplist()?;
         Some((encoding, props))
+    }
+
+    pub fn volume(&mut self) -> Option<u32> {
+        self.expect(VOLUME)?;
+        Some(u32::from_be_bytes(self.take(4)?.try_into().ok()?))
     }
 
     pub fn usec(&mut self) -> Option<u64> {
@@ -309,6 +322,24 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_text_property_carries_its_nul_on_the_wire_only() {
+        let mut b = Builder::new();
+        b.proplist(&[("media.name".into(), "tone".into())]);
+        let bytes = b.into_vec();
+        // As PulseAudio writes it: the length counts the NUL.
+        let mut expected = vec![PROPLIST];
+        let mut key = Builder::new();
+        key.string("media.name");
+        key.u32(5);
+        key.arbitrary(b"tone\0");
+        key.null_string();
+        expected.extend(key.into_vec());
+        assert_eq!(bytes, expected);
+        let props = Reader::new(&bytes).proplist().unwrap();
+        assert_eq!(props, vec![("media.name".to_string(), "tone".to_string())]);
+    }
 
     #[test]
     fn every_tag_round_trips() {
@@ -362,7 +393,7 @@ mod tests {
         b.proplist(&[("k".into(), "v".into())]);
         assert_eq!(
             b.into_vec(),
-            vec![b'P', b't', b'k', 0, b'L', 0, 0, 0, 1, b'x', 0, 0, 0, 1, b'v', b'N']
+            vec![b'P', b't', b'k', 0, b'L', 0, 0, 0, 2, b'x', 0, 0, 0, 2, b'v', 0, b'N']
         );
     }
 

@@ -57,7 +57,10 @@ pub fn sink_info(rate: u32, volume: u8, mute: bool, latency_usec: u64, state: u3
     b.u32(wire::INVALID_INDEX);
     b.u32(0);
     b.null_string();
-    b.u8(0);
+    // libpulse refuses a sink with no formats; PulseAudio's own sinks list
+    // one, plain PCM.
+    b.u8(1);
+    b.format_info(wire::ENCODING_PCM, &[]);
     b.into_vec()
 }
 
@@ -96,6 +99,14 @@ pub fn sink_input_info(input: &SinkInput) -> Vec<u8> {
     b.boolean(input.corked);
     b.boolean(true);
     b.boolean(true);
-    b.format_info(0, &[]);
+    let spec = SampleSpec {
+        format: input.format,
+        channels: input.channels,
+        rate: input.rate,
+    };
+    b.format_info(
+        wire::ENCODING_PCM,
+        &crate::pulse::stream::pcm_props(spec, map),
+    );
     b.into_vec()
 }

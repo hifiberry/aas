@@ -82,6 +82,9 @@ pub const FORMAT_S32LE: u8 = 7;
 pub const FORMAT_S24LE: u8 = 9;
 pub const FORMAT_S24_32LE: u8 = 11;
 
+/// `PA_ENCODING_PCM`, the only encoding this endpoint plays.
+pub const ENCODING_PCM: u8 = 1;
+
 /// PulseAudio's unit volume.
 pub const VOLUME_NORM: u32 = 0x1_0000;
 /// The invalid index.

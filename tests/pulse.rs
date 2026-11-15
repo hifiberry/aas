@@ -790,3 +790,163 @@ fn another_connection_sets_a_streams_volume_and_mute() {
     let (command, _, _) = pactl.command(wire::SET_SINK_INPUT_VOLUME, &body.into_vec());
     assert_eq!(command, wire::ERROR);
 }
+
+/// Reads a sink info reply field by field, as libpulse 17 does for
+/// protocol 35, and returns the number of formats. Panics where libpulse
+/// would fail the connection with a protocol error.
+fn read_sink_info_as_libpulse(body: &[u8]) -> u8 {
+    let mut r = Reader::new(body);
+    r.u32().expect("index");
+    r.string().expect("name");
+    r.string().expect("description");
+    r.sample_spec().expect("sample spec");
+    r.channel_map().expect("channel map");
+    r.u32().expect("owner module");
+    r.cvolume().expect("volume");
+    r.boolean().expect("mute");
+    r.u32().expect("monitor source");
+    let _ = r.string(); // monitor source name, may be null
+    r.usec().expect("latency");
+    r.string().expect("driver");
+    r.u32().expect("flags");
+    r.proplist().expect("proplist");
+    r.usec().expect("configured latency");
+    r.volume().expect("base volume");
+    r.u32().expect("state");
+    r.u32().expect("volume steps");
+    r.u32().expect("card");
+    assert_eq!(r.u32(), Some(0), "no ports");
+    let _ = r.string(); // active port, may be null
+    let formats = r.u8().expect("format count");
+    for _ in 0..formats {
+        r.format_info().expect("a format");
+    }
+    assert!(r.eof(), "nothing after the formats");
+    formats
+}
+
+/// Reads a sink input info reply as libpulse 17 does and returns its name
+/// and format.
+fn read_sink_input_as_libpulse(body: &[u8]) -> (String, (u8, Vec<(String, String)>)) {
+    let mut r = Reader::new(body);
+    r.u32().expect("index");
+    let name = r.string().expect("name").to_string();
+    r.u32().expect("owner module");
+    r.u32().expect("client");
+    r.u32().expect("sink");
+    r.sample_spec().expect("sample spec");
+    r.channel_map().expect("channel map");
+    r.cvolume().expect("volume");
+    r.usec().expect("buffer latency");
+    r.usec().expect("sink latency");
+    r.string().expect("resample method");
+    r.string().expect("driver");
+    r.boolean().expect("mute");
+    r.proplist().expect("proplist");
+    r.boolean().expect("corked");
+    r.boolean().expect("has volume");
+    r.boolean().expect("volume writable");
+    let format = r.format_info().expect("format");
+    assert!(r.eof(), "nothing after the format");
+    (name, format)
+}
+
+#[test]
+fn the_sink_reads_as_libpulse_reads_it_with_one_format() {
+    let daemon = Daemon::start();
+    let mut client = RawPulse::connect(&daemon.pulse_socket());
+    client.auth();
+    client.set_name("pactl");
+    let mut body = Builder::new();
+    body.u32(u32::MAX);
+    body.string("@DEFAULT_SINK@");
+    let (command, _, reply) = client.command(wire::GET_SINK_INFO, &body.into_vec());
+    assert_eq!(command, wire::REPLY);
+    // libpulse fails the whole connection on a sink without formats.
+    assert_eq!(read_sink_info_as_libpulse(&reply), 1);
+}
+
+#[test]
+fn a_stream_name_comes_back_without_the_clients_nul() {
+    let daemon = Daemon::start();
+    let mut client = RawPulse::connect(&daemon.pulse_socket());
+    client.auth();
+    client.set_name("player");
+    // create_body's proplist carries "a test stream" with its NUL, as
+    // libpulse sends text properties.
+    let (stream, _, _) = client.create_stream(48_000, wire::FORMAT_S16LE, 2, 200);
+    let mut body = Builder::new();
+    body.u32(stream);
+    let (command, _, reply) = client.command(wire::GET_SINK_INPUT_INFO, &body.into_vec());
+    assert_eq!(command, wire::REPLY);
+    let (name, (encoding, _)) = read_sink_input_as_libpulse(&reply);
+    assert_eq!(name, "a test stream");
+    assert_eq!(encoding, 1, "PCM");
+    let (command, _, reply) = client.command(wire::GET_CLIENT_INFO_LIST, &[]);
+    assert_eq!(command, wire::REPLY);
+    let mut r = Reader::new(&reply);
+    r.u32().expect("index");
+    assert_eq!(r.string(), Some("player"));
+}
+
+#[test]
+fn a_stream_given_as_a_pcm_format_list_plays() {
+    let daemon = Daemon::start();
+    let mut client = RawPulse::connect(&daemon.pulse_socket());
+    client.auth();
+    client.set_name("mpv");
+    // As pa_stream_new_extended sends it: an invalid placeholder sample
+    // spec, an empty channel map, and the real format in the list.
+    let mut body = Builder::new();
+    body.sample_spec(aas::pulse::tagstruct::SampleSpec {
+        format: 0xff,
+        channels: 0,
+        rate: 0,
+    });
+    body.channel_map(&[]);
+    body.u32(u32::MAX);
+    body.null_string();
+    body.u32(u32::MAX);
+    body.boolean(false);
+    body.u32(u32::MAX);
+    body.u32(u32::MAX);
+    body.u32(u32::MAX);
+    body.u32(0);
+    body.cvolume(&[wire::VOLUME_NORM; 2]);
+    for _ in 0..9 {
+        body.boolean(false);
+    }
+    body.proplist(&[("media.name".to_string(), "audio stream".to_string())]);
+    for _ in 0..7 {
+        body.boolean(false);
+    }
+    body.u8(1);
+    body.format_info(
+        1,
+        &[
+            ("format.sample_format".to_string(), "\"float32le\"".to_string()),
+            ("format.rate".to_string(), "44100".to_string()),
+            ("format.channels".to_string(), "2".to_string()),
+            (
+                "format.channel_map".to_string(),
+                "\"front-left,front-right\"".to_string(),
+            ),
+        ],
+    );
+    let (command, _, reply) = client.command(wire::CREATE_PLAYBACK_STREAM, &body.into_vec());
+    assert_eq!(command, wire::REPLY, "a PCM format list is played");
+    let mut r = Reader::new(&reply);
+    let stream = r.u32().unwrap();
+    for _ in 0..6 {
+        r.u32().unwrap();
+    }
+    let spec = r.sample_spec().unwrap();
+    assert_eq!(
+        (spec.format, spec.channels, spec.rate),
+        (wire::FORMAT_FLOAT32LE, 2, 44_100)
+    );
+    // 512 stereo float frames.
+    client.send_memblock(stream, &vec![0u8; 4096]);
+    let (_, write_index, _) = client.latency(stream);
+    assert_eq!(write_index, 4096);
+}

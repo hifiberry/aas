@@ -213,6 +213,9 @@ than applied halfway.
 
 A playback stream is negotiated with the client:
 
+- The format comes from the sample spec or, for a stream made with
+  `pa_stream_new_extended` as `mpv` and GStreamer make theirs, from the first PCM
+  entry of its format list; encoded entries are refused *(call)*.
 - Formats are S16, S24, S24 in a 32-bit container, S32 and float, little endian.
   Mono and stereo are accepted; more than two channels is refused rather than
   folded down. Rates are 8 kHz to 384 kHz. Anything else gets an error *(call)*.

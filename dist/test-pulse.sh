@@ -58,7 +58,7 @@ fi
 
 pactl set-sink-volume @DEFAULT_SINK@ 40% 2>/dev/null
 volume=$(aasctl outputs 2>/dev/null |
-	python3 -c 'import json,sys; print(json.load(sys.stdin)["outputs"][0]["volume"])' 2>/dev/null)
+	python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["volume"])' 2>/dev/null)
 if [ "$volume" = 40 ]; then
 	pass volume
 else

@@ -2,7 +2,7 @@
 //! daemon.
 
 use crate::pulse::registry::SinkInput;
-use crate::pulse::tagstruct::Reader;
+use crate::pulse::tagstruct::{Reader, SampleSpec};
 use crate::pulse::wire;
 use aas_client::client::Client;
 use aas_client::convert::ClientFormat;
@@ -86,10 +86,10 @@ impl Stream {
         index: u32,
         reader: &mut Reader,
     ) -> Result<Created, CreateError> {
-        let spec = reader
+        let mut spec = reader
             .sample_spec()
             .ok_or_else(|| CreateError::new(wire::ERR_INVALID, "no sample spec"))?;
-        let map = reader
+        let mut map = reader
             .channel_map()
             .ok_or_else(|| CreateError::new(wire::ERR_INVALID, "no channel map"))?;
         let _sink_index = reader
@@ -138,19 +138,29 @@ impl Stream {
         let n_formats = reader
             .u8()
             .ok_or_else(|| CreateError::new(wire::ERR_PROTOCOL, "no format count"))?;
+        let mut formats = Vec::new();
         for _ in 0..n_formats {
-            reader
+            let format = reader
                 .format_info()
                 .ok_or_else(|| CreateError::new(wire::ERR_PROTOCOL, "a broken format"))?;
+            formats.push(format);
         }
         if !reader.eof() {
             return Err(CreateError::new(wire::ERR_PROTOCOL, "trailing stream data"));
         }
-        if n_formats != 0 {
-            return Err(CreateError::new(
-                wire::ERR_NOTSUPPORTED,
-                "encoded formats are not supported",
-            ));
+        // A stream made with pa_stream_new_extended, as mpv and GStreamer
+        // make theirs, sends a placeholder sample spec and its real format
+        // as a list. The first PCM entry is played; encoded ones are not.
+        if !formats.is_empty() {
+            let pcm = formats
+                .iter()
+                .find(|(encoding, _)| *encoding == wire::ENCODING_PCM)
+                .ok_or_else(|| {
+                    CreateError::new(wire::ERR_NOTSUPPORTED, "encoded formats are not supported")
+                })?;
+            (spec, map) = pcm_spec(&pcm.1).ok_or_else(|| {
+                CreateError::new(wire::ERR_NOTSUPPORTED, "that PCM format is not supported")
+            })?;
         }
         let format = match spec.format {
             wire::FORMAT_S16LE => ClientFormat::S16,
@@ -244,7 +254,7 @@ impl Stream {
         reply.string("aas");
         reply.boolean(false);
         reply.usec(u64::from(buffer_ms) * 1000);
-        reply.format_info(0, &[]);
+        reply.format_info(wire::ENCODING_PCM, &pcm_props(spec, &map));
         Ok(Created {
             stream,
             reply: reply.into_vec(),
@@ -457,6 +467,75 @@ impl Stream {
     pub fn release(&mut self) {
         self.daemon.release();
     }
+}
+
+/// The sample spec and channel map of a PCM `format_info`. PulseAudio
+/// stores each property as JSON: a quoted string or a number.
+fn pcm_spec(props: &[(String, String)]) -> Option<(SampleSpec, Vec<u8>)> {
+    let get = |key: &str| {
+        props
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.trim().trim_matches('"').to_string())
+    };
+    let format = match get("format.sample_format")?.as_str() {
+        "s16le" => wire::FORMAT_S16LE,
+        "float32le" => wire::FORMAT_FLOAT32LE,
+        "s32le" => wire::FORMAT_S32LE,
+        "s24le" => wire::FORMAT_S24LE,
+        "s24-32le" => wire::FORMAT_S24_32LE,
+        _ => return None,
+    };
+    let rate: u32 = get("format.rate")?.parse().ok()?;
+    let channels: u8 = get("format.channels")?.parse().ok()?;
+    let map = match get("format.channel_map") {
+        Some(names) => names
+            .split(',')
+            .map(|name| match name.trim() {
+                "mono" => Some(0),
+                "front-left" | "left" => Some(1),
+                "front-right" | "right" => Some(2),
+                _ => None,
+            })
+            .collect::<Option<Vec<u8>>>()?,
+        None if channels == 1 => vec![0],
+        None => vec![1, 2],
+    };
+    Some((
+        SampleSpec {
+            format,
+            channels,
+            rate,
+        },
+        map,
+    ))
+}
+
+/// The properties of a PCM `format_info` for `spec`, as PulseAudio writes
+/// them.
+pub fn pcm_props(spec: SampleSpec, map: &[u8]) -> Vec<(String, String)> {
+    let format = match spec.format {
+        wire::FORMAT_S16LE => "s16le",
+        wire::FORMAT_FLOAT32LE => "float32le",
+        wire::FORMAT_S32LE => "s32le",
+        wire::FORMAT_S24LE => "s24le",
+        wire::FORMAT_S24_32LE => "s24-32le",
+        _ => "invalid",
+    };
+    let names: Vec<&str> = map
+        .iter()
+        .map(|&position| match position {
+            0 => "mono",
+            1 => "front-left",
+            _ => "front-right",
+        })
+        .collect();
+    vec![
+        ("format.sample_format".into(), format!("\"{format}\"")),
+        ("format.rate".into(), spec.rate.to_string()),
+        ("format.channels".into(), spec.channels.to_string()),
+        ("format.channel_map".into(), format!("\"{}\"", names.join(","))),
+    ]
 }
 
 fn minreq_bytes(capacity_frames: u32, frame_bytes: u32) -> u32 {
