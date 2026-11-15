@@ -236,7 +236,7 @@ fn apply_values(
             },
         };
         if let Some(value) = value {
-            chain.set_param(plugin, index, value);
+            chain.set_param_now(plugin, index, value);
         }
     }
 }

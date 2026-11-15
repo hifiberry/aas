@@ -214,6 +214,10 @@ pub trait Plugin: Send {
     fn set_text(&mut self, _index: usize, _text: &str) -> Result<(), (Failure, String)> {
         Err((Failure::Config, "it takes no text".into()))
     }
+    /// Takes the values set so far at once, with no smoothing toward them.
+    /// Called on the control thread, for a plugin that has not played yet,
+    /// so the values it is built with are where it starts.
+    fn settle(&mut self) {}
     /// Forgets what it kept from earlier blocks, such as a filter's state.
     /// Called when the plugin runs again after blocks that did not pass it.
     /// Runs on the audio thread, so it must not allocate.

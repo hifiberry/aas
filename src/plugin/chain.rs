@@ -365,6 +365,17 @@ impl Chain {
         }
     }
 
+    /// `set_param` without smoothing, for a chain that has not run: the
+    /// plugin starts at the value. Done on the control thread, before the
+    /// chain goes to the audio thread.
+    pub fn set_param_now(&mut self, plugin: usize, index: usize, value: f64) {
+        self.set_param(plugin, index, value);
+        if let Some(p) = self.plugins.get_mut(plugin) {
+            p.settle();
+            self.publish(plugin);
+        }
+    }
+
     /// Enables or disables plugin `plugin`, crossfading over 10 ms between
     /// its input and its output. A disabled plugin is passed over once its
     /// fade has ended, and one enabled from there is reset first, so it
@@ -1788,6 +1799,17 @@ mod tests {
             s[0].neutral.load(Relaxed),
             "the end of the ramp not published"
         );
+    }
+
+    #[test]
+    fn set_param_now_starts_a_balance_at_the_value() {
+        let balance = Box::new(crate::plugin::balance::Balance::new(48_000));
+        let mut c = chain_at_48k(vec![balance]);
+        c.set_param_now(0, 0, 0.5);
+        assert_eq!(run_frames(&mut c, 1.0, 1), [0.5]);
+        // On the audio thread a value ramps.
+        c.set_param(0, 0, 0.0);
+        assert!(run_frames(&mut c, 1.0, 1)[0] < 1.0);
     }
 
     #[test]

@@ -6652,6 +6652,54 @@ mod tests {
     }
 
     #[test]
+    fn a_balance_leaving_the_copy_path_ramps_from_the_centre() {
+        let mut rig = Rig::<F64>::new(BitPerfect::Auto);
+        let mut a = client(1);
+        rig.add(&mut a);
+        let balance: Vec<Box<dyn Plugin>> =
+            vec![Box::new(crate::plugin::balance::Balance::new(RATE))];
+        let chain = Chain::new(balance, format_of::<F64>(), MAX_PERIOD as usize, 2).unwrap();
+        rig.send(Command::SetChain(
+            Target::master(Place::Output),
+            Box::new(chain),
+        ));
+        const LEVEL: i32 = 1 << 30;
+        for _ in 0..3 {
+            a.ring.write(&frames(LEVEL, PERIOD));
+            rig.cycle();
+        }
+        // A centred balance is neutral: the frames are copied, and the
+        // chains do not run.
+        assert_eq!(decide(&rig.engine.situation()), Ok(()));
+        let copied = rig.log.frames().len();
+        rig.send(Command::SetParam {
+            target: Target::master(Place::Output),
+            plugin: 0,
+            index: 0,
+            value: 0.5,
+        });
+        // 480 frames of ramp at 48 kHz, and a period after.
+        for _ in 0..480usize.div_ceil(PERIOD) + 1 {
+            a.ring.write(&frames(LEVEL, PERIOD));
+            rig.cycle();
+        }
+        let left: Vec<i64> = rig.log.frames()[copied - 1..]
+            .iter()
+            .map(|f| i64::from(f[0]))
+            .collect();
+        let slope = i64::from(LEVEL) / 2 / 480 + 1;
+        for (i, w) in left.windows(2).enumerate() {
+            assert!(
+                (w[0] - w[1]).abs() <= slope,
+                "frame {i}: a step of {} is above the ramp's {slope}",
+                w[0] - w[1]
+            );
+        }
+        assert_eq!(left[0], i64::from(LEVEL), "not from the copied level");
+        assert_eq!(*left.last().unwrap(), i64::from(LEVEL / 2));
+    }
+
+    #[test]
     fn a_neutral_plugin_leaves_one_source_bit_exact() {
         bit_exact_beside_neutral_plugins::<I32>();
         bit_exact_beside_neutral_plugins::<F32>();

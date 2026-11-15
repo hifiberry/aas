@@ -130,7 +130,10 @@ pub fn build_chain(
             let param = &plugin.params()[index];
             check_value(param, value).map_err(|e| config_error(format!("{prefix}{e}")))?;
             match value {
-                ParamValue::Number(v) => plugin.set_param(index, *v),
+                ParamValue::Number(v) => {
+                    plugin.set_param(index, *v);
+                    plugin.settle();
+                }
                 ParamValue::Text(text) => {
                     plugin.set_text(index, text).map_err(|(kind, e)| {
                         let what = match kind {

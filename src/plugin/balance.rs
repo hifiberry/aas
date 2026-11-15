@@ -18,9 +18,6 @@ pub struct Balance {
     left: u32,
     /// The frames a ramp lasts: 10 ms at the rate.
     ramp_frames: u32,
-    /// Whether it has processed a block. A value set before that, as the
-    /// config's is when the chain is built, applies from the first frame.
-    started: bool,
 }
 
 impl Balance {
@@ -40,7 +37,6 @@ impl Balance {
             step: 0.0,
             left: 0,
             ramp_frames: (rate / 100).max(1),
-            started: false,
         }
     }
 
@@ -131,9 +127,6 @@ impl Plugin for Balance {
             } else {
                 self.ramp_frames
             };
-            if !self.started {
-                self.reset();
-            }
         }
     }
 
@@ -149,7 +142,6 @@ impl Plugin for Balance {
 
     fn process(&mut self, block: Block<'_>) -> Status {
         debug_assert_eq!(block.channels, 2);
-        self.started = true;
         if self.neutral() {
             return Status::default();
         }
@@ -200,9 +192,16 @@ impl Plugin for Balance {
         Status::default()
     }
 
-    /// Jumps to the value set: after blocks that did not pass the plugin
-    /// there is nothing to ramp from.
-    fn reset(&mut self) {
+    /// Keeps the value and the ramp as they are: a balance keeps nothing
+    /// from earlier blocks. The blocks that did not pass it played what it
+    /// would have at the value it is at, as the bit-perfect copy path plays
+    /// a centred balance, so a ramp to a new value set meanwhile still runs
+    /// from there, and a jump would click.
+    fn reset(&mut self) {}
+
+    /// Jumps to the value set: the config's and the stored values apply from
+    /// the first frame.
+    fn settle(&mut self) {
         self.balance = self.target;
         self.left = 0;
     }
@@ -226,10 +225,12 @@ mod tests {
     use super::*;
     use assert_no_alloc::assert_no_alloc;
 
-    /// A balance at `b`, its ramp already run.
+    /// A balance at `b`, settled as a built chain's are, so it applies at
+    /// once and no ramp runs.
     fn with(b: f64) -> Balance {
         let mut p = Balance::new(48_000);
         p.set_param(0, b);
+        p.settle();
         p
     }
 
@@ -266,7 +267,6 @@ mod tests {
             d.map(|x| x.map(f64::to_bits)),
             d0.map(|x| x.map(f64::to_bits))
         );
-        // Back at the centre after a move.
         // Back at the centre after a move, once the ramp there has run.
         let mut p = with(0.5);
         assert!(!p.neutral());
@@ -339,7 +339,7 @@ mod tests {
         });
         assert_eq!(d, [[0.0, 1.0]]);
         p.set_param(0, -7.0);
-        p.reset();
+        ramped(&mut p, 480);
         let mut d = [[1.0f64, 1.0]];
         p.process(Block {
             channels: 2,
@@ -483,19 +483,22 @@ mod tests {
     }
 
     #[test]
-    fn a_value_set_before_the_first_block_applies_at_once() {
+    fn a_settled_value_applies_at_once() {
         let mut p = Balance::new(48_000);
         p.set_param(0, 0.5);
+        p.settle();
         assert_eq!(ramped(&mut p, 1), [[0.5, 1.0]]);
     }
 
     #[test]
-    fn a_reset_jumps_to_the_value_set() {
+    fn a_reset_keeps_the_ramp_from_where_it_is() {
         let mut p = Balance::new(48_000);
         ramped(&mut p, 1);
         p.set_param(0, -1.0);
         p.reset();
-        assert_eq!(ramped(&mut p, 1), [[1.0, 0.0]]);
+        let d = ramped(&mut p, 480);
+        assert!((d[0][1] - (1.0 - 1.0 / 480.0)).abs() < 1e-12, "{:?}", d[0]);
+        assert_eq!(d[479], [1.0, 0.0]);
     }
 
     #[test]
