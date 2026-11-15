@@ -12,6 +12,42 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Duration;
 
+fn create_body(rate: u32, format: u8, channels: u8, tlength_ms: u32) -> Vec<u8> {
+    let frame = match format {
+        wire::FORMAT_S16LE => 2,
+        wire::FORMAT_S24LE => 3,
+        _ => 4,
+    } * u32::from(channels);
+    let mut body = Builder::new();
+    body.sample_spec(aas::pulse::tagstruct::SampleSpec {
+        format,
+        channels,
+        rate,
+    });
+    let map: &[u8] = if channels == 1 { &[0] } else { &[1, 2] };
+    body.channel_map(map);
+    body.u32(u32::MAX);
+    body.null_string();
+    body.u32(u32::MAX);
+    body.boolean(false);
+    body.u32(rate / 1000 * tlength_ms * frame);
+    body.u32(0);
+    body.u32(0);
+    body.u32(0);
+    body.cvolume(&[wire::VOLUME_NORM; 2]);
+    for _ in 0..7 {
+        body.boolean(false);
+    }
+    body.boolean(false);
+    body.boolean(false);
+    body.proplist(&[("media.name".to_string(), "a test stream".to_string())]);
+    for value in [true, false, false, false, false, false, false] {
+        body.boolean(value);
+    }
+    body.u8(0);
+    body.into_vec()
+}
+
 /// A PulseAudio client that speaks the wire format itself.
 struct RawPulse {
     stream: UnixStream,
@@ -100,46 +136,23 @@ impl RawPulse {
 
 
 impl RawPulse {
-    fn create_stream(&mut self, rate: u32, format: u8, channels: u8, tlength_ms: u32) -> (u32, u32) {
+    fn create_stream(&mut self, rate: u32, format: u8, channels: u8, tlength_ms: u32) -> (u32, usize, u32) {
         let frame = match format {
             wire::FORMAT_S16LE => 2,
             wire::FORMAT_S24LE => 3,
             _ => 4,
         } * u32::from(channels);
-        let mut body = Builder::new();
-        body.sample_spec(aas::pulse::tagstruct::SampleSpec {
-            format,
-            channels,
-            rate,
-        });
-        let map: &[u8] = if channels == 1 { &[0] } else { &[1, 2] };
-        body.channel_map(map);
-        body.u32(u32::MAX);
-        body.null_string();
-        body.u32(u32::MAX);
-        body.boolean(false);
-        body.u32(rate / 1000 * tlength_ms * frame);
-        body.u32(0);
-        body.u32(0);
-        body.u32(0);
-        body.cvolume(&[wire::VOLUME_NORM; 2]);
-        for _ in 0..7 {
-            body.boolean(false);
-        }
-        body.boolean(false);
-        body.boolean(false);
-        body.proplist(&[("media.name".to_string(), "a test stream".to_string())]);
-        for value in [true, false, false, false, false, false, false] {
-            body.boolean(value);
-        }
-        body.u8(0);
-        let (command, _, reply) = self.command(wire::CREATE_PLAYBACK_STREAM, &body.into_vec());
+        let (command, _, reply) = self.command(
+            wire::CREATE_PLAYBACK_STREAM,
+            &create_body(rate, format, channels, tlength_ms),
+        );
         assert_eq!(command, wire::REPLY);
         let mut reader = Reader::new(&reply);
         let stream = reader.u32().expect("a stream index");
         assert_eq!(reader.u32(), Some(stream), "a sink-input index");
-        assert!(reader.u32().unwrap() > 0, "the first request is not empty");
-        (stream, frame)
+        let missing = reader.u32().unwrap() as usize;
+        assert!(missing > 0, "the first request is not empty");
+        (stream, missing, frame)
     }
 
     fn send_memblock(&mut self, stream: u32, data: &[u8]) {
@@ -148,15 +161,6 @@ impl RawPulse {
         head[4..8].copy_from_slice(&stream.to_be_bytes());
         self.stream.write_all(&head).unwrap();
         self.stream.write_all(data).unwrap();
-    }
-
-    fn request(&mut self) -> (u32, usize) {
-        let (command, _, body) = self.recv();
-        assert_eq!(command, wire::REQUEST);
-        let mut reader = Reader::new(&body);
-        let stream = reader.u32().expect("a stream");
-        let length = reader.u32().expect("a request length") as usize;
-        (stream, length)
     }
 
     fn latency(&mut self, stream: u32) -> (u64, i64, i64) {
@@ -234,6 +238,7 @@ fn a_pulse_client_authenticates_and_is_refused_before_it_does() {
     assert_eq!((command, tag), (wire::ERROR, 3));
     let mut reader = Reader::new(&body);
     assert_eq!(reader.u32(), Some(wire::ERR_ACCESS));
+    assert!(reader.eof(), "an error carries only its code");
     client.auth();
     client.set_name("a test player");
 }
@@ -337,11 +342,9 @@ fn create_playback_stream_returns_a_ring_and_asks_for_data() {
     let mut client = RawPulse::connect(&daemon.pulse_socket());
     client.auth();
     client.set_name("a player");
-    let (stream, frame) = client.create_stream(48_000, wire::FORMAT_S16LE, 2, 40);
-    let (asked, length) = client.request();
-    assert_eq!(asked, stream);
-    assert_eq!(length % (frame as usize), 0);
-    client.send_memblock(stream, &vec![0u8; length]);
+    let (stream, missing, frame) = client.create_stream(48_000, wire::FORMAT_S16LE, 2, 40);
+    assert_eq!(missing % (frame as usize), 0);
+    client.send_memblock(stream, &vec![0u8; missing]);
     std::thread::sleep(Duration::from_millis(100));
     let (sink_usec, write, read) = client.latency(stream);
     assert!(write > 0, "the client has written");
@@ -355,9 +358,8 @@ fn a_misaligned_memblock_is_ignored() {
     let mut client = RawPulse::connect(&daemon.pulse_socket());
     client.auth();
     client.set_name("a player");
-    let (stream, _) = client.create_stream(48_000, wire::FORMAT_S16LE, 2, 40);
-    let (_, length) = client.request();
-    client.send_memblock(stream, &vec![0u8; length - 3]);
+    let (stream, missing, _) = client.create_stream(48_000, wire::FORMAT_S16LE, 2, 40);
+    client.send_memblock(stream, &vec![0u8; missing - 3]);
     std::thread::sleep(Duration::from_millis(30));
     let (_, write, _) = client.latency(stream);
     assert_eq!(write, 0, "nothing misaligned was written");
@@ -369,9 +371,8 @@ fn delete_stops_the_stream_and_another_keeps_playing() {
     let mut client = RawPulse::connect(&daemon.pulse_socket());
     client.auth();
     client.set_name("a player");
-    let (first, _) = client.create_stream(48_000, wire::FORMAT_S16LE, 2, 40);
-    let _ = client.request();
-    let (second, _) = client.create_stream(48_000, wire::FORMAT_S16LE, 2, 40);
+    let (first, _, _) = client.create_stream(48_000, wire::FORMAT_S16LE, 2, 40);
+    let (second, _, _) = client.create_stream(48_000, wire::FORMAT_S16LE, 2, 40);
     let mut body = Builder::new();
     body.u32(first);
     let (command, _, _) = client.command(wire::DELETE_PLAYBACK_STREAM, &body.into_vec());
@@ -397,7 +398,7 @@ fn stream_volume_is_the_client_gain() {
     let mut client = RawPulse::connect(&daemon.pulse_socket());
     client.auth();
     client.set_name("volume");
-    let (stream, _) = client.create_stream(48_000, wire::FORMAT_S16LE, 2, 40);
+    let (stream, _, _) = client.create_stream(48_000, wire::FORMAT_S16LE, 2, 40);
     client.set_stream_volume(stream, 50);
     let (_, inputs) = daemon.get("/inputs");
     let found = inputs
@@ -473,9 +474,8 @@ fn a_pulse_and_an_alsa_client_play_together() {
     let mut pulse = RawPulse::connect(&daemon.pulse_socket());
     pulse.auth();
     pulse.set_name("pulse player");
-    let (stream, _) = pulse.create_stream(48_000, wire::FORMAT_S16LE, 2, 40);
-    let (_, length) = pulse.request();
-    pulse.send_memblock(stream, &vec![0u8; length]);
+    let (stream, missing, _) = pulse.create_stream(48_000, wire::FORMAT_S16LE, 2, 40);
+    pulse.send_memblock(stream, &vec![0u8; missing]);
     let (_, state) = daemon.get("/state");
     assert_eq!(state["rate"], serde_json::json!(48_000));
     assert!(
@@ -502,13 +502,120 @@ fn a_client_killed_mid_stream_does_not_block_the_daemon() {
     let mut first = RawPulse::connect(&daemon.pulse_socket());
     first.auth();
     first.set_name("one");
-    let _ = first.create_stream(48_000, wire::FORMAT_S16LE, 2, 40);
+    let (gone, _, _) = first.create_stream(48_000, wire::FORMAT_S16LE, 2, 40);
     drop(first);
 
     let mut second = RawPulse::connect(&daemon.pulse_socket());
     second.auth();
     second.set_name("two");
-    let (stream, _) = second.create_stream(48_000, wire::FORMAT_S16LE, 2, 40);
-    let (asked, _) = second.request();
-    assert_eq!(asked, stream);
+    let (_stream, missing, _) = second.create_stream(48_000, wire::FORMAT_S16LE, 2, 40);
+    assert!(missing > 0);
+    let mut body = Builder::new();
+    body.u32(gone);
+    let query = body.into_vec();
+    let mut waited = 0;
+    let reply = loop {
+        let (command, _, _) = second.command(wire::GET_SINK_INPUT_INFO, &query);
+        if command == wire::ERROR || waited > 200 {
+            break command;
+        }
+        waited += 10;
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(reply, wire::ERROR, "the dead stream is gone from the registry");
+}
+
+#[test]
+fn a_partial_packet_does_not_block_another_connection() {
+    let daemon = Daemon::start();
+    let mut stalled = RawPulse::connect(&daemon.pulse_socket());
+    stalled.stream.write_all(&[0u8; 7]).unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    let mut other = RawPulse::connect(&daemon.pulse_socket());
+    other.auth();
+    let (command, _, _) = other.command(wire::STAT, &[]);
+    assert_eq!(command, wire::REPLY);
+}
+
+#[test]
+fn mute_survives_the_connection_that_set_it() {
+    let daemon = Daemon::start();
+    let mut first = RawPulse::connect(&daemon.pulse_socket());
+    first.auth();
+    first.set_sink_volume(40);
+    first.set_sink_mute(true);
+    drop(first);
+
+    let mut second = RawPulse::connect(&daemon.pulse_socket());
+    second.auth();
+    assert_eq!(second.sink_state(), (0, true));
+    second.set_sink_mute(false);
+    assert_eq!(second.sink_state(), (40, false));
+}
+
+#[test]
+fn a_client_gain_change_reaches_a_subscriber() {
+    let daemon = Daemon::start();
+    let mut client = RawPulse::connect(&daemon.pulse_socket());
+    client.auth();
+    client.set_name("gain");
+    let mut mask = Builder::new();
+    mask.u32(wire::MASK_SINK_INPUT);
+    let (command, _, _) = client.command(wire::SUBSCRIBE, &mask.into_vec());
+    assert_eq!(command, wire::REPLY);
+    let (_stream, _missing, _) = client.create_stream(48_000, wire::FORMAT_S16LE, 2, 40);
+    let name = std::fs::read_to_string("/proc/self/comm")
+        .unwrap()
+        .trim_end()
+        .to_string();
+    daemon.patch(
+        &format!("/inputs/clients/{}", name),
+        r#"{"volume_db":-6}"#,
+    );
+    loop {
+        let (command, _, body) = client.recv();
+        if command != wire::SUBSCRIBE_EVENT {
+            continue;
+        }
+        let mut reader = Reader::new(&body);
+        let event = reader.u32().expect("an event");
+        if event & 0xf == wire::EVENT_SINK_INPUT && event & 0x30 == wire::EVENT_CHANGE {
+            break;
+        }
+    }
+}
+
+#[test]
+fn a_refused_format_is_an_error_and_the_connection_survives() {
+    let daemon = Daemon::start();
+    let mut client = RawPulse::connect(&daemon.pulse_socket());
+    client.auth();
+    client.set_name("bad format");
+    let (command, tag, body) =
+        client.command(wire::CREATE_PLAYBACK_STREAM, &create_body(48_000, 99, 2, 40));
+    assert_eq!((command, tag), (wire::ERROR, 3));
+    let mut reader = Reader::new(&body);
+    assert_eq!(reader.u32(), Some(wire::ERR_NOTSUPPORTED));
+    let (command, _, _) = client.command(wire::STAT, &[]);
+    assert_eq!(command, wire::REPLY);
+}
+
+#[test]
+fn a_volume_race_leaves_the_last_value_and_no_deadlock() {
+    let daemon = Daemon::start();
+    let mut client = RawPulse::connect(&daemon.pulse_socket());
+    client.auth();
+    client.set_name("race");
+    for step in 0..20u8 {
+        let percent = 20 + step;
+        if step % 2 == 0 {
+            client.set_sink_volume(percent);
+        } else {
+            daemon.patch(
+                "/outputs/1",
+                &format!(r#"{{"volume":{percent}}}"#),
+            );
+        }
+    }
+    assert_eq!(client.sink_state().0, 39);
 }

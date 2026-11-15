@@ -3,7 +3,7 @@
 use crate::pulse::objects;
 use crate::pulse::packet::{Encoder, Frame, Reader as Framer};
 use crate::pulse::registry::{Event, Registry};
-use crate::pulse::stream::{Polled, Stream, now_timeval};
+use crate::pulse::stream::{Stream, now_timeval};
 use crate::pulse::volume;
 use crate::pulse::tagstruct::{Builder, Reader};
 use crate::pulse::wire;
@@ -38,13 +38,18 @@ pub fn serve(
             Ok(0) => break,
             Ok(n) => match conn.framer.read(&buf[..n]) {
                 Ok(frames) => {
+                    let mut ok = true;
                     for frame in frames {
                         if conn.handle(frame).is_err() {
-                            return;
+                            ok = false;
+                            break;
                         }
                     }
+                    if !ok {
+                        break;
+                    }
                 }
-                Err(_) => return,
+                Err(_) => break,
             },
             Err(e)
                 if matches!(
@@ -61,13 +66,15 @@ pub fn serve(
         }
     }
     let _ = conn.flush();
-    for stream in &mut conn.streams {
-        stream.release();
+}
+
+impl Drop for Conn {
+    fn drop(&mut self) {
+        self.registry.remove_client(self.client_index);
+        for stream in &self.streams {
+            self.registry.remove_sink_input(stream.index);
+        }
     }
-    for stream in &conn.streams {
-        conn.registry.remove_sink_input(stream.index);
-    }
-    conn.registry.remove_client(conn.client_index);
 }
 
 pub struct Conn {
@@ -87,7 +94,6 @@ pub struct Conn {
     events: Receiver<Event>,
     subscribed: u32,
     streams: Vec<Stream>,
-    sink_mute: Option<u8>,
     done: bool,
 }
 
@@ -120,7 +126,6 @@ impl Conn {
             events,
             subscribed: 0,
             streams: Vec::new(),
-            sink_mute: None,
             done: false,
         }
     }
@@ -203,8 +208,8 @@ impl Conn {
             return Ok(());
         }
         let version = version & 0xffff;
-        if version < 8 {
-            self.send_error(tag, wire::ERR_VERSION, "a protocol older than 8");
+        if version < 21 {
+            self.send_error(tag, wire::ERR_VERSION, "a protocol older than 21");
             return Ok(());
         }
         self.version = version;
@@ -273,27 +278,25 @@ impl Conn {
             self.send_error(tag, wire::ERR_NOENTITY, "no such sink");
             return;
         }
-        let rate = self.daemon_rate();
-        let level = self.daemon_volume();
-        let mute = self.sink_mute.is_some();
-        let state = if self.streams.iter().any(|stream| !stream.corked) {
-            0
-        } else {
-            1
-        };
-        let latency = self
-            .streams
-            .first()
-            .map_or(0, |stream| stream.latency().sink_usec);
-        let body = objects::sink_info(rate, level, mute, latency, state);
+        let body = self.sink_info_body();
         self.send_reply(tag, body);
     }
 
     fn sink_info_list(&mut self, tag: u32) {
+        let body = self.sink_info_body();
+        self.send_reply(tag, body);
+    }
+
+    fn sink_info_body(&mut self) -> Vec<u8> {
         let rate = self.daemon_rate();
         let level = self.daemon_volume();
-        let mute = self.sink_mute.is_some();
-        let state = if self.streams.iter().any(|stream| !stream.corked) {
+        let mute = self.registry.sink_muted().is_some();
+        let state = if self
+            .registry
+            .sink_inputs()
+            .iter()
+            .any(|input| !input.corked)
+        {
             0
         } else {
             1
@@ -302,8 +305,7 @@ impl Conn {
             .streams
             .first()
             .map_or(0, |stream| stream.latency().sink_usec);
-        let body = objects::sink_info(rate, level, mute, latency, state);
-        self.send_reply(tag, body);
+        objects::sink_info(rate, level, mute, latency, state)
     }
 
     fn client_info(&mut self, reader: &mut Reader, tag: u32) {
@@ -383,11 +385,7 @@ impl Conn {
             Ok(created) => {
                 self.registry.add_sink_input(created.stream.entry());
                 self.streams.push(created.stream);
-                let request = self.streams.last_mut().and_then(Stream::request);
                 self.send_reply(tag, created.reply);
-                if let Some(request) = request {
-                    self.send_packet(request);
-                }
             }
             Err(e) => {
                 eprintln!("aas: pulse: create: {}", e.message);
@@ -480,8 +478,12 @@ impl Conn {
     }
 
     fn prebuf_stream(&mut self, reader: &mut Reader, tag: u32) {
-        if reader.u32().is_none() {
+        let Some(index) = reader.u32() else {
             self.send_error(tag, wire::ERR_INVALID, "no stream index");
+            return;
+        };
+        if self.stream_mut(index).is_none() {
+            self.send_error(tag, wire::ERR_NOENTITY, "no such stream");
             return;
         }
         self.send_reply(tag, Vec::new());
@@ -535,8 +537,12 @@ impl Conn {
     }
 
     fn stream_proplist(&mut self, reader: &mut Reader, tag: u32) {
-        if reader.u32().is_none() {
+        let Some(index) = reader.u32() else {
             self.send_error(tag, wire::ERR_INVALID, "no stream index");
+            return;
+        };
+        if self.stream_mut(index).is_none() {
+            self.send_error(tag, wire::ERR_NOENTITY, "no such stream");
             return;
         }
         self.send_reply(tag, Vec::new());
@@ -605,8 +611,8 @@ impl Conn {
             self.send_error(tag, wire::ERR_INVALID, "no volume");
             return;
         };
-        let ours = name == Some("aas") || index.is_none_or(|index| index == 0 || index == wire::INVALID_INDEX);
-        if !ours {
+        let by_index = index.is_some_and(|index| index == 0 || index == wire::INVALID_INDEX);
+        if !by_index || !(name.is_none() || name == Some("aas")) {
             self.send_error(tag, wire::ERR_NOENTITY, "no such sink");
             return;
         }
@@ -614,7 +620,7 @@ impl Conn {
         if let Some(control) = &mut self.control {
             let _ = control.set_volume(percent);
         }
-        self.sink_mute = None;
+        self.registry.set_sink_muted(None);
         self.send_reply(tag, Vec::new());
     }
 
@@ -625,22 +631,24 @@ impl Conn {
             self.send_error(tag, wire::ERR_INVALID, "no mute flag");
             return;
         };
-        let ours = name == Some("aas") || index.is_none_or(|index| index == 0 || index == wire::INVALID_INDEX);
-        if !ours {
+        let by_index = index.is_some_and(|index| index == 0 || index == wire::INVALID_INDEX);
+        if !by_index || !(name.is_none() || name == Some("aas")) {
             self.send_error(tag, wire::ERR_NOENTITY, "no such sink");
             return;
         }
         if mute {
-            if self.sink_mute.is_none() {
-                self.sink_mute = Some(self.daemon_volume());
+            if self.registry.sink_muted().is_none() {
+                let current = self.daemon_volume();
+                self.registry.set_sink_muted(Some(current));
             }
             if let Some(control) = &mut self.control {
                 let _ = control.set_volume(0);
             }
-        } else if let Some(previous) = self.sink_mute.take()
-            && let Some(control) = &mut self.control
-        {
-            let _ = control.set_volume(previous);
+        } else if let Some(previous) = self.registry.sink_muted() {
+            self.registry.set_sink_muted(None);
+            if let Some(control) = &mut self.control {
+                let _ = control.set_volume(previous);
+            }
         }
         self.send_reply(tag, Vec::new());
     }
@@ -692,11 +700,11 @@ impl Conn {
     }
 
     fn set_default_sink(&mut self, reader: &mut Reader, tag: u32) {
-        if reader.string().is_none() {
-            self.send_error(tag, wire::ERR_INVALID, "no sink name");
-            return;
+        match reader.string() {
+            Some("aas") | Some("@NONE@") => self.send_reply(tag, Vec::new()),
+            Some(_) => self.send_error(tag, wire::ERR_NOENTITY, "no such sink"),
+            None => self.send_error(tag, wire::ERR_INVALID, "no sink name"),
         }
-        self.send_reply(tag, Vec::new());
     }
 
     fn tick(&mut self) -> io::Result<()> {
@@ -709,25 +717,41 @@ impl Conn {
                 ));
             }
         }
-        let mut changed = false;
+        let mut sink_changed = false;
         if let Some(control) = &mut self.control
-            && let Ok(Some(Reply::VolumeChanged { .. })) = control.poll_notice()
+            && let Ok(Some(Reply::VolumeChanged { percent })) = control.poll_notice()
         {
-            changed = true;
+            sink_changed = true;
+            if percent != 0 && self.registry.sink_muted().is_some_and(|muted| muted != percent) {
+                self.registry.set_sink_muted(None);
+            }
         }
-        if changed && self.subscribed & wire::MASK_SINK != 0 {
+        if sink_changed && self.subscribed & wire::MASK_SINK != 0 {
             self.send_packet(wire::subscribe_event(wire::EVENT_SINK | wire::EVENT_CHANGE, 0));
         }
         let mut packets = Vec::new();
         let mut dead = Vec::new();
+        let mut changed = Vec::new();
         for stream in &mut self.streams {
-            match stream.poll() {
-                Polled::Packets(polled) => packets.extend(polled),
-                Polled::Gone => dead.push(stream.index),
+            let polled = stream.poll();
+            packets.extend(polled.packets);
+            if polled.volume_changed {
+                let entry = stream.entry();
+                self.registry.update_sink_input(entry);
+                changed.push(stream.index);
+            }
+            if polled.gone {
+                dead.push(stream.index);
             }
         }
         for packet in packets {
             self.send_packet(packet);
+        }
+        for index in changed {
+            self.send_packet(wire::subscribe_event(
+                wire::EVENT_SINK_INPUT | wire::EVENT_CHANGE,
+                index,
+            ));
         }
         for index in dead {
             self.streams.retain(|stream| stream.index != index);
@@ -741,7 +765,8 @@ impl Conn {
     }
 
     fn send_error(&mut self, tag: u32, code: u32, message: &str) {
-        self.send_packet(wire::error(tag, code, message));
+        eprintln!("aas: pulse: {message}");
+        self.send_packet(wire::error(tag, code));
     }
 
     fn send_packet(&mut self, payload: Vec<u8>) {

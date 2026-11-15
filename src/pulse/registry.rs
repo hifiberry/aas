@@ -31,6 +31,7 @@ pub struct SinkInput {
 pub struct Registry {
     clients: Mutex<BTreeMap<u32, String>>,
     sink_inputs: Mutex<BTreeMap<u32, SinkInput>>,
+    sink_mute: Mutex<Option<u8>>,
     next_stream: AtomicU32,
     events: Mutex<Vec<Sender<Event>>>,
 }
@@ -40,6 +41,7 @@ impl Default for Registry {
         Registry {
             clients: Mutex::new(BTreeMap::new()),
             sink_inputs: Mutex::new(BTreeMap::new()),
+            sink_mute: Mutex::new(None),
             next_stream: AtomicU32::new(1),
             events: Mutex::new(Vec::new()),
         }
@@ -124,6 +126,17 @@ impl Registry {
 
     pub fn sink_input(&self, index: u32) -> Option<SinkInput> {
         self.sink_inputs.lock().unwrap().get(&index).cloned()
+    }
+
+    /// The output percent remembered before a mute, while the sink is
+    /// muted. Shared, because a client's connection may close between the
+    /// mute and the unmute.
+    pub fn sink_muted(&self) -> Option<u8> {
+        *self.sink_mute.lock().unwrap()
+    }
+
+    pub fn set_sink_muted(&self, percent: Option<u8>) {
+        *self.sink_mute.lock().unwrap() = percent;
     }
 
     pub fn subscribe(self: &Arc<Self>) -> Receiver<Event> {

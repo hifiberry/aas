@@ -99,10 +99,9 @@ pub fn reply(tag: u32, body: Vec<u8>) -> Vec<u8> {
 }
 
 /// An error packet's payload.
-pub fn error(tag: u32, code: u32, message: &str) -> Vec<u8> {
+pub fn error(tag: u32, code: u32) -> Vec<u8> {
     let mut body = Builder::new();
     body.u32(code);
-    body.string(message);
     reply_as_error(tag, body.into_vec())
 }
 
@@ -135,11 +134,12 @@ pub fn request(stream: u32, length: u32) -> Vec<u8> {
     out.into_vec()
 }
 
-pub fn underflow(stream: u32) -> Vec<u8> {
+pub fn underflow(stream: u32, offset: i64) -> Vec<u8> {
     let mut out = Builder::new();
     out.u32(UNDERFLOW);
     out.u32(INVALID_INDEX);
     out.u32(stream);
+    out.i64(offset);
     out.into_vec()
 }
 
@@ -149,4 +149,31 @@ pub fn killed(stream: u32) -> Vec<u8> {
     out.u32(INVALID_INDEX);
     out.u32(stream);
     out.into_vec()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pulse::tagstruct::Builder;
+
+    #[test]
+    fn an_error_ends_after_its_code() {
+        let bytes = error(7, ERR_INVALID);
+        let mut expected = Builder::new();
+        expected.u32(ERROR);
+        expected.u32(7);
+        expected.u32(ERR_INVALID);
+        assert_eq!(bytes, expected.into_vec());
+    }
+
+    #[test]
+    fn an_underflow_carries_its_offset() {
+        let bytes = underflow(3, -1);
+        let mut expected = Builder::new();
+        expected.u32(UNDERFLOW);
+        expected.u32(INVALID_INDEX);
+        expected.u32(3);
+        expected.i64(-1);
+        assert_eq!(bytes, expected.into_vec());
+    }
 }

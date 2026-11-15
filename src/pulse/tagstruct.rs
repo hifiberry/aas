@@ -105,6 +105,7 @@ impl Builder {
         self.out.push(PROPLIST);
         for (key, value) in props {
             self.string(key);
+            self.u32(value.len() as u32);
             self.arbitrary(value.as_bytes());
         }
         self.null_string();
@@ -112,7 +113,7 @@ impl Builder {
 
     pub fn format_info(&mut self, encoding: u8, props: &[(String, String)]) {
         self.out.push(FORMAT_INFO);
-        self.out.push(encoding);
+        self.u8(encoding);
         self.proplist(props);
     }
 
@@ -273,7 +274,11 @@ impl<'a> Reader<'a> {
             let Some(key) = self.tagged_string()? else {
                 return Some(props);
             };
+            let length = self.u32()? as usize;
             let value = self.arbitrary()?;
+            if value.len() != length {
+                return None;
+            }
             props.push((
                 key.to_string(),
                 String::from_utf8_lossy(value).into_owned(),
@@ -283,7 +288,7 @@ impl<'a> Reader<'a> {
 
     pub fn format_info(&mut self) -> Option<(u8, Vec<(String, String)>)> {
         self.expect(FORMAT_INFO)?;
-        let encoding = self.take(1)?[0];
+        let encoding = self.u8()?;
         let props = self.proplist()?;
         Some((encoding, props))
     }
@@ -349,6 +354,23 @@ mod tests {
         assert_eq!(r.usec(), Some(12_345));
         assert_eq!(r.timeval(), Some((7, 8)));
         assert!(r.eof());
+    }
+
+    #[test]
+    fn a_proplist_pair_carries_its_length_twice() {
+        let mut b = Builder::new();
+        b.proplist(&[("k".into(), "v".into())]);
+        assert_eq!(
+            b.into_vec(),
+            vec![b'P', b't', b'k', 0, b'L', 0, 0, 0, 1, b'x', 0, 0, 0, 1, b'v', b'N']
+        );
+    }
+
+    #[test]
+    fn a_format_info_encoding_is_tagged() {
+        let mut b = Builder::new();
+        b.format_info(0, &[]);
+        assert_eq!(b.into_vec(), vec![b'f', b'B', 0, b'P', b'N']);
     }
 
     #[test]

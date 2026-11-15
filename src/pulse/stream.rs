@@ -30,9 +30,10 @@ pub struct Created {
     pub reply: Vec<u8>,
 }
 
-pub enum Polled {
-    Packets(Vec<Vec<u8>>),
-    Gone,
+pub struct Polled {
+    pub packets: Vec<Vec<u8>>,
+    pub gone: bool,
+    pub volume_changed: bool,
 }
 
 pub struct Latency {
@@ -58,7 +59,6 @@ pub struct Stream {
     daemon: Client,
     started: bool,
     write_index: u64,
-    read_base: u64,
     underruns: u64,
     pending: Option<u32>,
     drain_tag: Option<u32>,
@@ -211,9 +211,8 @@ impl Stream {
             daemon,
             started: !corked,
             write_index: 0,
-            read_base: 0,
             underruns: 0,
-            pending: None,
+            pending: Some(missing),
             drain_tag: None,
         };
         let mut reply = crate::pulse::tagstruct::Builder::new();
@@ -256,6 +255,9 @@ impl Stream {
         if data.len() % self.frame_bytes != 0 {
             return;
         }
+        if !self.started && !self.corked && self.daemon.start().is_ok() {
+            self.started = true;
+        }
         if let Ok(frames) = self.daemon.write(data) {
             self.write_index += (frames * self.frame_bytes) as u64;
         }
@@ -279,7 +281,6 @@ impl Stream {
 
     pub fn flush(&mut self) -> io::Result<()> {
         self.daemon.reset()?;
-        self.read_base = self.write_index;
         if !self.corked {
             self.daemon.start()?;
             self.started = true;
@@ -305,8 +306,8 @@ impl Stream {
         let read = self
             .daemon
             .hw_position()
-            .map(|frames| self.read_base + frames * self.frame_bytes as u64)
-            .unwrap_or(self.read_base);
+            .map(|frames| frames * self.frame_bytes as u64)
+            .unwrap_or(0);
         let frames = self.daemon.delay_frames();
         Latency {
             sink_usec: frames * 1_000_000 / u64::from(self.rate.max(1)),
@@ -355,28 +356,65 @@ impl Stream {
     /// room for more.
     pub fn poll(&mut self) -> Polled {
         let mut packets = Vec::new();
+        let mut volume_changed = false;
+        loop {
+            match self.daemon.poll_notice() {
+                Ok(Some(aas_client::proto::Reply::ClientVolumeChanged { db_millis, muted })) => {
+                    self.db_millis = db_millis;
+                    self.mute = muted;
+                    volume_changed = true;
+                }
+                Ok(Some(_)) | Ok(None) => break,
+                Err(_) => return Polled {
+                    packets,
+                    gone: true,
+                    volume_changed,
+                },
+            }
+        }
         if let Some(tag) = self.drain_tag {
             match self.daemon.poll_drain() {
                 Ok(true) => {
                     packets.push(wire::reply(tag, Vec::new()));
                     self.drain_tag = None;
+                    self.started = false;
                 }
                 Ok(false) => {}
-                Err(_) => return Polled::Gone,
+                Err(_) => {
+                    packets.push(wire::error(tag, wire::ERR_NOENTITY));
+                    self.drain_tag = None;
+                    return Polled {
+                        packets,
+                        gone: true,
+                        volume_changed,
+                    };
+                }
             }
         }
         let underruns = self.daemon.underruns();
         if underruns > self.underruns {
             self.underruns = underruns;
-            packets.push(wire::underflow(self.index));
+            packets.push(wire::underflow(self.index, self.latency().read_index));
         }
         if self.daemon.check_alive().is_err() {
-            return Polled::Gone;
+            packets.push(wire::killed(self.index));
+            if let Some(tag) = self.drain_tag.take() {
+                packets.push(wire::error(tag, wire::ERR_NOENTITY));
+            }
+            return Polled {
+                packets,
+                gone: true,
+                volume_changed,
+            };
         }
         if let Some(request) = self.request() {
             packets.push(request);
         }
-        Polled::Packets(packets)
+        Polled {
+            packets,
+            gone: false,
+            volume_changed,
+        }
     }
 
     pub fn release(&mut self) {
