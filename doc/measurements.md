@@ -2369,6 +2369,17 @@ dBFS, is where enabling and disabling are. **No click was seen.** The ten
 minute runs above were made before the fix; the ramp adds a step per frame
 for 10 ms after a change, which the plugin's timing there does not include.
 
+Both captures ran with `bit_perfect = "off"`. With the default, `"auto"`, a
+centred balance is neutral and the master copies the client's frames without
+running the chains, so a change away from the centre starts the plugin on
+its first block. That first version of the ramp jumped there instead. Fixed
+in 02e2f8a, and captured again with that build and the config above without
+the `bit_perfect` line: `/state` read `"bit_perfect": true` before the first
+change, and the same 21 changes gave a largest step of 0.0648 / 0.0328, the
+tone's, and above 3 kHz at worst -85.1 / -90.6 dBFS against -94.6 / -95.3
+dBFS quiet. Each return to the centre went back to the copy, so five of the
+changes left it. No click.
+
 ### Lowering the latency while a client plays
 
 The daemon started with a `latency_ms` above the board's default, `aplay`
