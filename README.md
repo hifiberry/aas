@@ -114,6 +114,8 @@ is kept in `/var/lib/aas/state.toml`.
 | `volume_control` | a mixer control name | the first of `Digital`, `Master`, `PCM` | The card's control that carries the volume. |
 | `default_rate` | 8000 to 384000 | 48000 | The rate the output opens at before the first client plays. |
 | `api_port` | 0 to 65535 | 2718 | The port of the HTTP API, on 127.0.0.1. 0 turns the API off. |
+| `pulse_socket` | a path, or `""` | the client socket's directory plus `pulse` | The PulseAudio native-protocol socket. An empty value turns the endpoint off. |
+| `pulse_buffer_ms` | 20 to 2000 | 200 | The default and the cap for a PulseAudio stream's buffer. An error with the endpoint off. |
 
 Three tables set up the analog input, the audio plugins and the mixing matrix.
 

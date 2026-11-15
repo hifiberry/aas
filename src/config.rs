@@ -186,6 +186,11 @@ pub struct Config {
     pub outputs: Vec<OutputConfig>,
     /// The port the API listens on, on 127.0.0.1. 0 turns the API off.
     pub api_port: u16,
+    /// The PulseAudio socket. None is the client socket's directory plus
+    /// `pulse`; an empty path turns the endpoint off.
+    pub pulse_socket: Option<PathBuf>,
+    /// The default and cap for a PulseAudio stream's buffer, in ms.
+    pub pulse_buffer_ms: Option<u16>,
 }
 
 /// The port of the API unless the config names another.
@@ -230,6 +235,8 @@ struct Raw {
     matrix: Option<Vec<RawRoute>>,
     output: Option<Vec<RawOutput>>,
     api_port: Option<toml::Value>,
+    pulse_socket: Option<toml::Value>,
+    pulse_buffer_ms: Option<toml::Value>,
 }
 
 #[derive(Deserialize)]
@@ -383,6 +390,8 @@ impl Default for Config {
             matrix: None,
             outputs: Vec::new(),
             api_port: DEFAULT_API_PORT,
+            pulse_socket: None,
+            pulse_buffer_ms: None,
         }
     }
 }
@@ -555,6 +564,33 @@ impl Config {
                 ));
             }
         };
+        let pulse_socket = match raw.pulse_socket {
+            None => None,
+            Some(toml::Value::String(path)) => Some(PathBuf::from(path)),
+            Some(_) => {
+                return Err(format!("{}: pulse_socket must be a path", path.display()));
+            }
+        };
+        let pulse_buffer_ms = match raw.pulse_buffer_ms {
+            None => None,
+            Some(toml::Value::Integer(ms)) if (20..=2000).contains(&ms) => Some(ms as u16),
+            Some(_) => {
+                return Err(format!(
+                    "{}: pulse_buffer_ms must be from 20 to 2000",
+                    path.display()
+                ));
+            }
+        };
+        if pulse_socket
+            .as_ref()
+            .is_some_and(|p| p.as_os_str().is_empty())
+            && pulse_buffer_ms.is_some()
+        {
+            return Err(format!(
+                "{}: pulse_buffer_ms must not be set while the PulseAudio endpoint is off",
+                path.display()
+            ));
+        }
         let mut outputs: Vec<OutputConfig> = Vec::new();
         for (i, table) in raw_outputs.into_iter().enumerate() {
             let n = i + 2;
@@ -591,6 +627,8 @@ impl Config {
             matrix,
             outputs,
             api_port,
+            pulse_socket,
+            pulse_buffer_ms,
         })
     }
 }
@@ -1169,5 +1207,39 @@ type = "balance"
         .unwrap_err();
         assert!(e.contains("output 2") && e.contains("matrix 1"), "{e}");
         assert!(load_str("card = \"a\"\n[[output]]\ncard = \"b\"\nbogus = 1\n").is_err());
+    }
+
+    #[test]
+    fn pulse_keys_have_their_defaults() {
+        let c = load_str("").unwrap();
+        assert_eq!(c.pulse_socket, None);
+        assert_eq!(c.pulse_buffer_ms, None);
+    }
+
+    #[test]
+    fn an_empty_pulse_socket_turns_the_endpoint_off() {
+        assert_eq!(
+            load_str("pulse_socket = \"\"\n").unwrap().pulse_socket,
+            Some(PathBuf::new())
+        );
+        assert_eq!(
+            load_str("pulse_socket = \"/tmp/pulse\"\n").unwrap().pulse_socket,
+            Some(PathBuf::from("/tmp/pulse"))
+        );
+    }
+
+    #[test]
+    fn pulse_buffer_ms_is_20_to_2000() {
+        assert!(load_str("pulse_buffer_ms = 20\n").is_ok());
+        assert!(load_str("pulse_buffer_ms = 2000\n").is_ok());
+        assert!(load_str("pulse_buffer_ms = 19\n").is_err());
+        assert!(load_str("pulse_buffer_ms = 2001\n").is_err());
+        assert!(load_str("pulse_buffer_ms = \"200\"\n").is_err());
+    }
+
+    #[test]
+    fn a_pulse_buffer_with_the_endpoint_off_is_an_error() {
+        let e = err("pulse_socket = \"\"\npulse_buffer_ms = 200\n");
+        assert!(e.contains("pulse_buffer_ms") && e.contains("off"), "{e}");
     }
 }
