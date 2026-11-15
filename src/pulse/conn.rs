@@ -317,10 +317,7 @@ impl Conn {
         } else {
             1
         };
-        let latency = self
-            .streams
-            .first()
-            .map_or(0, |stream| stream.latency().sink_usec);
+        let latency = self.registry.sink_latency();
         objects::sink_info(rate, level, mute, latency, state)
     }
 
@@ -509,11 +506,13 @@ impl Conn {
             self.send_error(tag, wire::ERR_INVALID, "no stream index");
             return;
         };
-        for _ in 0..4 {
-            if reader.u32().is_none() {
+        let mut attr = [0u32; 4];
+        for value in &mut attr {
+            let Some(read) = reader.u32() else {
                 self.send_error(tag, wire::ERR_PROTOCOL, "a short buffer attr");
                 return;
-            }
+            };
+            *value = read;
         }
         let _ = reader.boolean();
         let _ = reader.boolean();
@@ -521,14 +520,18 @@ impl Conn {
             self.send_error(tag, wire::ERR_NOENTITY, "no such stream");
             return;
         };
-        let bytes = stream.capacity_bytes();
-        let minreq = stream.minreq_bytes();
+        // maxlength, tlength, prebuf, minreq: the ring cannot change size,
+        // so tlength and minreq are honoured within it and the reply says
+        // what holds.
+        let [maxlength, tlength, prebuf, minreq] = stream.set_buffer_attr(attr[1], attr[3]);
+        let configured = stream.latency().sink_usec
+            + u64::from(tlength) * 1_000_000 / (u64::from(stream.rate) * stream.frame_bytes as u64).max(1);
         let mut body = Builder::new();
-        body.u32(bytes);
-        body.u32(bytes);
-        body.u32(0);
+        body.u32(maxlength);
+        body.u32(tlength);
+        body.u32(prebuf);
         body.u32(minreq);
-        body.usec(0);
+        body.usec(configured);
         self.send_reply(tag, body.into_vec());
     }
 
@@ -794,6 +797,9 @@ impl Conn {
         for stream in &mut self.streams {
             let polled = stream.poll();
             packets.extend(polled.packets);
+            let latency = stream.latency();
+            self.registry
+                .set_latency(stream.index, latency.buffer_usec, latency.sink_usec);
             if polled.volume_changed {
                 let entry = stream.entry();
                 self.registry.update_sink_input(entry);

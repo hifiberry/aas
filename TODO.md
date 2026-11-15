@@ -590,19 +590,11 @@ volume onto the output volume and the client gain. See "PulseAudio clients" in
 - Native `libpipewire` clients. They do not use the PulseAudio API, so they
   need the native PipeWire protocol or a `libpipewire` shim. Neither is
   planned; players that link `pw_stream` stay on PipeWire until one exists.
-- Per-channel volume. `aas` has one output volume and one gain per client, so
-  a stereo cvolume is averaged; a player that wants independent channels does
-  not get them.
+- Per-channel volume: kept as an average by the owner's choice (2026-11-15).
+  `aas` has one gain per client; the output's `balance` plugin covers left and
+  right for the whole output.
 - SHM, the shared-ringbuffer channel, memfd pools, loadable modules, moving and
   suspending streams. All are declined or answered with an error.
-- Smaller gaps from the first review: `STARTED` and
-  `PLAYBACK_BUFFER_ATTR_CHANGED` are listed in the design but never sent;
-  `SET_PLAYBACK_STREAM_BUFFER_ATTR` ignores the new values; an uncorked stream
-  starts before its first write and so reports an underflow at once; there is
-  no cap on connections (the HTTP API has 32); `GET_SINK_INFO`'s latency comes
-  from the asking connection's first stream; `Identify` lets any member of
-  group `audio` take another process's name and gain. A sink input reports
-  0 for its buffer and sink latency in `pactl list sink-inputs`.
 - A board measurement of `pulse_buffer_ms`: 200 ms works with `paplay`, `mpv`
   and a browser, but which players need more, and what latency they see, is
   not measured. First step: run `dist/test-pulse.sh` with the endpoint on a

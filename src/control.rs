@@ -787,6 +787,9 @@ struct Conn {
     recorder: Option<Recorder>,
     /// Told of every change to the output volume.
     subscribed: bool,
+    /// May name itself after another process with `Identify`: only a
+    /// connection from the daemon's own process, its PulseAudio endpoint.
+    may_identify: bool,
 }
 
 /// The analog input as the control thread keeps it.
@@ -1214,8 +1217,17 @@ impl Control {
             stream: None,
             recorder: None,
             subscribed: false,
+            may_identify: false,
         };
         self.conns.insert(conn, state);
+    }
+
+    /// Lets a connection send `Identify`. The server calls this for a
+    /// connection whose peer is the daemon's own process.
+    pub fn allow_identify(&mut self, conn: ConnId) {
+        if let Some(state) = self.conns.get_mut(&conn) {
+            state.may_identify = true;
+        }
     }
 
     /// A closed socket removes the client, whatever state it was in.
@@ -1383,6 +1395,9 @@ impl Control {
         let Some(state) = self.conns.get(&conn) else {
             return Answer::fatal(libc::ENOTCONN);
         };
+        if !state.may_identify {
+            return Answer::error(libc::EPERM);
+        }
         if state.stream.is_some() || state.recorder.is_some() {
             return Answer::error(libc::EINVAL);
         }

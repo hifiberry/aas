@@ -26,6 +26,9 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 const ACCEPT_PAUSE: Duration = Duration::from_millis(100);
+/// The most PulseAudio connections served at once, as the HTTP API caps
+/// its own. One more is closed at once and logged.
+const MAX_CONNECTIONS: usize = 32;
 
 /// A running endpoint. Dropping it stops the listener and removes the
 /// socket.
@@ -124,6 +127,10 @@ fn accept_loop(
     let mut conns: Vec<JoinHandle<()>> = Vec::new();
     while !stop.load(Ordering::Relaxed) && !shutdown.load(Ordering::Relaxed) {
         match listener.accept() {
+            Ok((stream, _)) if conns.len() >= MAX_CONNECTIONS => {
+                drop(stream);
+                eprintln!("aas: pulse: {MAX_CONNECTIONS} connections already, one refused");
+            }
             Ok((stream, _)) => {
                 let daemon = daemon.clone();
                 let stop = stop.clone();

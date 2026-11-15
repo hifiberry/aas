@@ -146,6 +146,15 @@ pub fn underflow(stream: u32, offset: i64) -> Vec<u8> {
     out.into_vec()
 }
 
+/// The stream has started playing: sent once its first data is in.
+pub fn started(stream: u32) -> Vec<u8> {
+    let mut out = Builder::new();
+    out.u32(STARTED);
+    out.u32(INVALID_INDEX);
+    out.u32(stream);
+    out.into_vec()
+}
+
 pub fn killed(stream: u32) -> Vec<u8> {
     let mut out = Builder::new();
     out.u32(PLAYBACK_STREAM_KILLED);

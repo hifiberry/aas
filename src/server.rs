@@ -773,9 +773,14 @@ impl Server {
             }
             let conn = self.next_conn;
             self.next_conn += 1;
-            let (name, label) = peer_name(&fd);
+            let (name, label, pid) = peer_name(&fd);
             self.conns.insert(conn, fd);
             self.control.connected_as(conn, name, label);
+            // Only the daemon's own adapters, the PulseAudio endpoint, may
+            // name a connection after another process.
+            if pid == Some(std::process::id()) {
+                self.control.allow_identify(conn);
+            }
         }
     }
 
@@ -966,8 +971,8 @@ fn notice_is_due(fd: &OwnedFd) -> bool {
 /// The client's process name, from its credentials, and its label for the
 /// log, the name with the pid. A client whose name cannot be read has an
 /// empty name, which no API path can give, so no volume is ever set for
-/// it and it plays at 0 dB.
-fn peer_name(fd: &OwnedFd) -> (String, String) {
+/// it and it plays at 0 dB. The pid is the third value, when known.
+fn peer_name(fd: &OwnedFd) -> (String, String, Option<u32>) {
     // SAFETY: an all-zero ucred is valid, and getsockopt fills at most len.
     let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
     let mut len = size_of::<libc::ucred>() as libc::socklen_t;
@@ -981,12 +986,12 @@ fn peer_name(fd: &OwnedFd) -> (String, String) {
         )
     };
     if rc < 0 {
-        return (String::new(), "a client".into());
+        return (String::new(), "a client".into(), None);
     }
     let comm = fs::read_to_string(format!("/proc/{}/comm", cred.pid));
     let name = comm.map(|c| c.trim_end().to_string()).unwrap_or_default();
     let label = format!("{name} ({})", cred.pid);
-    (name, label)
+    (name, label, u32::try_from(cred.pid).ok())
 }
 
 /// A listening seqpacket socket at `path`, readable and writable by its

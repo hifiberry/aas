@@ -2994,6 +2994,20 @@ mod tests {
         let hello = Request::Hello {
             version: proto::VERSION,
         };
+        control.request(7, Some(hello), now);
+        // A connection from another process may not name itself.
+        let answer = control.request(
+            7,
+            Some(Request::Identify {
+                pid: std::process::id(),
+            }),
+            now,
+        );
+        assert_eq!(answer.reply, Some(Reply::Error { code: libc::EPERM as u32 }));
+        control.allow_identify(7);
+        let hello = Request::Hello {
+            version: proto::VERSION,
+        };
         assert_eq!(
             control.request(7, Some(hello), now).reply,
             Some(Reply::Hello {
@@ -3023,6 +3037,8 @@ mod tests {
             now,
         );
         play_as(&mut control, 8, "mpd", now);
+        // play_as connects afresh, so the permission is given after it.
+        control.allow_identify(8);
         let answer = control.request(
             8,
             Some(Request::Identify {

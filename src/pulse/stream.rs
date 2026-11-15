@@ -41,7 +41,10 @@ pub struct Polled {
 }
 
 pub struct Latency {
+    /// What plays after the ring: the output's delay.
     pub sink_usec: u64,
+    /// What the ring holds.
+    pub buffer_usec: u64,
     pub playing: bool,
     pub write_index: i64,
     pub read_index: i64,
@@ -74,6 +77,11 @@ pub struct Stream {
     outstanding: u64,
     /// The smallest request, in bytes.
     minreq: u32,
+    /// The fill the client asked to keep, in bytes: its `tlength`, at most
+    /// the ring. Requests fill the ring up to this, not beyond.
+    target: u32,
+    /// The daemon stream was started and `STARTED` has not gone out yet.
+    announce_started: bool,
     /// Whether a write past the request was logged, so a client that
     /// keeps doing it logs once.
     overrun_logged: bool,
@@ -209,11 +217,9 @@ impl Stream {
         daemon
             .configure(spec.rate, format, spec.channels, frames)
             .map_err(|_| CreateError::new(wire::ERR_INVALID, "the daemon refused the stream"))?;
-        if !corked {
-            daemon
-                .start()
-                .map_err(|_| CreateError::new(wire::ERR_INTERNAL, "the daemon could not start"))?;
-        }
+        // An uncorked stream starts with its first write, not now: started
+        // empty, it would underrun at once and hold the output's rate
+        // before it has anything to play.
         let (db_millis, muted) = daemon.client_volume().unwrap_or((0, muted));
         let capacity = daemon.capacity_frames().unwrap_or(frames as usize) as u32;
         let capacity_bytes = capacity * frame_bytes as u32;
@@ -237,11 +243,13 @@ impl Stream {
             silent: false,
             mute: muted,
             daemon,
-            started: !corked,
+            started: false,
             write_index: 0,
             underruns: 0,
             outstanding: u64::from(missing),
             minreq,
+            target: capacity_bytes,
+            announce_started: false,
             overrun_logged: false,
             drain_tag: None,
         };
@@ -266,13 +274,15 @@ impl Stream {
         })
     }
 
-    /// The request that should go out now: the ring's free room minus
-    /// what was asked for already, once that is at least `minreq`.
+    /// The request that should go out now: the room up to the target fill
+    /// minus what was asked for already, once that is at least `minreq`.
     pub fn request(&mut self) -> Option<Vec<u8>> {
         if self.corked {
             return None;
         }
-        let room = (self.daemon.free_frames().ok()? * self.frame_bytes) as u64;
+        let free = (self.daemon.free_frames().ok()? * self.frame_bytes) as u64;
+        let fill = u64::from(self.capacity_bytes()).saturating_sub(free);
+        let room = u64::from(self.target).saturating_sub(fill);
         let unasked = room.saturating_sub(self.outstanding);
         if unasked < u64::from(self.minreq) {
             return None;
@@ -292,9 +302,7 @@ impl Stream {
         if data.len() % self.frame_bytes != 0 {
             return;
         }
-        if !self.started && !self.corked && self.daemon.start().is_ok() {
-            self.started = true;
-        }
+        let start = !self.started && !self.corked;
         if let Ok(frames) = self.daemon.write(data) {
             self.write_index += (frames * self.frame_bytes) as u64;
             if frames * self.frame_bytes < data.len() && !self.overrun_logged {
@@ -302,6 +310,51 @@ impl Stream {
                 eprintln!("aas: pulse: stream {} wrote past its request", self.index);
             }
         }
+        // Started once the data is in the ring, so the first period has
+        // something to play.
+        if start && !data.is_empty() {
+            self.begin();
+        }
+    }
+
+    /// Starts the daemon stream and has `STARTED` sent on the next poll.
+    fn begin(&mut self) {
+        if self.daemon.start().is_ok() {
+            self.started = true;
+            self.announce_started = true;
+        }
+    }
+
+    /// Frames the ring holds.
+    fn fill_frames(&self) -> usize {
+        let capacity = self.daemon.capacity_frames().unwrap_or(0);
+        capacity.saturating_sub(self.daemon.free_frames().unwrap_or(capacity))
+    }
+
+    /// Applies `SET_PLAYBACK_STREAM_BUFFER_ATTR` as far as the ring allows
+    /// and returns what holds now: maxlength, tlength, prebuf and minreq,
+    /// in bytes. The ring is not resized, so a `tlength` above it is cut to
+    /// it, as PulseAudio cuts what it cannot give; `u32::MAX` or 0 keep the
+    /// current value.
+    pub fn set_buffer_attr(&mut self, tlength: u32, minreq: u32) -> [u32; 4] {
+        let capacity = self.capacity_bytes();
+        let frame = self.frame_bytes as u32;
+        let floor = (self.rate / 1000 * 20).max(1) * frame;
+        if tlength != 0 && tlength != u32::MAX {
+            self.target = (tlength.clamp(floor.min(capacity), capacity) / frame) * frame;
+        }
+        let quarter = ((self.target / 4) / frame).max(1) * frame;
+        self.minreq = if minreq == 0 || minreq == u32::MAX {
+            quarter
+        } else {
+            ((minreq.clamp(frame, self.target / 2) / frame) * frame).max(frame)
+        };
+        [capacity, self.target, 0, self.minreq]
+    }
+
+    /// The fill the client asked to keep, in bytes.
+    pub fn target_bytes(&self) -> u32 {
+        self.target
     }
 
     /// The smallest request, in bytes, as the buffer attributes report it.
@@ -323,27 +376,35 @@ impl Stream {
         if corked {
             self.daemon.stop()?;
             self.started = false;
+            self.corked = true;
         } else {
-            self.daemon.start()?;
-            self.started = true;
+            self.corked = false;
+            // With data in the ring it plays on now; empty, it starts with
+            // its next write, like a new stream.
+            if self.fill_frames() > 0 {
+                self.begin();
+                if !self.started {
+                    return Err(io::Error::other("the daemon could not start"));
+                }
+            }
         }
-        self.corked = corked;
         Ok(())
     }
 
+    /// Empties the ring. The stream starts again with its next write.
     pub fn flush(&mut self) -> io::Result<()> {
         self.daemon.reset()?;
-        if !self.corked {
-            self.daemon.start()?;
-            self.started = true;
-        }
+        self.started = false;
         Ok(())
     }
 
+    /// Starts the stream now, even with nothing written.
     pub fn trigger(&mut self) -> io::Result<()> {
         if !self.started && !self.corked {
-            self.daemon.start()?;
-            self.started = true;
+            self.begin();
+            if !self.started {
+                return Err(io::Error::other("the daemon could not start"));
+            }
         }
         Ok(())
     }
@@ -360,9 +421,15 @@ impl Stream {
             .hw_position()
             .map(|frames| frames * self.frame_bytes as u64)
             .unwrap_or(0);
-        let frames = self.daemon.delay_frames();
+        // The client adds what the ring holds (write minus read index), so
+        // the sink's part is only what plays after the ring.
+        let after = self
+            .daemon
+            .delay_frames()
+            .saturating_sub(self.fill_frames() as u64);
         Latency {
-            sink_usec: frames * 1_000_000 / u64::from(self.rate.max(1)),
+            sink_usec: after * 1_000_000 / u64::from(self.rate.max(1)),
+            buffer_usec: self.fill_frames() as u64 * 1_000_000 / u64::from(self.rate.max(1)),
             playing: self.started && !self.corked,
             write_index: self.write_index as i64,
             read_index: read as i64,
@@ -403,6 +470,8 @@ impl Stream {
             db_millis: self.db_millis,
             silent: self.silent,
             mute: self.mute,
+            buffer_usec: 0,
+            sink_usec: 0,
         }
     }
 
@@ -450,6 +519,9 @@ impl Stream {
                     };
                 }
             }
+        }
+        if std::mem::take(&mut self.announce_started) {
+            packets.push(wire::started(self.index));
         }
         let underruns = self.daemon.underruns();
         if underruns > self.underruns {

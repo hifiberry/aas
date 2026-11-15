@@ -2,7 +2,7 @@
 
 use crate::pulse::wire;
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 
@@ -28,6 +28,9 @@ pub struct SinkInput {
     /// volume 0 rather than as a mute.
     pub silent: bool,
     pub mute: bool,
+    /// What its ring holds and what plays after it, as last measured.
+    pub buffer_usec: u64,
+    pub sink_usec: u64,
 }
 
 /// A change to a stream that another connection asked for. Only the
@@ -45,6 +48,9 @@ pub struct Registry {
     inboxes: Mutex<BTreeMap<u32, Sender<Remote>>>,
     sink_inputs: Mutex<BTreeMap<u32, SinkInput>>,
     sink_mute: Mutex<Option<u8>>,
+    /// The output's delay after a stream's ring, as a playing stream last
+    /// measured it.
+    sink_latency: AtomicU64,
     next_stream: AtomicU32,
     events: Mutex<Vec<Sender<Event>>>,
 }
@@ -56,6 +62,7 @@ impl Default for Registry {
             inboxes: Mutex::new(BTreeMap::new()),
             sink_inputs: Mutex::new(BTreeMap::new()),
             sink_mute: Mutex::new(None),
+            sink_latency: AtomicU64::new(0),
             next_stream: AtomicU32::new(1),
             events: Mutex::new(Vec::new()),
         }
@@ -133,9 +140,16 @@ impl Registry {
         });
     }
 
-    pub fn update_sink_input(&self, input: SinkInput) {
+    pub fn update_sink_input(&self, mut input: SinkInput) {
         let index = input.index;
-        self.sink_inputs.lock().unwrap().insert(index, input);
+        let mut inputs = self.sink_inputs.lock().unwrap();
+        if let Some(old) = inputs.get(&index) {
+            // A stream's entry carries no measurement; keep the last one.
+            input.buffer_usec = old.buffer_usec;
+            input.sink_usec = old.sink_usec;
+        }
+        inputs.insert(index, input);
+        drop(inputs);
         self.notify(Event {
             facility: wire::EVENT_SINK_INPUT,
             change: wire::EVENT_CHANGE,
@@ -151,6 +165,20 @@ impl Registry {
                 index,
             });
         }
+    }
+
+    /// Records a stream's latency, without an event: it changes all the
+    /// time and clients ask for it.
+    pub fn set_latency(&self, index: u32, buffer_usec: u64, sink_usec: u64) {
+        if let Some(input) = self.sink_inputs.lock().unwrap().get_mut(&index) {
+            input.buffer_usec = buffer_usec;
+            input.sink_usec = sink_usec;
+        }
+        self.sink_latency.store(sink_usec, Ordering::Relaxed);
+    }
+
+    pub fn sink_latency(&self) -> u64 {
+        self.sink_latency.load(Ordering::Relaxed)
     }
 
     pub fn sink_inputs(&self) -> Vec<SinkInput> {

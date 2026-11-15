@@ -201,13 +201,14 @@ The server advertises protocol 35 and implements this playback subset:
 | Introspection | `GET_SERVER_INFO`, `GET_SINK_INFO`, `GET_SINK_INFO_LIST`, `GET_SINK_INPUT_INFO`, `GET_SINK_INPUT_INFO_LIST`, `GET_CLIENT_INFO`, `GET_CLIENT_INFO_LIST`, `GET_CARD_INFO_LIST`, `GET_MODULE_INFO_LIST`, `GET_SAMPLE_INFO_LIST`, `GET_SOURCE_INFO_LIST`, `STAT`, `LOOKUP_SINK` |
 | Streams | `CREATE_PLAYBACK_STREAM`, `DELETE_PLAYBACK_STREAM`, `DRAIN_PLAYBACK_STREAM`, `CORK_PLAYBACK_STREAM`, `FLUSH_PLAYBACK_STREAM`, `TRIGGER_PLAYBACK_STREAM`, `PREBUF_PLAYBACK_STREAM`, `SET_PLAYBACK_STREAM_BUFFER_ATTR`, `SET_PLAYBACK_STREAM_NAME`, `UPDATE_PLAYBACK_STREAM_PROPLIST`, `REMOVE_PLAYBACK_STREAM_PROPLIST`, `GET_PLAYBACK_LATENCY` |
 | Volume | `SET_SINK_VOLUME`, `SET_SINK_MUTE`, `SET_SINK_INPUT_VOLUME`, `SET_SINK_INPUT_MUTE`, `SET_DEFAULT_SINK` |
-| Notifications | `SUBSCRIBE`, and the server-to-client `REQUEST`, `STARTED`, `SUBSCRIBE_EVENT`, `PLAYBACK_STREAM_KILLED`, `UNDERFLOW`, `PLAYBACK_BUFFER_ATTR_CHANGED` |
+| Notifications | `SUBSCRIBE`, and the server-to-client `REQUEST`, `STARTED`, `SUBSCRIBE_EVENT`, `PLAYBACK_STREAM_KILLED`, `UNDERFLOW` |
 
 Every other command, including record streams, modules, moves, suspends and
 extensions, is answered with `PA_COMMAND_ERROR` and `PA_ERR_NOTSUPPORTED`, and
 the connection stays usable *(call)*. A command that cannot be carried out for
-this stream, such as a buffer it cannot honour, is refused the same way rather
-than applied halfway.
+this stream is refused the same way rather than applied halfway.
+`PLAYBACK_BUFFER_ATTR_CHANGED` is never sent, because the endpoint never changes
+a stream's buffer on its own.
 
 ### Streams
 
@@ -223,12 +224,20 @@ A playback stream is negotiated with the client:
   `aas` needs at the stream's rate and to `pulse_buffer_ms`. Without a
   `tlength`, `pulse_buffer_ms` is the value. `maxlength` does not make the ring
   larger *(call)*.
-- The stream starts as the client asks: corked if it said so, otherwise at
-  once. `prebuf` and a trigger timestamp are advisory, because the card cannot
-  promise an exact start later *(call)*.
-- Free ring space produces a `REQUEST` for whole frames: the free room minus
-  what was requested and has not arrived yet, so requests never add up to more
-  than the ring holds, however small the pieces the client writes. A request is
+- The stream starts as the client asks: corked if it said so, otherwise with
+  its first write, and `STARTED` is sent then. Started empty, it would underrun
+  at once and hold the output's rate before it had anything to play. An uncork
+  starts it again if the ring holds data, otherwise with the next write; a
+  `FLUSH` likewise. `TRIGGER` starts it at once. `prebuf` and a trigger
+  timestamp are advisory beyond that, because the card cannot promise an exact
+  start later *(call)*.
+- `SET_PLAYBACK_STREAM_BUFFER_ATTR` is honoured within the ring, which is not
+  resized: `tlength` becomes the fill that requests aim for, at most the ring,
+  and `minreq` the smallest request; the reply gives the values that hold, as
+  PulseAudio's does when it cannot grant all of a request *(call)*.
+- Free ring space produces a `REQUEST` for whole frames: the room up to the
+  stream's `tlength` minus what was requested and has not arrived yet, so
+  requests never add up to more than the ring holds, however small the pieces the client writes. A request is
   at least a quarter of the ring (its `minreq`) and at most 64 KiB, so a large
   buffer is filled over several requests. The memblock that answers it is
   written with the same conversion the ALSA plugin uses; nothing is allocated
@@ -237,10 +246,12 @@ A playback stream is negotiated with the client:
   smallest ring, between 2 and 20 ms, rather than only when the client sends
   something. A client that filled its ring and waits is asked again well before
   the ring runs out *(call)*.
-- `write_index` counts the frames the client has handed over. `read_index` and
-  the sink latency come from the ring's hardware position and delay, so
-  `GET_PLAYBACK_LATENCY` and a sink input's reported latency are the real path,
-  not a guess *(call)*.
+- `write_index` counts the frames the client has handed over and `read_index`
+  is the ring's hardware position, so the client's own sum of what is buffered
+  is real. The sink latency is what plays after the ring, the output's delay,
+  so it is not counted twice. A sink input reports what its ring holds as its
+  buffer latency and the output's delay as its sink latency, and the sink
+  reports that delay too, all as the streams last measured them *(call)*.
 - `DRAIN_PLAYBACK_STREAM` waits for the ring to play out; `CORK` stops and
   starts; `FLUSH` stops and empties the ring; `DELETE` stops the stream and ends
   its daemon connection. A new request cancels a drain, as the client protocol
@@ -305,6 +316,9 @@ default and 20 to 2000, is the default and the cap for a stream's buffer. Both
 are validated at startup like every other key, and `pulse_buffer_ms` with the
 endpoint off is an error *(call)*.
 
+At most 32 PulseAudio connections are served at once, as the HTTP API caps its
+own; one more is closed at once and logged *(call)*.
+
 A socket that cannot be bound or created is logged once and the daemon plays on
 without the PulseAudio endpoint, as it does without the API. The socket is
 unlinked at start and at shutdown, and the listener's threads are joined when the
@@ -320,6 +334,8 @@ the 20-byte request and 8-byte reply and need no version change:
 
 - `Identify { pid }`, sent before `Configure`, so the daemon reads the player's
   process name for a connection it did not accept from that process itself.
+  Only a connection from the daemon's own process may send it; any other gets
+  `EPERM`, so a client cannot take another process's name and gain.
 - `GetClientVolume` and `SetClientVolume`, so a stream's volume is the client
   gain the API knows. A client's gain is also sent to its connection as a
   `ClientVolumeChanged` notice whenever it changes, so one subscription covers

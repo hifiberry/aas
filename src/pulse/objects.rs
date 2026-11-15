@@ -94,8 +94,8 @@ pub fn sink_input_info(input: &SinkInput) -> Vec<u8> {
         volume::cvolume_from_db(input.db_millis)
     };
     b.cvolume(&cvolume[..usize::from(input.channels).min(2)]);
-    b.usec(0);
-    b.usec(0);
+    b.usec(input.buffer_usec);
+    b.usec(input.sink_usec);
     b.string("null");
     b.string("aas");
     b.boolean(input.mute);

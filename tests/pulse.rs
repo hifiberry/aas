@@ -996,3 +996,130 @@ fn a_stream_at_volume_zero_is_silent_and_says_so() {
     assert!(!client_muted());
     assert_eq!(read_back(&mut client), (wire::VOLUME_NORM, false));
 }
+
+#[test]
+fn a_stream_starts_with_its_first_write_and_says_so() {
+    let daemon = Daemon::start();
+    let mut client = RawPulse::connect(&daemon.pulse_socket());
+    client.auth();
+    client.set_name("late");
+    let (stream, missing, _) = client.create_stream(48_000, wire::FORMAT_S16LE, 2, 200);
+    // Nothing written yet: no underflow, and no STARTED.
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_millis(300) {
+        if let Some((command, _, _)) = client.try_recv(Duration::from_millis(20)) {
+            assert_ne!(command, wire::UNDERFLOW, "an empty stream underran");
+            assert_ne!(command, wire::STARTED, "started before any data");
+        }
+    }
+    client.send_memblock(stream, &vec![0u8; missing]);
+    let start = std::time::Instant::now();
+    loop {
+        assert!(start.elapsed() < Duration::from_secs(1), "no STARTED");
+        if let Some((command, _, body)) = client.try_recv(Duration::from_millis(20))
+            && command == wire::STARTED
+        {
+            assert_eq!(Reader::new(&body).u32(), Some(stream));
+            break;
+        }
+    }
+}
+
+#[test]
+fn a_smaller_tlength_keeps_the_ring_at_that_fill() {
+    let daemon = Daemon::start();
+    let mut client = RawPulse::connect(&daemon.pulse_socket());
+    client.auth();
+    client.set_name("short");
+    let (stream, missing, _) = client.create_stream(48_000, wire::FORMAT_S16LE, 2, 200);
+    // 50 ms of the 200 ms ring.
+    let target = 48 * 50 * 4;
+    let mut body = Builder::new();
+    body.u32(stream);
+    body.u32(u32::MAX);
+    body.u32(target);
+    body.u32(u32::MAX);
+    body.u32(u32::MAX);
+    body.boolean(false);
+    body.boolean(false);
+    let (command, _, reply) =
+        client.command(wire::SET_PLAYBACK_STREAM_BUFFER_ATTR, &body.into_vec());
+    assert_eq!(command, wire::REPLY);
+    let mut r = Reader::new(&reply);
+    let maxlength = r.u32().unwrap();
+    assert_eq!(r.u32(), Some(target), "tlength is honoured");
+    let _prebuf = r.u32();
+    let minreq = r.u32().unwrap();
+    assert!(minreq > 0 && minreq <= target / 2);
+    assert!(maxlength >= target);
+    // The first request was for the whole ring; send only the target, then
+    // answer each request and watch the fill.
+    let _ = missing;
+    client.send_memblock(stream, &vec![0u8; target as usize]);
+    let mut fullest = 0i64;
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_millis(500) {
+        if let Some((command, _, body)) = client.try_recv(Duration::from_millis(5))
+            && command == wire::REQUEST
+        {
+            client.send_memblock(stream, &vec![0u8; request_length(&body)]);
+            let (_, write, read) = client.latency(stream);
+            fullest = fullest.max(write - read);
+        }
+    }
+    assert!(fullest <= i64::from(target), "the ring held {fullest} of {target} bytes");
+}
+
+#[test]
+fn latencies_are_measured_not_zero() {
+    let daemon = Daemon::start();
+    let mut client = RawPulse::connect(&daemon.pulse_socket());
+    client.auth();
+    client.set_name("measured");
+    let (stream, missing, _) = client.create_stream(48_000, wire::FORMAT_S16LE, 2, 200);
+    client.send_memblock(stream, &vec![0u8; missing]);
+    // The ring holds up to 200 ms; GET_PLAYBACK_LATENCY's sink part is what
+    // plays after it, which the client adds to write minus read.
+    let (sink_usec, write, read) = client.latency(stream);
+    assert!(write - read > 0);
+    assert!(sink_usec < 200_000, "the sink part counts the ring: {sink_usec}");
+    std::thread::sleep(Duration::from_millis(100));
+    let mut body = Builder::new();
+    body.u32(stream);
+    let (command, _, reply) = client.command(wire::GET_SINK_INPUT_INFO, &body.into_vec());
+    assert_eq!(command, wire::REPLY);
+    let mut r = Reader::new(&reply);
+    r.u32();
+    r.string();
+    r.u32();
+    r.u32();
+    r.u32();
+    r.sample_spec();
+    r.channel_map();
+    r.cvolume();
+    let buffer_usec = r.usec().unwrap();
+    assert!(buffer_usec > 0, "the stream's buffer latency is measured");
+}
+
+#[test]
+fn connections_beyond_the_cap_are_closed() {
+    let daemon = Daemon::start();
+    let mut held: Vec<RawPulse> = (0..32)
+        .map(|_| {
+            let mut c = RawPulse::connect(&daemon.pulse_socket());
+            c.auth();
+            c
+        })
+        .collect();
+    let mut extra = UnixStream::connect(daemon.pulse_socket()).unwrap();
+    extra
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut byte = [0u8; 1];
+    assert_eq!(extra.read(&mut byte).unwrap(), 0, "the 33rd is closed");
+    // One leaves, and a newcomer is served again.
+    held.pop();
+    std::thread::sleep(Duration::from_millis(400));
+    let mut again = RawPulse::connect(&daemon.pulse_socket());
+    again.auth();
+}
