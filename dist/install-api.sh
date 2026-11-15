@@ -17,7 +17,12 @@ sudo install -o root -g root -m 0644 dist/auth.d/aas.json "$auth_dir/aas.json"
 echo "installed $auth_dir/aas.json"
 
 if systemctl is-active --quiet nginx; then
-	sudo nginx -t
+	if ! sudo nginx -t; then
+		# Leave no location nginx refuses: it would stop the next start.
+		sudo rm -f "$nginx_dir/hifiberry-aas.nginx"
+		echo "nginx refused the configuration; removed $nginx_dir/hifiberry-aas.nginx" >&2
+		exit 1
+	fi
 	sudo systemctl reload nginx
 	echo "reloaded nginx"
 else
