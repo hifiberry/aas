@@ -362,7 +362,9 @@ an unknown field is 400, an unknown output or input is 404, and a value out of
 range or a matrix that breaks a rule is 422; nothing is clamped. A body over
 64 KiB is 413. A call the daemon has not answered in 2 s is 503; a `PATCH` or
 `PUT` answered so may still have applied, and can safely be sent again. Each
-error is `{"error": "..."}`, with the message the config would give.
+error is `{"error": "..."}`, with the message the config would give. At most 32
+connections are open at once; one more is answered 503 and closed. A connection
+that sends nothing for 30 s is closed.
 
 ```sh
 curl -s 127.0.0.1:2718/state
@@ -392,7 +394,9 @@ subscriber that falls more than 256 events behind gets `{"type": "resync"}`
 and should read `/state` again; nothing waits for it. Clients are told apart by
 name alone, so with two processes of one name, `gone` for the name means that
 one of them has gone, not that none plays. A message from a subscriber is
-ignored; one over 4 KiB closes its socket.
+ignored; one over 4 KiB closes its socket. A subscriber is sent a ping every
+10 s and has to answer it, as WebSocket libraries and browsers do on their own;
+one that answers nothing for 30 s is closed.
 
 What the API sets is kept in the state file and survives a restart: the
 master's volume, each client's volume and mute, the analog input's, each

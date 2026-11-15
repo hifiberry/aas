@@ -290,6 +290,22 @@ fn events_announce_a_volume_change() {
     assert_eq!(event["volume"], json!(50));
 }
 
+/// A quiet subscriber is pinged every 10 s; its pong is what keeps the
+/// socket from being closed as idle after 30 s.
+#[test]
+fn a_quiet_subscriber_is_pinged() {
+    let daemon = Daemon::start();
+    let mut socket = subscribe(&daemon);
+    socket
+        .get_mut()
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+    match socket.read().unwrap() {
+        Message::Ping(_) => {}
+        other => panic!("not a ping: {other:?}"),
+    }
+}
+
 #[test]
 fn a_reader_that_never_reads_does_not_slow_the_daemon() {
     let daemon = Daemon::start();

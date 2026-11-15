@@ -6,6 +6,8 @@
 //!
 //! The paths here are without the `/api/aas/v1` that nginx puts in front.
 
+mod conns;
+
 use crate::api::{ApiCall, ApiError, ApiEvent, Call};
 use axum::Router;
 use axum::body::Bytes;
@@ -38,6 +40,17 @@ const MAX_BODY: usize = 64 * 1024;
 /// The largest WebSocket message or frame taken from a subscriber, whose
 /// messages are read only to be dropped.
 const MAX_PEER_MESSAGE: usize = 4096;
+
+/// The most connections open at once; one more is answered 503.
+const MAX_CONNECTIONS: usize = 32;
+
+/// How long a connection may go without a byte from its peer before it is
+/// closed, so that the cap cannot be filled by connections left open.
+const IDLE: Duration = Duration::from_secs(30);
+
+/// How often a subscriber is sent a ping. Its pong is what keeps a quiet
+/// `/events` socket from counting as idle.
+const PING_EVERY: Duration = Duration::from_secs(10);
 
 /// What every handler shares.
 struct Shared {
@@ -84,6 +97,7 @@ pub fn spawn(
                     }
                 };
                 let app = router(shared);
+                let listener = conns::Capped::new(listener, MAX_CONNECTIONS, IDLE);
                 tokio::spawn(async move {
                     if let Err(e) = axum::serve(listener, app).await {
                         eprintln!("aas: API: {e}");
@@ -264,11 +278,12 @@ async fn events(
     upgrade.on_upgrade(move |socket| forward(socket, receiver))
 }
 
-/// What a subscriber's task waits for: the next event, or something from
-/// its peer.
+/// What a subscriber's task waits for: the next event, something from its
+/// peer, or the time for a ping.
 enum Next {
     Event(Option<ApiEvent>),
     Peer(Option<Result<Message, axum::Error>>),
+    Ping,
 }
 
 /// The next event for a subscriber: a `resync` if it has fallen behind
@@ -285,18 +300,28 @@ async fn next_event(events: &mut broadcast::Receiver<ApiEvent>) -> Option<ApiEve
 /// Sends each event to one subscriber as a JSON text message, until either
 /// side closes. A send to a peer that does not read waits in this task
 /// alone; the channel goes on without it, and when the task gets to read
-/// again it has lagged, which it tells the peer with a `resync`.
+/// again it has lagged, which it tells the peer with a `resync`. A ping
+/// goes out every `PING_EVERY`; a peer that answers none is closed as idle.
 async fn forward(mut socket: WebSocket, mut events: broadcast::Receiver<ApiEvent>) {
+    let mut ping = tokio::time::interval(PING_EVERY);
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The first tick is at once; the first ping is one period in.
+    ping.reset();
     loop {
-        // Both are cancel-safe, so the one that did not finish loses nothing.
+        // All three are cancel-safe, so those that did not finish lose
+        // nothing.
         let next = {
             let mut event = pin!(next_event(&mut events));
             let mut peer = pin!(socket.recv());
+            let mut tick = pin!(ping.tick());
             poll_fn(|cx| {
                 if let Poll::Ready(e) = event.as_mut().poll(cx) {
                     return Poll::Ready(Next::Event(e));
                 }
-                peer.as_mut().poll(cx).map(Next::Peer)
+                if let Poll::Ready(p) = peer.as_mut().poll(cx) {
+                    return Poll::Ready(Next::Peer(p));
+                }
+                tick.as_mut().poll(cx).map(|_| Next::Ping)
             })
             .await
         };
@@ -305,6 +330,12 @@ async fn forward(mut socket: WebSocket, mut events: broadcast::Receiver<ApiEvent
             Next::Event(None) => return,
             Next::Peer(None | Some(Err(_)) | Some(Ok(Message::Close(_)))) => return,
             Next::Peer(Some(Ok(_))) => continue,
+            Next::Ping => {
+                if socket.send(Message::Ping(Bytes::new())).await.is_err() {
+                    return;
+                }
+                continue;
+            }
         };
         let Ok(text) = serde_json::to_string(&event) else {
             continue;
