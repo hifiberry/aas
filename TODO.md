@@ -194,29 +194,46 @@ warning; rare, and it goes away with the replan. First step: have the control th
 in the writer tests, a `Sim` with `granted_periods = 4` that runs with no
 starve then shows it works.
 
-## The web UI, the Debian package and removing `pw-api` and `vu-meter`
+## Stage 5: ship `aas` beside PipeWire, with the user choosing
 
-The API is built: both parts of stage 4's API, `aasctl`, the `hifiberry-auth`
-manifest and the nginx location with their install script
-(`dist/install-api.sh`). See "The API in part 1" and "The API in part 2" in
-`doc/design.md`, the API section of `README.md`, and "Stage 4 part 1" and
-"Stage 4 part 2" in `doc/measurements.md`. What the design leaves for later:
+The owner decided (2026-11-15) that HiFiBerry OS ships both audio servers for
+some time, PipeWire and `aas`, and the user selects which one runs. See
+"Non-goals for the first version" and "API" in `doc/design.md`. Removing
+PipeWire, `pw-api` and `vu-meter` is a later stage, not this one.
 
-- The web UI still talks to `/api/pipewire` and the `vu-meter` service. It has
-  to move to `/api/aas/v1`, and its meter to the `/levels` framing: one meter
-  after another, each with its id, its channel count, RMS and peak per channel
-  and a byte of clip bits. The level bytes are the `vu-meter` service's, so
-  only the framing changes.
-- A Debian package for the daemon, `aasctl`, the ALSA plugin, the systemd
-  unit, `dist/90-aas.conf` and the two API files. It has to restart
-  `hifiberry-auth` and reload nginx as `dist/install-api.sh` does.
-- Removing `pw-api` and `vu-meter`, which frees ports 2716 and 2717, once the
-  web UI no longer needs them.
+Done: the daemon, the ALSA plugin, both parts of stage 4's API, `aasctl`,
+the `hifiberry-auth` manifest and the nginx location with their install
+script (`dist/install-api.sh`). See "The API in part 1" and "The API in part
+2" in `doc/design.md`, the API section of `README.md`, and "Stage 4 part 1"
+and "Stage 4 part 2" in `doc/measurements.md`.
+
+Missing, each needing a design before it is built:
+
+- How the switch works on a device. What it changes: which services run (the
+  PipeWire user services and WirePlumber, or the `aas` system service), which
+  ALSA `default` device `/etc/asound.conf` names (the `aas` plugin, or
+  PipeWire's), and whether a reboot is needed or a restart of the players is
+  enough. Both nginx locations and both auth manifests can stay installed.
+- Where the choice is kept and who applies it: a HiFiBerry OS setting, set
+  from the web UI through the config server, which already enables and
+  disables services by name.
+- How the web UI knows which server runs, and uses `/api/aas/v1` with the
+  `/levels` framing (one meter after another, each with its id, its channel
+  count, RMS and peak per channel and a byte of clip bits) under `aas`, and
+  `/api/pipewire` and `/api/vu-meter` under PipeWire.
+- What a device using speaker EQ or AES67 is told before it switches, since
+  `aas` has neither yet.
+- Debian packages that install `aas` beside PipeWire without either
+  conflicting: the daemon, `aasctl`, the ALSA plugin, the systemd unit,
+  `dist/90-aas.conf` and the two API files, restarting `hifiberry-auth` and
+  reloading nginx as `dist/install-api.sh` does. The `hifiberryos`
+  meta-package depends on both.
 
 The web UI and the services live in the HiFiBerry OS repositories, not here.
-Missing: a plan for the order, since the web UI can move only once the
-package installs the daemon. First step: list every call the web UI makes to
-`/api/pipewire` and `/api/vu-meter` and map each to its `/api/aas/v1` route.
+First step: list what a PipeWire device has running and configured for audio
+(services, `/etc/asound.conf`, PipeWire configs, the services that call
+`/api/pipewire`), so the switch can be written as the exact set of changes
+between that and an `aas` device, then write the design of the switch.
 
 ## A reopen cuts the sound instead of fading it
 

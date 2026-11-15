@@ -7,7 +7,7 @@ explicitly confirmed. Everything else was stated or chosen by the owner.
 
 ## Intent
 
-`aas` replaces PipeWire and WirePlumber on HiFiBerry OS. The reason is not
+`aas` is to replace PipeWire and WirePlumber on HiFiBerry OS. The reason is not
 missing features. That stack is hard to understand and hard to configure, and
 its behaviour does not follow from a few simple rules.
 
@@ -35,15 +35,20 @@ built for them now.
 - USB audio gadget
 - Porting `speakereq` to a native plugin
 
-The first version is a real replacement on shipped systems, not an opt-in. So it
-includes Debian packaging and the changes to the `hifiberry-os` packages that
-depend on PipeWire today: `hifiberryos`, `hifiberry-pipewire-configs`,
-`analoginput` and the volume API users.
+For some time HiFiBerry OS ships both audio servers, PipeWire and `aas`, and the
+user selects which one runs *(owner's call)*. So the first shipped version is an
+alternative the user switches to, not yet the replacement. It still includes
+Debian packaging and the changes to the `hifiberry-os` packages that depend on
+PipeWire today: `hifiberryos`, `hifiberry-pipewire-configs`, `analoginput` and
+the volume API users. Those changes must keep PipeWire working: both servers are
+installed side by side, exactly one runs, and switching is a setting the user
+changes, not a reinstall. Switching works in both directions, and each server
+keeps its own settings across a switch. PipeWire is removed only in a later
+stage, when `aas` covers what users need.
 
-AES67 and speaker EQ are accepted as lost on update until their later stages land.
-
-The switch needs a way back to PipeWire on a device. Devices using speaker EQ or
-AES67 are held back from the switch and do not lose them silently *(call)*.
+AES67 and speaker EQ stay available under PipeWire until their `aas` stages
+land. A device that uses them stays on PipeWire unless the user switches, and is
+told what it loses before it does *(call)*.
 
 ## Anti-goals
 
@@ -1285,8 +1290,10 @@ starts at 0 dB, as HiFiBerry OS does today *(call)*.
 ## API
 
 A new API, with no compatibility layer for `/api/pipewire`. The web UI is changed
-to use it. It replaces both `pw-api` and the `vu-meter` service, freeing ports 2716
-and 2717.
+to use it while `aas` runs. It takes over from `pw-api` and the `vu-meter`
+service; while both audio servers ship, those two stay for PipeWire, and the web
+UI uses the API of the server that runs. Ports 2716 and 2717 are freed only when
+PipeWire is removed.
 
 - HTTP with JSON, plus WebSocket, built with `axum` and `tokio`.
 - It binds to `127.0.0.1` on one new port and sits behind nginx at `/api/aas/v1`.
