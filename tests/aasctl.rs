@@ -110,3 +110,47 @@ fn levels_prints_a_line() {
     child.wait().unwrap();
     assert!(line.starts_with("1:"), "{line}");
 }
+
+#[test]
+fn an_unreadable_matrix_file_exits_1() {
+    let out = aasctl(1, &["matrix", "put", "/nonexistent/matrix.json"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("matrix.json") && !stderr.contains("usage"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn a_config_that_does_not_load_exits_1() {
+    let out = Command::new(env!("CARGO_BIN_EXE_aasctl"))
+        .args(["--config", "/nonexistent/aas.toml", "state"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("usage"));
+}
+
+#[test]
+fn a_closed_pipe_ends_quietly() {
+    let daemon = Daemon::start();
+    let mut child = aasctl(daemon.port.unwrap(), &["levels"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Read one line, then close the pipe as `| head -1` does.
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    lines.next().unwrap().unwrap();
+    drop(lines);
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    assert!(
+        out.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

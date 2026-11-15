@@ -5,6 +5,7 @@ mod client;
 
 use args::{Command, USAGE};
 use serde_json::Value;
+use std::io::Write;
 use std::net::TcpStream;
 use std::process::ExitCode;
 use tungstenite::Message;
@@ -19,21 +20,48 @@ fn main() -> ExitCode {
     });
     let args = match parsed {
         Ok(args) => args,
-        Err(e) => {
+        Err(args::Error::Usage(e)) => {
             eprintln!("aasctl: {e}\n{USAGE}");
             return ExitCode::from(2);
         }
+        Err(args::Error::Failed(e)) => {
+            eprintln!("aasctl: {e}");
+            return ExitCode::from(1);
+        }
     };
     match run(args.port, args.command) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
+        Ok(()) | Err(Stop::Pipe) => ExitCode::SUCCESS,
+        Err(Stop::Failed(e)) => {
             eprintln!("aasctl: {e}");
             ExitCode::from(1)
         }
     }
 }
 
-fn run(port: u16, command: Command) -> Result<(), String> {
+/// Why a command ended early.
+enum Stop {
+    /// The reader of stdout went away (`aasctl events | head`): not an error.
+    Pipe,
+    Failed(String),
+}
+
+impl From<String> for Stop {
+    fn from(e: String) -> Self {
+        Stop::Failed(e)
+    }
+}
+
+/// Writes one line to stdout; a closed pipe ends the command quietly.
+fn say(text: &str) -> Result<(), Stop> {
+    let mut out = std::io::stdout().lock();
+    match out.write_all(text.as_bytes()).and_then(|()| out.flush()) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Err(Stop::Pipe),
+        Err(e) => Err(Stop::Failed(format!("cannot write: {e}"))),
+    }
+}
+
+fn run(port: u16, command: Command) -> Result<(), Stop> {
     match command {
         Command::Get(name) => call(port, "GET", &format!("/{name}"), None),
         Command::Graph { dot } => {
@@ -41,22 +69,24 @@ fn run(port: u16, command: Command) -> Result<(), String> {
             call(port, "GET", path, None)
         }
         Command::Patch { path, body } => call(port, "PATCH", &path, Some(&body.to_string())),
-        Command::Put { path, body } => call(port, "PUT", &path, Some(&body.to_string())),
-        Command::Events => stream(port, "/events", |message| {
-            if let Message::Text(text) = message {
-                println!("{text}");
-            }
+        Command::Put { path, file } => {
+            let text = std::fs::read_to_string(&file).map_err(|e| format!("{file}: {e}"))?;
+            let body: Value = serde_json::from_str(&text).map_err(|e| format!("{file}: {e}"))?;
+            call(port, "PUT", &path, Some(&body.to_string()))
+        }
+        Command::Events => stream(port, "/events", |message| match message {
+            Message::Text(text) => say(&format!("{text}\n")),
+            _ => Ok(()),
         }),
-        Command::Levels => stream(port, "/levels", |message| {
-            if let Message::Binary(frame) = message {
-                println!("{}", levels_line(&frame));
-            }
+        Command::Levels => stream(port, "/levels", |message| match message {
+            Message::Binary(frame) => say(&format!("{}\n", levels_line(&frame))),
+            _ => Ok(()),
         }),
     }
 }
 
 /// One request; the answer on stdout, or its error on stderr.
-fn call(port: u16, method: &str, path: &str, body: Option<&str>) -> Result<(), String> {
+fn call(port: u16, method: &str, path: &str, body: Option<&str>) -> Result<(), Stop> {
     let (status, text) = client::request(port, method, path, body)
         .map_err(|e| format!("cannot reach the daemon on port {port}: {e}"))?;
     let json = serde_json::from_str::<Value>(&text).ok();
@@ -65,17 +95,23 @@ fn call(port: u16, method: &str, path: &str, body: Option<&str>) -> Result<(), S
             .as_ref()
             .and_then(|j| j["error"].as_str())
             .unwrap_or(text.trim());
-        return Err(format!("{status}: {message}"));
+        return Err(format!("{status}: {message}").into());
     }
     match json {
-        Some(json) => println!("{}", serde_json::to_string_pretty(&json).unwrap()),
-        None => print!("{text}"),
+        Some(json) => say(&format!(
+            "{}\n",
+            serde_json::to_string_pretty(&json).unwrap()
+        )),
+        None => say(&text),
     }
-    Ok(())
 }
 
 /// Calls `each` with every message of a WebSocket until it closes.
-fn stream(port: u16, path: &str, mut each: impl FnMut(Message)) -> Result<(), String> {
+fn stream(
+    port: u16,
+    path: &str,
+    mut each: impl FnMut(Message) -> Result<(), Stop>,
+) -> Result<(), Stop> {
     let unreachable =
         |e: &dyn std::fmt::Display| format!("cannot reach the daemon on port {port}: {e}");
     let tcp = TcpStream::connect(("127.0.0.1", port)).map_err(|e| unreachable(&e))?;
@@ -83,11 +119,11 @@ fn stream(port: u16, path: &str, mut each: impl FnMut(Message)) -> Result<(), St
         .map_err(|e| unreachable(&e))?;
     loop {
         match socket.read() {
-            Ok(message) => each(message),
+            Ok(message) => each(message)?,
             Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) => {
                 return Ok(());
             }
-            Err(e) => return Err(e.to_string()),
+            Err(e) => return Err(Stop::Failed(e.to_string())),
         }
     }
 }

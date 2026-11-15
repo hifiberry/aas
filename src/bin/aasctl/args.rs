@@ -27,13 +27,23 @@ pub enum Command {
         path: String,
         body: Value,
     },
-    /// `matrix put FILE`.
+    /// `matrix put FILE`: the file is read when the command runs.
     Put {
         path: String,
-        body: Value,
+        file: String,
     },
     Events,
     Levels,
+}
+
+/// Why the command line gave no command.
+#[derive(Debug, PartialEq)]
+pub enum Error {
+    /// Not a command line `aasctl` understands: exit 2 with the usage.
+    Usage(String),
+    /// A well-formed one that cannot be carried out, such as a config file
+    /// that does not load: exit 1.
+    Failed(String),
 }
 
 #[derive(Debug, PartialEq)]
@@ -51,7 +61,7 @@ const GETS: [&str; 7] = [
 pub fn parse(
     given: impl IntoIterator<Item = OsString>,
     config_port: impl Fn(&Path) -> Result<u16, String>,
-) -> Result<Args, String> {
+) -> Result<Args, Error> {
     let mut port = None;
     let mut config: Option<PathBuf> = None;
     let mut words = Vec::new();
@@ -59,33 +69,42 @@ pub fn parse(
     while let Some(arg) = given.next() {
         match arg.to_str() {
             Some("--port") => {
-                let value = given.next().ok_or("--port needs a number")?;
+                let value = given.next().ok_or_else(|| usage("--port needs a number"))?;
                 let value = value.to_string_lossy();
                 port = Some(
                     value
                         .parse::<u16>()
-                        .map_err(|_| format!("--port needs a port number, not {value}"))?,
+                        .map_err(|_| usage(format!("--port needs a port number, not {value}")))?,
                 );
             }
             Some("--config") => {
-                config = Some(given.next().ok_or("--config needs a path")?.into());
+                config = Some(
+                    given
+                        .next()
+                        .ok_or_else(|| usage("--config needs a path"))?
+                        .into(),
+                );
             }
             _ => words.push(
                 arg.into_string()
-                    .map_err(|a| format!("not text: {}", a.to_string_lossy()))?,
+                    .map_err(|a| usage(format!("not text: {}", a.to_string_lossy())))?,
             ),
         }
     }
     let port = match (port, config) {
         (Some(port), _) => port,
-        (None, Some(path)) => config_port(&path)?,
+        (None, Some(path)) => config_port(&path).map_err(Error::Failed)?,
         (None, None) => DEFAULT_API_PORT,
     };
     let words: Vec<&str> = words.iter().map(String::as_str).collect();
     Ok(Args {
         port,
-        command: command(&words)?,
+        command: command(&words).map_err(Error::Usage)?,
     })
+}
+
+fn usage(e: impl Into<String>) -> Error {
+    Error::Usage(e.into())
 }
 
 fn command(words: &[&str]) -> Result<Command, String> {
@@ -106,14 +125,10 @@ fn command(words: &[&str]) -> Result<Command, String> {
             path: "/settings".into(),
             body: Value::Object(pairs_of(pairs, setting)?),
         }),
-        ["matrix", "put", file] => {
-            let text = std::fs::read_to_string(file).map_err(|e| format!("{file}: {e}"))?;
-            let body = serde_json::from_str(&text).map_err(|e| format!("{file}: {e}"))?;
-            Ok(Command::Put {
-                path: "/matrix".into(),
-                body,
-            })
-        }
+        ["matrix", "put", file] => Ok(Command::Put {
+            path: "/matrix".into(),
+            file: (*file).into(),
+        }),
         [other, ..] => Err(format!("unknown or incomplete command {other}")),
     }
 }
@@ -223,7 +238,7 @@ fn encode(name: &str) -> String {
 mod tests {
     use super::*;
 
-    fn parsed(line: &str) -> Result<Args, String> {
+    fn parsed(line: &str) -> Result<Args, Error> {
         parse(line.split_whitespace().map(OsString::from), |_| Ok(9999))
     }
 
@@ -310,11 +325,22 @@ mod tests {
         let args = parsed("--config /etc/aas.toml state").unwrap();
         assert_eq!(args.port, 9999);
         assert_eq!(args.command, Command::Get("state"));
-        assert!(
+        assert_eq!(
             parse(["--config", "x", "state"].map(OsString::from), |_| {
                 Err("broken".into())
-            })
-            .is_err()
+            }),
+            Err(Error::Failed("broken".into()))
+        );
+    }
+
+    #[test]
+    fn matrix_put_names_its_file_and_reads_nothing() {
+        assert_eq!(
+            parsed("matrix put /nonexistent.json").unwrap().command,
+            Command::Put {
+                path: "/matrix".into(),
+                file: "/nonexistent.json".into()
+            }
         );
     }
 
@@ -335,7 +361,7 @@ mod tests {
             "client mpd",
             "graph --svg",
         ] {
-            assert!(parsed(line).is_err(), "{line:?}");
+            assert!(matches!(parsed(line), Err(Error::Usage(_))), "{line:?}");
         }
     }
 
