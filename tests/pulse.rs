@@ -129,3 +129,71 @@ fn an_unknown_command_is_refused_and_the_connection_survives() {
     let (command, _, _) = client.command(104, &[]);
     assert_eq!(command, wire::ERROR);
 }
+
+#[test]
+fn pactl_style_introspection_sees_one_sink() {
+    let daemon = Daemon::start();
+    let mut client = RawPulse::connect(&daemon.pulse_socket());
+    client.auth();
+    client.set_name("introspect");
+
+    let (command, _, body) = client.command(wire::GET_SERVER_INFO, &[]);
+    assert_eq!(command, wire::REPLY);
+    let mut reader = Reader::new(&body);
+    assert_eq!(reader.string(), Some("aas"));
+    assert_eq!(reader.string(), Some("0.1.0"));
+    assert!(reader.string().is_some(), "a user");
+    assert!(reader.string().is_some(), "a host");
+    let spec = reader.sample_spec().expect("a sample spec");
+    assert_eq!(spec.channels, 2);
+    assert!(spec.rate >= 8000);
+    assert_eq!(reader.string(), Some("aas"));
+    assert_eq!(reader.string(), None, "no default source");
+    assert!(reader.u32().is_some(), "a cookie");
+    assert_eq!(reader.channel_map(), Some(vec![1, 2]));
+
+    let (command, _, body) = client.command(wire::GET_SINK_INFO_LIST, &[]);
+    assert_eq!(command, wire::REPLY);
+    let mut reader = Reader::new(&body);
+    assert_eq!(reader.u32(), Some(0));
+    assert_eq!(reader.string(), Some("aas"));
+    assert_eq!(reader.string(), Some("aas output"));
+    assert!(reader.sample_spec().is_some());
+    assert_eq!(reader.channel_map(), Some(vec![1, 2]));
+
+    for command in [
+        wire::GET_CARD_INFO_LIST,
+        wire::GET_MODULE_INFO_LIST,
+        wire::GET_SAMPLE_INFO_LIST,
+        wire::GET_SOURCE_INFO_LIST,
+        wire::GET_SINK_INPUT_INFO_LIST,
+    ] {
+        let (reply, _, body) = client.command(command, &[]);
+        assert_eq!(reply, wire::REPLY);
+        assert!(body.is_empty(), "a list with nothing in it");
+    }
+}
+
+#[test]
+fn subscribe_answers_then_sends_events() {
+    let daemon = Daemon::start();
+    let mut listener = RawPulse::connect(&daemon.pulse_socket());
+    listener.auth();
+    listener.set_name("listener");
+    let mut mask = Builder::new();
+    mask.u32(wire::MASK_SINK | wire::MASK_CLIENT | wire::MASK_SINK_INPUT);
+    let (command, tag, body) = listener.command(wire::SUBSCRIBE, &mask.into_vec());
+    assert_eq!((command, tag), (wire::REPLY, 3));
+    assert!(body.is_empty());
+
+    let mut newcomer = RawPulse::connect(&daemon.pulse_socket());
+    newcomer.auth();
+    newcomer.set_name("newcomer");
+
+    let (command, _, body) = listener.recv();
+    assert_eq!(command, wire::SUBSCRIBE_EVENT);
+    let mut reader = Reader::new(&body);
+    let event = reader.u32().expect("an event type");
+    assert_eq!(event & 0xf, wire::EVENT_CLIENT);
+    assert_eq!(event & 0x30, wire::EVENT_NEW);
+}

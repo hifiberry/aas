@@ -5,11 +5,14 @@
 //! the client protocol, as the ALSA plugin is.
 
 pub mod conn;
+pub mod objects;
 pub mod packet;
+pub mod registry;
 pub mod tagstruct;
 pub mod wire;
 
 use crate::config::Config;
+use crate::pulse::registry::Registry;
 use std::fs;
 use std::io;
 use std::os::unix::fs::PermissionsExt;
@@ -84,9 +87,10 @@ pub fn spawn(
     let thread_stop = stop.clone();
     let daemon = daemon_socket.to_path_buf();
     let buffer_ms = config.pulse_buffer_ms.map(u32::from).unwrap_or(200);
+    let registry = Arc::new(Registry::default());
     let listener = thread::Builder::new()
         .name("aas-pulse".into())
-        .spawn(move || accept_loop(listener, daemon, buffer_ms, thread_stop, shutdown))?;
+        .spawn(move || accept_loop(listener, daemon, buffer_ms, thread_stop, shutdown, registry))?;
     eprintln!("aas: PulseAudio on {}", path.display());
     Ok(Some(Pulse {
         path,
@@ -113,6 +117,7 @@ fn accept_loop(
     buffer_ms: u32,
     stop: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
+    registry: Arc<Registry>,
 ) {
     let mut conns: Vec<JoinHandle<()>> = Vec::new();
     while !stop.load(Ordering::Relaxed) && !shutdown.load(Ordering::Relaxed) {
@@ -121,11 +126,12 @@ fn accept_loop(
                 let daemon = daemon.clone();
                 let stop = stop.clone();
                 let shutdown = shutdown.clone();
+                let registry = registry.clone();
                 let spawned = thread::Builder::new()
                     .name("aas-pulse-conn".into())
                     .spawn(move || {
                         let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            conn::serve(stream, &daemon, buffer_ms, &stop, &shutdown);
+                            conn::serve(stream, &daemon, buffer_ms, &stop, &shutdown, registry);
                         }));
                         if ran.is_err() {
                             eprintln!("aas: pulse: a connection failed");
