@@ -20,6 +20,7 @@ pub mod levels;
 pub mod matrix;
 pub mod output_mix;
 pub mod plugin;
+pub mod pulse;
 pub mod rate;
 pub mod resample;
 pub mod rt;
