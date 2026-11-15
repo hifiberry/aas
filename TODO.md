@@ -229,11 +229,16 @@ Missing, each needing a design before it is built:
   reloading nginx as `dist/install-api.sh` does. The `hifiberryos`
   meta-package depends on both.
 
+Done since: `doc/pipewire-device.md` lists what a HiFiBerry OS device runs
+and has configured for audio under PipeWire, from a device and from the
+sources, and ends with the eight things a switch touches. It also found that
+Bluetooth audio is PipeWire's `bluez5` today, not `bluez-alsa`.
+
 The web UI and the services live in the HiFiBerry OS repositories, not here.
-First step: list what a PipeWire device has running and configured for audio
-(services, `/etc/asound.conf`, PipeWire configs, the services that call
-`/api/pipewire`), so the switch can be written as the exact set of changes
-between that and an `aas` device, then write the design of the switch.
+First step: write the design of the switch from the end of
+`doc/pipewire-device.md`, starting with the ALSA default and the services,
+and settle with the owner how `aas` and the players share the card's
+hardware volume control.
 
 ## A reopen cuts the sound instead of fading it
 
