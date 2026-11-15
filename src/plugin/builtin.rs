@@ -11,11 +11,11 @@ use super::{Channels, Failure, Formats, Param, Plugin};
 pub fn create(kind: &str, rate: u32, _channels: usize) -> Option<Result<Box<dyn Plugin>, Failure>> {
     match kind {
         "detect" => Some(Ok(Box::new(Detect::new(rate)))),
-        "balance" => Some(Ok(Box::new(Balance::new()))),
+        "balance" => Some(Ok(Box::new(Balance::new(rate)))),
         // Stand in for library plugins that do not support, or fail at,
         // the higher rates.
         #[cfg(test)]
-        "only-up-to-48k" if rate <= 48_000 => Some(Ok(Box::new(Balance::new()))),
+        "only-up-to-48k" if rate <= 48_000 => Some(Ok(Box::new(Balance::new(rate)))),
         #[cfg(test)]
         "only-up-to-48k" => Some(Err(Failure::Unsupported)),
         #[cfg(test)]
@@ -28,7 +28,7 @@ pub fn create(kind: &str, rate: u32, _channels: usize) -> Option<Result<Box<dyn 
         "fails-above-48k" => {
             FAILS_TRIED.with(|n| n.set(n.get() + 1));
             if rate <= 48_000 {
-                Some(Ok(Box::new(Balance::new())))
+                Some(Ok(Box::new(Balance::new(rate))))
             } else {
                 Some(Err(Failure::Failed))
             }
@@ -61,9 +61,9 @@ pub fn channels(kind: &str) -> Option<Channels> {
 pub fn describe(kind: &str) -> Option<(String, Vec<Param>, Channels, Formats)> {
     let plugin: Box<dyn Plugin> = match kind {
         "detect" => Box::new(Detect::new(48_000)),
-        "balance" => Box::new(Balance::new()),
+        "balance" => Box::new(Balance::new(48_000)),
         #[cfg(test)]
-        "only-up-to-48k" | "fails-above-48k" => Box::new(Balance::new()),
+        "only-up-to-48k" | "fails-above-48k" => Box::new(Balance::new(48_000)),
         #[cfg(test)]
         "widen" => Box::new(test::Spread::widen()),
         #[cfg(test)]

@@ -507,6 +507,11 @@ fn stage<S: Sample>(
         None => plugin.process(S::block(data, channels)),
         Some(to) => converted(plugin, data, channels, to, store),
     });
+    if status.changed && !fading {
+        // A plugin that changed a block may be neutral after it, as a
+        // balance whose ramp ends at the centre is.
+        publish(plugin, state, fade);
+    }
     if fading {
         // The chain may be neutral again by the end of the block, but this
         // block was crossfaded, so it must be played as processed.
@@ -1765,6 +1770,24 @@ mod tests {
         c.set_enabled(0, true);
         assert_eq!(s[0].latency_frames.load(Relaxed), 7);
         assert!(!s[0].neutral.load(Relaxed));
+    }
+
+    #[test]
+    fn stats_publish_neutral_when_a_ramp_ends_at_the_centre() {
+        let s = stats(1);
+        let balance = Box::new(crate::plugin::balance::Balance::new(48_000));
+        let mut c = chain_at_48k(vec![balance]).with_stats(s.clone());
+        c.set_param(0, 0, 0.5);
+        run_frames(&mut c, 1.0, 500);
+        assert!(!s[0].neutral.load(Relaxed));
+        c.set_param(0, 0, 0.0);
+        assert!(!s[0].neutral.load(Relaxed), "neutral while it ramps");
+        run_frames(&mut c, 1.0, 500);
+        assert!(c.neutral());
+        assert!(
+            s[0].neutral.load(Relaxed),
+            "the end of the ramp not published"
+        );
     }
 
     #[test]

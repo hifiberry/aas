@@ -233,7 +233,7 @@ fn format_of<P: Processing>() -> Format {
 }
 
 fn balance(format: Format, value: f64, rate: u32) -> Box<Chain> {
-    let mut plugin = Balance::new();
+    let mut plugin = Balance::new(rate);
     plugin.set_param(0, value);
     let plugins: Vec<Box<dyn Plugin>> = vec![Box::new(plugin)];
     let chain = Chain::new(plugins, format, MAX_PERIOD as usize, 2).unwrap();
