@@ -122,7 +122,9 @@ impl Control {
         if let Some(to) = conversion(entry.formats, self.format) {
             plugin["converts_to"] = json!(format_name(to));
         }
-        let extra = self.with_rate(json!({"format": format_name(self.format), "plugin": plugin}));
+        let extra = self.with_rate(json!({"format": format_name(self.format),
+            "latency_frames": entry.stats.latency_frames.load(Relaxed),
+            "plugin": plugin}));
         g.node(&id, "plugin", &entry.name, extra);
         id
     }
@@ -375,6 +377,7 @@ mod tests {
         assert_eq!(node["kind"], "plugin");
         assert_eq!(node["plugin"]["id"], "1/mix/1");
         assert_eq!(node["plugin"]["ns_avg"], 0);
+        assert_eq!(node["latency_frames"], 0);
     }
 
     #[test]
