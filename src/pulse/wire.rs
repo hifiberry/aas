@@ -56,10 +56,10 @@ pub const ERR_ACCESS: u32 = 1;
 pub const ERR_COMMAND: u32 = 2;
 pub const ERR_INVALID: u32 = 3;
 pub const ERR_NOENTITY: u32 = 5;
-pub const ERR_PROTOCOL: u32 = 6;
+pub const ERR_PROTOCOL: u32 = 7;
 pub const ERR_VERSION: u32 = 17;
 pub const ERR_INTERNAL: u32 = 10;
-pub const ERR_NOTSUPPORTED: u32 = 18;
+pub const ERR_NOTSUPPORTED: u32 = 19;
 
 // Subscription masks and events.
 pub const MASK_SINK: u32 = 0x0001;
@@ -155,6 +155,16 @@ pub fn killed(stream: u32) -> Vec<u8> {
 mod tests {
     use super::*;
     use crate::pulse::tagstruct::Builder;
+
+    #[test]
+    fn error_codes_are_pulseaudios() {
+        // pa_error_code in PulseAudio's def.h.
+        assert_eq!(
+            [ERR_ACCESS, ERR_COMMAND, ERR_INVALID, ERR_NOENTITY, ERR_PROTOCOL],
+            [1, 2, 3, 5, 7]
+        );
+        assert_eq!([ERR_INTERNAL, ERR_VERSION, ERR_NOTSUPPORTED], [10, 17, 19]);
+    }
 
     #[test]
     fn an_error_ends_after_its_code() {

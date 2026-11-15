@@ -595,6 +595,17 @@ volume onto the output volume and the client gain. See "PulseAudio clients" in
   not get them.
 - SHM, the shared-ringbuffer channel, memfd pools, loadable modules, moving and
   suspending streams. All are declined or answered with an error.
+- Streams created with a format list (`pa_stream_new_extended`, which
+  GStreamer's `pulsesink` uses) are refused, even when the format is PCM. Fix:
+  take the first PCM `format_info`'s rate, format and channels, and echo it in
+  the reply. Untested so far: no GStreamer on the build host.
+- Smaller gaps from the first review: `STARTED` and
+  `PLAYBACK_BUFFER_ATTR_CHANGED` are listed in the design but never sent;
+  `SET_PLAYBACK_STREAM_BUFFER_ATTR` ignores the new values; an uncorked stream
+  starts before its first write and so reports an underflow at once; there is
+  no cap on connections (the HTTP API has 32); `GET_SINK_INFO`'s latency comes
+  from the asking connection's first stream; `Identify` lets any member of
+  group `audio` take another process's name and gain.
 - A board measurement of `pulse_buffer_ms`: 200 ms works with `paplay`, `mpv`
   and a browser, but which players need more, and what latency they see, is
   not measured. First step: run `dist/test-pulse.sh` with the endpoint on a

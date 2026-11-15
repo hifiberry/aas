@@ -223,11 +223,17 @@ A playback stream is negotiated with the client:
 - The stream starts as the client asks: corked if it said so, otherwise at
   once. `prebuf` and a trigger timestamp are advisory, because the card cannot
   promise an exact start later *(call)*.
-- Free ring space produces a `REQUEST` for that many whole frames, with one
-  outstanding at a time and no request above 64 KiB, so a large buffer is filled
-  over several requests and a small one is not overrun. The memblock that answers
-  it is written with the same conversion the ALSA plugin uses; nothing is
-  allocated on the audio thread *(call)*.
+- Free ring space produces a `REQUEST` for whole frames: the free room minus
+  what was requested and has not arrived yet, so requests never add up to more
+  than the ring holds, however small the pieces the client writes. A request is
+  at least a quarter of the ring (its `minreq`) and at most 64 KiB, so a large
+  buffer is filled over several requests. The memblock that answers it is
+  written with the same conversion the ALSA plugin uses; nothing is allocated
+  on the audio thread *(call)*.
+- While a stream plays, its connection checks for room every eighth of the
+  smallest ring, between 2 and 20 ms, rather than only when the client sends
+  something. A client that filled its ring and waits is asked again well before
+  the ring runs out *(call)*.
 - `write_index` counts the frames the client has handed over. `read_index` and
   the sink latency come from the ring's hardware position and delay, so
   `GET_PLAYBACK_LATENCY` and a sink input's reported latency are the real path,
@@ -241,11 +247,14 @@ A playback stream is negotiated with the client:
 
 ### Objects and events
 
-- One sink, named `aas`, with the output's current rate and stereo channels, its
+- One sink, named `aas` and also found as `@DEFAULT_SINK@`, with the output's current rate and stereo channels, its
   volume from the output volume and its state RUNNING while a stream plays and
   IDLE otherwise. It is never suspended *(call)*.
 - One sink input per stream, named from the stream's media name, whose volume and
-  mute are the per-client gain. One client object per PulseAudio connection.
+  mute are the per-client gain. Any connection may change them, as `pactl` or a
+  mixer does: a change for a stream of another connection is handed to that
+  connection, which applies it on its next check and answers at once.
+  One client object per PulseAudio connection.
 - Card, module, sample and source lists are empty. The card is `aas`'s to own, and
   a client that lists them sees nothing rather than a graph *(call)*.
 - Subscriptions receive NEW, CHANGE and REMOVE for clients, sink inputs and the

@@ -2,7 +2,7 @@
 
 use crate::pulse::objects;
 use crate::pulse::packet::{Encoder, Frame, Reader as Framer};
-use crate::pulse::registry::{Event, Registry};
+use crate::pulse::registry::{Event, Registry, Remote};
 use crate::pulse::stream::{Stream, now_timeval};
 use crate::pulse::volume;
 use crate::pulse::tagstruct::{Builder, Reader};
@@ -16,7 +16,16 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
-const READ_TIMEOUT: Duration = Duration::from_millis(200);
+/// How long a read waits while no stream plays. It bounds how late the
+/// connection notices a stop or a shutdown.
+const IDLE_TICK: Duration = Duration::from_millis(200);
+/// The bounds of the wait while a stream plays. Between them the wait is an
+/// eighth of the smallest ring, so room is offered well before a ring that
+/// was full runs out.
+const MIN_TICK: Duration = Duration::from_millis(2);
+const MAX_TICK: Duration = Duration::from_millis(20);
+/// How long a write may block before the connection gives up on it.
+const WRITE_TIMEOUT: Duration = Duration::from_millis(200);
 
 static NEXT_CLIENT: AtomicU32 = AtomicU32::new(1);
 
@@ -29,11 +38,17 @@ pub fn serve(
     registry: Arc<Registry>,
 ) {
     let peer_pid = peer_pid(&stream);
-    let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
-    let _ = stream.set_write_timeout(Some(READ_TIMEOUT));
+    let _ = stream.set_read_timeout(Some(IDLE_TICK));
+    let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
     let mut conn = Conn::new(stream, daemon_socket, buffer_ms, peer_pid, registry);
     let mut buf = [0u8; 8192];
+    let mut tick = IDLE_TICK;
     while !stop.load(Ordering::Relaxed) && !shutdown.load(Ordering::Relaxed) && !conn.done {
+        let wanted = conn.tick_interval();
+        if wanted != tick {
+            tick = wanted;
+            let _ = conn.stream.set_read_timeout(Some(tick));
+        }
         match conn.stream.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => match conn.framer.read(&buf[..n]) {
@@ -92,6 +107,7 @@ pub struct Conn {
     control: Option<DaemonClient>,
     registry: Arc<Registry>,
     events: Receiver<Event>,
+    inbox: Receiver<Remote>,
     subscribed: u32,
     streams: Vec<Stream>,
     done: bool,
@@ -109,6 +125,7 @@ impl Conn {
         let name = format!("pulse-{client_index}");
         registry.add_client(client_index, name.clone());
         let events = registry.subscribe();
+        let inbox = registry.inbox(client_index);
         Conn {
             control: DaemonClient::connect(daemon_socket).ok(),
             stream,
@@ -124,6 +141,7 @@ impl Conn {
             proplist: Vec::new(),
             registry,
             events,
+            inbox,
             subscribed: 0,
             streams: Vec::new(),
             done: false,
@@ -272,9 +290,7 @@ impl Conn {
     fn sink_info(&mut self, reader: &mut Reader, tag: u32) {
         let index = reader.u32();
         let name = reader.string();
-        let ours = index.is_none_or(|index| index == 0 || index == wire::INVALID_INDEX)
-            && (name.is_none() || name == Some("aas"));
-        if !ours {
+        if !is_our_sink(index, name) {
             self.send_error(tag, wire::ERR_NOENTITY, "no such sink");
             return;
         }
@@ -343,9 +359,8 @@ impl Conn {
     }
 
     fn lookup_sink(&mut self, reader: &mut Reader, tag: u32) {
-        let index = reader.u32();
         let name = reader.string();
-        if index == Some(0) || name == Some("aas") {
+        if name.is_some_and(is_our_sink_name) {
             let mut body = Builder::new();
             body.u32(0);
             self.send_reply(tag, body.into_vec());
@@ -507,11 +522,12 @@ impl Conn {
             return;
         };
         let bytes = stream.capacity_bytes();
+        let minreq = stream.minreq_bytes();
         let mut body = Builder::new();
         body.u32(bytes);
         body.u32(bytes);
         body.u32(0);
-        body.u32(0);
+        body.u32(minreq);
         body.usec(0);
         self.send_reply(tag, body.into_vec());
     }
@@ -611,8 +627,7 @@ impl Conn {
             self.send_error(tag, wire::ERR_INVALID, "no volume");
             return;
         };
-        let by_index = index.is_some_and(|index| index == 0 || index == wire::INVALID_INDEX);
-        if !by_index || !(name.is_none() || name == Some("aas")) {
+        if !is_our_sink(index, name) {
             self.send_error(tag, wire::ERR_NOENTITY, "no such sink");
             return;
         }
@@ -631,8 +646,7 @@ impl Conn {
             self.send_error(tag, wire::ERR_INVALID, "no mute flag");
             return;
         };
-        let by_index = index.is_some_and(|index| index == 0 || index == wire::INVALID_INDEX);
-        if !by_index || !(name.is_none() || name == Some("aas")) {
+        if !is_our_sink(index, name) {
             self.send_error(tag, wire::ERR_NOENTITY, "no such sink");
             return;
         }
@@ -662,19 +676,8 @@ impl Conn {
             self.send_error(tag, wire::ERR_INVALID, "no volume");
             return;
         };
-        let Some(position) = self.streams.iter().position(|stream| stream.index == index) else {
-            self.send_error(tag, wire::ERR_NOENTITY, "no such stream");
-            return;
-        };
-        let client = self.streams[position].client;
-        let muted = self.streams[position].mute;
         let db_millis = volume::db_millis(&cvolume);
-        for stream in self.streams.iter_mut().filter(|stream| stream.client == client) {
-            let _ = stream.set_volume(db_millis, muted);
-            let entry = stream.entry();
-            self.registry.update_sink_input(entry);
-        }
-        self.send_reply(tag, Vec::new());
+        self.change_stream(tag, Remote::Volume { stream: index, db_millis });
     }
 
     fn set_sink_input_mute(&mut self, reader: &mut Reader, tag: u32) {
@@ -686,28 +689,78 @@ impl Conn {
             self.send_error(tag, wire::ERR_INVALID, "no mute flag");
             return;
         };
-        let Some(position) = self.streams.iter().position(|stream| stream.index == index) else {
-            self.send_error(tag, wire::ERR_NOENTITY, "no such stream");
-            return;
+        self.change_stream(tag, Remote::Mute { stream: index, muted });
+    }
+
+    /// Applies a stream change here if this connection owns the stream,
+    /// and otherwise hands it to the connection that does, as `pactl` or a
+    /// mixer changes another program's stream.
+    fn change_stream(&mut self, tag: u32, change: Remote) {
+        let index = match change {
+            Remote::Volume { stream, .. } | Remote::Mute { stream, .. } => stream,
         };
-        let client = self.streams[position].client;
+        if self.apply(change) {
+            self.send_reply(tag, Vec::new());
+            return;
+        }
+        let delivered = self
+            .registry
+            .sink_input(index)
+            .is_some_and(|input| self.registry.send_remote(input.client, change));
+        if delivered {
+            self.send_reply(tag, Vec::new());
+        } else {
+            self.send_error(tag, wire::ERR_NOENTITY, "no such stream");
+        }
+    }
+
+    /// Applies a stream change to every stream of the same client, since
+    /// they share one gain. False if this connection has no such stream.
+    fn apply(&mut self, change: Remote) -> bool {
+        let index = match change {
+            Remote::Volume { stream, .. } | Remote::Mute { stream, .. } => stream,
+        };
+        let Some(stream) = self.streams.iter().find(|stream| stream.index == index) else {
+            return false;
+        };
+        let (client, db_millis, muted) = match change {
+            Remote::Volume { db_millis, .. } => (stream.client, db_millis, stream.mute),
+            Remote::Mute { muted, .. } => (stream.client, stream.db_millis, muted),
+        };
         for stream in self.streams.iter_mut().filter(|stream| stream.client == client) {
-            let _ = stream.set_mute(muted);
+            let _ = stream.set_volume(db_millis, muted);
             let entry = stream.entry();
             self.registry.update_sink_input(entry);
         }
-        self.send_reply(tag, Vec::new());
+        true
+    }
+
+    /// How long the next read may wait: short while a stream plays, so
+    /// its ring is refilled in time, and long otherwise.
+    fn tick_interval(&self) -> Duration {
+        self.streams
+            .iter()
+            .filter(|stream| !stream.corked)
+            .map(|stream| (stream.capacity_duration() / 8).clamp(MIN_TICK, MAX_TICK))
+            .min()
+            .unwrap_or(IDLE_TICK)
     }
 
     fn set_default_sink(&mut self, reader: &mut Reader, tag: u32) {
         match reader.string() {
-            Some("aas") | Some("@NONE@") => self.send_reply(tag, Vec::new()),
+            Some(name) if name == "@NONE@" || is_our_sink_name(name) => {
+                self.send_reply(tag, Vec::new())
+            }
             Some(_) => self.send_error(tag, wire::ERR_NOENTITY, "no such sink"),
             None => self.send_error(tag, wire::ERR_INVALID, "no sink name"),
         }
     }
 
     fn tick(&mut self) -> io::Result<()> {
+        let remote: Vec<Remote> = self.inbox.try_iter().collect();
+        for change in remote {
+            self.apply(change);
+        }
         let events: Vec<Event> = self.events.try_iter().collect();
         for event in events {
             if self.subscribed & (1 << event.facility) != 0 {
@@ -791,6 +844,21 @@ impl Conn {
             }
         }
         Ok(())
+    }
+}
+
+/// Whether a sink name is the one sink, under its own name or the alias
+/// PulseAudio clients use for the default sink.
+fn is_our_sink_name(name: &str) -> bool {
+    name == "aas" || name == "@DEFAULT_SINK@"
+}
+
+/// Whether an index and name pick the one sink. A valid index decides
+/// alone; otherwise the name does, and no name means the default sink.
+fn is_our_sink(index: Option<u32>, name: Option<&str>) -> bool {
+    match index {
+        Some(index) if index != wire::INVALID_INDEX => index == 0,
+        _ => name.is_none_or(is_our_sink_name),
     }
 }
 

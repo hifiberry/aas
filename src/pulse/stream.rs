@@ -11,8 +11,12 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The largest request this endpoint makes, so a large buffer is filled
-/// over several rounds and a small one is not overrun.
+/// over several rounds.
 const REQUEST_CAP: u32 = 65_536;
+
+/// The smallest request, as a share of the ring: a quarter, so a client
+/// is not asked for a few frames at every tick.
+const MINREQ_DIVISOR: u32 = 4;
 
 pub struct CreateError {
     pub code: u32,
@@ -60,7 +64,15 @@ pub struct Stream {
     started: bool,
     write_index: u64,
     underruns: u64,
-    pending: Option<u32>,
+    /// Bytes requested from the client and not yet received. A request
+    /// never asks for more than the ring's free room minus these, so what
+    /// the client may write always fits.
+    outstanding: u64,
+    /// The smallest request, in bytes.
+    minreq: u32,
+    /// Whether a write past the request was logged, so a client that
+    /// keeps doing it logs once.
+    overrun_logged: bool,
     drain_tag: Option<u32>,
 }
 
@@ -197,6 +209,7 @@ impl Stream {
             .map(|(_, value)| value.clone())
             .unwrap_or_else(|| format!("stream {index}"));
         let missing = request_length(capacity_bytes, frame_bytes as u32);
+        let minreq = minreq_bytes(capacity, frame_bytes as u32);
         let stream = Stream {
             index,
             client: client_index,
@@ -212,7 +225,9 @@ impl Stream {
             started: !corked,
             write_index: 0,
             underruns: 0,
-            pending: Some(missing),
+            outstanding: u64::from(missing),
+            minreq,
+            overrun_logged: false,
             drain_tag: None,
         };
         let mut reply = crate::pulse::tagstruct::Builder::new();
@@ -222,7 +237,7 @@ impl Stream {
         reply.u32(capacity_bytes);
         reply.u32(capacity_bytes);
         reply.u32(0);
-        reply.u32(0);
+        reply.u32(minreq);
         reply.sample_spec(spec);
         reply.channel_map(&map);
         reply.u32(0);
@@ -236,22 +251,29 @@ impl Stream {
         })
     }
 
-    /// The request that should go out now, if the ring has room.
+    /// The request that should go out now: the ring's free room minus
+    /// what was asked for already, once that is at least `minreq`.
     pub fn request(&mut self) -> Option<Vec<u8>> {
-        if self.pending.is_some() || self.corked {
+        if self.corked {
             return None;
         }
-        let room = self.daemon.free_frames().ok()? * self.frame_bytes;
-        let length = request_length(room as u32, self.frame_bytes as u32);
+        let room = (self.daemon.free_frames().ok()? * self.frame_bytes) as u64;
+        let unasked = room.saturating_sub(self.outstanding);
+        if unasked < u64::from(self.minreq) {
+            return None;
+        }
+        let unasked = unasked.min(u64::from(REQUEST_CAP)) as u32;
+        let length = request_length(unasked, self.frame_bytes as u32);
         if length == 0 {
             return None;
         }
-        self.pending = Some(length);
+        self.outstanding += u64::from(length);
         Some(wire::request(self.index, length))
     }
 
     /// Writes a memblock. A misaligned one is dropped.
     pub fn write(&mut self, data: &[u8]) {
+        self.outstanding = self.outstanding.saturating_sub(data.len() as u64);
         if data.len() % self.frame_bytes != 0 {
             return;
         }
@@ -260,8 +282,23 @@ impl Stream {
         }
         if let Ok(frames) = self.daemon.write(data) {
             self.write_index += (frames * self.frame_bytes) as u64;
+            if frames * self.frame_bytes < data.len() && !self.overrun_logged {
+                self.overrun_logged = true;
+                eprintln!("aas: pulse: stream {} wrote past its request", self.index);
+            }
         }
-        self.pending = None;
+    }
+
+    /// The smallest request, in bytes, as the buffer attributes report it.
+    pub fn minreq_bytes(&self) -> u32 {
+        self.minreq
+    }
+
+    /// How long the ring plays when full, so the connection checks for room
+    /// often enough.
+    pub fn capacity_duration(&self) -> std::time::Duration {
+        let frames = self.daemon.capacity_frames().unwrap_or(0) as u64;
+        std::time::Duration::from_micros(frames * 1_000_000 / u64::from(self.rate.max(1)))
     }
 
     pub fn cork(&mut self, corked: bool) -> io::Result<()> {
@@ -420,6 +457,10 @@ impl Stream {
     pub fn release(&mut self) {
         self.daemon.release();
     }
+}
+
+fn minreq_bytes(capacity_frames: u32, frame_bytes: u32) -> u32 {
+    (capacity_frames / MINREQ_DIVISOR).max(1) * frame_bytes
 }
 
 fn request_length(room: u32, frame_bytes: u32) -> u32 {

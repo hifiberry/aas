@@ -27,9 +27,19 @@ pub struct SinkInput {
     pub mute: bool,
 }
 
+/// A change to a stream that another connection asked for. Only the
+/// connection that owns the stream holds its daemon client, so it applies
+/// the change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Remote {
+    Volume { stream: u32, db_millis: i32 },
+    Mute { stream: u32, muted: bool },
+}
+
 /// Every connection's client and stream, and everyone waiting for events.
 pub struct Registry {
     clients: Mutex<BTreeMap<u32, String>>,
+    inboxes: Mutex<BTreeMap<u32, Sender<Remote>>>,
     sink_inputs: Mutex<BTreeMap<u32, SinkInput>>,
     sink_mute: Mutex<Option<u8>>,
     next_stream: AtomicU32,
@@ -40,6 +50,7 @@ impl Default for Registry {
     fn default() -> Self {
         Registry {
             clients: Mutex::new(BTreeMap::new()),
+            inboxes: Mutex::new(BTreeMap::new()),
             sink_inputs: Mutex::new(BTreeMap::new()),
             sink_mute: Mutex::new(None),
             next_stream: AtomicU32::new(1),
@@ -71,7 +82,26 @@ impl Registry {
         });
     }
 
+    /// The inbox of the connection whose client is `index`, for changes
+    /// other connections ask for.
+    pub fn inbox(&self, index: u32) -> Receiver<Remote> {
+        let (sender, receiver) = channel();
+        self.inboxes.lock().unwrap().insert(index, sender);
+        receiver
+    }
+
+    /// Hands a change to the connection whose client is `client`. False if
+    /// that connection is gone.
+    pub fn send_remote(&self, client: u32, remote: Remote) -> bool {
+        self.inboxes
+            .lock()
+            .unwrap()
+            .get(&client)
+            .is_some_and(|sender| sender.send(remote).is_ok())
+    }
+
     pub fn remove_client(&self, index: u32) {
+        self.inboxes.lock().unwrap().remove(&index);
         if self.clients.lock().unwrap().remove(&index).is_some() {
             self.notify(Event {
                 facility: wire::EVENT_CLIENT,

@@ -619,3 +619,174 @@ fn a_volume_race_leaves_the_last_value_and_no_deadlock() {
     }
     assert_eq!(client.sink_state().0, 39);
 }
+
+impl RawPulse {
+    /// The next packet, or None if none comes within `wait`.
+    fn try_recv(&mut self, wait: Duration) -> Option<(u32, u32, Vec<u8>)> {
+        self.stream.set_read_timeout(Some(wait)).unwrap();
+        let mut head = [0u8; 20];
+        let got = self.stream.read_exact(&mut head);
+        self.stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        got.ok()?;
+        let length = u32::from_be_bytes(head[..4].try_into().unwrap()) as usize;
+        let mut payload = vec![0u8; length];
+        self.stream.read_exact(&mut payload).unwrap();
+        let mut reader = Reader::new(&payload);
+        let command = reader.u32().unwrap();
+        let tag = reader.u32().unwrap();
+        Some((command, tag, payload[reader.position()..].to_vec()))
+    }
+}
+
+fn request_length(body: &[u8]) -> usize {
+    let mut reader = Reader::new(body);
+    let _stream = reader.u32();
+    reader.u32().expect("a request length") as usize
+}
+
+#[test]
+fn a_client_that_answers_every_request_never_runs_dry() {
+    let daemon = Daemon::start();
+    let mut client = RawPulse::connect(&daemon.pulse_socket());
+    client.auth();
+    client.set_name("tone");
+    let (stream, missing, _) = client.create_stream(48_000, wire::FORMAT_S16LE, 2, 200);
+    client.send_memblock(stream, &vec![0u8; missing]);
+    // The stream starts before its first write, so an underflow from then
+    // may still arrive; count only from a moment after the ring was full.
+    let start = std::time::Instant::now();
+    let settled = Duration::from_millis(50);
+    let mut underflows = 0;
+    while start.elapsed() < Duration::from_millis(1200) {
+        match client.try_recv(Duration::from_millis(5)) {
+            Some((command, _, body)) if command == wire::REQUEST => {
+                client.send_memblock(stream, &vec![0u8; request_length(&body)]);
+            }
+            Some((command, _, _)) if command == wire::UNDERFLOW && start.elapsed() > settled => {
+                underflows += 1;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(underflows, 0, "the 200 ms ring ran dry");
+}
+
+#[test]
+fn small_writes_never_overfill_the_ring() {
+    let daemon = Daemon::start();
+    let mut client = RawPulse::connect(&daemon.pulse_socket());
+    client.auth();
+    client.set_name("tone");
+    let (stream, missing, _) = client.create_stream(48_000, wire::FORMAT_S16LE, 2, 200);
+    // A client that writes what it was asked for, in 4 KiB pieces, and
+    // adds every request to what it owes, as libpulse does.
+    let piece = 4096;
+    let mut owed = missing;
+    let mut sent = 0usize;
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_millis(300) {
+        if owed >= piece {
+            client.send_memblock(stream, &vec![0u8; piece]);
+            owed -= piece;
+            sent += piece;
+        }
+        while let Some((command, _, body)) = client.try_recv(Duration::from_millis(1)) {
+            if command == wire::REQUEST {
+                owed += request_length(&body);
+            }
+        }
+    }
+    let (_, write_index, _) = client.latency(stream);
+    assert_eq!(write_index as usize, sent, "every byte asked for is kept");
+}
+
+#[test]
+fn the_default_sink_alias_names_the_sink() {
+    let daemon = Daemon::start();
+    let mut client = RawPulse::connect(&daemon.pulse_socket());
+    client.auth();
+    client.set_name("pactl");
+    let mut body = Builder::new();
+    body.u32(u32::MAX);
+    body.string("@DEFAULT_SINK@");
+    body.cvolume(&[wire::VOLUME_NORM * 2 / 5; 2]);
+    let (command, _, _) = client.command(wire::SET_SINK_VOLUME, &body.into_vec());
+    assert_eq!(command, wire::REPLY);
+    assert_eq!(client.sink_state(), (40, false));
+    let mut body = Builder::new();
+    body.u32(u32::MAX);
+    body.string("@DEFAULT_SINK@");
+    let (command, _, _) = client.command(wire::GET_SINK_INFO, &body.into_vec());
+    assert_eq!(command, wire::REPLY);
+    let mut body = Builder::new();
+    body.string("@DEFAULT_SINK@");
+    let (command, _, _) = client.command(wire::LOOKUP_SINK, &body.into_vec());
+    assert_eq!(command, wire::REPLY);
+    let mut body = Builder::new();
+    body.u32(u32::MAX);
+    body.string("elsewhere");
+    let (command, _, _) = client.command(wire::GET_SINK_INFO, &body.into_vec());
+    assert_eq!(command, wire::ERROR);
+}
+
+#[test]
+fn another_connection_sets_a_streams_volume_and_mute() {
+    let daemon = Daemon::start();
+    let mut player = RawPulse::connect(&daemon.pulse_socket());
+    player.auth();
+    player.set_name("player");
+    let (stream, _, _) = player.create_stream(48_000, wire::FORMAT_S16LE, 2, 200);
+    let mut pactl = RawPulse::connect(&daemon.pulse_socket());
+    pactl.auth();
+    pactl.set_name("pactl");
+    let mut body = Builder::new();
+    body.u32(stream);
+    body.cvolume(&[wire::VOLUME_NORM / 2; 2]);
+    let (command, _, _) = pactl.command(wire::SET_SINK_INPUT_VOLUME, &body.into_vec());
+    assert_eq!(command, wire::REPLY);
+    let mut body = Builder::new();
+    body.u32(stream);
+    body.boolean(true);
+    let (command, _, _) = pactl.command(wire::SET_SINK_INPUT_MUTE, &body.into_vec());
+    assert_eq!(command, wire::REPLY);
+    // The owning connection applies both on its next tick.
+    let start = std::time::Instant::now();
+    loop {
+        let mut body = Builder::new();
+        body.u32(stream);
+        let (command, _, reply) = pactl.command(wire::GET_SINK_INPUT_INFO, &body.into_vec());
+        assert_eq!(command, wire::REPLY);
+        let mut reader = Reader::new(&reply);
+        for _ in 0..2 {
+            let _ = reader.u32();
+        }
+        let _ = reader.string();
+        for _ in 0..3 {
+            let _ = reader.u32();
+        }
+        let _ = reader.sample_spec();
+        let _ = reader.channel_map();
+        let cvolume = reader.cvolume().expect("a volume");
+        let _ = reader.usec();
+        let _ = reader.usec();
+        let _ = reader.string();
+        let _ = reader.string();
+        let muted = reader.boolean().expect("a mute flag");
+        let db = aas::pulse::volume::db_millis(&cvolume);
+        if (-6100..=-5900).contains(&db) && muted {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "the stream is at {db} millidB, muted {muted}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let mut body = Builder::new();
+    body.u32(9999);
+    body.cvolume(&[wire::VOLUME_NORM; 2]);
+    let (command, _, _) = pactl.command(wire::SET_SINK_INPUT_VOLUME, &body.into_vec());
+    assert_eq!(command, wire::ERROR);
+}
