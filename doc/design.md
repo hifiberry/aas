@@ -1450,7 +1450,10 @@ All of this is *(call)*. Paths are as the daemon sees them; nginx puts
   the buses, and per output its matrix, its volume, its `mix` and `output`
   chains in order, the master's delay line and the card. Each node gives its
   rate, channels, format and latency; a plugin gives its id, its time per
-  cycle and whether the chain converts its format for it. JSON by default,
+  cycle and whether the chain converts its format for it, and carries
+  `enabled`. A plugin's `channels` is the count it gives. A card's `format`
+  is the processing format it is fed: the control thread does not know the
+  card's own sample format. JSON by default,
   Graphviz DOT with `?format=dot`, as `text/vnd.graphviz`.
 - **Plugin ids.** A plugin is `{output}/{place}/{index}`: the output's number
   as in part 1, the place `analog`, `mix` or `output`, and its position in
@@ -1491,7 +1494,9 @@ All of this is *(call)*. Paths are as the daemon sees them; nginx puts
   disabled plugin's latency counts as 0.
 - **`GET` and `PATCH /settings`.** `bit_perfect`, `latency_ms` and
   `default_rate`, with `format` and `resampling` given but not changeable,
-  since the format is the engine's type. A change lasts until the next
+  since the format is the engine's type: sending one back with the value it
+  has is accepted, so a `GET` answer can be edited and sent whole, and any
+  other value is 422 `"<key> changes only in the config"`. A change lasts until the next
   restart: it is not stored, and the config is never rewritten.
   - `bit_perfect` goes to the engine as a new command, with no reopen.
     `forced` is refused with 422 while a chain changes the channel count, as
@@ -1566,8 +1571,10 @@ All of this is *(call)*. Paths are as the daemon sees them; nginx puts
     send the matching change and print the answer.
   - `events` prints each event as a line of JSON until stopped. `levels`
     prints each frame as a line of dBFS per meter and channel.
-  - An error answer prints its message on stderr and exits 1; a usage error
-    exits 2.
+  - An error answer prints its message on stderr and exits 1, as does a
+    `matrix put` file that cannot be read, a config that does not load and
+    an `api_port` of 0; only a usage error exits 2, with the usage text.
+    A closed stdout (`aasctl events | head`) ends the command with 0.
 
 ## Testing
 

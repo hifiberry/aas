@@ -527,3 +527,30 @@ them was seen to break playback. Search for the name given.
   a real writer thread and allows at most 5 refused pushes over about
   0.8 s, so it can fail on a loaded host. First step: run it on a test clock,
   as the writer's other tests do, or widen the bound with a reason.
+
+## Decide how a plugin that turns non-neutral leaves the bit-perfect copy path
+
+Found in the final review of part 2 of the API. While every plugin is neutral
+and the stream is bit-perfect, the engine copies the stream through. When a
+plugin then turns non-neutral, the copy path ends with no crossfade: a plugin
+whose first processed block differs from its input steps at that block. The
+balance plugin is handled, since it keeps its ramp across a reset; a library
+plugin that clears its ramp in `reset` would click.
+
+Decision for the owner, one of: a short crossfade on leaving the copy path in
+the engine, or a rule in the plugin ABI docs (`crates/aas-plugin/src/lib.rs`)
+that `reset` keeps a ramp in progress, and what a plugin must do to have none.
+First step: play a tone through a library plugin that clears its ramp in
+`reset`, turn it non-neutral with `aasctl plugin ID set ...`, and listen.
+
+## Decide the staleness limit of the level meters
+
+`/levels` calls a meter stale after a fixed 200 ms (`STALE_NS` in
+`src/levels.rs`). A period can reach 16384 frames, 341 ms at 48 kHz, so with
+`latency_ms` above about 683 ms a live meter reads silence for part of each
+cycle. Nothing is broken at the default latency.
+
+Decision for the owner: keep the fixed rule and document the limit, or use
+`max(200 ms, 2 periods)`, which needs the period where `STALE_NS` is read.
+First step: read where `STALE_NS` is used in `src/levels.rs` and see whether
+the period is at hand there.

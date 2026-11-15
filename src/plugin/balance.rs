@@ -225,8 +225,8 @@ mod tests {
     use super::*;
     use assert_no_alloc::assert_no_alloc;
 
-    /// A balance at `b`, settled as a built chain's are, so it applies at
-    /// once and no ramp runs.
+    /// A balance at `b` with its ramp already run, as a plugin of a chain
+    /// that has just been built, so `b` applies at once.
     fn with(b: f64) -> Balance {
         let mut p = Balance::new(48_000);
         p.set_param(0, b);

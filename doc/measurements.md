@@ -2293,7 +2293,7 @@ Each call was on a new connection, so 600 of each.
 | Pi 3, without calls | 0 | 0 | 5.43 / 10.67 ms | 0.214 ms | | | |
 | Pi 3, with calls | 0 | 0 | 5.54 / 10.67 ms | 0.200 ms | 1200, 0 | 2.8 / 3.3 / 14.4 ms | 3.1 / 3.6 / 3.7 ms |
 
-Against part 1's runs with calls, the worst gap is the same within 0.1 ms on
+Against part 1's runs with calls, the worst gap is the same within 0.11 ms on
 both boards (CM5 1.50 ms then, 1.39 ms now; Pi 3 5.53 and 5.54 ms), and the
 worst cycle is lower (CM5 0.053 then, 0.016 ms now; Pi 3 0.278 and 0.200 ms).
 Part 1's calls started a volume or matrix fade ten times a second, these a
