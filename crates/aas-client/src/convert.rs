@@ -8,6 +8,9 @@ pub enum ClientFormat {
     S24,
     /// 24 bits in 3 bytes.
     S24Packed,
+    /// 24 significant bits in the low end of a 4 byte container, as
+    /// PulseAudio's S24_32LE is.
+    S24In32,
     S32,
     Float,
 }
@@ -18,7 +21,7 @@ impl ClientFormat {
         match self {
             ClientFormat::S16 => 2,
             ClientFormat::S24Packed => 3,
-            ClientFormat::S24 | ClientFormat::S32 | ClientFormat::Float => 4,
+            ClientFormat::S24 | ClientFormat::S24In32 | ClientFormat::S32 | ClientFormat::Float => 4,
         }
     }
 }
@@ -29,6 +32,7 @@ fn sample(format: ClientFormat, b: &[u8]) -> i32 {
         // The shift drops the container's top byte and sign extends bit 23.
         ClientFormat::S24 => i32::from_le_bytes([b[0], b[1], b[2], b[3]]) << 8,
         ClientFormat::S24Packed => i32::from_le_bytes([0, b[0], b[1], b[2]]),
+        ClientFormat::S24In32 => i32::from_le_bytes([b[0], b[1], b[2], 0]) << 8,
         ClientFormat::S32 => i32::from_le_bytes([b[0], b[1], b[2], b[3]]),
         // Float to int casts saturate and map NaN to 0.
         ClientFormat::Float => (f32::from_le_bytes([b[0], b[1], b[2], b[3]]) * 2147483648.0) as i32,
@@ -120,8 +124,16 @@ mod tests {
     }
 
     #[test]
-    fn mono_is_copied_to_both_channels() {
-        let input = [0x34, 0x12, 0x00, 0x80];
+    fn s24_in_32_reads_the_low_24_bits() {
+        let input = [0x00, 0x34, 0x12, 0x00, 0x00, 0x00, 0x80, 0x00];
+        assert_eq!(
+            one(ClientFormat::S24In32, 2, &input),
+            [[0x1234_0000, i32::MIN]]
+        );
+    }
+
+    #[test]
+    fn mono_is_copied_to_both_channels() {        let input = [0x34, 0x12, 0x00, 0x80];
         assert_eq!(
             one(ClientFormat::S16, 1, &input),
             [[0x1234_0000, 0x1234_0000], [i32::MIN, i32::MIN]]

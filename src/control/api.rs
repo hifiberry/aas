@@ -3,6 +3,7 @@
 //! holds; nothing waits on the audio thread.
 
 use super::{ConnId, Control, Stream, check_alignment, plugins};
+use aas_client::proto::Reply;
 use crate::api::{
     self, ApiCall, ApiError, ApiEvent, Call, ClientView, InputPatch, InputView, MatrixPut,
     OutputPatch, OutputRoutes, OutputState, OutputView, RouteJson, StateView,
@@ -443,7 +444,7 @@ impl Control {
 
     /// The rate the master's cycle runs at, on its card or parked on the
     /// timer. None while it is off.
-    fn cycle_rate(&self) -> Option<u32> {
+    pub(super) fn cycle_rate(&self) -> Option<u32> {
         self.output.or(self.parked).map(|(rate, _)| rate)
     }
 
@@ -840,6 +841,20 @@ impl Control {
     /// A name is a process name, which the kernel cuts to 15 bytes, so a
     /// longer one could never match a client.
     fn patch_client(&mut self, name: String, patch: InputPatch, now: Instant) -> api::Answer {
+        self.set_client_input(name, patch, now)
+            .map(|view| api::answer(&view))
+            .unwrap_or_else(Err)
+    }
+
+    /// The body of `patch_client`, shared with the client protocol's
+    /// `SetClientVolume`. It sends a `ClientVolumeChanged` notice to every
+    /// connection of that client, from a volume set here or by the API.
+    pub(super) fn set_client_input(
+        &mut self,
+        name: String,
+        patch: InputPatch,
+        now: Instant,
+    ) -> Result<InputView, ApiError> {
         if name.len() > MAX_NAME {
             let message = format!("a process name has at most {MAX_NAME} bytes");
             return Err(ApiError::unprocessable(message));
@@ -848,7 +863,7 @@ impl Control {
         let stored = self.state.clients.get(&name);
         let input = patched_input(stored.unwrap_or(&UNITY), &patch);
         if input == *stored.unwrap_or(&UNITY) {
-            return api::answer(&self.client_view(&name));
+            return Ok(self.client_view(&name));
         }
         if stored.is_none() && self.state.clients.len() >= MAX_CLIENTS {
             return Err(ApiError::unprocessable(format!(
@@ -859,7 +874,7 @@ impl Control {
         if input == UNITY {
             self.state.clients.remove(&name);
         } else {
-            self.state.clients.insert(name.clone(), input);
+            self.state.clients.insert(name.clone(), input.clone());
         }
         let streams = self.conns.values().filter(|c| c.name == name);
         let batch = streams
@@ -867,10 +882,29 @@ impl Control {
             .map(|s| Command::SetSourceGain(s.id, gain))
             .collect();
         self.send(batch);
+        let notice = Reply::ClientVolumeChanged {
+            db_millis: (input.volume_db * 1000.0).round() as i32,
+            muted: input.muted,
+        };
+        let conns: Vec<ConnId> = self
+            .conns
+            .iter()
+            .filter(|(_, c)| c.name == name)
+            .map(|(&conn, _)| conn)
+            .collect();
+        for conn in conns {
+            self.notices.push((conn, notice));
+        }
         let view = self.client_view(&name);
         self.publish(view.event());
         self.save_later(now);
-        api::answer(&view)
+        Ok(view)
+    }
+
+    /// A client's gain, as the state file has it. A client without one
+    /// plays at 0 dB.
+    pub(super) fn client_input(&self, name: &str) -> StoredInput {
+        self.state.clients.get(name).cloned().unwrap_or(UNITY)
     }
 
     /// The analog input, if there is one, and every client known by name:
@@ -2950,5 +2984,122 @@ mod tests {
             text,
             r#"{"type":"settings","bit_perfect":"auto","latency_ms":5.0,"default_rate":48000}"#
         );
+    }
+
+    #[test]
+    fn identify_names_a_connection_from_its_pid() {
+        let (mut control, _engine, _logs, now) =
+            started_with(&Config::default(), Vec::new());
+        control.connected_as(7, "aas".into(), "aas (7)".into());
+        let hello = Request::Hello {
+            version: proto::VERSION,
+        };
+        assert_eq!(
+            control.request(7, Some(hello), now).reply,
+            Some(Reply::Hello {
+                version: proto::VERSION
+            })
+        );
+        let answer = control.request(
+            7,
+            Some(Request::Identify {
+                pid: std::process::id(),
+            }),
+            now,
+        );
+        assert_eq!(answer.reply, Some(Reply::Ok));
+        let comm = std::fs::read_to_string("/proc/self/comm")
+            .unwrap()
+            .trim_end()
+            .to_string();
+        assert_eq!(control.conns[&7].name, comm);
+        // Naming a connection that already plays is refused.
+        control.connected_as(8, "mpd".into(), "mpd (8)".into());
+        control.request(
+            8,
+            Some(Request::Hello {
+                version: proto::VERSION,
+            }),
+            now,
+        );
+        play_as(&mut control, 8, "mpd", now);
+        let answer = control.request(
+            8,
+            Some(Request::Identify {
+                pid: std::process::id(),
+            }),
+            now,
+        );
+        assert_eq!(answer.reply, Some(Reply::Error { code: libc::EINVAL as u32 }));
+    }
+
+    #[test]
+    fn a_client_volume_change_is_sent_to_its_connection() {
+        let (mut control, _engine, _logs, now) =
+            started_with(&Config::default(), Vec::new());
+        control.connected_as(3, "mpv".into(), "mpv (3)".into());
+        control.request(
+            3,
+            Some(Request::Hello {
+                version: proto::VERSION,
+            }),
+            now,
+        );
+        let answer = control.request(
+            3,
+            Some(Request::SetClientVolume {
+                db_millis: -6000,
+                muted: false,
+            }),
+            now,
+        );
+        assert_eq!(answer.reply, Some(Reply::Ok));
+        let notice = Reply::ClientVolumeChanged {
+            db_millis: -6000,
+            muted: false,
+        };
+        assert!(control.take_notices().iter().any(|(c, r)| *c == 3 && *r == notice));
+        let answer = control.request(3, Some(Request::GetClientVolume), now);
+        assert_eq!(
+            answer.reply,
+            Some(Reply::ClientVolume {
+                db_millis: -6000,
+                muted: false
+            })
+        );
+        // Out of range is refused, and the stored value is unchanged.
+        let answer = control.request(
+            3,
+            Some(Request::SetClientVolume {
+                db_millis: -60001,
+                muted: false,
+            }),
+            now,
+        );
+        assert_eq!(answer.reply, Some(Reply::Error { code: libc::EINVAL as u32 }));
+        let answer = control.request(3, Some(Request::GetClientVolume), now);
+        assert_eq!(
+            answer.reply,
+            Some(Reply::ClientVolume {
+                db_millis: -6000,
+                muted: false
+            })
+        );
+    }
+
+    #[test]
+    fn the_output_rate_is_reported() {
+        let (mut control, _engine, _logs, now) =
+            started_with(&Config::default(), Vec::new());
+        control.connected_as(4, "mpv".into(), "mpv (4)".into());
+        control.request(
+            4,
+            Some(Request::Hello {
+                version: proto::VERSION,
+            }),
+            now,
+        );
+        let answer = control.request(4, Some(Request::GetOutputRate), now);
+        assert!(matches!(answer.reply, Some(Reply::OutputRate { .. })));
     }
 }
