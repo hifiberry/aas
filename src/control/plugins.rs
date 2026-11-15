@@ -236,7 +236,7 @@ fn check(param: &Param, value: f64) -> Result<(), String> {
     let (min, max) = match &param.kind {
         ParamKind::Text => {
             return Err(format!(
-                "{name} is a text parameter, which changes only in the config"
+                "{name} is a text parameter; it changes only in the config"
             ));
         }
         ParamKind::Switch => (0.0, 1.0),
@@ -244,10 +244,10 @@ fn check(param: &Param, value: f64) -> Result<(), String> {
         ParamKind::Float | ParamKind::Integer => (param.min, param.max),
     };
     if !(value.is_finite() && (min..=max).contains(&value)) {
-        return Err(format!("{name} must be from {min} to {max}, not {value}"));
+        return Err(format!("{name} must be from {min} to {max}"));
     }
     if param.kind != ParamKind::Float && value.fract() != 0.0 {
-        return Err(format!("{name} takes a whole number, not {value}"));
+        return Err(format!("{name} must be a whole number"));
     }
     Ok(())
 }
@@ -678,11 +678,17 @@ mod tests {
         let (mut control, mut engine, now) = open(&config());
         for bad in [1.5, -1.01, f64::NAN, f64::INFINITY] {
             let answer = patch(&mut control, "1/output/0", values(&[("balance", bad)]), now);
-            assert_eq!(status(answer), 422, "{bad}");
+            let e = answer.unwrap_err();
+            assert_eq!(e.status, 422, "{bad}");
+            assert_eq!(e.message, "balance must be from -1 to 1", "{bad}");
         }
         // One bad value refuses the good ones with it.
         let both = values(&[("gain", -6.0), ("steps", 9.0)]);
-        assert_eq!(status(patch(&mut control, "1/mix/0", both, now)), 422);
+        let e = patch(&mut control, "1/mix/0", both, now).unwrap_err();
+        assert_eq!(
+            (e.status, e.message.as_str()),
+            (422, "steps must be from 0 to 8")
+        );
         assert!(engine.take(true).is_empty());
         let view = get(&mut control, "1/mix/0", now);
         assert_eq!(view["params"][0]["value"], json!(0.0));
@@ -702,7 +708,11 @@ mod tests {
     fn a_fraction_for_an_integer_is_422() {
         let (mut control, mut engine, now) = open(&config());
         let answer = patch(&mut control, "1/mix/0", values(&[("steps", 1.5)]), now);
-        assert_eq!(status(answer), 422);
+        let e = answer.unwrap_err();
+        assert_eq!(
+            (e.status, e.message.as_str()),
+            (422, "steps must be a whole number")
+        );
         assert!(engine.take(true).is_empty());
         assert!(patch(&mut control, "1/mix/0", values(&[("steps", 2.0)]), now).is_ok());
     }
@@ -711,7 +721,12 @@ mod tests {
     fn a_text_parameter_is_422() {
         let (mut control, mut engine, now) = open(&config());
         let answer = patch(&mut control, "1/mix/0", values(&[("file", 1.0)]), now);
-        assert_eq!(status(answer), 422);
+        let e = answer.unwrap_err();
+        assert_eq!(e.status, 422);
+        assert_eq!(
+            e.message,
+            "file is a text parameter; it changes only in the config"
+        );
         assert!(engine.take(true).is_empty());
     }
 
