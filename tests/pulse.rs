@@ -408,9 +408,9 @@ fn stream_volume_is_the_client_gain() {
         .find(|input| {
             input["volume_db"]
                 .as_f64()
-                .is_some_and(|db| (db + 6.02).abs() < 0.1)
+                .is_some_and(|db| (db + 18.06).abs() < 0.1)
         })
-        .expect("the stream's client at 50 percent");
+        .expect("the stream's client at 50 percent, -18 dB on PulseAudio's curve");
     assert_eq!(found["muted"], serde_json::json!(false));
 }
 
@@ -775,7 +775,7 @@ fn another_connection_sets_a_streams_volume_and_mute() {
         let _ = reader.string();
         let muted = reader.boolean().expect("a mute flag");
         let db = aas::pulse::volume::db_millis(&cvolume);
-        if (-6100..=-5900).contains(&db) && muted {
+        if (-18_100..=-18_000).contains(&db) && muted {
             break;
         }
         assert!(
@@ -949,4 +949,50 @@ fn a_stream_given_as_a_pcm_format_list_plays() {
     client.send_memblock(stream, &vec![0u8; 4096]);
     let (_, write_index, _) = client.latency(stream);
     assert_eq!(write_index, 4096);
+}
+
+#[test]
+fn a_stream_at_volume_zero_is_silent_and_says_so() {
+    let daemon = Daemon::start();
+    let mut client = RawPulse::connect(&daemon.pulse_socket());
+    client.auth();
+    client.set_name("quiet");
+    let (stream, _, _) = client.create_stream(48_000, wire::FORMAT_S16LE, 2, 200);
+    let read_back = |client: &mut RawPulse| {
+        let mut body = Builder::new();
+        body.u32(stream);
+        let (command, _, reply) = client.command(wire::GET_SINK_INPUT_INFO, &body.into_vec());
+        assert_eq!(command, wire::REPLY);
+        let mut r = Reader::new(&reply);
+        r.u32();
+        r.string();
+        r.u32();
+        r.u32();
+        r.u32();
+        r.sample_spec();
+        r.channel_map();
+        let cvolume = r.cvolume().unwrap();
+        r.usec();
+        r.usec();
+        r.string();
+        r.string();
+        (cvolume[0], r.boolean().unwrap())
+    };
+    let client_muted = || {
+        let (_, inputs) = daemon.get("/inputs");
+        inputs
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|input| input["id"] != "analog")
+            .any(|input| input["muted"] == serde_json::json!(true))
+    };
+    client.set_stream_volume(stream, 0);
+    // Silence is the client's mute in aas, and volume 0 without a mute in
+    // PulseAudio, as pactl shows it.
+    assert!(client_muted());
+    assert_eq!(read_back(&mut client), (0, false));
+    client.set_stream_volume(stream, 100);
+    assert!(!client_muted());
+    assert_eq!(read_back(&mut client), (wire::VOLUME_NORM, false));
 }

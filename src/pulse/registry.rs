@@ -24,6 +24,9 @@ pub struct SinkInput {
     pub format: u8,
     pub corked: bool,
     pub db_millis: i32,
+    /// Set to PulseAudio's silence, volume 0: muted in `aas`, reported as
+    /// volume 0 rather than as a mute.
+    pub silent: bool,
     pub mute: bool,
 }
 
@@ -32,7 +35,7 @@ pub struct SinkInput {
 /// the change.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Remote {
-    Volume { stream: u32, db_millis: i32 },
+    Volume { stream: u32, db_millis: i32, silent: bool },
     Mute { stream: u32, muted: bool },
 }
 

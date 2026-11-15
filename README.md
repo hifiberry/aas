@@ -558,7 +558,8 @@ started.
 Every playback stream is a client of the daemon, like an ALSA client: it is
 mixed, resampled, processed by the same plugins and counted by the same API.
 The client's process name is its name in the API, and its stream volume is the
-per-client gain (`-6 dB` is 50 percent of the linear volume). The sink volume
+per-client gain, on PulseAudio's curve: 50 percent is -18 dB, as `pactl`
+shows it, and volume 0 mutes the client. The sink volume
 is the output volume: `pactl set-sink-volume`, `GET /outputs/1` and `amixer`
 show the same number.
 

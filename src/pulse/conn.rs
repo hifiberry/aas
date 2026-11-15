@@ -676,8 +676,12 @@ impl Conn {
             self.send_error(tag, wire::ERR_INVALID, "no volume");
             return;
         };
-        let db_millis = volume::db_millis(&cvolume);
-        self.change_stream(tag, Remote::Volume { stream: index, db_millis });
+        let change = Remote::Volume {
+            stream: index,
+            db_millis: volume::db_millis(&cvolume),
+            silent: volume::is_silent(&cvolume),
+        };
+        self.change_stream(tag, change);
     }
 
     fn set_sink_input_mute(&mut self, reader: &mut Reader, tag: u32) {
@@ -723,12 +727,14 @@ impl Conn {
         let Some(stream) = self.streams.iter().find(|stream| stream.index == index) else {
             return false;
         };
-        let (client, db_millis, muted) = match change {
-            Remote::Volume { db_millis, .. } => (stream.client, db_millis, stream.mute),
-            Remote::Mute { muted, .. } => (stream.client, stream.db_millis, muted),
+        let (client, db_millis, silent, muted) = match change {
+            Remote::Volume {
+                db_millis, silent, ..
+            } => (stream.client, db_millis, silent, stream.mute),
+            Remote::Mute { muted, .. } => (stream.client, stream.db_millis, stream.silent, muted),
         };
         for stream in self.streams.iter_mut().filter(|stream| stream.client == client) {
-            let _ = stream.set_volume(db_millis, muted);
+            let _ = stream.set_volume(db_millis, silent, muted);
             let entry = stream.entry();
             self.registry.update_sink_input(entry);
         }

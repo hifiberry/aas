@@ -278,11 +278,20 @@ average back to a percent. `pactl`, `GET /outputs/1` and `amixer` therefore agre
 *(call)*. The percent is `aas`'s own curve, not PulseAudio's perceptual one, so
 the slider, the API and the card always show the same number.
 
-A stream's volume is its client's gain: PulseAudio's linear volume becomes dB
-(`20 log10`), clamped to the -60 dB floor of a client volume, and stored where
-`PATCH /inputs/clients/{name}` reads and writes it *(call)*. Because clients are
+A stream's volume is its client's gain, on PulseAudio's own software curve: the
+gain is the cube of the volume, so `dB = 60 log10(v / PA_VOLUME_NORM)` and 50
+percent is -18 dB. That is the meaning libpulse gives a volume
+(`pa_sw_volume_from_dB`) and what `pactl` prints, so a player that asks for -6 dB
+gets -6 dB *(owner's call)*. The gain is clamped to the -60 dB floor of a client
+volume, which is 10 percent; below that it stays at the floor. Volume 0,
+PulseAudio's silence, sets the client's mute bit while the stream still reports
+volume 0 and no mute; any other volume clears it. The gain is stored where
+`PATCH /inputs/clients/{name}` reads and writes it. Because clients are
 identified by process name, streams of the same process share one gain, as they
 already do for ALSA clients. Mute is the client's mute bit.
+
+The sink volume keeps `aas`'s percent instead, so the output shows one number
+everywhere *(owner's call)*.
 
 Bit-perfect is unchanged. A PulseAudio stream at 0 dB with the output at 100 can
 still be copied untouched when it is the only client at the output rate; any

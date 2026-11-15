@@ -88,7 +88,11 @@ pub fn sink_input_info(input: &SinkInput) -> Vec<u8> {
     });
     let map: &[u8] = if input.channels == 1 { &[0] } else { &[1, 2] };
     b.channel_map(map);
-    let cvolume = volume::cvolume_from_db(input.db_millis);
+    let cvolume = if input.silent {
+        [0; 2]
+    } else {
+        volume::cvolume_from_db(input.db_millis)
+    };
     b.cvolume(&cvolume[..usize::from(input.channels).min(2)]);
     b.usec(0);
     b.usec(0);

@@ -603,9 +603,6 @@ volume onto the output volume and the client gain. See "PulseAudio clients" in
   from the asking connection's first stream; `Identify` lets any member of
   group `audio` take another process's name and gain. A sink input reports
   0 for its buffer and sink latency in `pactl list sink-inputs`.
-- `pactl` shows a stream at 50% as -18 dB, PulseAudio's cubic curve, while
-  `aas` applies -6 dB, the linear mapping the design chose. Decide whether the
-  stream volume should follow PulseAudio's curve, as players expect.
 - A board measurement of `pulse_buffer_ms`: 200 ms works with `paplay`, `mpv`
   and a browser, but which players need more, and what latency they see, is
   not measured. First step: run `dist/test-pulse.sh` with the endpoint on a

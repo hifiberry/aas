@@ -59,6 +59,10 @@ pub struct Stream {
     pub frame_bytes: usize,
     pub corked: bool,
     pub db_millis: i32,
+    /// Set to PulseAudio's silence, volume 0. `aas` has no gain below
+    /// -60 dB, so silence is the client's mute bit, while the stream reports
+    /// volume 0 and its own mute flag apart.
+    pub silent: bool,
     pub mute: bool,
     daemon: Client,
     started: bool,
@@ -230,6 +234,7 @@ impl Stream {
             frame_bytes,
             corked,
             db_millis,
+            silent: false,
             mute: muted,
             daemon,
             started: !corked,
@@ -374,15 +379,16 @@ impl Stream {
             .saturating_mul(self.frame_bytes) as u32
     }
 
-    pub fn set_volume(&mut self, db_millis: i32, muted: bool) -> io::Result<()> {
-        self.daemon.set_client_volume(db_millis, muted)?;
+    pub fn set_volume(&mut self, db_millis: i32, silent: bool, muted: bool) -> io::Result<()> {
+        self.daemon.set_client_volume(db_millis, muted || silent)?;
         self.db_millis = db_millis;
+        self.silent = silent;
         self.mute = muted;
         Ok(())
     }
 
     pub fn set_mute(&mut self, muted: bool) -> io::Result<()> {
-        self.set_volume(self.db_millis, muted)
+        self.set_volume(self.db_millis, self.silent, muted)
     }
 
     pub fn entry(&self) -> SinkInput {
@@ -395,6 +401,7 @@ impl Stream {
             format: self.format,
             corked: self.corked,
             db_millis: self.db_millis,
+            silent: self.silent,
             mute: self.mute,
         }
     }
@@ -407,8 +414,14 @@ impl Stream {
         loop {
             match self.daemon.poll_notice() {
                 Ok(Some(aas_client::proto::Reply::ClientVolumeChanged { db_millis, muted })) => {
-                    self.db_millis = db_millis;
-                    self.mute = muted;
+                    // The echo of what this endpoint set changes nothing;
+                    // a change from elsewhere (the API, another stream of
+                    // the same process) replaces silence too.
+                    if (db_millis, muted) != (self.db_millis, self.mute || self.silent) {
+                        self.db_millis = db_millis;
+                        self.silent = false;
+                        self.mute = muted;
+                    }
                     volume_changed = true;
                 }
                 Ok(Some(_)) | Ok(None) => break,
