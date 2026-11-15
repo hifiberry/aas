@@ -473,6 +473,33 @@ that has a config key applies only while the config still says what it said
 when the value was stored, so an edit of the config always wins. The API never
 rewrites the config, and what `/settings` changes is not kept.
 
+### aasctl
+
+`aasctl` is the command line tool on top of the API, a second binary of this
+crate. It talks to `127.0.0.1` on port 2718, or `--port N`, or the `api_port` of
+the config given with `--config PATH`; the flag wins.
+
+```sh
+aasctl state                         # also metrics, outputs, inputs, matrix, plugins, settings
+aasctl graph --dot | dot -Tsvg > graph.svg
+aasctl output 1 volume 60
+aasctl output 2 volume-db -6
+aasctl output 2 idle zeros           # or: idle off 120
+aasctl analog volume-db -6           # or: analog mute, analog unmute
+aasctl client mpd mute               # or: client mpd volume-db -6
+aasctl plugin 1/mix/0 set gain_db=-3 # or: plugin 1/mix/0 disable
+aasctl settings latency_ms=5 bit_perfect=off
+aasctl matrix put matrix.json        # the body of PUT /matrix
+aasctl events                        # one JSON line per event, until stopped
+aasctl levels                        # one line per frame
+```
+
+A `GET` prints the answer as indented JSON, `graph --dot` as DOT, and a change
+prints the daemon's answer. `levels` prints each meter as `id:` followed by the
+RMS and peak of every channel in dBFS with one decimal, `-inf` below -60 and
+`CLIP` where the channel clipped. An error answer prints its message on stderr
+and exits 1, as does a daemon that cannot be reached; a usage error exits 2.
+
 ## Writing a plugin
 
 A plugin is a shared library built against `crates/aas-plugin`, which describes
