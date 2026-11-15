@@ -281,6 +281,13 @@ impl<'a> Reader<'a> {
         }
     }
 
+    pub fn format_info(&mut self) -> Option<(u8, Vec<(String, String)>)> {
+        self.expect(FORMAT_INFO)?;
+        let encoding = self.take(1)?[0];
+        let props = self.proplist()?;
+        Some((encoding, props))
+    }
+
     pub fn usec(&mut self) -> Option<u64> {
         self.expect(USEC)?;
         Some(u64::from_be_bytes(self.take(8)?.try_into().ok()?))

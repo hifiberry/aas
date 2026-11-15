@@ -88,6 +88,10 @@ impl Daemon {
             wait_for(|| daemon.path.exists()),
             "the socket never appeared"
         );
+        assert!(
+            wait_for(|| daemon.pulse_socket().exists()),
+            "the PulseAudio socket never appeared"
+        );
         daemon
     }
 

@@ -8,6 +8,7 @@ pub mod conn;
 pub mod objects;
 pub mod packet;
 pub mod registry;
+pub mod stream;
 pub mod tagstruct;
 pub mod wire;
 

@@ -89,7 +89,91 @@ impl RawPulse {
         let mut encoded = payload.into_vec();
         encoded.extend_from_slice(body);
         self.send(&encoded);
-        self.recv()
+        loop {
+            let reply = self.recv();
+            if reply.0 == wire::REPLY || reply.0 == wire::ERROR {
+                return reply;
+            }
+        }
+    }
+}
+
+
+impl RawPulse {
+    fn create_stream(&mut self, rate: u32, format: u8, channels: u8, tlength_ms: u32) -> (u32, u32) {
+        let frame = match format {
+            wire::FORMAT_S16LE => 2,
+            wire::FORMAT_S24LE => 3,
+            _ => 4,
+        } * u32::from(channels);
+        let mut body = Builder::new();
+        body.sample_spec(aas::pulse::tagstruct::SampleSpec {
+            format,
+            channels,
+            rate,
+        });
+        let map: &[u8] = if channels == 1 { &[0] } else { &[1, 2] };
+        body.channel_map(map);
+        body.u32(u32::MAX);
+        body.null_string();
+        body.u32(u32::MAX);
+        body.boolean(false);
+        body.u32(rate / 1000 * tlength_ms * frame);
+        body.u32(0);
+        body.u32(0);
+        body.u32(0);
+        body.cvolume(&[wire::VOLUME_NORM; 2]);
+        for _ in 0..7 {
+            body.boolean(false);
+        }
+        body.boolean(false);
+        body.boolean(false);
+        body.proplist(&[("media.name".to_string(), "a test stream".to_string())]);
+        for value in [true, false, false, false, false, false, false] {
+            body.boolean(value);
+        }
+        body.u8(0);
+        let (command, _, reply) = self.command(wire::CREATE_PLAYBACK_STREAM, &body.into_vec());
+        assert_eq!(command, wire::REPLY);
+        let mut reader = Reader::new(&reply);
+        let stream = reader.u32().expect("a stream index");
+        assert_eq!(reader.u32(), Some(stream), "a sink-input index");
+        assert!(reader.u32().unwrap() > 0, "the first request is not empty");
+        (stream, frame)
+    }
+
+    fn send_memblock(&mut self, stream: u32, data: &[u8]) {
+        let mut head = [0u8; 20];
+        head[..4].copy_from_slice(&(data.len() as u32).to_be_bytes());
+        head[4..8].copy_from_slice(&stream.to_be_bytes());
+        self.stream.write_all(&head).unwrap();
+        self.stream.write_all(data).unwrap();
+    }
+
+    fn request(&mut self) -> (u32, usize) {
+        let (command, _, body) = self.recv();
+        assert_eq!(command, wire::REQUEST);
+        let mut reader = Reader::new(&body);
+        let stream = reader.u32().expect("a stream");
+        let length = reader.u32().expect("a request length") as usize;
+        (stream, length)
+    }
+
+    fn latency(&mut self, stream: u32) -> (u64, i64, i64) {
+        let mut body = Builder::new();
+        body.u32(stream);
+        body.timeval(0, 0);
+        let (command, _, reply) = self.command(wire::GET_PLAYBACK_LATENCY, &body.into_vec());
+        assert_eq!(command, wire::REPLY);
+        let mut reader = Reader::new(&reply);
+        let sink_usec = reader.usec().expect("a sink latency");
+        let _source = reader.usec();
+        let _playing = reader.boolean();
+        let _request = reader.timeval();
+        let _now = reader.timeval();
+        let write = reader.i64().expect("a write index");
+        let read = reader.i64().expect("a read index");
+        (sink_usec, write, read)
     }
 }
 
@@ -196,4 +280,52 @@ fn subscribe_answers_then_sends_events() {
     let event = reader.u32().expect("an event type");
     assert_eq!(event & 0xf, wire::EVENT_CLIENT);
     assert_eq!(event & 0x30, wire::EVENT_NEW);
+}
+
+#[test]
+fn create_playback_stream_returns_a_ring_and_asks_for_data() {
+    let daemon = Daemon::start();
+    let mut client = RawPulse::connect(&daemon.pulse_socket());
+    client.auth();
+    client.set_name("a player");
+    let (stream, frame) = client.create_stream(48_000, wire::FORMAT_S16LE, 2, 40);
+    let (asked, length) = client.request();
+    assert_eq!(asked, stream);
+    assert_eq!(length % (frame as usize), 0);
+    client.send_memblock(stream, &vec![0u8; length]);
+    std::thread::sleep(Duration::from_millis(100));
+    let (sink_usec, write, read) = client.latency(stream);
+    assert!(write > 0, "the client has written");
+    assert!(read >= 0, "the daemon has taken frames");
+    assert!(sink_usec > 0 || read > 0, "the stream is moving");
+}
+
+#[test]
+fn a_misaligned_memblock_is_ignored() {
+    let daemon = Daemon::start();
+    let mut client = RawPulse::connect(&daemon.pulse_socket());
+    client.auth();
+    client.set_name("a player");
+    let (stream, _) = client.create_stream(48_000, wire::FORMAT_S16LE, 2, 40);
+    let (_, length) = client.request();
+    client.send_memblock(stream, &vec![0u8; length - 3]);
+    std::thread::sleep(Duration::from_millis(30));
+    let (_, write, _) = client.latency(stream);
+    assert_eq!(write, 0, "nothing misaligned was written");
+}
+
+#[test]
+fn delete_stops_the_stream_and_another_keeps_playing() {
+    let daemon = Daemon::start();
+    let mut client = RawPulse::connect(&daemon.pulse_socket());
+    client.auth();
+    client.set_name("a player");
+    let (first, _) = client.create_stream(48_000, wire::FORMAT_S16LE, 2, 40);
+    let _ = client.request();
+    let (second, _) = client.create_stream(48_000, wire::FORMAT_S16LE, 2, 40);
+    let mut body = Builder::new();
+    body.u32(first);
+    let (command, _, _) = client.command(wire::DELETE_PLAYBACK_STREAM, &body.into_vec());
+    assert_eq!(command, wire::REPLY);
+    client.latency(second);
 }

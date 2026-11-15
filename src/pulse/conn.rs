@@ -3,6 +3,7 @@
 use crate::pulse::objects;
 use crate::pulse::packet::{Encoder, Frame, Reader as Framer};
 use crate::pulse::registry::{Event, Registry};
+use crate::pulse::stream::{Polled, Stream, now_timeval};
 use crate::pulse::tagstruct::{Builder, Reader};
 use crate::pulse::wire;
 use aas_client::client::Client as DaemonClient;
@@ -58,6 +59,12 @@ pub fn serve(
         }
     }
     let _ = conn.flush();
+    for stream in &mut conn.streams {
+        stream.release();
+    }
+    for stream in &conn.streams {
+        conn.registry.remove_sink_input(stream.index);
+    }
     conn.registry.remove_client(conn.client_index);
 }
 
@@ -77,6 +84,7 @@ pub struct Conn {
     registry: Arc<Registry>,
     events: Receiver<Event>,
     subscribed: u32,
+    streams: Vec<Stream>,
     done: bool,
 }
 
@@ -108,6 +116,7 @@ impl Conn {
             registry,
             events,
             subscribed: 0,
+            streams: Vec::new(),
             done: false,
         }
     }
@@ -117,7 +126,7 @@ impl Conn {
             if !self.authorized {
                 return Err(invalid("a memblock before AUTH"));
             }
-            let _ = memblock;
+            self.handle_memblock(memblock);
             return Ok(());
         }
         self.command(&frame.payload)
@@ -144,10 +153,21 @@ impl Conn {
             wire::GET_SINK_INFO_LIST => self.sink_info_list(tag),
             wire::GET_CLIENT_INFO => self.client_info(&mut reader, tag),
             wire::GET_CLIENT_INFO_LIST => self.client_info_list(tag),
-            wire::GET_SINK_INPUT_INFO => {
-                self.send_error(tag, wire::ERR_NOENTITY, "no such stream");
+            wire::GET_SINK_INPUT_INFO => self.sink_input_info(&mut reader, tag),
+            wire::GET_SINK_INPUT_INFO_LIST => self.sink_input_info_list(tag),
+            wire::CREATE_PLAYBACK_STREAM => self.create_stream(&mut reader, tag),
+            wire::DELETE_PLAYBACK_STREAM => self.delete_stream(&mut reader, tag),
+            wire::DRAIN_PLAYBACK_STREAM => self.drain_stream(&mut reader, tag),
+            wire::CORK_PLAYBACK_STREAM => self.cork_stream(&mut reader, tag),
+            wire::FLUSH_PLAYBACK_STREAM => self.flush_stream(&mut reader, tag),
+            wire::TRIGGER_PLAYBACK_STREAM => self.trigger_stream(&mut reader, tag),
+            wire::PREBUF_PLAYBACK_STREAM => self.prebuf_stream(&mut reader, tag),
+            wire::SET_PLAYBACK_STREAM_BUFFER_ATTR => self.set_buffer_attr(&mut reader, tag),
+            wire::SET_PLAYBACK_STREAM_NAME => self.set_stream_name(&mut reader, tag),
+            wire::UPDATE_PLAYBACK_STREAM_PROPLIST | wire::REMOVE_PLAYBACK_STREAM_PROPLIST => {
+                self.stream_proplist(&mut reader, tag)
             }
-            wire::GET_SINK_INPUT_INFO_LIST => self.send_reply(tag, Vec::new()),
+            wire::GET_PLAYBACK_LATENCY => self.playback_latency(&mut reader, tag),
             wire::GET_CARD_INFO_LIST
             | wire::GET_MODULE_INFO_LIST
             | wire::GET_SAMPLE_INFO_LIST
@@ -313,6 +333,239 @@ impl Conn {
         self.send_reply(tag, Vec::new());
     }
 
+    fn stream_mut(&mut self, index: u32) -> Option<&mut Stream> {
+        self.streams.iter_mut().find(|stream| stream.index == index)
+    }
+
+    fn create_stream(&mut self, reader: &mut Reader, tag: u32) {
+        let index = self.registry.next_stream();
+        let created = Stream::create(
+            &self.daemon_socket,
+            self.peer_pid,
+            self.buffer_ms,
+            self.client_index,
+            index,
+            reader,
+        );
+        match created {
+            Ok(created) => {
+                self.registry.add_sink_input(created.stream.entry());
+                self.streams.push(created.stream);
+                let request = self.streams.last_mut().and_then(Stream::request);
+                self.send_reply(tag, created.reply);
+                if let Some(request) = request {
+                    self.send_packet(request);
+                }
+            }
+            Err(e) => {
+                eprintln!("aas: pulse: create: {}", e.message);
+                self.send_error(tag, e.code, e.message)
+            }
+        }
+    }
+
+    fn delete_stream(&mut self, reader: &mut Reader, tag: u32) {
+        let Some(index) = reader.u32() else {
+            self.send_error(tag, wire::ERR_INVALID, "no stream index");
+            return;
+        };
+        if let Some(position) = self.streams.iter().position(|stream| stream.index == index) {
+            let mut stream = self.streams.remove(position);
+            stream.release();
+            self.registry.remove_sink_input(index);
+            self.send_reply(tag, Vec::new());
+        } else {
+            self.send_error(tag, wire::ERR_NOENTITY, "no such stream");
+        }
+    }
+
+    fn drain_stream(&mut self, reader: &mut Reader, tag: u32) {
+        let Some(index) = reader.u32() else {
+            self.send_error(tag, wire::ERR_INVALID, "no stream index");
+            return;
+        };
+        match self.stream_mut(index) {
+            Some(stream) => match stream.drain(tag) {
+                Ok(()) => {}
+                Err(_) => self.send_error(tag, wire::ERR_NOENTITY, "the stream is gone"),
+            },
+            None => self.send_error(tag, wire::ERR_NOENTITY, "no such stream"),
+        }
+    }
+
+    fn cork_stream(&mut self, reader: &mut Reader, tag: u32) {
+        let Some(index) = reader.u32() else {
+            self.send_error(tag, wire::ERR_INVALID, "no stream index");
+            return;
+        };
+        let Some(corked) = reader.boolean() else {
+            self.send_error(tag, wire::ERR_INVALID, "no cork flag");
+            return;
+        };
+        match self.stream_mut(index) {
+            Some(stream) => match stream.cork(corked) {
+                Ok(()) => {
+                    let entry = stream.entry();
+                    self.registry.update_sink_input(entry);
+                    self.send_reply(tag, Vec::new());
+                }
+                Err(_) => self.send_error(tag, wire::ERR_NOENTITY, "the stream is gone"),
+            },
+            None => self.send_error(tag, wire::ERR_NOENTITY, "no such stream"),
+        }
+    }
+
+    fn flush_stream(&mut self, reader: &mut Reader, tag: u32) {
+        let Some(index) = reader.u32() else {
+            self.send_error(tag, wire::ERR_INVALID, "no stream index");
+            return;
+        };
+        match self.stream_mut(index) {
+            Some(stream) => match stream.flush() {
+                Ok(()) => self.send_reply(tag, Vec::new()),
+                Err(_) => self.send_error(tag, wire::ERR_NOENTITY, "the stream is gone"),
+            },
+            None => self.send_error(tag, wire::ERR_NOENTITY, "no such stream"),
+        }
+    }
+
+    fn trigger_stream(&mut self, reader: &mut Reader, tag: u32) {
+        let Some(index) = reader.u32() else {
+            self.send_error(tag, wire::ERR_INVALID, "no stream index");
+            return;
+        };
+        if reader.timeval().is_none() {
+            self.send_error(tag, wire::ERR_PROTOCOL, "no trigger time");
+            return;
+        }
+        match self.stream_mut(index) {
+            Some(stream) => match stream.trigger() {
+                Ok(()) => self.send_reply(tag, Vec::new()),
+                Err(_) => self.send_error(tag, wire::ERR_NOENTITY, "the stream is gone"),
+            },
+            None => self.send_error(tag, wire::ERR_NOENTITY, "no such stream"),
+        }
+    }
+
+    fn prebuf_stream(&mut self, reader: &mut Reader, tag: u32) {
+        if reader.u32().is_none() {
+            self.send_error(tag, wire::ERR_INVALID, "no stream index");
+            return;
+        }
+        self.send_reply(tag, Vec::new());
+    }
+
+    fn set_buffer_attr(&mut self, reader: &mut Reader, tag: u32) {
+        let Some(index) = reader.u32() else {
+            self.send_error(tag, wire::ERR_INVALID, "no stream index");
+            return;
+        };
+        for _ in 0..4 {
+            if reader.u32().is_none() {
+                self.send_error(tag, wire::ERR_PROTOCOL, "a short buffer attr");
+                return;
+            }
+        }
+        let _ = reader.boolean();
+        let _ = reader.boolean();
+        let Some(stream) = self.stream_mut(index) else {
+            self.send_error(tag, wire::ERR_NOENTITY, "no such stream");
+            return;
+        };
+        let bytes = stream.capacity_bytes();
+        let mut body = Builder::new();
+        body.u32(bytes);
+        body.u32(bytes);
+        body.u32(0);
+        body.u32(0);
+        body.usec(0);
+        self.send_reply(tag, body.into_vec());
+    }
+
+    fn set_stream_name(&mut self, reader: &mut Reader, tag: u32) {
+        let Some(index) = reader.u32() else {
+            self.send_error(tag, wire::ERR_INVALID, "no stream index");
+            return;
+        };
+        let Some(name) = reader.string() else {
+            self.send_error(tag, wire::ERR_INVALID, "no name");
+            return;
+        };
+        match self.stream_mut(index) {
+            Some(stream) => {
+                stream.name = name.to_string();
+                let entry = stream.entry();
+                self.registry.update_sink_input(entry);
+                self.send_reply(tag, Vec::new());
+            }
+            None => self.send_error(tag, wire::ERR_NOENTITY, "no such stream"),
+        }
+    }
+
+    fn stream_proplist(&mut self, reader: &mut Reader, tag: u32) {
+        if reader.u32().is_none() {
+            self.send_error(tag, wire::ERR_INVALID, "no stream index");
+            return;
+        }
+        self.send_reply(tag, Vec::new());
+    }
+
+    fn playback_latency(&mut self, reader: &mut Reader, tag: u32) {
+        let Some(index) = reader.u32() else {
+            self.send_error(tag, wire::ERR_INVALID, "no stream index");
+            return;
+        };
+        let Some((sec, usec)) = reader.timeval() else {
+            self.send_error(tag, wire::ERR_PROTOCOL, "no request time");
+            return;
+        };
+        let Some(stream) = self.stream_mut(index) else {
+            self.send_error(tag, wire::ERR_NOENTITY, "no such stream");
+            return;
+        };
+        let latency = stream.latency();
+        let (now_sec, now_usec) = now_timeval();
+        let mut body = Builder::new();
+        body.usec(latency.sink_usec);
+        body.usec(0);
+        body.boolean(latency.playing);
+        body.timeval(sec, usec);
+        body.timeval(now_sec, now_usec);
+        body.i64(latency.write_index);
+        body.i64(latency.read_index);
+        body.u64(latency.underrun_for);
+        body.u64(latency.playing_for);
+        self.send_reply(tag, body.into_vec());
+    }
+
+    fn sink_input_info(&mut self, reader: &mut Reader, tag: u32) {
+        let Some(index) = reader.u32() else {
+            self.send_error(tag, wire::ERR_INVALID, "no stream index");
+            return;
+        };
+        match self.registry.sink_input(index) {
+            Some(input) => self.send_reply(tag, objects::sink_input_info(&input)),
+            None => self.send_error(tag, wire::ERR_NOENTITY, "no such stream"),
+        }
+    }
+
+    fn sink_input_info_list(&mut self, tag: u32) {
+        let mut body = Vec::new();
+        for input in self.registry.sink_inputs() {
+            body.extend(objects::sink_input_info(&input));
+        }
+        self.send_reply(tag, body);
+    }
+
+    fn handle_memblock(&mut self, memblock: crate::pulse::packet::Memblock) {
+        if let Some(stream) = self.stream_mut(memblock.stream) {
+            stream.write(&memblock.data);
+            if let Some(request) = stream.request() {
+                self.send_packet(request);
+            }
+        }
+    }
+
     fn tick(&mut self) -> io::Result<()> {
         let events: Vec<Event> = self.events.try_iter().collect();
         for event in events {
@@ -322,6 +575,21 @@ impl Conn {
                     event.index,
                 ));
             }
+        }
+        let mut packets = Vec::new();
+        let mut dead = Vec::new();
+        for stream in &mut self.streams {
+            match stream.poll() {
+                Polled::Packets(polled) => packets.extend(polled),
+                Polled::Gone => dead.push(stream.index),
+            }
+        }
+        for packet in packets {
+            self.send_packet(packet);
+        }
+        for index in dead {
+            self.streams.retain(|stream| stream.index != index);
+            self.registry.remove_sink_input(index);
         }
         Ok(())
     }

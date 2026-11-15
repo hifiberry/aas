@@ -58,6 +58,7 @@ pub const ERR_INVALID: u32 = 3;
 pub const ERR_NOENTITY: u32 = 5;
 pub const ERR_PROTOCOL: u32 = 6;
 pub const ERR_VERSION: u32 = 17;
+pub const ERR_INTERNAL: u32 = 10;
 pub const ERR_NOTSUPPORTED: u32 = 18;
 
 // Subscription masks and events.

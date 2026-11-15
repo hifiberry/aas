@@ -2,6 +2,7 @@
 
 use crate::pulse::wire;
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 
@@ -12,14 +13,44 @@ pub struct Event {
     pub index: u32,
 }
 
+/// A playback stream as every context sees it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SinkInput {
+    pub index: u32,
+    pub client: u32,
+    pub name: String,
+    pub rate: u32,
+    pub channels: u8,
+    pub format: u8,
+    pub corked: bool,
+    pub volume: u8,
+    pub mute: bool,
+}
+
 /// Every connection's client and stream, and everyone waiting for events.
-#[derive(Default)]
 pub struct Registry {
     clients: Mutex<BTreeMap<u32, String>>,
+    sink_inputs: Mutex<BTreeMap<u32, SinkInput>>,
+    next_stream: AtomicU32,
     events: Mutex<Vec<Sender<Event>>>,
 }
 
+impl Default for Registry {
+    fn default() -> Self {
+        Registry {
+            clients: Mutex::new(BTreeMap::new()),
+            sink_inputs: Mutex::new(BTreeMap::new()),
+            next_stream: AtomicU32::new(1),
+            events: Mutex::new(Vec::new()),
+        }
+    }
+}
+
 impl Registry {
+    pub fn next_stream(&self) -> u32 {
+        self.next_stream.fetch_add(1, Ordering::Relaxed)
+    }
+
     pub fn add_client(&self, index: u32, name: String) {
         self.clients.lock().unwrap().insert(index, name);
         self.notify(Event {
@@ -55,6 +86,44 @@ impl Registry {
             .iter()
             .map(|(&index, name)| (index, name.clone()))
             .collect()
+    }
+
+    pub fn add_sink_input(&self, input: SinkInput) {
+        let index = input.index;
+        self.sink_inputs.lock().unwrap().insert(index, input);
+        self.notify(Event {
+            facility: wire::EVENT_SINK_INPUT,
+            change: wire::EVENT_NEW,
+            index,
+        });
+    }
+
+    pub fn update_sink_input(&self, input: SinkInput) {
+        let index = input.index;
+        self.sink_inputs.lock().unwrap().insert(index, input);
+        self.notify(Event {
+            facility: wire::EVENT_SINK_INPUT,
+            change: wire::EVENT_CHANGE,
+            index,
+        });
+    }
+
+    pub fn remove_sink_input(&self, index: u32) {
+        if self.sink_inputs.lock().unwrap().remove(&index).is_some() {
+            self.notify(Event {
+                facility: wire::EVENT_SINK_INPUT,
+                change: wire::EVENT_REMOVE,
+                index,
+            });
+        }
+    }
+
+    pub fn sink_inputs(&self) -> Vec<SinkInput> {
+        self.sink_inputs.lock().unwrap().values().cloned().collect()
+    }
+
+    pub fn sink_input(&self, index: u32) -> Option<SinkInput> {
+        self.sink_inputs.lock().unwrap().get(&index).cloned()
     }
 
     pub fn subscribe(self: &Arc<Self>) -> Receiver<Event> {

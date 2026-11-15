@@ -1,6 +1,7 @@
 //! The replies for the one sink, its clients and this daemon's fixed
 //! objects.
 
+use crate::pulse::registry::SinkInput;
 use crate::pulse::tagstruct::{Builder, SampleSpec};
 use crate::pulse::wire;
 
@@ -66,5 +67,34 @@ pub fn client_info(index: u32, name: &str) -> Vec<u8> {
     b.u32(wire::INVALID_INDEX);
     b.string("aas");
     b.proplist(&[("application.name".into(), name.into())]);
+    b.into_vec()
+}
+
+pub fn sink_input_info(input: &SinkInput) -> Vec<u8> {
+    let mut b = Builder::new();
+    b.u32(input.index);
+    b.string(&input.name);
+    b.u32(wire::INVALID_INDEX);
+    b.u32(input.client);
+    b.u32(0);
+    b.sample_spec(SampleSpec {
+        format: input.format,
+        channels: input.channels,
+        rate: input.rate,
+    });
+    let map: &[u8] = if input.channels == 1 { &[0] } else { &[1, 2] };
+    b.channel_map(map);
+    let level = u32::from(input.volume) * wire::VOLUME_NORM / 100;
+    b.cvolume(&vec![level; usize::from(input.channels)]);
+    b.usec(0);
+    b.usec(0);
+    b.string("null");
+    b.string("aas");
+    b.boolean(input.mute);
+    b.proplist(&[("media.name".into(), input.name.clone())]);
+    b.boolean(input.corked);
+    b.boolean(true);
+    b.boolean(true);
+    b.format_info(0, &[]);
     b.into_vec()
 }
