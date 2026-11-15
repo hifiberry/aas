@@ -177,6 +177,55 @@ impl RawPulse {
     }
 }
 
+
+impl RawPulse {
+    fn set_sink_volume(&mut self, percent: u8) {
+        let level = u32::from(percent) * wire::VOLUME_NORM / 100;
+        let mut body = Builder::new();
+        body.u32(0);
+        body.null_string();
+        body.cvolume(&[level; 2]);
+        let (command, _, _) = self.command(wire::SET_SINK_VOLUME, &body.into_vec());
+        assert_eq!(command, wire::REPLY);
+    }
+
+    fn set_sink_mute(&mut self, mute: bool) {
+        let mut body = Builder::new();
+        body.u32(0);
+        body.null_string();
+        body.boolean(mute);
+        let (command, _, _) = self.command(wire::SET_SINK_MUTE, &body.into_vec());
+        assert_eq!(command, wire::REPLY);
+    }
+
+    fn set_stream_volume(&mut self, stream: u32, percent: u8) {
+        let level = u32::from(percent) * wire::VOLUME_NORM / 100;
+        let mut body = Builder::new();
+        body.u32(stream);
+        body.cvolume(&[level; 2]);
+        let (command, _, _) = self.command(wire::SET_SINK_INPUT_VOLUME, &body.into_vec());
+        assert_eq!(command, wire::REPLY);
+    }
+
+    fn sink_state(&mut self) -> (u8, bool) {
+        let mut body = Builder::new();
+        body.u32(0);
+        body.null_string();
+        let (command, _, reply) = self.command(wire::GET_SINK_INFO, &body.into_vec());
+        assert_eq!(command, wire::REPLY);
+        let mut reader = Reader::new(&reply);
+        assert_eq!(reader.u32(), Some(0));
+        assert_eq!(reader.string(), Some("aas"));
+        let _ = reader.string();
+        let _ = reader.sample_spec();
+        let _ = reader.channel_map();
+        let _ = reader.u32();
+        let cvolume = reader.cvolume().expect("a volume");
+        let mute = reader.boolean().expect("a mute flag");
+        (aas::pulse::volume::percent(&cvolume), mute)
+    }
+}
+
 #[test]
 fn a_pulse_client_authenticates_and_is_refused_before_it_does() {
     let daemon = Daemon::start();
@@ -328,4 +377,75 @@ fn delete_stops_the_stream_and_another_keeps_playing() {
     let (command, _, _) = client.command(wire::DELETE_PLAYBACK_STREAM, &body.into_vec());
     assert_eq!(command, wire::REPLY);
     client.latency(second);
+}
+
+#[test]
+fn sink_volume_and_the_api_are_one_number() {
+    let daemon = Daemon::start();
+    let mut client = RawPulse::connect(&daemon.pulse_socket());
+    client.auth();
+    client.set_name("volume");
+    client.set_sink_volume(40);
+    assert_eq!(client.sink_state().0, 40);
+    let (_, body) = daemon.get("/outputs/1");
+    assert_eq!(body["volume"], serde_json::json!(40));
+}
+
+#[test]
+fn stream_volume_is_the_client_gain() {
+    let daemon = Daemon::start();
+    let mut client = RawPulse::connect(&daemon.pulse_socket());
+    client.auth();
+    client.set_name("volume");
+    let (stream, _) = client.create_stream(48_000, wire::FORMAT_S16LE, 2, 40);
+    client.set_stream_volume(stream, 50);
+    let (_, inputs) = daemon.get("/inputs");
+    let found = inputs
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|input| {
+            input["volume_db"]
+                .as_f64()
+                .is_some_and(|db| (db + 6.02).abs() < 0.1)
+        })
+        .expect("the stream's client at 50 percent");
+    assert_eq!(found["muted"], serde_json::json!(false));
+}
+
+#[test]
+fn mute_sets_zero_and_restores_the_remembered_percent() {
+    let daemon = Daemon::start();
+    let mut client = RawPulse::connect(&daemon.pulse_socket());
+    client.auth();
+    client.set_name("volume");
+    client.set_sink_volume(40);
+    client.set_sink_mute(true);
+    assert_eq!(client.sink_state(), (0, true));
+    client.set_sink_mute(false);
+    assert_eq!(client.sink_state(), (40, false));
+}
+
+#[test]
+fn a_volume_change_made_elsewhere_reaches_a_subscriber() {
+    let daemon = Daemon::start();
+    let mut listener = RawPulse::connect(&daemon.pulse_socket());
+    listener.auth();
+    listener.set_name("listener");
+    let mut mask = Builder::new();
+    mask.u32(wire::MASK_SINK);
+    let (command, _, _) = listener.command(wire::SUBSCRIBE, &mask.into_vec());
+    assert_eq!(command, wire::REPLY);
+    daemon.patch("/outputs/1", r#"{"volume":25}"#);
+    loop {
+        let (command, _, body) = listener.recv();
+        if command != wire::SUBSCRIBE_EVENT {
+            continue;
+        }
+        let mut reader = Reader::new(&body);
+        let event = reader.u32().expect("an event");
+        assert_eq!(event & 0xf, wire::EVENT_SINK);
+        assert_eq!(event & 0x30, wire::EVENT_CHANGE);
+        break;
+    }
 }

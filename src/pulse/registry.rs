@@ -23,7 +23,7 @@ pub struct SinkInput {
     pub channels: u8,
     pub format: u8,
     pub corked: bool,
-    pub volume: u8,
+    pub db_millis: i32,
     pub mute: bool,
 }
 

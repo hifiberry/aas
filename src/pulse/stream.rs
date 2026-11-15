@@ -53,7 +53,7 @@ pub struct Stream {
     pub channels: u8,
     pub frame_bytes: usize,
     pub corked: bool,
-    pub volume: u8,
+    pub db_millis: i32,
     pub mute: bool,
     daemon: Client,
     started: bool,
@@ -188,6 +188,7 @@ impl Stream {
                 .start()
                 .map_err(|_| CreateError::new(wire::ERR_INTERNAL, "the daemon could not start"))?;
         }
+        let (db_millis, muted) = daemon.client_volume().unwrap_or((0, muted));
         let capacity = daemon.capacity_frames().unwrap_or(frames as usize) as u32;
         let capacity_bytes = capacity * frame_bytes as u32;
         let name = props
@@ -205,7 +206,7 @@ impl Stream {
             channels: spec.channels,
             frame_bytes,
             corked,
-            volume: 100,
+            db_millis,
             mute: muted,
             daemon,
             started: !corked,
@@ -325,6 +326,17 @@ impl Stream {
             .saturating_mul(self.frame_bytes) as u32
     }
 
+    pub fn set_volume(&mut self, db_millis: i32, muted: bool) -> io::Result<()> {
+        self.daemon.set_client_volume(db_millis, muted)?;
+        self.db_millis = db_millis;
+        self.mute = muted;
+        Ok(())
+    }
+
+    pub fn set_mute(&mut self, muted: bool) -> io::Result<()> {
+        self.set_volume(self.db_millis, muted)
+    }
+
     pub fn entry(&self) -> SinkInput {
         SinkInput {
             index: self.index,
@@ -334,7 +346,7 @@ impl Stream {
             channels: self.channels,
             format: self.format,
             corked: self.corked,
-            volume: self.volume,
+            db_millis: self.db_millis,
             mute: self.mute,
         }
     }

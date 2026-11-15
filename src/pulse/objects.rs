@@ -2,6 +2,7 @@
 //! objects.
 
 use crate::pulse::registry::SinkInput;
+use crate::pulse::volume;
 use crate::pulse::tagstruct::{Builder, SampleSpec};
 use crate::pulse::wire;
 
@@ -40,7 +41,7 @@ pub fn sink_info(rate: u32, volume: u8, mute: bool, latency_usec: u64, state: u3
     });
     b.channel_map(&[1, 2]);
     b.u32(wire::INVALID_INDEX);
-    let level = u32::from(volume) * wire::VOLUME_NORM / 100;
+    let level = (u32::from(volume) * wire::VOLUME_NORM + 50) / 100;
     b.cvolume(&[level; 2]);
     b.boolean(mute);
     b.u32(wire::INVALID_INDEX);
@@ -84,8 +85,7 @@ pub fn sink_input_info(input: &SinkInput) -> Vec<u8> {
     });
     let map: &[u8] = if input.channels == 1 { &[0] } else { &[1, 2] };
     b.channel_map(map);
-    let level = u32::from(input.volume) * wire::VOLUME_NORM / 100;
-    b.cvolume(&vec![level; usize::from(input.channels)]);
+    b.cvolume(&volume::cvolume_from_db(input.db_millis));
     b.usec(0);
     b.usec(0);
     b.string("null");
