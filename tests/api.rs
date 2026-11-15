@@ -1,7 +1,7 @@
 //! The HTTP API end to end: the daemon with a `MemorySink`, clients on a
 //! real socket, and HTTP on a listener of its own.
 
-use aas::config::{Config, Idle};
+use aas::config::{Config, Idle, PluginConfig, PluginPlace};
 use aas::server;
 use aas::sink::{MemorySink, Sink};
 use aas_client::client::Client;
@@ -35,10 +35,16 @@ impl Daemon {
     /// its own.
     fn start() -> Daemon {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        Daemon::start_with(Some(listener))
+        Daemon::start_with(Some(listener), Vec::new())
     }
 
-    fn start_with(api: Option<TcpListener>) -> Daemon {
+    /// The same, with these plugins on the master.
+    fn with_plugins(plugins: Vec<PluginConfig>) -> Daemon {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        Daemon::start_with(Some(listener), plugins)
+    }
+
+    fn start_with(api: Option<TcpListener>, plugins: Vec<PluginConfig>) -> Daemon {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("aas.sock");
         let state = dir.path().join("state.toml");
@@ -47,6 +53,7 @@ impl Daemon {
         let config = Config {
             latency_ms: Some(LATENCY_MS),
             idle: Idle::Off { delay_s: 60 },
+            plugins,
             ..Config::default()
         };
         let thread = {
@@ -335,7 +342,7 @@ fn a_reader_that_never_reads_does_not_slow_the_daemon() {
 
 #[test]
 fn the_api_off_leaves_no_thread() {
-    let daemon = Daemon::start_with(None);
+    let daemon = Daemon::start_with(None, Vec::new());
     let mut client = daemon.playing(16384);
     let start = client.hw_position().unwrap();
     assert!(
@@ -476,4 +483,45 @@ fn get_metrics_counts_cycles() {
     assert_eq!(streams.len(), 1);
     assert_eq!(streams[0]["rate"], json!(48000));
     assert_eq!(metrics["analog"], json!(null));
+}
+
+#[test]
+fn patch_a_plugin_and_read_it_back() {
+    let balance = PluginConfig {
+        place: PluginPlace::Output,
+        kind: "balance".into(),
+        path: None,
+        params: Default::default(),
+    };
+    let daemon = Daemon::with_plugins(vec![balance]);
+    let (status, list) = daemon.get("/plugins");
+    assert_eq!(status, 200);
+    assert_eq!(list.as_array().unwrap().len(), 1);
+    assert_eq!(list[0]["id"], json!("1/output/0"));
+    assert_eq!(list[0]["type"], json!("balance"));
+    assert_eq!(list[0]["params"][0]["value"], json!(0.0));
+    let path = "/plugins/1/output/0";
+    let (status, body) = daemon.patch(path, r#"{"params": {"balance": 0.5}, "enabled": false}"#);
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["params"][0]["value"], json!(0.5));
+    assert_eq!(body["enabled"], json!(false));
+    let (status, body) = daemon.get(path);
+    assert_eq!(status, 200);
+    assert_eq!(body["params"][0]["value"], json!(0.5));
+    assert_eq!(body["enabled"], json!(false));
+    // Disabled, it is neutral once its fade has run.
+    assert!(wait_for(|| daemon.get(path).1["neutral"] == json!(true)));
+    // Out of range, unknown, not there.
+    let (status, _) = daemon.patch(path, r#"{"params": {"balance": 2}}"#);
+    assert_eq!(status, 422);
+    let (status, _) = daemon.patch(path, r#"{"params": {"gain": 0}}"#);
+    assert_eq!(status, 422);
+    let (status, _) = daemon.patch(path, r#"{"colour": "red"}"#);
+    assert_eq!(status, 400);
+    assert_eq!(daemon.get("/plugins/1/output/1").0, 404);
+    assert_eq!(daemon.get("/plugins/1/nowhere/0").0, 404);
+    assert_eq!(daemon.get("/plugins/9/output/0").0, 404);
+    // Its time per cycle is in the metrics, by its id.
+    let (_, metrics) = daemon.get("/metrics");
+    assert_eq!(metrics["plugins"][0]["id"], json!("1/output/0"));
 }

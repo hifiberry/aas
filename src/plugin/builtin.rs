@@ -2,7 +2,7 @@
 
 use super::balance::Balance;
 use super::detect::Detect;
-use super::{Channels, Failure, Plugin};
+use super::{Channels, Failure, Param, Plugin};
 
 /// Builds the plugin called `kind` for a stream at `rate` and blocks of
 /// `channels` channels, or `None` if there is no such plugin. The built-ins
@@ -22,6 +22,8 @@ pub fn create(kind: &str, rate: u32, _channels: usize) -> Option<Result<Box<dyn 
         "widen" => Some(Ok(Box::new(test::Spread::widen()))),
         #[cfg(test)]
         "narrow" => Some(Ok(Box::new(test::Spread::narrow()))),
+        #[cfg(test)]
+        "gain" => Some(Ok(Box::new(test::Gain::new(rate)))),
         #[cfg(test)]
         "fails-above-48k" => {
             FAILS_TRIED.with(|n| n.set(n.get() + 1));
@@ -45,7 +47,7 @@ pub fn channels(kind: &str) -> Option<Channels> {
     match kind {
         "detect" | "balance" => Some(stereo),
         #[cfg(test)]
-        "only-up-to-48k" | "fails-above-48k" => Some(stereo),
+        "only-up-to-48k" | "fails-above-48k" | "gain" => Some(stereo),
         #[cfg(test)]
         "widen" => Some(test::Spread::widen().counts()),
         #[cfg(test)]
@@ -54,11 +56,110 @@ pub fn channels(kind: &str) -> Option<Channels> {
     }
 }
 
+/// The name and the parameters of the plugin called `kind`, without
+/// building it for a rate, or `None` if there is no such plugin.
+pub fn describe(kind: &str) -> Option<(String, Vec<Param>, Channels)> {
+    let plugin: Box<dyn Plugin> = match kind {
+        "detect" => Box::new(Detect::new(48_000)),
+        "balance" => Box::new(Balance::new()),
+        #[cfg(test)]
+        "only-up-to-48k" | "fails-above-48k" => Box::new(Balance::new()),
+        #[cfg(test)]
+        "widen" => Box::new(test::Spread::widen()),
+        #[cfg(test)]
+        "narrow" => Box::new(test::Spread::narrow()),
+        #[cfg(test)]
+        "gain" => Box::new(test::Gain::new(48_000)),
+        _ => return None,
+    };
+    Some((
+        plugin.name().to_string(),
+        plugin.params().to_vec(),
+        plugin.channels(),
+    ))
+}
+
 #[cfg(test)]
 pub mod test {
     //! Plugins that change the channel count, for the tests.
 
-    use super::super::{Block, Channels, Formats, Param, Plugin, Samples, Status};
+    use super::super::{
+        Block, Channels, Failure, Formats, Param, ParamKind, Plugin, Samples, Status,
+    };
+    use std::cell::RefCell;
+
+    thread_local! {
+        /// Every `set_param` of a `gain` plugin on this thread: the rate it
+        /// was built for, the parameter and the value.
+        pub static GAIN_SET: RefCell<Vec<(u32, usize, f64)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// `gain`, a stand-in for the example library: a float, an integer
+    /// and a text parameter, and it leaves the audio as it is. It records
+    /// each `set_param` in `GAIN_SET`.
+    pub struct Gain {
+        rate: u32,
+        params: Vec<Param>,
+    }
+
+    impl Gain {
+        pub fn new(rate: u32) -> Gain {
+            let param = |name: &str, unit: &str, kind, min, max| Param {
+                name: name.into(),
+                unit: unit.into(),
+                kind,
+                min,
+                max,
+                default: 0.0,
+            };
+            Gain {
+                rate,
+                params: vec![
+                    param("gain", "dB", ParamKind::Float, -60.0, 20.0),
+                    param("steps", "", ParamKind::Integer, 0.0, 8.0),
+                    param("file", "", ParamKind::Text, 0.0, 0.0),
+                ],
+            }
+        }
+    }
+
+    impl Plugin for Gain {
+        fn name(&self) -> &str {
+            "gain"
+        }
+
+        fn formats(&self) -> Formats {
+            Formats {
+                i32: true,
+                f32: true,
+                f64: true,
+            }
+        }
+
+        fn params(&self) -> &[Param] {
+            &self.params
+        }
+
+        fn set_param(&mut self, index: usize, value: f64) {
+            GAIN_SET.with(|s| s.borrow_mut().push((self.rate, index, value)));
+        }
+
+        fn set_text(&mut self, _: usize, _: &str) -> Result<(), (Failure, String)> {
+            Ok(())
+        }
+
+        fn neutral(&self) -> bool {
+            true
+        }
+
+        fn latency_frames(&self) -> u32 {
+            0
+        }
+
+        fn process(&mut self, _: Block<'_>) -> Status {
+            Status::default()
+        }
+    }
 
     /// `widen` copies a stereo block onto channels 1 and 2 and 3 and 4.
     /// `narrow` takes four channels and keeps 1 and 2.

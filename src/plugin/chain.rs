@@ -389,6 +389,18 @@ impl Chain {
         self.publish(plugin);
     }
 
+    /// `set_enabled` without a fade, for a chain that has not run: a
+    /// plugin disabled here is passed over from the first block. Done on
+    /// the control thread, before the chain goes to the audio thread.
+    pub fn set_enabled_now(&mut self, plugin: usize, enabled: bool) {
+        let fade = self.fade_frames();
+        self.set_enabled(plugin, enabled);
+        if let Some(state) = self.states.get_mut(plugin) {
+            state.dry = state.target(fade);
+            self.publish(plugin);
+        }
+    }
+
     /// Whether plugin `plugin` is enabled, false for an unknown one. True
     /// from `set_enabled(plugin, true)` on, also while it fades in.
     pub fn enabled(&self, plugin: usize) -> bool {
@@ -1566,6 +1578,20 @@ mod tests {
         let out = run_frames(&mut c, 1.0, 600);
         assert_eq!(out[0], 1.0);
         assert!((out[480] - 0.5).abs() < 1e-6, "{}", out[480]);
+        assert_eq!(&out[481..], vec![0.5; 600 - 481]);
+    }
+
+    #[test]
+    fn a_plugin_disabled_before_the_chain_runs_is_passed_over_from_the_first_block() {
+        let mut c = chain_at_48k(vec![mul(0.5).boxed()]);
+        c.set_enabled_now(0, false);
+        assert!(!c.enabled(0));
+        assert!(c.neutral());
+        assert_eq!(run_frames(&mut c, 1.0, 100), vec![1.0; 100]);
+        // Enabled again, it fades in as any.
+        c.set_enabled(0, true);
+        let out = run_frames(&mut c, 1.0, 600);
+        assert_eq!(out[0], 1.0);
         assert_eq!(&out[481..], vec![0.5; 600 - 481]);
     }
 

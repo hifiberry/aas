@@ -3,7 +3,9 @@
 //! publishes. The API thread decides nothing; each call goes to the control
 //! thread, which answers with the view it builds from what it holds.
 
+use crate::engine::Place;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// One call of the API, as the control thread handles it.
 #[derive(Debug, Clone, PartialEq)]
@@ -26,6 +28,112 @@ pub enum Call {
     PutMatrix(MatrixPut),
     /// `GET /metrics`.
     Metrics,
+    /// `GET /plugins`.
+    Plugins,
+    Plugin(PluginId),
+    PatchPlugin(PluginId, PluginPatch),
+}
+
+/// A plugin: its output, numbered as in `/outputs`, its place, and its
+/// position in that chain from 0. Written `1/mix/0`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PluginId {
+    pub output: usize,
+    pub place: Place,
+    pub index: usize,
+}
+
+impl PluginId {
+    /// The id from the three segments of its path. One that cannot name a
+    /// plugin is 404, as an unknown one is.
+    pub fn parse(output: &str, place: &str, index: &str) -> Result<PluginId, ApiError> {
+        let none = || ApiError::not_found(format!("no plugin {output}/{place}/{index}"));
+        let number = |s: &str| {
+            s.parse::<usize>()
+                .ok()
+                .filter(|_| s.bytes().all(|b| b.is_ascii_digit()))
+        };
+        let output_n = number(output).filter(|&n| n >= 1).ok_or_else(none)?;
+        let place_v = match place {
+            "analog" => Place::Analog,
+            "mix" => Place::Mix,
+            "output" => Place::Output,
+            _ => return Err(none()),
+        };
+        let index_n = number(index).ok_or_else(none)?;
+        Ok(PluginId {
+            output: output_n,
+            place: place_v,
+            index: index_n,
+        })
+    }
+
+    /// Its place as the path and the state file write it.
+    pub fn place_name(&self) -> &'static str {
+        match self.place {
+            Place::Analog => "analog",
+            Place::Mix => "mix",
+            Place::Output => "output",
+        }
+    }
+}
+
+impl std::fmt::Display for PluginId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}/{}", self.output, self.place_name(), self.index)
+    }
+}
+
+/// The body of `PATCH /plugins/{output}/{place}/{index}`. A field left out
+/// stays as it is.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginPatch {
+    /// Values by parameter name.
+    pub params: Option<BTreeMap<String, f64>>,
+    pub enabled: Option<bool>,
+}
+
+/// A plugin as `GET /plugins` gives it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PluginView {
+    /// `1/mix/0`.
+    pub id: String,
+    pub output: usize,
+    pub place: String,
+    pub index: usize,
+    /// `detect`, `balance` or `library`.
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// The library's path; None for a built-in.
+    pub path: Option<String>,
+    /// The name the library's descriptor gives, or the built-in's.
+    pub name: String,
+    pub enabled: bool,
+    /// Whether it leaves the audio as it is now, a disabled one too.
+    pub neutral: bool,
+    /// 0 while it is disabled.
+    pub latency_frames: u32,
+    pub params: Vec<ParamView>,
+}
+
+/// One parameter of a plugin.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ParamView {
+    pub name: String,
+    pub unit: String,
+    /// `float`, `integer`, `switch`, `enumeration` or `text`.
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub min: f64,
+    pub max: f64,
+    pub default: f64,
+    /// The names of an enumeration's values, from 0.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub values: Option<Vec<String>>,
+    /// A number, or a text parameter's config text; null for a text the
+    /// config does not give.
+    pub value: serde_json::Value,
 }
 
 /// A call and where its answer goes.
@@ -171,6 +279,12 @@ pub enum ApiEvent {
     },
     /// The rate the master runs at.
     Rate { rate: u32 },
+    /// A plugin's values or whether it is enabled. `id` is `1/mix/0`.
+    Plugin {
+        id: String,
+        enabled: bool,
+        params: BTreeMap<String, f64>,
+    },
     /// The subscriber fell behind and should read `/state` again.
     Resync,
 }
@@ -348,12 +462,53 @@ pub fn answer<T: Serialize>(view: &T) -> Answer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
 
     #[test]
     fn a_view_that_does_not_serialise_is_500() {
         // JSON has no map with keys that are not strings.
         let view: BTreeMap<(u8, u8), u8> = [((1, 2), 3)].into();
         assert_eq!(answer(&view).unwrap_err().status, 500);
+    }
+
+    #[test]
+    fn plugin_ids_parse_and_print() {
+        let id = PluginId::parse("1", "mix", "0").unwrap();
+        assert_eq!(
+            id,
+            PluginId {
+                output: 1,
+                place: Place::Mix,
+                index: 0
+            }
+        );
+        assert_eq!(id.to_string(), "1/mix/0");
+        let id = PluginId::parse("4", "analog", "12").unwrap();
+        assert_eq!(id.to_string(), "4/analog/12");
+        let refused = [
+            ("0", "mix", "0"),
+            ("1", "nowhere", "0"),
+            ("1", "mix", "x"),
+            ("1", "mix", "-1"),
+            ("+1", "mix", "0"),
+            ("", "mix", "0"),
+        ];
+        for (output, place, index) in refused {
+            let e = PluginId::parse(output, place, index).unwrap_err();
+            assert_eq!(e.status, 404, "{output}/{place}/{index}");
+        }
+    }
+
+    #[test]
+    fn a_plugin_event_has_its_type() {
+        let event = ApiEvent::Plugin {
+            id: "1/mix/0".into(),
+            enabled: true,
+            params: [("gain".to_string(), -6.0)].into(),
+        };
+        let text = serde_json::to_string(&event).unwrap();
+        assert_eq!(
+            text,
+            r#"{"type":"plugin","id":"1/mix/0","enabled":true,"params":{"gain":-6.0}}"#
+        );
     }
 }

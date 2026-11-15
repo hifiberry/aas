@@ -8,7 +8,7 @@
 
 mod conns;
 
-use crate::api::{ApiCall, ApiError, ApiEvent, Call};
+use crate::api::{ApiCall, ApiError, ApiEvent, Call, PluginId};
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -128,6 +128,11 @@ fn router(shared: Arc<Shared>) -> Router {
         )
         .route("/metrics", get(|s| ask(s, Call::Metrics)))
         .route("/matrix", get(|s| ask(s, Call::Matrix)).put(put_matrix))
+        .route("/plugins", get(|s| ask(s, Call::Plugins)))
+        .route(
+            "/plugins/{output}/{place}/{index}",
+            get(get_plugin).patch(patch_plugin),
+        )
         .route("/events", get(events))
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY))
         .fallback(|| async { error(StatusCode::NOT_FOUND, "no such path") })
@@ -250,6 +255,23 @@ async fn get_client(s: State<Arc<Shared>>, name: PathOf<String>) -> Response {
 
 async fn patch_client(s: State<Arc<Shared>>, name: PathOf<String>, body: BodyOf) -> Response {
     let call = path(name).and_then(|name| Ok(Call::PatchClient(name, parse(&body)?)));
+    ask_for(s, call).await
+}
+
+/// The three segments of a plugin's path.
+type PluginPath = PathOf<(String, String, String)>;
+
+fn plugin_id(id: PluginPath) -> Result<PluginId, ApiError> {
+    let (output, place, index) = path(id)?;
+    PluginId::parse(&output, &place, &index)
+}
+
+async fn get_plugin(s: State<Arc<Shared>>, id: PluginPath) -> Response {
+    ask_for(s, plugin_id(id).map(Call::Plugin)).await
+}
+
+async fn patch_plugin(s: State<Arc<Shared>>, id: PluginPath, body: BodyOf) -> Response {
+    let call = plugin_id(id).and_then(|id| Ok(Call::PatchPlugin(id, parse(&body)?)));
     ask_for(s, call).await
 }
 

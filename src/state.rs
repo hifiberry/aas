@@ -61,6 +61,44 @@ pub struct StoredOutput {
     /// Empty means the default matrix.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub matrix: Option<Stored<Vec<StoredRoute>>>,
+    /// Keyed by place and position, as `"mix/0"`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub plugins: BTreeMap<String, StoredPlugin>,
+}
+
+impl StoredOutput {
+    /// The plugin stored at `key`, if it was stored for a plugin of this
+    /// type and path. One stored for another plugin there is kept in the
+    /// file, unused.
+    pub fn plugin(&self, key: &str, kind: &str, path: Option<&str>) -> Option<&StoredPlugin> {
+        self.plugins
+            .get(key)
+            .filter(|p| p.kind == kind && p.path.as_deref() == path)
+    }
+}
+
+/// A plugin's values and whether it is enabled, with the plugin they were
+/// set for: they apply only to a plugin of the same type and path.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StoredPlugin {
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// By name. `config` is the config's value then, or the default where
+    /// the config gave none.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub params: BTreeMap<String, Stored<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+}
+
+impl StoredPlugin {
+    /// The value of parameter `name` now, the config's value for it, or
+    /// its default, being `config_now`.
+    pub fn value(&self, name: &str, config_now: f64) -> f64 {
+        Stored::resolve(self.params.get(name), &config_now)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -162,6 +200,17 @@ impl State {
                     say(&format!("the matrix of output {card:?}"));
                     o.matrix = None;
                 }
+            }
+            for (key, plugin) in &mut o.plugins {
+                plugin.params.retain(|name, v| {
+                    let ok = v.value.is_finite() && v.config.is_finite();
+                    if !ok {
+                        say(&format!(
+                            "parameter {name} of plugin {key} of output {card:?}"
+                        ));
+                    }
+                    ok
+                });
             }
         }
     }
@@ -462,6 +511,7 @@ mod tests {
                     }],
                     config: vec![],
                 }),
+                plugins: BTreeMap::new(),
             },
         );
         s.outputs
@@ -649,6 +699,89 @@ mod tests {
             assert!(s.outputs["x"].matrix.is_none(), "{bad}");
             assert!(s.outputs["y"].matrix.is_some(), "{bad}");
         }
+    }
+
+    fn stored_plugin(path: Option<&str>, value: f64, config: f64) -> StoredPlugin {
+        StoredPlugin {
+            kind: if path.is_some() { "library" } else { "balance" }.into(),
+            path: path.map(str::to_string),
+            params: [("balance".to_string(), Stored { value, config })].into(),
+            enabled: Some(false),
+        }
+    }
+
+    #[test]
+    fn stored_plugin_values_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        let mut state = full();
+        let output = state.outputs.get_mut("Loopback").unwrap();
+        output
+            .plugins
+            .insert("output/0".into(), stored_plugin(None, 0.5, 0.0));
+        output.plugins.insert(
+            "mix/1".into(),
+            stored_plugin(Some("/usr/lib/a.so"), -6.0, 0.0),
+        );
+        state.save(&path).unwrap();
+        assert_eq!(State::load(&path), state);
+        let output = &State::load(&path).outputs["Loopback"];
+        let plugin = output.plugin("output/0", "balance", None).unwrap();
+        assert_eq!(plugin.value("balance", 0.0), 0.5);
+        assert_eq!(plugin.enabled, Some(false));
+    }
+
+    #[test]
+    fn a_config_edit_of_a_parameter_wins() {
+        let plugin = stored_plugin(None, 0.5, 0.0);
+        assert_eq!(plugin.value("balance", 0.0), 0.5);
+        assert_eq!(plugin.value("balance", 0.2), 0.2);
+        // A parameter never stored takes the config's.
+        assert_eq!(plugin.value("other", 0.3), 0.3);
+    }
+
+    #[test]
+    fn a_plugin_in_another_place_does_not_take_the_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        let mut state = State::default();
+        let mut output = StoredOutput::default();
+        let a = stored_plugin(Some("/usr/lib/a.so"), 0.5, 0.0);
+        output.plugins.insert("mix/0".into(), a.clone());
+        state.outputs.insert("Loopback".into(), output);
+        state.save(&path).unwrap();
+        let loaded = State::load(&path);
+        let output = &loaded.outputs["Loopback"];
+        // The config has B there now, or a built-in, or A elsewhere.
+        assert!(
+            output
+                .plugin("mix/0", "library", Some("/usr/lib/b.so"))
+                .is_none()
+        );
+        assert!(output.plugin("mix/0", "balance", None).is_none());
+        assert!(
+            output
+                .plugin("mix/1", "library", Some("/usr/lib/a.so"))
+                .is_none()
+        );
+        // A's values stay in the file.
+        loaded.save(&path).unwrap();
+        assert_eq!(State::load(&path).outputs["Loopback"].plugins["mix/0"], a);
+        assert_eq!(
+            output.plugin("mix/0", "library", Some("/usr/lib/a.so")),
+            Some(&a)
+        );
+    }
+
+    #[test]
+    fn a_non_finite_plugin_value_is_dropped_alone() {
+        let s = load_text(
+            "[outputs.x.plugins.\"mix/0\"]\ntype = \"balance\"\n\
+             [outputs.x.plugins.\"mix/0\".params.balance]\nvalue = nan\nconfig = 0.0\n\
+             [outputs.x.plugins.\"mix/0\".params.other]\nvalue = 1.0\nconfig = 0.0\n",
+        );
+        let params = &s.outputs["x"].plugins["mix/0"].params;
+        assert_eq!(params.keys().collect::<Vec<_>>(), ["other"]);
     }
 
     #[test]

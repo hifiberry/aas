@@ -28,6 +28,24 @@ impl Libraries {
     }
 }
 
+/// The name, the parameters and the channel counts of the plugin a config
+/// table names: the library's descriptor's, or the built-in's. None for one
+/// that cannot be found, which the chain builder refuses.
+pub fn describe(
+    config: &PluginConfig,
+    libraries: &mut Libraries,
+) -> Option<(String, Vec<Param>, Channels)> {
+    match (config.kind.as_str(), &config.path) {
+        ("library", Some(path)) => {
+            let library = libraries.get(path).ok()?;
+            let name = library.name().to_string();
+            Some((name, library.params().to_vec(), library.channels()))
+        }
+        ("library", None) => None,
+        (kind, _) => builtin::describe(kind),
+    }
+}
+
 /// The engine's place for a place in the config.
 pub fn engine_place(place: PluginPlace) -> Place {
     match place {

@@ -8,7 +8,7 @@ use crate::api::{
     OutputPatch, OutputRoutes, OutputState, OutputView, RouteJson, StateView,
 };
 use crate::api::{
-    AnalogMetrics, LastGap, MasterMetrics, MetricsView, OutputMetrics, PluginMetrics, StreamMetrics,
+    AnalogMetrics, LastGap, MasterMetrics, MetricsView, OutputMetrics, StreamMetrics,
 };
 use crate::bitperfect::NotBitPerfect;
 use crate::config::{self, Config, DEFAULT_IDLE_DELAY_S, Format, Idle, Route};
@@ -314,6 +314,9 @@ impl Control {
             Call::Matrix => api::answer(&self.matrix_view()),
             Call::PutMatrix(put) => self.put_matrix(put, now),
             Call::Metrics => api::answer(&self.metrics_view()),
+            Call::Plugins => api::answer(&self.plugin_views()),
+            Call::Plugin(id) => self.plugin_answer(&id),
+            Call::PatchPlugin(id, patch) => self.patch_plugin(id, patch, now),
         };
         self.publish_changes();
         answer
@@ -579,7 +582,7 @@ impl Control {
 
     /// The card of the output at engine index `index`, which keys its
     /// state.
-    fn card_of(&self, index: usize) -> &str {
+    pub(super) fn card_of(&self, index: usize) -> &str {
         match index {
             0 => &self.card,
             _ => &self.further[index - 1].card,
@@ -879,12 +882,6 @@ impl Control {
         }
         let code = self.counters.bit_perfect.load(Ordering::Relaxed);
         NotBitPerfect::from_code(code).unwrap_or(Err(NotBitPerfect::NoSource))
-    }
-
-    /// Each plugin's time per cycle, by id. The control thread holds no
-    /// per-plugin stats yet; this is where they are read.
-    fn plugin_metrics(&self) -> Vec<PluginMetrics> {
-        Vec::new()
     }
 
     fn master_metrics(&self) -> MasterMetrics {

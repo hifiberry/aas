@@ -6,11 +6,12 @@
 //! one commit, so the audio thread never sees half a decision.
 
 mod api;
+mod plugins;
 
 use crate::adaptive::{Adaptive, MAX_DRIFT};
 use crate::api::ApiEvent;
 use crate::capture::{Capture, OpenError};
-use crate::config::{Config, Format, Idle, OutputConfig, PluginConfig, PluginPlace, Quality};
+use crate::config::{Config, Format, Idle, OutputConfig, PluginPlace, Quality};
 use crate::counters::{Counters, OutputCounters};
 use crate::dop;
 use crate::drift::SANE;
@@ -568,7 +569,7 @@ struct FurtherOutput {
     held_off: bool,
     volume_db: f32,
     config_volume_db: f32,
-    plugins: Vec<PluginConfig>,
+    plugins: Vec<plugins::PluginEntry>,
     rates: Vec<u32>,
     writer: Box<dyn FurtherWriter>,
     capacity: usize,
@@ -633,13 +634,15 @@ fn further_chains(
     libraries: &mut Libraries,
     batch: &mut Vec<Command>,
 ) -> Result<(), BuildError> {
-    let w = widths(&output.plugins, output.channels, libraries).map_err(|(_, e)| e)?;
+    let config = plugins::configs(&output.plugins);
+    let w = widths(&config, output.channels, libraries).map_err(|(_, e)| e)?;
     let places = [(PluginPlace::Mix, w.mix), (PluginPlace::Output, w.output)];
     for (slot, (place, channels)) in places.into_iter().enumerate() {
-        if output.built[slot] == Some(rate) || !output.plugins.iter().any(|p| p.place == place) {
+        if output.built[slot] == Some(rate) || !plugins::has_place(&output.plugins, place) {
             continue;
         }
-        let chain = build_chain(&output.plugins, place, rate, format, channels, libraries)?;
+        let chain = build_chain(&config, place, rate, format, channels, libraries)?;
+        let chain = plugins::prepare(&output.plugins, place, chain);
         output.built[slot] = Some(rate);
         let target = Target {
             output: output.index,
@@ -860,8 +863,9 @@ pub struct Control {
     state: State,
     /// Volume notifications for subscribers, not yet sent.
     notices: Vec<(ConnId, Reply)>,
-    /// The plugins of the config, to build chains from at each rate.
-    plugins: Vec<PluginConfig>,
+    /// The master's plugins, to build chains from at each rate, with the
+    /// values the API has set.
+    plugins: Vec<plugins::PluginEntry>,
     /// The card's channels, from the config, which the chains end at.
     channels: usize,
     libraries: Libraries,
@@ -930,6 +934,8 @@ impl Control {
         events: Consumer<Event>,
         audio: Thread,
     ) -> Control {
+        let mut libraries = Libraries::default();
+        let plugins = plugins::entries(1, &config.plugins, &mut libraries);
         Control {
             latency_ms,
             quality: config.resampling,
@@ -963,9 +969,9 @@ impl Control {
             save_at: None,
             state: State::default(),
             notices: Vec::new(),
-            plugins: config.plugins.clone(),
+            plugins,
             channels: config.channels,
-            libraries: Libraries::default(),
+            libraries,
             ready: None,
             built: [None; 3],
             spare: None,
@@ -1002,6 +1008,7 @@ impl Control {
         let latency_ms = config.latency_ms.unwrap_or(self.latency_ms);
         let matrix = api::OutputMatrix::new(setup.matrix.width(), config.matrix.as_deref());
         self.matrices.push(matrix);
+        let plugins = plugins::entries(setup.index + 1, &config.plugins, &mut self.libraries);
         self.further.push(FurtherOutput {
             index: setup.index,
             card: config.card,
@@ -1013,7 +1020,7 @@ impl Control {
             held_off: false,
             volume_db: config.volume_db,
             config_volume_db: config.volume_db,
-            plugins: config.plugins,
+            plugins,
             rates: setup.rates,
             writer: setup.writer,
             capacity: setup.feed_frames,
@@ -1096,6 +1103,7 @@ impl Control {
             output.idle = api::resolve_idle(entry, output.config_idle);
         }
         self.restore_matrices(&stored);
+        self.restore_plugins(&stored);
         self.state = stored;
         self.saver = Some(Saver::new(state));
         eprintln!(
@@ -2014,7 +2022,8 @@ impl Control {
         dop: bool,
     ) -> Result<Vec<(PluginPlace, Chain)>, (PluginPlace, BuildError)> {
         let mut ready = self.ready.take().filter(|c| c.rate == rate);
-        let widths = widths(&self.plugins, self.channels, &mut self.libraries)?;
+        let config = plugins::configs(&self.plugins);
+        let widths = widths(&config, self.channels, &mut self.libraries)?;
         let mut chains = Vec::new();
         for place in self.chain_places() {
             let built = self.built[slot(place)];
@@ -2044,7 +2053,7 @@ impl Control {
                     Err(e) => return Err((place, e)),
                 },
             };
-            chains.push((place, chain));
+            chains.push((place, plugins::prepare(&self.plugins, place, chain)));
         }
         Ok(chains)
     }
@@ -2056,8 +2065,15 @@ impl Control {
         rate: u32,
         channels: usize,
     ) -> Result<Chain, BuildError> {
-        let (plugins, format) = (&self.plugins, self.format);
-        build_chain(plugins, place, rate, format, channels, &mut self.libraries)
+        let config = plugins::configs(&self.plugins);
+        build_chain(
+            &config,
+            place,
+            rate,
+            self.format,
+            channels,
+            &mut self.libraries,
+        )
     }
 
     /// The chain at `place` built for the standard rate nearest `rate` at
@@ -2410,7 +2426,7 @@ impl Control {
             .into_iter()
             .filter(|&place| match place {
                 PluginPlace::Analog => self.analog.is_some(),
-                _ => self.plugins.iter().any(|p| p.place == place),
+                _ => plugins::has_place(&self.plugins, place),
             })
             .collect()
     }
@@ -3236,10 +3252,19 @@ mod tests {
         in_place: BTreeMap<usize, Box<Matrix>>,
         /// Every `SetMatrix` is refused, as one of another width is.
         pub(super) refuse_matrices: bool,
+        /// Every `SetParam`: where, the plugin, the parameter, the value.
+        pub(super) params: Vec<(Target, u8, u16, f64)>,
+        /// Every `SetEnabled`.
+        pub(super) enables: Vec<(Target, u8, bool)>,
+        /// Every chain sent, with whether each of its plugins is enabled.
+        pub(super) chains: Vec<(Target, Vec<bool>)>,
     }
 
     impl FakeEngine {
-        fn new(commands: rtrb::Consumer<Command>, events: rtrb::Producer<Event>) -> FakeEngine {
+        pub(super) fn new(
+            commands: rtrb::Consumer<Command>,
+            events: rtrb::Producer<Event>,
+        ) -> FakeEngine {
             FakeEngine {
                 commands,
                 events,
@@ -3251,6 +3276,9 @@ mod tests {
                 mixes: Vec::new(),
                 in_place: BTreeMap::new(),
                 refuse_matrices: false,
+                params: Vec::new(),
+                enables: Vec::new(),
+                chains: Vec::new(),
             }
         }
 
@@ -3286,6 +3314,8 @@ mod tests {
                     Command::Grow(t) => ("Grow".into(), Some(Event::OldTable(t))),
                     Command::SetChain(target, chain) => {
                         let names: Vec<&str> = chain.names().collect();
+                        let enabled = (0..names.len()).map(|i| chain.enabled(i)).collect();
+                        self.chains.push((target, enabled));
                         let place = target.place;
                         let name = match target.output {
                             0 => format!("SetChain {place:?} {}", names.join(",")),
@@ -3293,8 +3323,23 @@ mod tests {
                         };
                         (name, Some(Event::OldChain(target.output, chain)))
                     }
-                    Command::SetParam { .. } => ("SetParam".into(), None),
-                    Command::SetEnabled { .. } => ("SetEnabled".into(), None),
+                    Command::SetParam {
+                        target,
+                        plugin,
+                        index,
+                        value,
+                    } => {
+                        self.params.push((target, plugin, index, value));
+                        ("SetParam".into(), None)
+                    }
+                    Command::SetEnabled {
+                        target,
+                        plugin,
+                        enabled,
+                    } => {
+                        self.enables.push((target, plugin, enabled));
+                        ("SetEnabled".into(), None)
+                    }
                     Command::SetCapture(c) => {
                         let old = std::mem::replace(&mut self.capture, c);
                         let name = format!("SetCapture {}", self.capture.is_some());

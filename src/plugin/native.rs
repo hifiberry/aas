@@ -198,6 +198,16 @@ impl Library {
         self.channels
     }
 
+    /// The name its descriptor gives.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The parameters its descriptor lists, in order.
+    pub fn params(&self) -> &[Param] {
+        &self.params
+    }
+
     /// Builds an instance for `rate` Hz and blocks of up to `max_frames`
     /// frames, with its parameters at their defaults. `channels` is the
     /// count of the blocks that reach the plugin: a plugin for any count is

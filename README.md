@@ -328,6 +328,8 @@ without that prefix.
 | `GET`, `PATCH /inputs/analog` | The analog input's volume and mute |
 | `GET`, `PATCH /inputs/clients/{name}` | A client's volume and mute |
 | `GET`, `PUT /matrix` | Every output's routes |
+| `GET /plugins`, `GET /plugins/{output}/{place}/{index}` | Every plugin, or one |
+| `PATCH /plugins/{output}/{place}/{index}` | Change a plugin's values, or enable or disable it |
 | WebSocket `/events` | One JSON object per change |
 
 Outputs are numbered as in the config's error messages: the master is 1, the
@@ -357,6 +359,24 @@ route list is the default matrix. A matrix must have the width of the one in
 place. A change fades over 10 ms, and an output takes at most one matrix every
 20 ms; a later one in between replaces the one waiting.
 
+A plugin is named by its output, its place (`analog`, `mix` or `output`) and
+its position in that chain from 0: `/plugins/1/mix/0` is the first plugin of
+the master's `mix` chain. `GET /plugins` lists every plugin of every output in
+chain order, each with its `id` (`"1/mix/0"`), `type` (`detect`, `balance` or
+`library`), `path` for a library, the `name` its descriptor gives, whether it
+is `enabled` and `neutral`, its `latency_frames`, and its `params`: each with
+`name`, `unit`, `type` (`float`, `integer`, `switch`, `enumeration` or `text`),
+`min`, `max`, `default`, an enumeration's `values`, and the `value` it has now.
+`PATCH` takes `{"params": {"name": value}, "enabled": bool}`, either or both. A
+value is refused with 422 when it is out of range, not a whole number for an
+integer, a switch or an enumeration, or for a parameter the plugin does not
+have; a float is not clamped as it is in the config. A text parameter changes
+only in the config, so setting one is 422 too. A change takes effect between
+two blocks, and a plugin smooths it as `gain` does. A disabled plugin is passed
+over and its latency counts as 0; enabling or disabling fades over 10 ms, and a
+plugin enabled again starts from silence, with no old tail. `detect` cannot be
+disabled, nor can a plugin whose channel counts differ: both are 422.
+
 A field left out of a `PATCH` stays as it is. A body that does not parse or has
 an unknown field is 400, an unknown output or input is 404, and a value out of
 range or a matrix that breaks a rule is 422; nothing is clamped. A body over
@@ -369,6 +389,7 @@ that sends nothing for 30 s is closed.
 ```sh
 curl -s 127.0.0.1:2718/state
 curl -s -X PATCH -d '{"volume": 60}' 127.0.0.1:2718/outputs/1
+curl -s -X PATCH -d '{"params": {"balance": 0.2}}' 127.0.0.1:2718/plugins/1/output/0
 curl -s -X PATCH -d '{"volume_db": -6}' 127.0.0.1:2718/inputs/clients/mpd
 curl -s -X PUT 127.0.0.1:2718/matrix -d \
   '{"outputs": [{"output": 1, "routes": [{"from": "players.left", "to": 2}, {"from": "players.right", "to": 1}]}]}'
@@ -389,7 +410,8 @@ and a value out of range is answered like this, with status 422:
 WebSocket `/events` sends a JSON object with a `type` for each change:
 `output` (its volume or offset, idle and state), `input` (`id` is `analog` or
 `clients/<name>`, with `volume_db` and `muted`), `client` (a name `connected`,
-`running`, `stopped` or `gone`), `matrix` (an output's routes) and `rate`. A
+`running`, `stopped` or `gone`), `matrix` (an output's routes), `rate` and
+`plugin` (its `id`, whether it is `enabled`, and its `params` by name). A
 subscriber that falls more than 256 events behind gets `{"type": "resync"}`
 and should read `/state` again; nothing waits for it. Clients are told apart by
 name alone, so with two processes of one name, `gone` for the name means that
@@ -400,7 +422,10 @@ one that answers nothing for 30 s is closed.
 
 What the API sets is kept in the state file and survives a restart: the
 master's volume, each client's volume and mute, the analog input's, each
-further output's offset and idle rule, and each output's matrix. A stored value
+further output's offset and idle rule, each output's matrix, and each plugin's
+values and whether it is enabled. A plugin's are kept by the output's card, the
+place, the position and the plugin's type and path, and apply only while the
+config has that plugin there. A stored value
 that has a config key applies only while the config still says what it said
 when the value was stored, so an edit of the config always wins. The API never
 rewrites the config.
