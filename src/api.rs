@@ -277,7 +277,9 @@ pub struct MasterMetrics {
     pub wake_gaps: u64,
     pub worst_gap_ns: u64,
     pub last_gap: Option<LastGap>,
+    /// The period asked for, as the master was last opened.
     pub period_frames: u32,
+    /// `PERIODS` periods: the buffer asked for, not what the card granted.
     pub card_frames: u32,
     pub delay_frames: u32,
 }
@@ -304,7 +306,11 @@ pub struct OutputMetrics {
     pub locked: bool,
     /// Card frames per master frame; None before the writer has run.
     pub ratio: Option<f64>,
+    /// The card's period, as it was asked for.
     pub period_frames: u32,
+    /// The card's buffer, `PERIODS` periods: what was asked for, not what
+    /// the card granted. None while the output has no configuration.
+    pub card_frames: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]

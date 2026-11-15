@@ -932,6 +932,7 @@ impl Control {
                 locked: c.locked.load(Ordering::Relaxed),
                 ratio: (bits != 0).then(|| f64::from_bits(bits)),
                 period_frames: output.current.map_or(0, |(_, period, _)| period),
+                card_frames: output.current.map(|(_, period, _)| period * PERIODS),
             });
         }
         views
@@ -1118,6 +1119,13 @@ mod tests {
         assert_eq!(view["outputs"][0]["id"], json!(2));
         assert_eq!(view["outputs"][0]["card"], json!("Loopback"));
         assert_eq!(view["outputs"][0]["ratio"], json!(null));
+        let period = view["outputs"][0]["period_frames"].as_u64().unwrap();
+        let card = &view["outputs"][0]["card_frames"];
+        if period == 0 {
+            assert_eq!(*card, json!(null));
+        } else {
+            assert_eq!(*card, json!(period * u64::from(PERIODS)));
+        }
         assert_eq!(view["streams"].as_array().unwrap().len(), 1);
         assert_eq!(view["streams"][0]["name"], json!("mpd"));
         assert_eq!(view["streams"][0]["rate"], json!(48000));
