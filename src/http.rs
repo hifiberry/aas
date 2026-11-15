@@ -2,13 +2,17 @@
 //! `tokio` runtime. It decides nothing: each request becomes a `Call` for
 //! the control thread, sent on a channel with an eventfd that wakes its
 //! poll, and the answer comes back on a one-shot channel. WebSocket
-//! `/events` forwards what the control thread publishes.
+//! `/events` forwards what the control thread publishes. WebSocket
+//! `/levels` is the exception: it reads the levels the audio thread
+//! publishes itself, and never asks the control thread.
 //!
 //! The paths here are without the `/api/aas/v1` that nginx puts in front.
 
 mod conns;
 
 use crate::api::{ApiCall, ApiError, ApiEvent, Call, FIXED_SETTINGS, PluginId, SettingsPatch};
+use crate::counters::monotonic_ns;
+use crate::levels::{self, Levels};
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -52,6 +56,9 @@ const IDLE: Duration = Duration::from_secs(30);
 /// `/events` socket from counting as idle.
 const PING_EVERY: Duration = Duration::from_secs(10);
 
+/// How often a `/levels` subscriber is sent a frame.
+const LEVELS_EVERY: Duration = Duration::from_millis(100);
+
 /// What every handler shares.
 struct Shared {
     calls: Sender<ApiCall>,
@@ -60,16 +67,19 @@ struct Shared {
     /// Weak, so that the channel closes when the control thread drops its
     /// sender, and the thread then ends.
     events: broadcast::WeakSender<ApiEvent>,
+    /// What the audio thread measures, read for `/levels`.
+    levels: Arc<Levels>,
 }
 
 /// Starts the thread `aas-api`, serving on `listener` until the control
 /// thread drops `events`. Calls go out on `calls`, each followed by a
-/// write to the eventfd `wake`.
+/// write to the eventfd `wake`. `/levels` reads `levels`.
 pub fn spawn(
     listener: std::net::TcpListener,
     calls: Sender<ApiCall>,
     wake: OwnedFd,
     events: broadcast::Sender<ApiEvent>,
+    levels: Arc<Levels>,
 ) -> io::Result<JoinHandle<()>> {
     listener.set_nonblocking(true)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -83,6 +93,7 @@ pub fn spawn(
         calls,
         wake,
         events: events.downgrade(),
+        levels,
     });
     drop(events);
     thread::Builder::new()
@@ -139,6 +150,7 @@ fn router(shared: Arc<Shared>) -> Router {
             get(|s| ask(s, Call::Settings)).patch(patch_settings),
         )
         .route("/events", get(events))
+        .route("/levels", get(levels))
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY))
         .fallback(|| async { error(StatusCode::NOT_FOUND, "no such path") })
         .method_not_allowed_fallback(|| async {
@@ -431,6 +443,74 @@ async fn forward(mut socket: WebSocket, mut events: broadcast::Receiver<ApiEvent
     }
 }
 
+/// WebSocket `/levels`. A frame every 100 ms, read from the atomics the
+/// audio thread publishes.
+async fn levels(
+    State(shared): State<Arc<Shared>>,
+    upgrade: Result<WebSocketUpgrade, axum::extract::ws::rejection::WebSocketUpgradeRejection>,
+) -> Response {
+    let upgrade = match upgrade {
+        Ok(upgrade) => upgrade,
+        Err(e) => return error(e.status(), e.body_text()),
+    };
+    let levels = shared.levels.clone();
+    // A larger message from the peer ends its socket.
+    let upgrade = upgrade
+        .max_message_size(MAX_PEER_MESSAGE)
+        .max_frame_size(MAX_PEER_MESSAGE);
+    upgrade.on_upgrade(move |socket| send_levels(socket, levels))
+}
+
+/// What a `/levels` subscriber's task waits for.
+enum LevelsNext {
+    Frame,
+    Peer(Option<Result<Message, axum::Error>>),
+    Ping,
+}
+
+/// Sends a frame of levels every 100 ms as a binary message, until either
+/// side closes. A peer that does not read holds up this task alone, and
+/// the frames due meanwhile are skipped, not sent late. What the peer
+/// sends is dropped. A ping goes out every `PING_EVERY`, as on `/events`.
+async fn send_levels(mut socket: WebSocket, levels: Arc<Levels>) {
+    let mut every = tokio::time::interval(LEVELS_EVERY);
+    every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut ping = tokio::time::interval(PING_EVERY);
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The first ping is one period in.
+    ping.reset();
+    loop {
+        // All three are cancel-safe.
+        let next = {
+            let mut frame = pin!(every.tick());
+            let mut peer = pin!(socket.recv());
+            let mut tick = pin!(ping.tick());
+            poll_fn(|cx| {
+                if let Poll::Ready(p) = peer.as_mut().poll(cx) {
+                    return Poll::Ready(LevelsNext::Peer(p));
+                }
+                if frame.as_mut().poll(cx).is_ready() {
+                    return Poll::Ready(LevelsNext::Frame);
+                }
+                tick.as_mut().poll(cx).map(|_| LevelsNext::Ping)
+            })
+            .await
+        };
+        let message = match next {
+            LevelsNext::Peer(None | Some(Err(_)) | Some(Ok(Message::Close(_)))) => return,
+            LevelsNext::Peer(Some(Ok(_))) => continue,
+            LevelsNext::Ping => Message::Ping(Bytes::new()),
+            LevelsNext::Frame => {
+                let frame = levels::frame(&levels, monotonic_ns());
+                Message::Binary(frame.into())
+            }
+        };
+        if socket.send(message).await.is_err() {
+            return;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -476,6 +556,7 @@ mod tests {
             calls,
             wake: crate::control::eventfd().unwrap(),
             events: events.downgrade(),
+            levels: Arc::new(Levels::new([0; levels::METERS])),
         };
         (State(Arc::new(shared)), received)
     }

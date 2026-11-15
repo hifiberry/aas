@@ -45,6 +45,11 @@ impl Daemon {
     }
 
     fn start_with(api: Option<TcpListener>, plugins: Vec<PluginConfig>) -> Daemon {
+        Daemon::start_idle(api, plugins, Idle::Off { delay_s: 60 })
+    }
+
+    /// The same, with the master's idle rule `idle`.
+    fn start_idle(api: Option<TcpListener>, plugins: Vec<PluginConfig>, idle: Idle) -> Daemon {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("aas.sock");
         let state = dir.path().join("state.toml");
@@ -52,7 +57,7 @@ impl Daemon {
         let shutdown = Arc::new(AtomicBool::new(false));
         let config = Config {
             latency_ms: Some(LATENCY_MS),
-            idle: Idle::Off { delay_s: 60 },
+            idle,
             plugins,
             ..Config::default()
         };
@@ -288,10 +293,14 @@ fn volume_101_is_422() {
 
 /// A WebSocket on `/events`, subscribed once this returns.
 fn subscribe(daemon: &Daemon) -> tungstenite::WebSocket<TcpStream> {
+    websocket(daemon, "/events")
+}
+
+fn websocket(daemon: &Daemon, path: &str) -> tungstenite::WebSocket<TcpStream> {
     let port = daemon.port.unwrap();
     let stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
     stream.set_read_timeout(Some(PATIENCE)).unwrap();
-    let url = format!("ws://127.0.0.1:{port}/events");
+    let url = format!("ws://127.0.0.1:{port}{path}");
     let (socket, _) = tungstenite::client(url, stream).unwrap();
     socket
 }
@@ -606,4 +615,81 @@ fn lowering_the_latency_while_playing() {
         json!("latency_ms above the 4 ms the daemon started with needs a restart")
     );
     assert_eq!(period(&daemon), json!(32));
+}
+
+/// The next frame of levels, past any ping.
+fn next_levels(socket: &mut tungstenite::WebSocket<TcpStream>) -> Vec<u8> {
+    loop {
+        match socket.read().unwrap() {
+            Message::Binary(frame) => return frame.to_vec(),
+            Message::Ping(_) | Message::Pong(_) => {}
+            other => panic!("not a frame: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn levels_come_every_100_ms() {
+    let daemon = Daemon::start();
+    let mut socket = websocket(&daemon, "/levels");
+    // The stereo master alone: its id, 2 channels, RMS and peak for each,
+    // the clip bits.
+    let first = next_levels(&mut socket);
+    assert_eq!(first.len(), 7, "{first:?}");
+    assert_eq!(first[..2], [1, 2]);
+    let started = Instant::now();
+    for _ in 0..10 {
+        let frame = next_levels(&mut socket);
+        assert_eq!(frame[0], 1, "{frame:?}");
+    }
+    let took = started.elapsed();
+    assert!(
+        took >= Duration::from_millis(800) && took <= Duration::from_millis(1200),
+        "10 frames in {took:?}"
+    );
+}
+
+/// Fills the client's ring with frames at half scale as far as it takes.
+fn top_up_loud(client: &mut Client) {
+    let frame = [(1i32 << 30).to_le_bytes(), (1i32 << 30).to_le_bytes()].concat();
+    let data = frame.repeat(4096);
+    while client.write(&data).unwrap() > 0 {}
+}
+
+/// The master's levels read as silence once its idle rule has closed the
+/// card: its last window must not stay on the meter, and it stays in the
+/// frame.
+#[test]
+fn an_idle_master_reads_zeros() {
+    let api = TcpListener::bind("127.0.0.1:0").unwrap();
+    let daemon = Daemon::start_idle(Some(api), Vec::new(), Idle::Off { delay_s: 1 });
+    let mut socket = websocket(&daemon, "/levels");
+    let mut client = Client::connect(&daemon.path).unwrap();
+    client
+        .configure(48000, ClientFormat::S32, 2, 16384)
+        .unwrap();
+    top_up_loud(&mut client);
+    client.start().unwrap();
+    // Half scale: -6 dB, 229.
+    let mut frame = Vec::new();
+    let heard = wait_for(|| {
+        top_up_loud(&mut client);
+        frame = next_levels(&mut socket);
+        frame[2] >= 220
+    });
+    assert!(heard, "the master was never heard: {frame:?}");
+    client.stop().unwrap();
+    let state = || daemon.get("/outputs/1").1["state"].clone();
+    assert!(
+        wait_for(|| state() == json!("off")),
+        "the master never went off: {}",
+        state()
+    );
+    // A new socket: the old one holds frames sent while the master played.
+    drop(socket);
+    let mut socket = websocket(&daemon, "/levels");
+    for _ in 0..3 {
+        let frame = next_levels(&mut socket);
+        assert_eq!(frame, [1, 2, 0, 0, 0, 0, 0]);
+    }
 }

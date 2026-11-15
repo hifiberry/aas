@@ -13,11 +13,12 @@
 use crate::bitperfect::{NotBitPerfect, Situation, code_of, decide, plugins_apply, volumes_apply};
 use crate::capture::Capture;
 use crate::config::{BitPerfect, MAX_OUTPUTS};
-use crate::counters::Counters;
+use crate::counters::{Counters, monotonic_ns};
 use crate::dop;
 use crate::format::{BlockStore, Processing, Ramp, mix_add, mix_add_acc, mix_clear, mix_finish};
 use crate::further::Feed;
 use crate::latency::{MAX_PERIOD, PERIODS};
+use crate::levels::{ANALOG, Levels, METERS, Metering};
 use crate::matrix::{Bus, MAX_CHANNELS, Matrix};
 use crate::output_mix::{OutputMix, Routing};
 use crate::plugin::chain::Chain;
@@ -448,6 +449,8 @@ struct Analog<P: Processing> {
     chain: Chain,
     /// This cycle's period as captured.
     buf: Vec<[i32; 2]>,
+    /// `buf` holds a period captured this cycle.
+    captured: bool,
     /// This cycle's period after a chain that altered it, in the
     /// processing format, so that a float format keeps its headroom until
     /// the mix.
@@ -489,6 +492,7 @@ impl<P: Processing> Analog<P> {
             failed: None,
             chain: Chain::empty(),
             buf: vec![[0; 2]; max_frames],
+            captured: false,
             processed: vec![[P::zero(); 2]; max_frames],
             altered: false,
             faded: vec![[P::zero(); 2]; max_frames],
@@ -554,6 +558,7 @@ impl<P: Processing> Analog<P> {
         self.audible = false;
         self.signal = false;
         self.altered = false;
+        self.captured = false;
         self.latency = 0;
         self.plays = Plays::Captured;
         let Some(capture) = self.capture.as_mut() else {
@@ -570,6 +575,7 @@ impl<P: Processing> Analog<P> {
             self.closed = true;
             return;
         }
+        self.captured = true;
         if self.chain.is_empty() || !self.chain.fits(rate) {
             // Nothing measures it, so it has no signal: the analog input
             // never passes ungated. The control thread always sends a
@@ -1459,6 +1465,12 @@ pub struct Engine<P: Processing, S: Sink> {
     last_start: Option<Instant>,
     /// The last DoP claim handed out.
     claims: u64,
+    /// Where the levels go, once set.
+    levels: Option<Arc<Levels>>,
+    /// Each meter's window so far, numbered as in `levels`.
+    metering: [Metering; METERS],
+    /// The time this cycle's windows end at, on CLOCK_MONOTONIC.
+    levels_ns: u64,
 }
 
 impl<P: Processing, S: Sink> Engine<P, S> {
@@ -1511,10 +1523,28 @@ impl<P: Processing, S: Sink> Engine<P, S> {
             stopped: false,
             last_start: None,
             claims: 0,
+            levels: None,
+            metering: std::array::from_fn(|_| Metering::new(0, 0)),
+            levels_ns: 0,
         };
         // Nothing plays yet, which is not bit-perfect.
         engine.publish(decide(&engine.situation()));
         engine
+    }
+
+    /// Measures the outputs and the analog input into `levels` from now on,
+    /// each meter at the channels it has there. Off the audio thread.
+    pub fn set_levels(&mut self, levels: Arc<Levels>) {
+        let rate = self.rate;
+        self.metering = std::array::from_fn(|i| Metering::new(levels.meters[i].channels(), rate));
+        self.levels = Some(levels);
+    }
+
+    /// Starts every meter's window afresh at `rate`.
+    fn meter_at(&mut self, rate: u32) {
+        for metering in &mut self.metering {
+            metering.set_rate(rate);
+        }
     }
 
     /// True while there is no open sink and no parked cycle. `cycle` then
@@ -2001,6 +2031,7 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         self.open = true;
         self.parked = true;
         self.rate = rate;
+        self.meter_at(rate);
         for mix in self.mixes_mut() {
             mix.reopened(rate);
         }
@@ -2021,6 +2052,7 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         self.reopen = None;
         self.open = true;
         self.rate = rate;
+        self.meter_at(rate);
         for mix in self.mixes_mut() {
             mix.reopened(rate);
         }
@@ -2190,6 +2222,14 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         let plugins = plugins_apply(self.mode);
         self.analog
             .read(self.period, self.rate, &self.counters, store, plugins);
+        if let Some(levels) = &self.levels {
+            self.levels_ns = monotonic_ns();
+            // As captured, before its chain.
+            if self.analog.captured {
+                let frames = self.analog.buf[..self.period].as_flattened();
+                self.metering[ANALOG].add(frames, &levels.meters[ANALOG], self.levels_ns);
+            }
+        }
         if !self.parked {
             self.taps.deliver(&self.analog, self.period);
         }
@@ -2237,6 +2277,19 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         // which the close empties: it fades what leaves the line instead.
         if fade == FadeOut::Reopen && owner.is_none() && self.delay.frames > 0 {
             self.delay.fade_out(samples);
+        }
+        // What the card gets, before its conversion. A parked card gets
+        // nothing, and its meter goes stale.
+        if !self.parked
+            && let Some(levels) = &self.levels
+        {
+            let (metering, meter) = (&mut self.metering[0], &levels.meters[0]);
+            if owner.is_some() {
+                // DoP is not PCM.
+                metering.silence(self.period, meter, self.levels_ns);
+            } else {
+                metering.add(&*samples, meter, self.levels_ns);
+            }
         }
         let before_write = Instant::now();
         let result = if self.parked {
@@ -2323,9 +2376,14 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         self.master.finish_fade();
         // The other outputs are silent meanwhile.
         let woke = self.stamp();
-        for output in self.further.iter_mut().flatten() {
+        for (slot, output) in self.further.iter_mut().enumerate() {
+            let Some(output) = output else { continue };
             output.mix.silenced();
             output.feed.silence_at(self.period as u32, woke);
+            if let Some(levels) = &self.levels {
+                let meter = &levels.meters[slot + 1];
+                self.metering[slot + 1].silence(self.period, meter, self.levels_ns);
+            }
         }
         let (rate, period) = (self.rate, self.period);
         for (index, source) in self.table.iter_mut().enumerate() {
@@ -2546,13 +2604,18 @@ impl<P: Processing, S: Sink> Engine<P, S> {
                 .master
                 .mix_shared(players, analog, samples, rate, plugins, volumes),
         };
-        for output in self.further.iter_mut().flatten() {
+        for (slot, output) in self.further.iter_mut().enumerate() {
+            let Some(output) = output else { continue };
             let samples = &mut self.further_samples[..period * output.mix.channels];
             let mix = &mut output.mix;
             // Never bit-perfect: their gains and chains apply in every mode.
             let ran = mix.mix_shared(players, analog, samples, rate, true, true);
             mix.chains_ran(ran);
             output.feed.push_at(samples, woke);
+            if let Some(levels) = &self.levels {
+                let meter = &levels.meters[slot + 1];
+                self.metering[slot + 1].add(&*samples, meter, self.levels_ns);
+            }
         }
         chains_ran
     }
@@ -2620,6 +2683,7 @@ mod tests {
     use crate::config::{Format, Quality};
     use crate::format::{BlockStore, F32, F64, I32, db_to_gain};
     use crate::further::FeedProbe;
+    use crate::levels::Window;
     use crate::plugin::detect::Detect;
     use crate::plugin::{
         Block, Channels, Formats, Param, ParamKind, Plugin, Samples, Status as PluginStatus,
@@ -2650,6 +2714,9 @@ mod tests {
         events: rtrb::Consumer<Event>,
         log: SinkLog,
         counters: Arc<Counters>,
+        /// The master as wide as its sink, the further outputs and the
+        /// analog input stereo.
+        levels: Arc<Levels>,
     }
 
     impl<P: Processing> Rig<P> {
@@ -2675,7 +2742,7 @@ mod tests {
             let (commands, consumer) = RingBuffer::new(1024);
             let (producer, events) = RingBuffer::new(event_slots);
             let counters = Arc::new(Counters::default());
-            let engine = Engine::new(
+            let mut engine = Engine::new(
                 sink,
                 consumer,
                 producer,
@@ -2684,12 +2751,15 @@ mod tests {
                 matrix,
                 DELAY,
             );
+            let levels = Arc::new(Levels::new([channels as u8, 2, 2, 2, 2]));
+            engine.set_levels(levels.clone());
             Rig {
                 engine,
                 commands,
                 events,
                 log,
                 counters,
+                levels,
             }
         }
 
@@ -11113,5 +11183,124 @@ mod tests {
         assert_eq!(got[0], frames(1 << 18, PERIOD));
         let want = (f64::from(1 << 20) * f64::from(db_to_gain(-6.0))).round() as i32;
         assert_eq!(got[1], frames(want, PERIOD));
+    }
+
+    /// Meter `meter`'s newest window.
+    fn window(rig: &Rig<impl Processing>, meter: usize) -> Window {
+        rig.levels.meters[meter].read().unwrap()
+    }
+
+    /// A tone that is not quite periodic in a period, so that every window
+    /// sees a full cycle's worth of it.
+    fn sine(at: usize, n: usize, amp: f64) -> Vec<[i32; 2]> {
+        (at..at + n)
+            .map(|i| tone(i, f64::from(RATE), 997.0, amp))
+            .collect()
+    }
+
+    /// The RMS of channel 1 of the master's newest window, after `cycles`
+    /// periods of a sine at half scale.
+    fn master_rms<P: Processing>(rig: &mut Rig<P>, a: &Client, cycles: usize) -> f32 {
+        for i in 0..cycles {
+            a.ring.write(&sine(i * PERIOD, PERIOD, 0.5));
+            rig.cycle();
+        }
+        window(rig, 0).rms[0]
+    }
+
+    #[test]
+    fn the_master_is_metered_after_its_chains() {
+        fn check<P: Processing>() {
+            let what = format_of::<P>();
+            let mut rig = Rig::<P>::new(BitPerfect::Auto);
+            let mut a = client(1);
+            rig.add(&mut a);
+            // Two windows of 4800 frames, so that the newest is all tone.
+            let cycles = 2 * 4800 / PERIOD + 1;
+            let plain = master_rms(&mut rig, &a, cycles);
+            let db = 20.0 * (plain / 0.5).log10();
+            assert!((db + 3.01).abs() < 0.25, "{what:?}: {db} dB");
+            set_chain(
+                &mut rig,
+                Place::Output,
+                vec![times(db_to_gain(-6.0).into())],
+            );
+            let lowered = master_rms(&mut rig, &a, cycles);
+            let db = 20.0 * (lowered / plain).log10();
+            assert!((db + 6.0).abs() < 0.25, "{what:?}: {db} dB");
+            let w = window(&rig, 0);
+            assert!(w.end_ns > 0);
+            assert_eq!(w.clipped, 0);
+        }
+        check::<I32>();
+        check::<F32>();
+        check::<F64>();
+    }
+
+    #[test]
+    fn dop_meters_silence() {
+        let mut rig = Rig::<I32>::new(BitPerfect::Auto);
+        let mut probe = add_output(&mut rig, 1, stereo());
+        let mut dop = client(1);
+        rig.add(&mut dop);
+        let started = crate::counters::monotonic_ns();
+        for _ in 0..2 * 4800 / PERIOD + 1 {
+            dop.ring.write(&dop_frames(PERIOD));
+            rig.cycle();
+            probe.discard();
+        }
+        assert_eq!(rig.last_periods(1), dop_frames(PERIOD), "DoP played");
+        // Windows were published, all of silence.
+        for meter in [0, 1] {
+            let w = window(&rig, meter);
+            assert!(w.end_ns >= started, "meter {meter} not published");
+            assert_eq!((w.rms[0], w.peak[1], w.clipped), (0.0, 0.0, 0), "{meter}");
+        }
+    }
+
+    #[test]
+    fn further_outputs_and_the_analog_input_are_metered() {
+        let (mut rig, feed) = with_capture::<F32>(BitPerfect::Auto);
+        // The analog input is measured as captured, before its chain.
+        set_chain(&mut rig, Place::Analog, vec![times(0.5)]);
+        let mut probe = add_output(&mut rig, 2, stereo());
+        let mut a = client(1);
+        rig.add(&mut a);
+        for _ in 0..2 * 4800 / PERIOD + 1 {
+            a.ring.write(&frames(1 << 29, PERIOD));
+            feed.push(&frames(1 << 30, PERIOD));
+            rig.cycle();
+            probe.discard();
+        }
+        let analog = window(&rig, ANALOG);
+        assert_eq!((analog.rms[0], analog.peak[1]), (0.5, 0.5));
+        assert!(window(&rig, 2).rms[0] >= 0.24, "output 3 measured");
+        assert_eq!(
+            rig.levels.meters[1].read().unwrap().end_ns,
+            0,
+            "no output 2"
+        );
+    }
+
+    #[test]
+    fn a_parked_master_is_not_metered() {
+        let mut rig = Rig::<I32>::new(BitPerfect::Auto);
+        let mut probe = add_output(&mut rig, 1, stereo());
+        for _ in 0..4800 / PERIOD + 1 {
+            rig.cycle();
+            probe.discard();
+        }
+        let before = window(&rig, 0).end_ns;
+        assert!(before > 0);
+        rig.send(Command::ParkOutput {
+            rate: RATE,
+            period: PERIOD as u32,
+        });
+        for _ in 0..2 * 4800 / PERIOD {
+            rig.cycle();
+            probe.discard();
+        }
+        assert_eq!(window(&rig, 0).end_ns, before, "the master went on");
+        assert!(window(&rig, 1).end_ns > before, "output 2 is metered");
     }
 }

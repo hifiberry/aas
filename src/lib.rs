@@ -16,6 +16,7 @@ pub mod format;
 pub mod further;
 pub mod http;
 pub mod latency;
+pub mod levels;
 pub mod matrix;
 pub mod output_mix;
 pub mod plugin;

@@ -14,6 +14,7 @@ use crate::engine::Engine;
 use crate::format::{F32, F64, I32, Processing};
 use crate::further;
 use crate::http;
+use crate::levels::{ANALOG, Levels, METERS};
 use crate::matrix::{INPUT_NAMES, Matrix};
 use crate::plugin::Failure;
 use crate::plugin::build::{Chains, Libraries, build_chain, matrix_width, widths};
@@ -216,6 +217,15 @@ pub fn run_outputs(
     let notify = eventfd().map_err(|e| format!("eventfd: {e}"))?;
     let listener = listen(socket).map_err(|e| format!("{}: {e}", socket.display()))?;
     let mut sink = FallbackSink::new(sink);
+    // Each output's meter is as wide as what its card gets, the analog
+    // input's stereo; a meter of 0 channels is not there.
+    let mut meters = [0u8; METERS];
+    meters[0] = sink.channels() as u8;
+    for (meter, output) in meters[1..ANALOG].iter_mut().zip(&config.outputs) {
+        *meter = output.channels as u8;
+    }
+    meters[ANALOG] = if capture.is_some() { 2 } else { 0 };
+    let levels = Arc::new(Levels::new(meters));
     let rates = sink.rates_watch();
     let card = sink.card_watch();
     let search = probe.map(|probe| (sink.card_search(), probe));
@@ -262,7 +272,7 @@ pub fn run_outputs(
     let delay = delay_capacity(latency_ms, &latencies, config.resampling) as usize;
     let audio = match config.format {
         Format::I32 => {
-            let engine = Engine::<I32, _>::new(
+            let mut engine = Engine::<I32, _>::new(
                 sink,
                 command_queue,
                 event_queue,
@@ -271,10 +281,11 @@ pub fn run_outputs(
                 matrix,
                 delay,
             );
+            engine.set_levels(levels.clone());
             spawned.spawn(move || audio_loop(engine, wake))
         }
         Format::F32 => {
-            let engine = Engine::<F32, _>::new(
+            let mut engine = Engine::<F32, _>::new(
                 sink,
                 command_queue,
                 event_queue,
@@ -283,10 +294,11 @@ pub fn run_outputs(
                 matrix,
                 delay,
             );
+            engine.set_levels(levels.clone());
             spawned.spawn(move || audio_loop(engine, wake))
         }
         Format::F64 => {
-            let engine = Engine::<F64, _>::new(
+            let mut engine = Engine::<F64, _>::new(
                 sink,
                 command_queue,
                 event_queue,
@@ -295,6 +307,7 @@ pub fn run_outputs(
                 matrix,
                 delay,
             );
+            engine.set_levels(levels.clone());
             spawned.spawn(move || audio_loop(engine, wake))
         }
     }
@@ -348,7 +361,7 @@ pub fn run_outputs(
     server.control.start(Instant::now());
     // After the start, so that no call reaches an output the engine does
     // not have yet.
-    let api_thread = api.and_then(|listener| server.start_api(listener));
+    let api_thread = api.and_then(|listener| server.start_api(listener, levels));
     let mut gaps_seen = 0;
     // The audio thread only ends on its own if it panicked. The daemon then
     // stops with an error, so that systemd restarts it, rather than taking
@@ -571,15 +584,15 @@ fn poll_timeout(due: Option<Instant>, now: Instant) -> i32 {
 
 impl Server {
     /// Starts the API thread on `listener`, with the control thread
-    /// publishing its events. A failure is logged and the daemon plays on
-    /// without the API.
-    fn start_api(&mut self, listener: TcpListener) -> Option<JoinHandle<()>> {
+    /// publishing its events and the audio thread `levels`. A failure is
+    /// logged and the daemon plays on without the API.
+    fn start_api(&mut self, listener: TcpListener, levels: Arc<Levels>) -> Option<JoinHandle<()>> {
         let started = (|| {
             let address = listener.local_addr()?;
             let wake = eventfd()?;
             let (calls, received) = mpsc::channel();
             let (events, _) = broadcast::channel::<ApiEvent>(API_EVENTS);
-            let thread = http::spawn(listener, calls, wake.try_clone()?, events.clone())?;
+            let thread = http::spawn(listener, calls, wake.try_clone()?, events.clone(), levels)?;
             self.control.set_api(events);
             self.api = Some((received, wake));
             eprintln!("aas: API on {address}");

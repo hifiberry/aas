@@ -332,6 +332,7 @@ without that prefix.
 | `PATCH /plugins/{output}/{place}/{index}` | Change a plugin's values, or enable or disable it |
 | `GET`, `PATCH /settings` | The bit-perfect mode, the latency target and the default rate, until the next restart |
 | WebSocket `/events` | One JSON object per change |
+| WebSocket `/levels` | Every output's and the analog input's levels, a binary frame every 100 ms |
 
 Outputs are numbered as in the config's error messages: the master is 1, the
 `[[output]]` tables 2 to 4 in file order. Their fields:
@@ -437,6 +438,30 @@ one of them has gone, not that none plays. A message from a subscriber is
 ignored; one over 4 KiB closes its socket. A subscriber is sent a ping every
 10 s and has to answer it, as WebSocket libraries and browsers do on their own;
 one that answers nothing for 30 s is closed.
+
+WebSocket `/levels` sends a binary frame every 100 ms with the levels of every
+output and of the analog input, if enabled, measured by the audio thread over
+windows of 100 ms. Each frame is one meter after another:
+
+| Bytes | What they are |
+|---|---|
+| 1 | The meter: 1 to 4 the output, 16 the analog input |
+| 1 | Its channels, n |
+| 2 per channel | RMS, then peak, of channel 1, then of channel 2, and so on |
+| 1 | A bit per channel that clipped, channel 1 the lowest |
+
+A stereo master alone gives `[1, 2, rms1, peak1, rms2, peak2, clip]`. RMS and
+peak run from 0 at -60 dBFS or less to 255 at 0 dBFS or more,
+`round((dB + 60) / 60 * 255)` between, so a full-scale sine reads 242 RMS and
+255 peak. A sample at or past full scale is a clip. An output is measured after
+its chains, before the conversion to the card's format: what the card plays.
+During DoP it reads as silence. The analog input is measured as captured,
+before its chain. A meter whose newest window ended more than 200 ms ago, of an
+output that is off or parked or of an analog input with no capture open, reads
+as silence; it stays in the frame, so the layout does not change while the
+daemon runs. A subscriber that does not read loses frames and holds up no one.
+What a subscriber sends is ignored, one message over 4 KiB closes its socket,
+and it is pinged as on `/events`.
 
 What the API sets is kept in the state file and survives a restart: the
 master's volume, each client's volume and mute, the analog input's, each
