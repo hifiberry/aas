@@ -2,7 +2,7 @@
 
 use super::balance::Balance;
 use super::detect::Detect;
-use super::{Channels, Failure, Param, Plugin};
+use super::{Channels, Failure, Formats, Param, Plugin};
 
 /// Builds the plugin called `kind` for a stream at `rate` and blocks of
 /// `channels` channels, or `None` if there is no such plugin. The built-ins
@@ -58,7 +58,7 @@ pub fn channels(kind: &str) -> Option<Channels> {
 
 /// The name and the parameters of the plugin called `kind`, without
 /// building it for a rate, or `None` if there is no such plugin.
-pub fn describe(kind: &str) -> Option<(String, Vec<Param>, Channels)> {
+pub fn describe(kind: &str) -> Option<(String, Vec<Param>, Channels, Formats)> {
     let plugin: Box<dyn Plugin> = match kind {
         "detect" => Box::new(Detect::new(48_000)),
         "balance" => Box::new(Balance::new()),
@@ -76,6 +76,7 @@ pub fn describe(kind: &str) -> Option<(String, Vec<Param>, Channels)> {
         plugin.name().to_string(),
         plugin.params().to_vec(),
         plugin.channels(),
+        plugin.formats(),
     ))
 }
 

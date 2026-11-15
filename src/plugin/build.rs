@@ -3,7 +3,7 @@
 use super::builtin;
 use super::chain::{self, Chain};
 use super::native::Library;
-use super::{BuildError, Channels, Failure, Param, ParamKind, Plugin};
+use super::{BuildError, Channels, Failure, Formats, Param, ParamKind, Plugin};
 use crate::config::{Format, ParamValue, PluginConfig, PluginPlace};
 use crate::engine::Place;
 use crate::latency::MAX_PERIOD;
@@ -34,12 +34,17 @@ impl Libraries {
 pub fn describe(
     config: &PluginConfig,
     libraries: &mut Libraries,
-) -> Option<(String, Vec<Param>, Channels)> {
+) -> Option<(String, Vec<Param>, Channels, Formats)> {
     match (config.kind.as_str(), &config.path) {
         ("library", Some(path)) => {
             let library = libraries.get(path).ok()?;
             let name = library.name().to_string();
-            Some((name, library.params().to_vec(), library.channels()))
+            Some((
+                name,
+                library.params().to_vec(),
+                library.channels(),
+                library.formats(),
+            ))
         }
         ("library", None) => None,
         (kind, _) => builtin::describe(kind),

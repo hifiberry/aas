@@ -6,6 +6,8 @@
 //! one commit, so the audio thread never sees half a decision.
 
 mod api;
+mod graph;
+pub use graph::to_dot;
 mod plugins;
 
 use crate::adaptive::{Adaptive, MAX_DRIFT};

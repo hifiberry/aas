@@ -1,0 +1,423 @@
+//! `GET /graph`: the processing graph as the control thread holds it, and
+//! its Graphviz form. The JSON is built here from the views; the DOT is made
+//! from the JSON by the HTTP thread, so that it costs the control thread
+//! nothing.
+
+use super::Control;
+use super::api::format_name;
+use crate::config::PluginPlace;
+use crate::latency::PERIODS;
+use crate::plugin::chain::conversion;
+use serde_json::{Value, json};
+use std::collections::BTreeMap;
+use std::sync::atomic::Ordering::Relaxed;
+
+/// Nodes and edges, in the order they are made.
+#[derive(Default)]
+struct Graph {
+    nodes: Vec<Value>,
+    edges: Vec<Value>,
+}
+
+impl Graph {
+    fn node(&mut self, id: &str, kind: &str, label: &str, extra: Value) {
+        let mut node = json!({"id": id, "kind": kind, "label": label});
+        if let (Some(node), Value::Object(extra)) = (node.as_object_mut(), extra) {
+            node.extend(extra);
+        }
+        self.nodes.push(node);
+    }
+
+    fn edge(&mut self, from: &str, to: &str) {
+        self.edges.push(json!({"from": from, "to": to}));
+    }
+
+    /// Makes `ids` a path, each node leading to the next.
+    fn path(&mut self, ids: &[String]) {
+        for pair in ids.windows(2) {
+            self.edge(&pair[0], &pair[1]);
+        }
+    }
+}
+
+impl Control {
+    /// The master's rate, which every node of the processing runs at.
+    fn graph_rate(&self) -> Option<u32> {
+        self.output.or(self.parked).map(|(rate, _)| rate)
+    }
+
+    /// `node` with the master's rate, when there is one.
+    fn with_rate(&self, mut node: Value) -> Value {
+        if let (Some(rate), Some(map)) = (self.graph_rate(), node.as_object_mut()) {
+            map.insert("rate".into(), json!(rate));
+        }
+        node
+    }
+
+    pub(super) fn graph(&self) -> Value {
+        let mut g = Graph::default();
+        let format = format_name(self.format);
+        let with_rate = |extra: Value| self.with_rate(extra);
+
+        // Each connected client by name, into the players bus.
+        let mut clients = BTreeMap::new();
+        for conn in self.conns.values() {
+            if let Some(stream) = &conn.stream {
+                let latency = stream.view.header().output_delay_frames.load(Relaxed);
+                clients.insert(conn.name.clone(), (stream.rate, latency));
+            }
+        }
+        for (name, (client_rate, latency)) in &clients {
+            let id = format!("client/{name}");
+            let extra = json!({"rate": client_rate, "latency_frames": latency});
+            g.node(&id, "client", name, extra);
+            g.edge(&id, "bus/players");
+        }
+        g.node(
+            "bus/players",
+            "bus",
+            "players",
+            with_rate(json!({"format": format})),
+        );
+
+        // The analog input, its chain and its bus.
+        if self.analog.is_some() {
+            let latency = self.counters.analog_latency_frames.load(Relaxed);
+            let extra = json!({"latency_frames": latency});
+            g.node("analog", "analog", "analog input", with_rate(extra));
+            let mut path = vec!["analog".to_string()];
+            for entry in self.entries_of(0) {
+                if entry.config.place == PluginPlace::Analog {
+                    path.push(self.plugin_node(&mut g, entry));
+                }
+            }
+            path.push("bus/analog".into());
+            g.node(
+                "bus/analog",
+                "bus",
+                "analog",
+                with_rate(json!({"format": format})),
+            );
+            g.path(&path);
+        }
+
+        for index in 0..=self.further.len() {
+            self.output_nodes(&mut g, index);
+        }
+        json!({"nodes": g.nodes, "edges": g.edges})
+    }
+
+    /// A plugin's node, and its id.
+    fn plugin_node(&self, g: &mut Graph, entry: &super::plugins::PluginEntry) -> String {
+        let id = format!("out/{}", entry.id);
+        let mut plugin = json!({
+            "id": entry.id.to_string(),
+            "ns_avg": entry
+                .stats
+                .total_ns
+                .load(Relaxed)
+                .checked_div(entry.stats.runs.load(Relaxed))
+                .unwrap_or(0),
+        });
+        if let Some(to) = conversion(entry.formats, self.format) {
+            plugin["converts_to"] = json!(format_name(to));
+        }
+        let extra = self.with_rate(json!({"format": format_name(self.format), "plugin": plugin}));
+        g.node(&id, "plugin", &entry.name, extra);
+        id
+    }
+
+    /// The nodes of the output at engine index `index`, from its matrix to
+    /// its card, and the edges into and through them.
+    fn output_nodes(&self, g: &mut Graph, index: usize) {
+        let n = index + 1;
+        let format = format_name(self.format);
+        let rate = self.graph_rate();
+        let extra = |extra: Value| self.with_rate(extra);
+        let matrix = format!("out/{n}/matrix");
+        let width = self.matrices[index].width;
+        let node = json!({"format": format, "channels": width});
+        g.node(&matrix, "matrix", "matrix", extra(node));
+        // A bus feeds the matrix when a route starts from it.
+        let routes = self.route_views(index);
+        for (bus, prefix) in [("bus/players", "players"), ("bus/analog", "analog")] {
+            let used = routes.iter().any(|r| r.from.starts_with(prefix));
+            if used && (prefix == "players" || self.analog.is_some()) {
+                g.edge(bus, &matrix);
+            }
+        }
+
+        let volume = format!("out/{n}/volume");
+        g.node(
+            &volume,
+            "volume",
+            "volume",
+            extra(json!({"format": format})),
+        );
+        let mut path = vec![matrix, volume];
+        let entries = self.entries_of(index);
+        for place in [PluginPlace::Mix, PluginPlace::Output] {
+            for entry in entries.iter().filter(|e| e.config.place == place) {
+                path.push(self.plugin_node(g, entry));
+            }
+        }
+        let (card_rate, channels, period) = match index {
+            0 => (
+                rate,
+                self.channels,
+                self.output.or(self.parked).map(|(_, p)| p),
+            ),
+            _ => {
+                let output = &self.further[index - 1];
+                let current = output.current;
+                (
+                    current.map(|(r, ..)| r),
+                    output.channels,
+                    current.map(|(_, p, _)| p),
+                )
+            }
+        };
+        if index == 0 {
+            let delay = format!("out/{n}/delay");
+            let latency = self.delay.unwrap_or(0);
+            let node = json!({"latency_frames": latency});
+            g.node(&delay, "delay", "delay", extra(node));
+            path.push(delay);
+        }
+        let card = format!("out/{n}/card");
+        let mut node = json!({"channels": channels});
+        if let Some(rate) = card_rate {
+            node["rate"] = json!(rate);
+        }
+        if let Some(period) = period {
+            node["latency_frames"] = json!(period * PERIODS);
+        }
+        let label = self.card_of(index);
+        let label = if label.is_empty() { "card" } else { label };
+        g.node(&card, "card", label, node);
+        path.push(card);
+        g.path(&path);
+    }
+}
+
+/// A DOT string, quoted.
+fn quoted(text: &str) -> String {
+    let escaped = text.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{}\"", escaped.replace('\n', "\\n"))
+}
+
+/// The graph as Graphviz DOT: a node for each node, labelled with what it
+/// has to say, and an arrow for each edge.
+pub fn to_dot(graph: &Value) -> String {
+    let mut dot = String::from("digraph aas {\n  rankdir=LR;\n");
+    let empty = Vec::new();
+    for node in graph["nodes"].as_array().unwrap_or(&empty) {
+        let id = node["id"].as_str().unwrap_or_default();
+        let mut label = node["label"].as_str().unwrap_or(id).to_string();
+        if let Some(rate) = node["rate"].as_u64() {
+            label.push_str(&format!("\n{rate} Hz"));
+        }
+        if let Some(channels) = node["channels"].as_u64() {
+            label.push_str(&format!("\n{channels} ch"));
+        }
+        if let Some(format) = node["format"].as_str() {
+            label.push_str(&format!("\n{format}"));
+        }
+        if let Some(frames) = node["latency_frames"].as_u64() {
+            label.push_str(&format!("\n{frames} frames"));
+        }
+        if let Some(plugin) = node.get("plugin") {
+            let ns = plugin["ns_avg"].as_u64().unwrap_or(0);
+            label.push_str(&format!("\n{ns} ns per cycle"));
+            if let Some(to) = plugin["converts_to"].as_str() {
+                label.push_str(&format!("\nconverted to {to}"));
+            }
+        }
+        let kind = node["kind"].as_str().unwrap_or_default();
+        let shape = match kind {
+            "client" | "analog" | "card" => "box",
+            "bus" => "ellipse",
+            _ => "record",
+        };
+        dot.push_str(&format!(
+            "  {} [label={}, shape={shape}];\n",
+            quoted(id),
+            quoted(&label)
+        ));
+    }
+    for edge in graph["edges"].as_array().unwrap_or(&empty) {
+        let from = edge["from"].as_str().unwrap_or_default();
+        let to = edge["to"].as_str().unwrap_or_default();
+        dot.push_str(&format!("  {} -> {};\n", quoted(from), quoted(to)));
+    }
+    dot.push_str("}\n");
+    dot
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::tests::{further, play, started, started_with};
+    use super::*;
+    use crate::api::Call;
+    use crate::config::{Config, PluginConfig};
+    use crate::control::tests::{Opener, analog_config};
+    use std::time::Instant;
+
+    fn plugin(place: PluginPlace, kind: &str) -> PluginConfig {
+        PluginConfig {
+            place,
+            kind: kind.into(),
+            path: None,
+            params: Default::default(),
+        }
+    }
+
+    fn ids(graph: &Value) -> Vec<String> {
+        let nodes = graph["nodes"].as_array().unwrap();
+        nodes
+            .iter()
+            .map(|n| n["id"].as_str().unwrap().into())
+            .collect()
+    }
+
+    fn edges(graph: &Value) -> Vec<(String, String)> {
+        let edges = graph["edges"].as_array().unwrap();
+        let text = |e: &Value, k: &str| e[k].as_str().unwrap().to_string();
+        edges
+            .iter()
+            .map(|e| (text(e, "from"), text(e, "to")))
+            .collect()
+    }
+
+    /// The edges as a path, when each one leaves where the last arrived.
+    fn path(graph: &Value) -> Vec<String> {
+        let edges = edges(graph);
+        let mut path = vec![edges[0].0.clone()];
+        for (from, to) in &edges {
+            assert_eq!(from, path.last().unwrap(), "{edges:?}");
+            path.push(to.clone());
+        }
+        path
+    }
+
+    fn graph(control: &mut Control, now: Instant) -> Value {
+        control.call(Call::Graph, now).unwrap()
+    }
+
+    #[test]
+    fn the_master_alone() {
+        let (mut control, _engine, now) = started(&Config::default(), None);
+        play(&mut control, 1, 48000, now);
+        let g = graph(&mut control, now);
+        let kinds: Vec<&str> = g["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["kind"].as_str().unwrap())
+            .collect();
+        assert!(kinds.contains(&"client"));
+        let edges = edges(&g);
+        let names = |ids: &[&str]| -> Vec<(String, String)> {
+            ids.windows(2)
+                .map(|p| (p[0].to_string(), p[1].to_string()))
+                .collect()
+        };
+        let expected = names(&[
+            "bus/players",
+            "out/1/matrix",
+            "out/1/volume",
+            "out/1/delay",
+            "out/1/card",
+        ]);
+        assert!(
+            edges
+                .iter()
+                .any(|e| e.0.starts_with("client/") && e.1 == "bus/players")
+        );
+        let rest: Vec<_> = edges
+            .into_iter()
+            .filter(|e| !e.0.starts_with("client/"))
+            .collect();
+        assert_eq!(rest, expected);
+    }
+
+    #[test]
+    fn plugins_in_chain_order() {
+        let config = Config {
+            plugins: vec![
+                plugin(PluginPlace::Output, "balance"),
+                plugin(PluginPlace::Mix, "balance"),
+                plugin(PluginPlace::Mix, "gain"),
+            ],
+            ..Config::default()
+        };
+        let (mut control, _engine, now) = started(&config, None);
+        let g = graph(&mut control, now);
+        assert_eq!(
+            path(&g),
+            [
+                "bus/players",
+                "out/1/matrix",
+                "out/1/volume",
+                "out/1/mix/0",
+                "out/1/mix/1",
+                "out/1/output/0",
+                "out/1/delay",
+                "out/1/card",
+            ]
+        );
+        let node = g["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["id"] == "out/1/mix/1")
+            .unwrap();
+        assert_eq!(node["kind"], "plugin");
+        assert_eq!(node["plugin"]["id"], "1/mix/1");
+        assert_eq!(node["plugin"]["ns_avg"], 0);
+    }
+
+    #[test]
+    fn the_analog_chain_comes_before_its_bus() {
+        let config = Config {
+            plugins: vec![plugin(PluginPlace::Analog, "detect")],
+            ..analog_config()
+        };
+        let opener = Opener::default();
+        let (mut control, _engine, now) = started(&config, Some(&opener));
+        let g = graph(&mut control, now);
+        let edges = edges(&g);
+        let at = |e: (&str, &str)| edges.iter().position(|x| (x.0.as_str(), x.1.as_str()) == e);
+        let chain = at(("analog", "out/1/analog/0")).unwrap();
+        let bus = at(("out/1/analog/0", "bus/analog")).unwrap();
+        assert_eq!(chain + 1, bus);
+        assert!(at(("bus/analog", "out/1/matrix")).is_some());
+    }
+
+    #[test]
+    fn a_further_output_has_no_delay_node() {
+        let (mut control, _engine, _logs, now) =
+            started_with(&Config::default(), vec![further(&[])]);
+        let g = graph(&mut control, now);
+        let ids = ids(&g);
+        assert!(ids.contains(&"out/1/delay".to_string()));
+        assert!(!ids.contains(&"out/2/delay".to_string()));
+        for id in ["out/2/matrix", "out/2/volume", "out/2/card"] {
+            assert!(ids.contains(&id.to_string()), "{id}");
+        }
+        assert!(edges(&g).contains(&("out/2/volume".into(), "out/2/card".into())));
+        assert!(edges(&g).contains(&("bus/players".into(), "out/2/matrix".into())));
+    }
+
+    #[test]
+    fn dot_is_a_digraph() {
+        let (mut control, _engine, now) = started(&Config::default(), None);
+        let g = graph(&mut control, now);
+        let dot = to_dot(&g);
+        assert!(dot.starts_with("digraph aas {"));
+        assert_eq!(dot.matches("->").count(), edges(&g).len());
+        for id in ids(&g) {
+            assert!(dot.contains(&format!("\"{id}\"")), "{id}");
+        }
+    }
+}

@@ -194,6 +194,10 @@ impl Library {
     }
 
     /// The channel counts the library's plugin takes and gives.
+    pub fn formats(&self) -> Formats {
+        self.formats
+    }
+
     pub fn channels(&self) -> Channels {
         self.channels
     }

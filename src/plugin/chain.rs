@@ -578,7 +578,7 @@ pub(super) fn fit(
 /// `format`: its own if it takes it, else `f64`, `f32` or `i32` in that
 /// order. `None` means no conversion. A plugin that names no format at all
 /// is given the chain's.
-fn conversion(formats: Formats, format: Format) -> Option<Format> {
+pub fn conversion(formats: Formats, format: Format) -> Option<Format> {
     if formats.has(format) {
         None
     } else {

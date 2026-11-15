@@ -165,7 +165,7 @@ const MATRIX_GAP: Duration = Duration::from_millis(20);
 pub(super) struct OutputMatrix {
     /// The width its buffers and chains on the audio thread are built for,
     /// fixed at the start. A matrix of another width is refused.
-    width: usize,
+    pub(super) width: usize,
     /// The routes as last set; empty is the default matrix.
     routes: Vec<Route>,
     /// The routes of the config, which a stored matrix is checked against.
@@ -254,7 +254,7 @@ fn route_json(route: &Route) -> RouteJson {
     }
 }
 
-fn format_name(format: Format) -> &'static str {
+pub(super) fn format_name(format: Format) -> &'static str {
     match format {
         Format::I32 => "i32",
         Format::F32 => "f32",
@@ -314,6 +314,7 @@ impl Control {
             Call::Matrix => api::answer(&self.matrix_view()),
             Call::PutMatrix(put) => self.put_matrix(put, now),
             Call::Metrics => api::answer(&self.metrics_view()),
+            Call::Graph => Ok(self.graph()),
             Call::Plugins => api::answer(&self.plugin_views()),
             Call::Plugin(id) => self.plugin_answer(&id),
             Call::PatchPlugin(id, patch) => self.patch_plugin(id, patch, now),
@@ -599,7 +600,7 @@ impl Control {
 
     /// The routes of the output at `index` as last set, the default matrix
     /// written out route by route.
-    fn route_views(&self, index: usize) -> Vec<RouteJson> {
+    pub(super) fn route_views(&self, index: usize) -> Vec<RouteJson> {
         let slot = &self.matrices[index];
         let default;
         let routes = if slot.routes.is_empty() {

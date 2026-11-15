@@ -139,6 +139,13 @@ fn top_up(client: &mut Client) {
 /// One HTTP/1.1 request on its own connection. The body of every answer
 /// of the API is JSON.
 fn http(port: u16, method: &str, path: &str, body: Option<&str>) -> (u16, Value) {
+    let (status, _, body) = http_raw(port, method, path, body);
+    let body = serde_json::from_str(&body).unwrap_or_else(|e| panic!("{e}: {body:?}"));
+    (status, body)
+}
+
+/// The same, with the content type and the body as text.
+fn http_raw(port: u16, method: &str, path: &str, body: Option<&str>) -> (u16, String, String) {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
     stream.set_read_timeout(Some(PATIENCE)).unwrap();
     let body = body.unwrap_or("");
@@ -152,8 +159,15 @@ fn http(port: u16, method: &str, path: &str, body: Option<&str>) -> (u16, Value)
     stream.read_to_string(&mut answer).unwrap();
     let (head, body) = answer.split_once("\r\n\r\n").expect("no end of the head");
     let status = head.split(' ').nth(1).unwrap().parse().unwrap();
-    let body = serde_json::from_str(body).unwrap_or_else(|e| panic!("{e}: {body:?}"));
-    (status, body)
+    let content_type = head
+        .lines()
+        .find_map(|l| {
+            l.to_ascii_lowercase()
+                .strip_prefix("content-type:")
+                .map(|v| v.trim().to_string())
+        })
+        .unwrap_or_default();
+    (status, content_type, body.to_string())
 }
 
 /// The name the daemon knows this process by: its `comm`.
@@ -524,4 +538,28 @@ fn patch_a_plugin_and_read_it_back() {
     // Its time per cycle is in the metrics, by its id.
     let (_, metrics) = daemon.get("/metrics");
     assert_eq!(metrics["plugins"][0]["id"], json!("1/output/0"));
+}
+
+#[test]
+fn graph_as_json() {
+    let daemon = Daemon::start();
+    let (status, graph) = daemon.get("/graph");
+    assert_eq!(status, 200);
+    let nodes = graph["nodes"].as_array().unwrap();
+    assert!(nodes.iter().any(|n| n["id"] == "out/1/card"));
+    assert!(!graph["edges"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn graph_as_dot() {
+    let daemon = Daemon::start();
+    let port = daemon.port.unwrap();
+    let (status, content_type, body) = http_raw(port, "GET", "/graph?format=dot", None);
+    assert_eq!(status, 200);
+    assert_eq!(content_type, "text/vnd.graphviz");
+    assert!(body.starts_with("digraph aas {"), "{body}");
+    let (status, _, _) = http_raw(port, "GET", "/graph?format=json", None);
+    assert_eq!(status, 200);
+    let (status, _) = daemon.get("/graph?format=svg");
+    assert_eq!(status, 400);
 }

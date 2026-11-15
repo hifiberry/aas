@@ -13,7 +13,7 @@ use axum::Router;
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use serde::de::DeserializeOwned;
@@ -126,6 +126,7 @@ fn router(shared: Arc<Shared>) -> Router {
             "/inputs/clients/{name}",
             get(get_client).patch(patch_client),
         )
+        .route("/graph", get(get_graph))
         .route("/metrics", get(|s| ask(s, Call::Metrics)))
         .route("/matrix", get(|s| ask(s, Call::Matrix)).put(put_matrix))
         .route("/plugins", get(|s| ask(s, Call::Plugins)))
@@ -157,11 +158,23 @@ impl IntoResponse for ApiError {
 
 /// Sends `call` to the control thread and gives its answer. 503 when the
 /// control thread does not answer in time, or has stopped.
-async fn ask(State(shared): State<Arc<Shared>>, call: Call) -> Response {
-    let stopped = || ApiError::unavailable("the control thread has stopped").into_response();
+async fn ask(s: State<Arc<Shared>>, call: Call) -> Response {
+    match fetch(s, call).await {
+        Ok(body) => axum::Json(body).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// Sends `call` to the control thread and gives its answer, or why there
+/// is none.
+async fn fetch(
+    State(shared): State<Arc<Shared>>,
+    call: Call,
+) -> Result<serde_json::Value, ApiError> {
+    let stopped = || ApiError::unavailable("the control thread has stopped");
     let (answer, answered) = oneshot::channel();
     if shared.calls.send(ApiCall { call, answer }).is_err() {
-        return stopped();
+        return Err(stopped());
     }
     let one = 1u64;
     // SAFETY: a plain write of 8 bytes to a non-blocking eventfd. One that
@@ -176,12 +189,41 @@ async fn ask(State(shared): State<Arc<Shared>>, call: Call) -> Response {
     match tokio::time::timeout(ANSWER_WITHIN, answered).await {
         Err(_) => {
             let s = ANSWER_WITHIN.as_secs();
-            ApiError::unavailable(format!("no answer from the control thread in {s} s"))
-                .into_response()
+            Err(ApiError::unavailable(format!(
+                "no answer from the control thread in {s} s"
+            )))
         }
-        Ok(Err(_)) => stopped(),
-        Ok(Ok(Ok(body))) => axum::Json(body).into_response(),
-        Ok(Ok(Err(e))) => e.into_response(),
+        Ok(Err(_)) => Err(stopped()),
+        Ok(Ok(answer)) => answer,
+    }
+}
+
+/// The value of the query's `format`, if it has one.
+fn format_of(uri: &Uri) -> Option<&str> {
+    let query = uri.query()?;
+    query
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("format="))
+}
+
+/// `GET /graph`: JSON, or DOT with `?format=dot`. The DOT is made here, from
+/// the control thread's JSON, so that it costs the control thread nothing.
+async fn get_graph(s: State<Arc<Shared>>, uri: Uri) -> Response {
+    let dot = match format_of(&uri) {
+        None | Some("json") => false,
+        Some("dot") => true,
+        Some(other) => {
+            let message = format!("format is json or dot, not \"{other}\"");
+            return ApiError::bad_request(message).into_response();
+        }
+    };
+    match fetch(s, Call::Graph).await {
+        Ok(graph) if dot => {
+            let text = crate::control::to_dot(&graph);
+            ([(header::CONTENT_TYPE, "text/vnd.graphviz")], text).into_response()
+        }
+        Ok(graph) => axum::Json(graph).into_response(),
+        Err(e) => e.into_response(),
     }
 }
 

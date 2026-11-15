@@ -28,6 +28,8 @@ pub enum Call {
     PutMatrix(MatrixPut),
     /// `GET /metrics`.
     Metrics,
+    /// `GET /graph`.
+    Graph,
     /// `GET /plugins`.
     Plugins,
     Plugin(PluginId),

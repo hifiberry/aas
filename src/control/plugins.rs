@@ -14,7 +14,7 @@ use crate::counters::PluginStats;
 use crate::engine::{Command, Target};
 use crate::plugin::build::{Libraries, describe, engine_place};
 use crate::plugin::chain::Chain;
-use crate::plugin::{Channels, Param, ParamKind};
+use crate::plugin::{Channels, Formats, Param, ParamKind};
 use crate::state::{State, Stored, StoredPlugin};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -34,6 +34,8 @@ pub(super) struct PluginEntry {
     pub params: Vec<Param>,
     /// Its channel counts differ, so it cannot be disabled.
     pub changes_count: bool,
+    /// The formats it takes, which decide whether a chain converts for it.
+    pub formats: Formats,
     pub enabled: bool,
     /// Shared with every chain built for it, so a rebuild keeps them.
     pub stats: Arc<PluginStats>,
@@ -147,8 +149,17 @@ pub(super) fn entries(
             let slot = &mut seen[super::slot(p.place)];
             let index = *slot;
             *slot += 1;
-            let (name, params, channels) =
-                describe(p, libraries).unwrap_or((p.kind.clone(), Vec::new(), Channels::Any));
+            let every = Formats {
+                i32: true,
+                f32: true,
+                f64: true,
+            };
+            let (name, params, channels, formats) = describe(p, libraries).unwrap_or((
+                p.kind.clone(),
+                Vec::new(),
+                Channels::Any,
+                every,
+            ));
             let changes_count = match channels {
                 Channels::Fixed { input, output } => input != output,
                 Channels::Any => false,
@@ -168,6 +179,7 @@ pub(super) fn entries(
                 name,
                 params,
                 changes_count,
+                formats,
                 enabled: true,
                 stats: Arc::new(stats),
             }
