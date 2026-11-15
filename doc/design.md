@@ -1472,7 +1472,9 @@ All of this is *(call)*. Paths are as the daemon sees them; nginx puts
   `set_param` between blocks, without allocating. The control thread keeps the
   value in its copy of the plugin's config, and sets it in every chain it
   holds ready for another rate, so a rebuild at a rate change keeps it. A
-  plugin smooths its own parameter changes, as `gain` does.
+  plugin smooths its own parameter changes: `balance` ramps to a new value
+  over 10 ms, a step per frame. The example `gain` does not smooth, so a
+  change of it clicks.
 - **Enabled.** A disabled plugin is passed over by its chain and counts as
   neutral. Enabling and disabling crossfade over 10 ms between the plugin's
   input and its output, with one more buffer per chain that holds a plugin,

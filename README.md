@@ -374,7 +374,8 @@ value is refused with 422 when it is out of range, not a whole number for an
 integer, a switch or an enumeration, or for a parameter the plugin does not
 have; a float is not clamped as it is in the config. A text parameter changes
 only in the config, so setting one is 422 too. A change takes effect between
-two blocks, and a plugin smooths it as `gain` does. A disabled plugin is passed
+two blocks, and a plugin has to smooth it itself: `balance` ramps to a new
+value over 10 ms, while the example `gain` jumps. A disabled plugin is passed
 over and its latency counts as 0; enabling or disabling fades over 10 ms, and a
 plugin enabled again starts from silence, with no old tail. `detect` cannot be
 disabled, nor can a plugin whose channel counts differ: both are 422.

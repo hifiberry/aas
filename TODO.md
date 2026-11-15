@@ -218,19 +218,29 @@ Missing: a plan for the order, since the web UI can move only once the
 package installs the daemon. First step: list every call the web UI makes to
 `/api/pipewire` and `/api/vu-meter` and map each to its `/api/aas/v1` route.
 
-## Smooth the `balance` plugin's changes
+## A reopen cuts the sound instead of fading it
 
-A new `balance` value clicks: on the CM5 test board, through the loopback
-cable, a change from 0 to 0.5 and back stepped the left channel by up to
-0.186 between two samples, above 3 kHz -38 dBFS against -95 dBFS without a
-change (`doc/measurements.md`, "Stage 4 part 2", "A plugin's change and its
-enabling through the cable"). The design says a plugin smooths its own
-parameter changes, as `gain` does; `Balance::set_param` in
-`src/plugin/balance.rs` takes the value for the next block at once.
-Enabling and disabling fade and do not click. First step: ramp the two
-gains in `process` over 10 ms towards the ones `set_param` set, without
-allocating, keep `neutral` false until the ramp ends at 0, and capture the
-same change again.
+A change of `latency_ms` through `/settings` leaves a hole of 7 to 8 ms in
+the sound on the CM5 test board, cut without a fade, with a click at each
+edge (`doc/measurements.md`, "Stage 4 part 2", "Lowering the latency while a
+client plays"). A change of rate takes the same path, `Command::Reconfigure`,
+so it should cut the same way; that is read from the code, not captured.
+The engine does fade one period out ahead of a reopen (`FadeOut::Reopen` in
+`src/engine.rs`), but the card is then closed, and closing drops the two
+periods its buffer holds, the faded one last, so the fade is never heard.
+Missing: the owner's decision whether a reopen should be silent at its
+edges, and at what cost in time: draining the card before the close would
+play the fade but delays the reopen by the buffer. First step: capture a
+rate change through the loopback cable to confirm it cuts too, then try
+draining the faded period before the close.
+
+## The example `gain` plugin does not smooth its changes
+
+`plugins/gain` takes a new value at the next block, so a change of it clicks
+as `balance` did before it ramped (`doc/measurements.md`, "Stage 4 part 2").
+It is the example a plugin author starts from. First step: give it the ramp
+`src/plugin/balance.rs` has, 10 ms a step per frame, which needs the rate
+`create` is given.
 
 ## Stage 4 part 3: a matrix row and a plugin chain per client
 

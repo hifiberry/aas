@@ -2347,12 +2347,27 @@ in part 1:
 Enabling and disabling do not click: the largest step stays the tone's own,
 0.0647, and above 3 kHz the change reaches -85 to -86 dBFS, where part 1's
 10 ms volume fades reached -82 to -91 dBFS. **A change of the `balance`
-value clicks.** The left channel jumps by up to 0.186 between two samples,
-almost three times the tone's step, and above 3 kHz it reaches -38 dBFS, close
-to part 1's computed hard jump, -36 dBFS. The built-in `balance` takes a new
-value at the next block and applies it to the whole block at once, where the
-design says that a plugin smooths its own changes, as `gain` does. In the ten
-minute runs that was a click every second, which the counters do not show.
+value clicked.** The left channel jumped by up to 0.186 between two samples,
+almost three times the tone's step, and above 3 kHz it reached -38 dBFS, close
+to part 1's computed hard jump, -36 dBFS. The built-in `balance` took a new
+value at the next block and applied it to the whole block at once, where the
+design says that a plugin smooths its own changes. In the ten minute runs
+that was a click every second, which the counters do not show.
+
+This was fixed on the branch before the merge: `balance` now ramps to a new
+value over 10 ms, a step per frame. The daemon built from 021b9dc was
+captured the same way, with a change every second from 10 to 30 s, through
+0.5, 0, -0.5, 0 and so on, 21 changes, all answered 200:
+
+| Window | Largest step, L / R | Above 3 kHz, worst 5 ms, L / R |
+|---|---|---|
+| Quiet, five seconds | 0.0648 / 0.0328 | -94.4 / -95.3 dBFS |
+| 21 changes, worst of each | 0.0648 / 0.0328 | -85.3 / -90.1 dBFS |
+
+No step is larger than the tone's, and above 3 kHz the worst change, -85.3
+dBFS, is where enabling and disabling are. **No click was seen.** The ten
+minute runs above were made before the fix; the ramp adds a step per frame
+for 10 ms after a change, which the plugin's timing there does not include.
 
 ### Lowering the latency while a client plays
 
@@ -2377,9 +2392,17 @@ The card did not: each change reopens it, as a change of rate does. The daemon
 logged the card open again 9 to 16 ms after the change on the CM5 and 23 to
 40 ms after it on the Pi 3. On the CM5 the capture through the cable has a
 hole of 7 to 8 ms of silence at each change, cut without a fade: the tone
-stops and starts at once, with steps of up to 0.29 and above 3 kHz
--33 to -45 dBFS, against -95 dBFS without a change. So a latency change is heard as a short dropout with a
-click, as a rate change is.
+stops at once and is back at full level within a millisecond, with steps of
+up to 0.29 and above 3 kHz -33 to -45 dBFS, against -95 dBFS without a
+change. So a latency change is heard as a short dropout with a click.
+
+A rate change takes the same path, so it should cut the same way; this was
+read from the code, not captured. Both reach the audio thread as one command
+to reconfigure, and ahead of it the engine fades one period out, as for any
+reopen. But the card is then closed, and closing drops what its buffer still
+holds, two periods with the faded one last, so the fade is never played. A
+capture of one change from 12 to 4 ms with the build from 021b9dc gave the
+same 8 ms hole.
 
 ### What these figures do not show
 
