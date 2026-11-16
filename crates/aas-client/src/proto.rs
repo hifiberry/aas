@@ -4,7 +4,8 @@
 //! arguments a message does not use to zero. A receiver ignores them.
 //! `Configure` carries the direction of the stream and whether a capture
 //! stream records the output monitor in its channels word, as `CAPTURE`
-//! and `MONITOR` describe.
+//! and `MONITOR` describe. A monitor's rate word, otherwise unused, is the
+//! id of the stream it records, 0 for the master.
 //!
 //! Each request gets one reply, in order. A connection that has sent
 //! `SubscribeVolume` is also sent `Reply::VolumeChanged` when the output
@@ -60,7 +61,9 @@ pub enum Request {
     /// to what the daemon needs, never refused for being small.
     ///
     /// With `monitor`, which needs `capture`, the stream records what the
-    /// master card is sent instead of the analog input.
+    /// master card is sent instead of the analog input. Then `rate` names
+    /// the stream to record: the id `GetStreamId` gave, or 0 for the
+    /// master. An id that names no stream fails with `ENOENT`.
     Configure {
         rate: u32,
         format: ClientFormat,
@@ -99,6 +102,8 @@ pub enum Request {
     },
     /// Answered by `OutputRate`.
     GetOutputRate,
+    /// Answered by `StreamId`.
+    GetStreamId,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -137,6 +142,12 @@ pub enum Reply {
     /// The reply to `GetOutputRate`, zero while the output is off.
     OutputRate {
         rate: u32,
+    },
+    /// The reply to `GetStreamId`: the id of this connection's playback
+    /// stream, which a monitor names in `Configure`'s rate word. Zero for a
+    /// connection without a playback stream.
+    StreamId {
+        id: u32,
     },
 }
 
@@ -178,7 +189,10 @@ fn client_volume_from_word(word: u32) -> Option<(i32, bool)> {
     if word & !((1 << 18) - 1) != 0 || (word & 0x1_ffff) > 60_000 {
         return None;
     }
-    Some(((word & 0x1_ffff) as i32 + CLIENT_DB_MIN, word & (1 << 17) != 0))
+    Some((
+        (word & 0x1_ffff) as i32 + CLIENT_DB_MIN,
+        word & (1 << 17) != 0,
+    ))
 }
 
 fn pack(tag: u32, args: [u32; 4]) -> [u8; REQUEST_LEN] {
@@ -222,6 +236,7 @@ pub fn encode_request(r: &Request) -> [u8; REQUEST_LEN] {
             pack(12, [db_millis as u32, u32::from(muted), 0, 0])
         }
         Request::GetOutputRate => pack(13, [0; 4]),
+        Request::GetStreamId => pack(14, [0; 4]),
     }
 }
 
@@ -273,6 +288,7 @@ pub fn decode_request(b: &[u8]) -> Option<Request> {
             },
         },
         13 => Request::GetOutputRate,
+        14 => Request::GetStreamId,
         _ => return None,
     })
 }
@@ -290,6 +306,7 @@ pub fn encode_reply(r: &Reply) -> [u8; REPLY_LEN] {
             (8, client_volume_word(db_millis, muted))
         }
         Reply::OutputRate { rate } => (9, rate),
+        Reply::StreamId { id } => (10, id),
     };
     let mut out = [0u8; REPLY_LEN];
     out[..4].copy_from_slice(&tag.to_le_bytes());
@@ -325,6 +342,7 @@ pub fn decode_reply(b: &[u8]) -> Option<Reply> {
             Reply::ClientVolumeChanged { db_millis, muted }
         }
         9 => Reply::OutputRate { rate: word(b, 1) },
+        10 => Reply::StreamId { id: word(b, 1) },
         _ => return None,
     })
 }
@@ -557,5 +575,29 @@ mod tests {
             Some(Request::SetVolume { percent: 55 })
         );
         assert_eq!(decode_reply(&[1, 0, 0, 0, 9, 0, 0, 0]), Some(Reply::Ok));
+    }
+
+    #[test]
+    fn get_stream_id_round_trips() {
+        let r = Request::GetStreamId;
+        assert_eq!(decode_request(&encode_request(&r)), Some(r));
+        let r = Reply::StreamId { id: 7 };
+        assert_eq!(decode_reply(&encode_reply(&r)), Some(r));
+    }
+
+    #[test]
+    fn a_monitors_rate_word_names_its_stream() {
+        let r = Request::Configure {
+            rate: 42,
+            format: ClientFormat::S32,
+            channels: 2,
+            buffer_frames: 4800,
+            capture: true,
+            monitor: true,
+        };
+        match decode_request(&encode_request(&r)) {
+            Some(Request::Configure { rate, .. }) => assert_eq!(rate, 42),
+            other => panic!("{other:?}"),
+        }
     }
 }

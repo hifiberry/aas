@@ -291,7 +291,10 @@ impl Client {
 
     /// As `receive_reply`, but does not wait with `flags` set to
     /// `MSG_DONTWAIT`.
-    fn receive_reply_flags(&mut self, flags: libc::c_int) -> io::Result<Option<(Reply, Vec<OwnedFd>)>> {
+    fn receive_reply_flags(
+        &mut self,
+        flags: libc::c_int,
+    ) -> io::Result<Option<(Reply, Vec<OwnedFd>)>> {
         if let Some(reply) = self.pending_reply.take() {
             return Ok(Some((reply, Vec::new())));
         }
@@ -338,6 +341,18 @@ impl Client {
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "unexpected reply to an output rate",
+            )),
+        }
+    }
+
+    /// The id of this connection's playback stream, which
+    /// `configure_stream_monitor` takes. Zero when the connection has none.
+    pub fn stream_id(&mut self) -> io::Result<u32> {
+        match self.call(&Request::GetStreamId)?.0 {
+            Reply::StreamId { id } => Ok(id),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unexpected reply to a stream id",
             )),
         }
     }
@@ -446,7 +461,16 @@ impl Client {
     /// when the daemon's rate changes, and a ring that is full drops what
     /// does not fit.
     pub fn configure_monitor(&mut self, buffer_frames: u32) -> io::Result<u32> {
-        self.set_up(0, ClientFormat::S32, 2, buffer_frames, true, true)
+        self.configure_stream_monitor(buffer_frames, 0)
+    }
+
+    /// Like `configure_monitor`, but records one playback stream, by the
+    /// id `stream_id` gave on its connection, after its own gain and before
+    /// the mix. Stream 0 is the master. An id that names no stream fails
+    /// with `ENOENT`, and the stream ends, as at a rate change, when its
+    /// stream is removed or replaced.
+    pub fn configure_stream_monitor(&mut self, buffer_frames: u32, stream: u32) -> io::Result<u32> {
+        self.set_up(stream, ClientFormat::S32, 2, buffer_frames, true, true)
     }
 
     /// Sends a configure and maps the ring it is answered with. Returns the

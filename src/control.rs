@@ -1381,6 +1381,9 @@ impl Control {
             Request::GetOutputRate => Answer::reply(Reply::OutputRate {
                 rate: self.cycle_rate().unwrap_or(0),
             }),
+            // Stream ids come with the per-stream monitors: until then
+            // no connection has one.
+            Request::GetStreamId => Answer::reply(Reply::StreamId { id: 0 }),
         }
     }
 
