@@ -95,7 +95,9 @@ not this one is kept as `/etc/asound.conf.before-aas`. After that:
   [Recording](#recording).
 - ALSA's `default` control is the daemon's output volume, one element called
   `Master`, 0 to 100. Plain `amixer` shows only `Master`. The card's own
-  controls are reached with `amixer -c <card>`.
+  controls are reached with `amixer -c <card>`. A change made to the card's
+  control by another program, a player's mixer or `amixer -c`, becomes the
+  volume; at start the card's control is read, not written.
 
 `dist/install-pulse.sh` installs `/etc/pulse/client.conf` with
 `default-server = unix:/run/aas/pulse` and `autospawn = no`, so players that
@@ -120,7 +122,7 @@ is kept in `/var/lib/aas/state.toml`.
 | `bit_perfect` | `"auto"`, `"forced"`, `"off"` | `"auto"` | `auto` copies the samples untouched while one client plays at the output rate with no software volume. `forced` also ignores the software volume and bypasses plugins, except input detection. `off` always mixes. |
 | `idle` | `"off"`, `"zeros"` | `"off"` | What the output does when nothing plays: close the card after a delay, or keep it open and send zeros. |
 | `idle_delay_s` | whole seconds | 60 | The delay before `idle = "off"` closes the card. An error with `idle = "zeros"`. |
-| `volume_mode` | `"hardware"`, `"software"` | the card's control if it has one | Who applies the volume: the card's mixer, or the daemon. `hardware` on a card without a control warns and uses software. |
+| `volume_mode` | `"hardware"`, `"software"`, `"follow"` | the card's control if it has one | Who applies the volume: the card's mixer, or the daemon. `hardware` on a card without a control warns and uses software. `follow` follows and writes `volume_control`, such as a user-space `Softvol`, and applies the volume in software. |
 | `volume_control` | a mixer control name | the first of `Digital`, `Master`, `PCM` | The card's control that carries the volume. |
 | `volume_poll_ms` | 50 to 5000 | 100 | How often, in ms, the card's volume control is checked for a change made by another program. |
 | `default_rate` | 8000 to 384000 | 48000 | The rate the output opens at before the first client plays. |
@@ -351,7 +353,9 @@ Outputs are numbered as in the config's error messages: the master is 1, the
 `[[output]]` tables 2 to 4 in file order. Their fields:
 
 - `volume`, the master only: 0 to 100. It is the `Master` control, so a change
-  through either is seen by both.
+  through either is seen by both. A change made to the card's control by
+  another program, a player's mixer or `amixer -c`, becomes the volume; at
+  start the card's control is read, not written.
 - `volume_db`, a further output only: its offset to the master, -60 to 0.
 - `idle`, `"off"` or `"zeros"`, and `idle_delay_s`, with the rules of the
   config keys: a delay with `zeros` is refused. A change takes effect at the

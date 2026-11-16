@@ -26,6 +26,9 @@ pub enum Format {
 pub enum VolumeMode {
     Hardware,
     Software,
+    /// aas follows and writes the named control, and applies the volume
+    /// itself.
+    Follow,
 }
 
 /// Resampler quality.
@@ -539,6 +542,12 @@ impl Config {
                 path.display()
             ));
         }
+        if raw.volume_mode == Some(VolumeMode::Follow) && raw.volume_control.is_none() {
+            return Err(format!(
+                "{}: volume_mode = \"follow\" needs volume_control",
+                path.display()
+            ));
+        }
         let mut analog = d.analog;
         if let Some(a) = raw.analog {
             analog.enabled = a.enabled.unwrap_or(analog.enabled);
@@ -686,6 +695,19 @@ mod tests {
             let e = load_str(&format!("volume_poll_ms = {bad}\n")).unwrap_err();
             assert!(e.contains("volume_poll_ms"), "{e}");
         }
+    }
+
+    #[test]
+    fn volume_mode_follow_loads_with_a_control() {
+        let c = load_str("volume_mode = \"follow\"\nvolume_control = \"Softvol\"\n").unwrap();
+        assert_eq!(c.volume_mode, Some(VolumeMode::Follow));
+        assert_eq!(c.volume_control.as_deref(), Some("Softvol"));
+    }
+
+    #[test]
+    fn volume_mode_follow_needs_a_control() {
+        let e = load_str("volume_mode = \"follow\"\n").unwrap_err();
+        assert!(e.contains("volume_control"), "{e}");
     }
 
     #[test]

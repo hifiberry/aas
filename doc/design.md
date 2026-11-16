@@ -302,7 +302,8 @@ identified by process name, streams of the same process share one gain, as they
 already do for ALSA clients. Mute is the client's mute bit.
 
 The sink volume keeps `aas`'s percent instead, so the output shows one number
-everywhere *(owner's call)*.
+everywhere *(owner's call)*. It follows the card's volume control too: a change
+another program makes to that control becomes the sink volume.
 
 Bit-perfect is unchanged. A PulseAudio stream at 0 dB with the output at 100 can
 still be copied untouched when it is the only client at the output rate; any

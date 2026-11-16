@@ -123,18 +123,24 @@ fn further_outputs(config: &Config) -> Result<Vec<server::FurtherSink>, String> 
 }
 
 /// Opens the card's volume control, unless the config asks for software
-/// volume. The server calls it at the start and each time the card comes
-/// back.
+/// volume. Under `volume_mode = "follow"` the control is followed and
+/// written, but the volume is applied in software. The server calls it at
+/// the start and each time the card comes back.
 #[cfg(feature = "alsa-output")]
 fn hardware_volume(config: &Config) -> Option<OpenVolume> {
-    if config.volume_mode == Some(config::VolumeMode::Software) {
+    use aas::config::VolumeMode;
+    if config.volume_mode == Some(VolumeMode::Software) {
         return None;
     }
     let card = config.card.clone();
     let control = config.volume_control.clone();
-    let forced = config.volume_mode == Some(config::VolumeMode::Hardware);
+    let forced = matches!(
+        config.volume_mode,
+        Some(VolumeMode::Hardware | VolumeMode::Follow)
+    );
+    let carries = config.volume_mode != Some(VolumeMode::Follow);
     Some(Box::new(move || {
-        let found = aas::sink_alsa::AlsaVolume::open(card.as_deref(), control.as_deref());
+        let found = aas::sink_alsa::AlsaVolume::open(card.as_deref(), control.as_deref(), carries);
         if found.is_none() && forced {
             eprintln!("aas: warning: no hardware volume found, using software volume");
         }
@@ -144,8 +150,14 @@ fn hardware_volume(config: &Config) -> Option<OpenVolume> {
 
 #[cfg(not(feature = "alsa-output"))]
 fn hardware_volume(config: &Config) -> Option<OpenVolume> {
-    if config.volume_mode == Some(config::VolumeMode::Hardware) {
-        eprintln!("aas: warning: built without ALSA, volume_mode = \"hardware\" is ignored");
+    match config.volume_mode {
+        Some(config::VolumeMode::Hardware) => {
+            eprintln!("aas: warning: built without ALSA, volume_mode = \"hardware\" is ignored")
+        }
+        Some(config::VolumeMode::Follow) => {
+            eprintln!("aas: warning: built without ALSA, volume_mode = \"follow\" is ignored")
+        }
+        _ => {}
     }
     None
 }

@@ -306,9 +306,9 @@ pub use mixer::AlsaVolume;
 #[cfg(feature = "alsa-output")]
 mod mixer {
     use super::card_device;
-    use crate::volume::{HardwareVolume, MUTE_MB, find_control};
+    use crate::volume::{HardwareVolume, MUTE_MB, Watch, control_db, find_control};
     use alsa::Round;
-    use alsa::mixer::{MilliBel, Mixer, Selem, SelemId};
+    use alsa::mixer::{MilliBel, Mixer, Selem, SelemChannelId, SelemId};
 
     /// A volume control of the card, set in dB. Used from the control
     /// thread only.
@@ -319,6 +319,14 @@ mod mixer {
         switch: bool,
         /// The lowest step of the control is a mute.
         floor_mutes: bool,
+        /// The control carries the volume; false when aas follows it but
+        /// applies the volume itself.
+        carries: bool,
+        /// Tells a level another program set from one aas set.
+        watch: Watch,
+        /// The last read failed and was logged, so the next failures are
+        /// not, until a read succeeds again.
+        read_failed: bool,
     }
 
     /// The control's dB range in millibel, if it has a playback volume
@@ -331,11 +339,25 @@ mod mixer {
         (min < max).then_some((min.0, max.0))
     }
 
+    /// The control's level in dB from its first channel, with its switch
+    /// if it has one.
+    fn read_level(selem: &Selem, switch: bool) -> alsa::Result<f32> {
+        let millibel = selem.get_playback_vol_db(SelemChannelId::FrontLeft)?;
+        let on = !switch || selem.get_playback_switch(SelemChannelId::FrontLeft)? != 0;
+        Ok(control_db(millibel.0, on))
+    }
+
     impl AlsaVolume {
         /// The card's volume control: `configured` if the card has it, else
         /// the first of `Digital`, `Master` and `PCM`. None if the card is
-        /// missing or has no such control with a range in dB.
-        pub fn open(card: Option<&str>, configured: Option<&str>) -> Option<AlsaVolume> {
+        /// missing or has no such control with a range in dB. `carries` is
+        /// false for a control aas follows and writes but whose volume aas
+        /// applies itself.
+        pub fn open(
+            card: Option<&str>,
+            configured: Option<&str>,
+            carries: bool,
+        ) -> Option<AlsaVolume> {
             let device = match card_device(card) {
                 Ok(device) => device,
                 Err(e) => {
@@ -379,9 +401,14 @@ mod mixer {
                 format!("{} dB", range.0)
             };
             eprintln!(
-                "aas: hardware volume {device} {name}, {floor} to {} dB{}",
+                "aas: hardware volume {device} {name}, {floor} to {} dB{}{}",
                 range.1,
-                if switch { ", with a switch" } else { "" }
+                if switch { ", with a switch" } else { "" },
+                if carries {
+                    ""
+                } else {
+                    ", followed and applied in software"
+                }
             );
             Some(AlsaVolume {
                 mixer,
@@ -389,7 +416,36 @@ mod mixer {
                 range,
                 switch,
                 floor_mutes,
+                carries,
+                watch: Watch::default(),
+                read_failed: false,
             })
+        }
+
+        /// The control's level now, `f32::NEG_INFINITY` when muted. None if
+        /// the control has gone or cannot be read; that is logged once,
+        /// not at every poll, until a read succeeds again.
+        fn level(&mut self) -> Option<f32> {
+            // Takes in changes others made, so the element is current.
+            let _ = self.mixer.handle_events();
+            let read = match self.mixer.find_selem(&self.id) {
+                None => Err("the hardware volume control has gone".to_string()),
+                Some(selem) => read_level(&selem, self.switch)
+                    .map_err(|e| format!("could not read the hardware volume: {e}")),
+            };
+            match read {
+                Ok(db) => {
+                    self.read_failed = false;
+                    Some(db)
+                }
+                Err(e) => {
+                    if !self.read_failed {
+                        eprintln!("aas: {e}");
+                        self.read_failed = true;
+                    }
+                    None
+                }
+            }
         }
     }
 
@@ -412,6 +468,11 @@ mod mixer {
                     eprintln!("aas: could not set the hardware mute: {e}");
                 }
             }
+            // What the control took, so it is not taken back in as a
+            // change another program made.
+            if let Some(level) = self.level() {
+                self.watch.known(level);
+            }
         }
 
         fn range_db(&self) -> (f32, f32) {
@@ -422,13 +483,28 @@ mod mixer {
             self.switch || self.floor_mutes
         }
 
-        // Task 3 replaces `read_db` and `changed` with reads of the control.
         fn read_db(&mut self) -> f32 {
-            self.range.1
+            match self.level() {
+                Some(db) => {
+                    self.watch.known(db);
+                    db
+                }
+                None => {
+                    eprintln!(
+                        "aas: taking the hardware volume as {} dB, it could not be read",
+                        self.range.1
+                    );
+                    self.range.1
+                }
+            }
         }
 
         fn changed(&mut self) -> Option<f32> {
-            None
+            self.level().and_then(|db| self.watch.seen(db))
+        }
+
+        fn carries_volume(&self) -> bool {
+            self.carries
         }
     }
 }
