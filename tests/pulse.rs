@@ -2071,3 +2071,28 @@ fn record_a_source_output_carries_its_clients_application() {
     assert_eq!(get("application.process.binary"), Some("pavucontrol"));
     assert_eq!(get("window.x11.display"), None, "only the application's");
 }
+
+#[test]
+fn record_direct_a_corked_meter_of_a_deleted_sink_input_is_killed() {
+    let daemon = Daemon::start();
+    let (index, player) = const_player(&daemon, 3_277);
+    let mut recorder = pactl(&daemon);
+    let spec = SampleSpec {
+        format: wire::FORMAT_FLOAT32LE,
+        channels: 1,
+        rate: 144,
+    };
+    let invalid = wire::INVALID_INDEX;
+    let body = record_body(spec, invalid, Some("0"), u32::MAX, true, 4, true, index);
+    let (command, _, reply) = recorder.command(wire::CREATE_RECORD_STREAM, &body);
+    assert_eq!(command, wire::REPLY, "the meter is created");
+    let stream = read_record_reply(&reply).stream;
+    stop_player(player);
+    let (_, packets) = recorder.collect(stream, Duration::from_secs(1));
+    let killed = packets.iter().any(|(command, body)| {
+        *command == wire::RECORD_STREAM_KILLED && Reader::new(body).u32() == Some(stream)
+    });
+    assert!(killed, "the corked meter is told it is gone");
+    let (command, _, _) = recorder.command(wire::GET_SERVER_INFO, &[]);
+    assert_eq!(command, wire::REPLY);
+}

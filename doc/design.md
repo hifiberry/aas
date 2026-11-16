@@ -458,7 +458,8 @@ without an analog input.
   when it opens and at each reopen. A sink input that does not exist gets
   `PA_ERR_NOENTITY` at create; one that is gone at a reopen ends the record
   stream with `RECORD_STREAM_KILLED`, as PulseAudio kills a direct output with
-  its sink input.
+  its sink input. A corked stream reopens when its tap ends too, not only at
+  the uncork, so its meter goes with the sink input.
 
 Any client allowed on the daemon's socket can thereby record one other client
 alone. It could already record the whole mix, so nothing new is exposed to

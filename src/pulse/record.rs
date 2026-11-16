@@ -403,6 +403,11 @@ impl Record {
         }
         let mut packets = Vec::new();
         if self.corked {
+            // Reopened now rather than at the uncork, so that a meter of a
+            // sink input that is gone is killed while corked too.
+            if self.daemon.ended() && self.open().is_err() {
+                return gone;
+            }
             return RecordPolled {
                 packets,
                 gone: false,
