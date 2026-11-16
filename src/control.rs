@@ -3069,11 +3069,45 @@ mod tests {
     }
 
     /// A card's mixer that records what it is set to.
-    struct FakeMixer(std::sync::Arc<std::sync::Mutex<Vec<f32>>>);
+    struct FakeMixer {
+        set: std::sync::Arc<std::sync::Mutex<Vec<f32>>>,
+        /// What the control reads: set by `set_db`, and by a test as
+        /// "another program".
+        level: std::sync::Arc<std::sync::Mutex<f32>>,
+        watch: crate::volume::Watch,
+    }
+
+    impl FakeMixer {
+        fn new(set: std::sync::Arc<std::sync::Mutex<Vec<f32>>>) -> Self {
+            Self::with_level(set, Default::default())
+        }
+
+        fn with_level(
+            set: std::sync::Arc<std::sync::Mutex<Vec<f32>>>,
+            level: std::sync::Arc<std::sync::Mutex<f32>>,
+        ) -> Self {
+            let mut watch = crate::volume::Watch::default();
+            watch.known(*level.lock().unwrap());
+            FakeMixer { set, level, watch }
+        }
+    }
 
     impl HardwareVolume for FakeMixer {
         fn set_db(&mut self, db: f32) {
-            self.0.lock().unwrap().push(db);
+            self.set.lock().unwrap().push(db);
+            *self.level.lock().unwrap() = db;
+            self.watch.known(db);
+        }
+
+        fn read_db(&mut self) -> f32 {
+            let level = *self.level.lock().unwrap();
+            self.watch.known(level);
+            level
+        }
+
+        fn changed(&mut self) -> Option<f32> {
+            let level = *self.level.lock().unwrap();
+            self.watch.seen(level)
         }
 
         fn range_db(&self) -> (f32, f32) {
@@ -3089,7 +3123,7 @@ mod tests {
     fn the_same_volume_again_is_written_to_the_card_but_not_announced() {
         let (mut control, mut commands, now) = hello();
         let set = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        control.card_changed(Some(Box::new(FakeMixer(set.clone()))));
+        control.card_changed(Some(Box::new(FakeMixer::new(set.clone()))));
         let volume = |percent| Some(Request::SetVolume { percent });
         assert_eq!(
             control
@@ -5297,7 +5331,7 @@ mod tests {
         // With the volume on the master's card, the master's samples are
         // left alone; the further output still follows, in software.
         let set = Arc::new(Mutex::new(Vec::new()));
-        control.card_changed(Some(Box::new(FakeMixer(set))));
+        control.card_changed(Some(Box::new(FakeMixer::new(set))));
         engine.take(true);
         engine.gains.clear();
         assert_eq!(control.request(1, volume(40), now).reply, Some(Reply::Ok));

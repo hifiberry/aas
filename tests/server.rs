@@ -6,7 +6,7 @@ use aas::control::OpenCapture;
 use aas::rate::SETTLE;
 use aas::server::{self, CardProbe, FurtherSink};
 use aas::sink::{MemorySink, Sink, SinkError, SinkLog};
-use aas::volume::{HardwareVolume, OpenVolume};
+use aas::volume::{HardwareVolume, OpenVolume, Watch};
 use aas_client::client::Client;
 use aas_client::convert::ClientFormat;
 use aas_client::proto::{self, Reply, Request};
@@ -1183,11 +1183,42 @@ fn a_panic_on_the_audio_thread_stops_the_daemon_with_an_error() {
 type Mixer = Arc<Mutex<Vec<f32>>>;
 
 /// A card's volume control that records what it is set to.
-struct FakeVolume(Mixer);
+struct FakeVolume {
+    set: Mixer,
+    /// What the control reads: set by `set_db`, and by a test as
+    /// "another program".
+    level: Arc<Mutex<f32>>,
+    watch: Watch,
+}
+
+impl FakeVolume {
+    fn new(set: Mixer) -> Self {
+        Self::with_level(set, Arc::default())
+    }
+
+    fn with_level(set: Mixer, level: Arc<Mutex<f32>>) -> Self {
+        let mut watch = Watch::default();
+        watch.known(*level.lock().unwrap());
+        FakeVolume { set, level, watch }
+    }
+}
 
 impl HardwareVolume for FakeVolume {
     fn set_db(&mut self, db: f32) {
-        self.0.lock().unwrap().push(db);
+        self.set.lock().unwrap().push(db);
+        *self.level.lock().unwrap() = db;
+        self.watch.known(db);
+    }
+
+    fn read_db(&mut self) -> f32 {
+        let level = *self.level.lock().unwrap();
+        self.watch.known(level);
+        level
+    }
+
+    fn changed(&mut self) -> Option<f32> {
+        let level = *self.level.lock().unwrap();
+        self.watch.seen(level)
     }
 
     fn range_db(&self) -> (f32, f32) {
@@ -1209,7 +1240,7 @@ fn fake_volume(present: Arc<AtomicBool>) -> (OpenVolume, Arc<Mutex<Vec<Mixer>>>)
         }
         let mixer = Mixer::default();
         opened.lock().unwrap().push(mixer.clone());
-        Some(Box::new(FakeVolume(mixer)) as Box<dyn HardwareVolume>)
+        Some(Box::new(FakeVolume::new(mixer)) as Box<dyn HardwareVolume>)
     });
     (open, mixers)
 }

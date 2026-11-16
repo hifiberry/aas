@@ -306,7 +306,7 @@ pub use mixer::AlsaVolume;
 #[cfg(feature = "alsa-output")]
 mod mixer {
     use super::card_device;
-    use crate::volume::{HardwareVolume, find_control};
+    use crate::volume::{HardwareVolume, MUTE_MB, find_control};
     use alsa::Round;
     use alsa::mixer::{MilliBel, Mixer, Selem, SelemId};
 
@@ -320,9 +320,6 @@ mod mixer {
         /// The lowest step of the control is a mute.
         floor_mutes: bool,
     }
-
-    /// What ALSA reports as the dB of a step that mutes, in millibel.
-    const MUTE_MB: i64 = -9_999_999;
 
     /// The control's dB range in millibel, if it has a playback volume
     /// with one.
@@ -423,6 +420,15 @@ mod mixer {
 
         fn can_mute(&self) -> bool {
             self.switch || self.floor_mutes
+        }
+
+        // Task 3 replaces `read_db` and `changed` with reads of the control.
+        fn read_db(&mut self) -> f32 {
+            self.range.1
+        }
+
+        fn changed(&mut self) -> Option<f32> {
+            None
         }
     }
 }
