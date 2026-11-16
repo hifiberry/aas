@@ -671,9 +671,10 @@ enum Plays {
 }
 
 /// A capture stream as the audio thread sees it: a ring it writes the
-/// analog input into, after the input's chain, for a client to read. The
-/// roles of the ring are those of a source swapped: the engine moves only
-/// `write_pos`, and the client only `read_pos`.
+/// analog input into, after the input's chain, or for a monitor what the
+/// master card gets, for a client to read. The roles of the ring are those
+/// of a source swapped: the engine moves only `write_pos`, and the client
+/// only `read_pos`.
 pub struct Tap {
     pub id: ClientId,
     pub ring: Ring,
@@ -823,23 +824,22 @@ impl Taps {
 
     /// Writes what the master card gets this cycle to every running monitor
     /// and wakes it as due: `samples` holds `channels` channels a frame, of
-    /// which a monitor takes the first two, or the one twice. Zeros when
-    /// `silent`, so that a monitor keeps real time while the card plays
-    /// what is not PCM or is parked.
-    fn deliver_monitor(&mut self, samples: &[i32], channels: usize, silent: bool) {
+    /// which a monitor takes the first two, or the one twice. The first
+    /// `silent` frames are not PCM, or not played, and are zeros instead,
+    /// so that a monitor keeps real time through DoP and while parked.
+    fn deliver_monitor(&mut self, samples: &[i32], channels: usize, silent: usize) {
         let Taps { table, buf } = self;
         if !table.iter().any(|t| t.running && t.monitor) {
             return;
         }
         let frames = samples.len() / channels;
         let block = &mut buf[..frames];
-        if silent {
-            block.fill([0; 2]);
-        } else {
-            let right = if channels > 1 { 1 } else { 0 };
-            for (frame, out) in samples.chunks_exact(channels).zip(block.iter_mut()) {
-                *out = [frame[0], frame[right]];
-            }
+        let silent = silent.min(frames);
+        block[..silent].fill([0; 2]);
+        let right = if channels > 1 { 1 } else { 0 };
+        let pcm = samples.chunks_exact(channels).skip(silent);
+        for (frame, out) in pcm.zip(block[silent..].iter_mut()) {
+            *out = [frame[0], frame[right]];
         }
         for tap in table.iter_mut().filter(|t| t.running && t.monitor) {
             let header = tap.ring.header();
@@ -2322,8 +2322,15 @@ impl<P: Processing, S: Sink> Engine<P, S> {
                 metering.add(&*samples, meter, self.levels_ns);
             }
         }
-        // Monitors keep real time while parked, unlike the meter.
-        let silent = self.parked || owner.is_some();
+        // Monitors keep real time while parked, unlike the meter. DoP is
+        // not PCM, also where it leaves the delay line after its stream.
+        let silent = if self.parked || owner.is_some() {
+            self.period
+        } else if self.delay.active() {
+            self.delay.dop_out
+        } else {
+            0
+        };
         let channels = self.master.channels;
         self.taps.deliver_monitor(samples, channels, silent);
         let before_write = Instant::now();
@@ -8175,6 +8182,33 @@ mod tests {
         }
         assert_eq!(rig.last_periods(4), dop);
         assert_eq!(monitor.take(), frames(0, 4 * PERIOD));
+    }
+
+    #[test]
+    fn a_monitor_gets_zeros_for_dop_that_leaves_the_delay_line() {
+        let mut rig = Rig::<I32>::new(BitPerfect::Auto);
+        rig.send(Command::SetDelay(200));
+        let monitor = add_monitor(&mut rig, 5);
+        let mut a = client(1);
+        rig.add(&mut a);
+        let start = rig.log.frames().len();
+        for _ in 0..6 {
+            a.ring.write(&dop_frames(PERIOD));
+            rig.cycle();
+        }
+        for _ in 0..8 {
+            a.ring.write(&frames(1 << 20, PERIOD));
+            rig.cycle();
+        }
+        // The line's 200 frames, the stream, then the PCM. The stream's
+        // tail leaves the line while the PCM plays.
+        let dop = 200 + 6 * PERIOD;
+        let card = &rig.log.frames()[start..];
+        assert_eq!(card[200..dop], dop_frames(6 * PERIOD)[..]);
+        assert_eq!(card[dop..], frames(1 << 20, 14 * PERIOD - dop)[..]);
+        let mut want = frames(0, dop);
+        want.extend(frames(1 << 20, 14 * PERIOD - dop));
+        assert_eq!(monitor.take(), want);
     }
 
     #[test]
