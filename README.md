@@ -602,6 +602,14 @@ percent and unmuted. `pactl set-source-volume` and the like answer "not
 supported", so a recording is never changed behind another client's back. A
 recording client appears in the API by its process name, like a player.
 
+Volume meters work: pavucontrol, and the GNOME and KDE settings, open record
+streams with peak detection, which may run at any rate from 1 Hz, and each
+value is the peak of the audio it covers (a mono stream takes the louder
+channel). Meters of the two sources show what they carry. The meter of one
+playing stream records that sink input alone, only on `aas.monitor`, after the
+stream's own volume and before the output volume, so it does not follow the
+volume of the output.
+
 ## Writing a plugin
 
 A plugin is a shared library built against `crates/aas-plugin`, which describes
