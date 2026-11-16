@@ -1887,11 +1887,20 @@ fn const_player(
     daemon: &Daemon,
     level: i16,
 ) -> (u32, (Arc<AtomicBool>, std::thread::JoinHandle<()>)) {
+    const_player_at(daemon, level, 48_000)
+}
+
+/// `const_player` at `rate`.
+fn const_player_at(
+    daemon: &Daemon,
+    level: i16,
+    rate: u32,
+) -> (u32, (Arc<AtomicBool>, std::thread::JoinHandle<()>)) {
     let stop = Arc::new(AtomicBool::new(false));
     let mut player = RawPulse::connect(&daemon.pulse_socket());
     player.auth();
     player.set_name("constant");
-    let (stream, missing, _) = player.create_stream(48_000, wire::FORMAT_S16LE, 2, 200);
+    let (stream, missing, _) = player.create_stream(rate, wire::FORMAT_S16LE, 2, 200);
     let flag = stop.clone();
     let handle = std::thread::spawn(move || {
         let fill = |bytes: usize| level.to_le_bytes().repeat(bytes / 2);
@@ -2095,4 +2104,40 @@ fn record_direct_a_corked_meter_of_a_deleted_sink_input_is_killed() {
     assert!(killed, "the corked meter is told it is gone");
     let (command, _, _) = recorder.command(wire::GET_SERVER_INFO, &[]);
     assert_eq!(command, wire::REPLY);
+}
+
+#[test]
+fn record_direct_a_meter_survives_a_rate_change() {
+    let daemon = Daemon::start();
+    let holder = tone_player(&daemon, 48_000);
+    let (index, quiet) = const_player_at(&daemon, 3_277, 44_100);
+    let mut recorder = pactl(&daemon);
+    assert_eq!(server_rate(&mut recorder), 48_000);
+    let body = peak_meter_body(index);
+    let (command, _, reply) = recorder.command(wire::CREATE_RECORD_STREAM, &body);
+    assert_eq!(command, wire::REPLY, "the meter is created");
+    let stream = read_record_reply(&reply).stream;
+    assert!(recorder.first_block(stream, Duration::from_secs(1)));
+    // With the 48 kHz player gone, the output follows the metered one.
+    stop_player(holder);
+    let start = Instant::now();
+    while server_rate(&mut recorder) != 44_100 {
+        assert!(start.elapsed() < Duration::from_secs(2), "the rate never changed");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // Let the meter fill again after the fade and the reopen.
+    let _ = recorder.collect(stream, Duration::from_millis(200));
+    let (blocks, packets) = recorder.collect(stream, Duration::from_millis(500));
+    stop_player(quiet);
+    assert!(
+        packets.iter().all(|(command, _)| *command != wire::RECORD_STREAM_KILLED),
+        "the meter was killed"
+    );
+    let values: Vec<f32> = blocks
+        .iter()
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+    assert!(values.len() >= 50, "{} values after the change", values.len());
+    let near = values.iter().filter(|v| (0.08..0.12).contains(*v)).count();
+    assert!(near * 10 >= values.len() * 9, "values near 0.1: {values:?}");
 }
