@@ -661,7 +661,7 @@ impl Server {
         // opened again. One that is gone has none, and the old one is closed.
         if self.card.changed() {
             if let Some(open) = &mut self.hardware {
-                self.control.card_changed(open());
+                self.control.card_changed(open(), now);
             }
         }
         // After the card change above: the mixer of a card that has just

@@ -1192,10 +1192,6 @@ struct FakeVolume {
 }
 
 impl FakeVolume {
-    fn new(set: Mixer) -> Self {
-        Self::with_level(set, Arc::default())
-    }
-
     fn with_level(set: Mixer, level: Arc<Mutex<f32>>) -> Self {
         let mut watch = Watch::default();
         watch.known(*level.lock().unwrap());
@@ -1231,7 +1227,11 @@ impl HardwareVolume for FakeVolume {
 }
 
 /// Opens a fake control while `present` is set, and keeps every opening.
-fn fake_volume(present: Arc<AtomicBool>) -> (OpenVolume, Arc<Mutex<Vec<Mixer>>>) {
+/// All of them read `level`, which a test sets as "another program".
+fn fake_volume(
+    present: Arc<AtomicBool>,
+    level: Arc<Mutex<f32>>,
+) -> (OpenVolume, Arc<Mutex<Vec<Mixer>>>) {
     let mixers = Arc::new(Mutex::new(Vec::new()));
     let opened = mixers.clone();
     let open: OpenVolume = Box::new(move || {
@@ -1240,7 +1240,7 @@ fn fake_volume(present: Arc<AtomicBool>) -> (OpenVolume, Arc<Mutex<Vec<Mixer>>>)
         }
         let mixer = Mixer::default();
         opened.lock().unwrap().push(mixer.clone());
-        Some(Box::new(FakeVolume::new(mixer)) as Box<dyn HardwareVolume>)
+        Some(Box::new(FakeVolume::with_level(mixer, level.clone())) as Box<dyn HardwareVolume>)
     });
     (open, mixers)
 }
@@ -1251,19 +1251,25 @@ fn last_set(mixers: &Arc<Mutex<Vec<Mixer>>>) -> Option<f32> {
 }
 
 #[test]
-fn a_card_missing_at_the_start_gets_the_volume_when_it_appears() {
+fn a_card_missing_at_the_start_brings_its_own_volume() {
     let (sink, log) = memory_sink();
     log.fail(Some(SinkError::Gone));
     let present = Arc::new(AtomicBool::new(false));
-    let (open, mixers) = fake_volume(present.clone());
+    let level = Arc::new(Mutex::new(-20.0));
+    let (open, mixers) = fake_volume(present.clone(), level);
     let daemon = Daemon::start_with_volume(default_config(), sink, open);
     let control = volume_client(&daemon);
     let set = call_raw(&control, &Request::SetVolume { percent: 50 });
     assert_eq!(set, Some(Reply::Ok));
+    let subscribed = call_raw(&control, &Request::SubscribeVolume);
+    assert_eq!(subscribed, Some(Reply::Volume { percent: 50 }));
     assert!(mixers.lock().unwrap().is_empty());
     present.store(true, Ordering::Relaxed);
     log.fail(None);
-    assert!(wait_for(|| last_set(&mixers) == Some(-30.0)));
+    // The card's level is the truth: it is followed, and not written.
+    let notice = receive_raw(&control, PATIENCE);
+    assert_eq!(notice, Some(Reply::VolumeChanged { percent: 67 }));
+    assert_eq!(last_set(&mixers), None);
     // The card's control carries the volume now, so the samples pass as
     // they are.
     let mut client = daemon.client_at(48000, 4096);
@@ -1275,10 +1281,11 @@ fn a_card_missing_at_the_start_gets_the_volume_when_it_appears() {
 }
 
 #[test]
-fn a_card_that_comes_back_gets_the_volume_again() {
+fn a_card_that_comes_back_is_read_and_not_written() {
     let (sink, log) = memory_sink();
     let present = Arc::new(AtomicBool::new(true));
-    let (open, mixers) = fake_volume(present.clone());
+    let level = Arc::new(Mutex::new(0.0));
+    let (open, mixers) = fake_volume(present.clone(), level.clone());
     let daemon = Daemon::start_with_volume(default_config(), sink, open);
     // The card is lost only once the output has opened on it.
     assert!(wait_for(|| last_open(&log).is_some()));
@@ -1286,18 +1293,67 @@ fn a_card_that_comes_back_gets_the_volume_again() {
     let set = call_raw(&control, &Request::SetVolume { percent: 40 });
     assert_eq!(set, Some(Reply::Ok));
     assert_eq!(last_set(&mixers), Some(-36.0));
-    present.store(false, Ordering::Relaxed);
-    log.fail(Some(SinkError::Gone));
-    // The old control is let go, as a card being removed waits for that.
-    let old = mixers.lock().unwrap().last().unwrap().clone();
-    assert!(wait_for(|| Arc::strong_count(&old) == 2));
-    let before = mixers.lock().unwrap().len();
-    present.store(true, Ordering::Relaxed);
-    log.fail(None);
-    // The new control is listed when it is opened, and set just after:
-    // wait for the setting, as the test before does.
-    assert!(wait_for(|| mixers.lock().unwrap().len() > before));
-    assert!(wait_for(|| last_set(&mixers) == Some(-36.0)));
+    let subscribed = call_raw(&control, &Request::SubscribeVolume);
+    assert_eq!(subscribed, Some(Reply::Volume { percent: 40 }));
+    let gone_and_back = |level_back: f32| {
+        present.store(false, Ordering::Relaxed);
+        log.fail(Some(SinkError::Gone));
+        // The old control is let go, as a card being removed waits for that.
+        let old = mixers.lock().unwrap().last().unwrap().clone();
+        assert!(wait_for(|| Arc::strong_count(&old) == 2));
+        *level.lock().unwrap() = level_back;
+        let before = mixers.lock().unwrap().len();
+        present.store(true, Ordering::Relaxed);
+        log.fail(None);
+        assert!(wait_for(|| mixers.lock().unwrap().len() > before));
+    };
+    // Back at the level 40 percent sets: the volume stays, nothing is
+    // written, and nothing is announced.
+    gone_and_back(-36.0);
+    assert_eq!(receive_raw(&control, Duration::from_millis(500)), None);
+    assert!(
+        mixers
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .is_empty()
+    );
+    let got = call_raw(&control, &Request::GetVolume);
+    assert_eq!(got, Some(Reply::Volume { percent: 40 }));
+    // Back at another level: that level is the volume.
+    gone_and_back(-20.0);
+    let notice = receive_raw(&control, PATIENCE);
+    assert_eq!(notice, Some(Reply::VolumeChanged { percent: 67 }));
+    assert!(
+        mixers
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn an_outside_change_reaches_subscribers() {
+    let (sink, log) = memory_sink();
+    let present = Arc::new(AtomicBool::new(true));
+    let level = Arc::new(Mutex::new(0.0));
+    let (open, mixers) = fake_volume(present, level.clone());
+    let daemon = Daemon::start_with_volume(default_config(), sink, open);
+    assert!(wait_for(|| last_open(&log).is_some()));
+    let watcher = volume_client(&daemon);
+    let subscribed = call_raw(&watcher, &Request::SubscribeVolume);
+    assert_eq!(subscribed, Some(Reply::Volume { percent: 100 }));
+    *level.lock().unwrap() = -30.0;
+    let notice = receive_raw(&watcher, PATIENCE);
+    assert_eq!(notice, Some(Reply::VolumeChanged { percent: 50 }));
+    assert_eq!(last_set(&mixers), None);
 }
 
 /// How often the wake-up was written since it was last read, and whether
@@ -1691,11 +1747,7 @@ fn a_monitor_records_what_a_player_plays() {
 }
 
 /// Plays a constant `value` on both channels at 48 kHz until `done` is set.
-fn play_constant(
-    mut player: Client,
-    value: i32,
-    done: Arc<AtomicBool>,
-) -> JoinHandle<Client> {
+fn play_constant(mut player: Client, value: i32, done: Arc<AtomicBool>) -> JoinHandle<Client> {
     thread::spawn(move || {
         let data = bytes(&vec![[value, value]; 48]);
         player.start().unwrap();

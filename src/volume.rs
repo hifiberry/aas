@@ -113,6 +113,18 @@ pub fn find_control(names: &[String], configured: Option<&str>) -> Option<String
     }
 }
 
+/// What `percent` sets on `hardware`: its dB within the control's range,
+/// `NEG_INFINITY` for 0.
+fn level_for(percent: u8, hardware: &dyn HardwareVolume) -> f32 {
+    match percent_to_db(percent) {
+        Some(db) => {
+            let (min, max) = hardware.range_db();
+            db.clamp(min, max)
+        }
+        None => f32::NEG_INFINITY,
+    }
+}
+
 /// The output volume. With a hardware control it is in hardware mode and
 /// the engine gain stays at 0 dB, so bit-perfect is still possible.
 /// Without one it is in software mode, and the engine gain carries it.
@@ -148,14 +160,7 @@ impl OutputVolume {
         self.percent = percent.min(100);
         self.outside = None;
         if let Some(hardware) = &mut self.hardware {
-            let db = match percent_to_db(self.percent) {
-                Some(db) => {
-                    let (min, max) = hardware.range_db();
-                    db.clamp(min, max)
-                }
-                None => f32::NEG_INFINITY,
-            };
-            hardware.set_db(db);
+            hardware.set_db(level_for(self.percent, hardware.as_ref()));
         }
     }
 
@@ -176,13 +181,7 @@ impl OutputVolume {
             return;
         };
         let read = hardware.read_db();
-        let expected = match percent_to_db(percent) {
-            Some(db) => {
-                let (min, max) = hardware.range_db();
-                db.clamp(min, max)
-            }
-            None => f32::NEG_INFINITY,
-        };
+        let expected = level_for(percent, hardware.as_ref());
         let same = if read.is_finite() && expected.is_finite() {
             (read - expected).abs() <= SAME_DB
         } else {
@@ -194,6 +193,11 @@ impl OutputVolume {
         } else {
             self.follow(read);
         }
+    }
+
+    /// A level someone else set on the control, none without a control.
+    pub fn changed(&mut self) -> Option<f32> {
+        self.hardware.as_mut().and_then(|h| h.changed())
     }
 
     /// Takes a newly opened control, or none, and adopts the current volume

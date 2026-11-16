@@ -898,6 +898,10 @@ pub struct Control {
     saver: Option<Saver>,
     /// When the state file is due to be written.
     save_at: Option<Instant>,
+    /// When the card's control is checked next, none until the first tick.
+    follow_at: Option<Instant>,
+    /// How often it is checked.
+    volume_poll: Duration,
     /// Everything the state file keeps, as loaded and as changed since,
     /// with the values of cards no longer in the config. Saved whole.
     state: State,
@@ -1011,6 +1015,8 @@ impl Control {
             volume: OutputVolume::new(None, config.bit_perfect),
             saver: None,
             save_at: None,
+            follow_at: None,
+            volume_poll: Duration::from_millis(u64::from(config.volume_poll_ms)),
             state: State::default(),
             notices: Vec::new(),
             plugins,
@@ -1131,7 +1137,7 @@ impl Control {
     /// the config are kept, unused.
     pub fn restore(&mut self, mut volume: OutputVolume, state: PathBuf, cards: &[String]) {
         let stored = State::load(&state);
-        volume.set(stored.output_percent);
+        volume.adopt(stored.output_percent);
         self.volume = volume;
         self.analog_input = api::resolve_input(stored.analog.as_ref(), &self.analog_config);
         if let Some(card) = cards.first() {
@@ -1162,14 +1168,24 @@ impl Control {
     /// none. A card that is back may be a new instance, its mixer at its own
     /// default. The old control is closed, and the current volume is set on
     /// the new one, or carried in software without one.
-    pub fn card_changed(&mut self, hardware: Option<Box<dyn HardwareVolume>>) {
+    pub fn card_changed(&mut self, hardware: Option<Box<dyn HardwareVolume>>, now: Instant) {
+        let before = self.volume_state();
         self.volume.replace_hardware(hardware);
         eprintln!(
             "aas: output volume {}%, in {}",
             self.volume.percent(),
             self.volume_mode()
         );
-        self.send(vec![Command::SetGain(0, self.volume.gain())]);
+        self.volume_moved(before, now);
+    }
+
+    /// The volume as `volume_moved` compares it.
+    fn volume_state(&self) -> (u8, f32, Option<f32>) {
+        (
+            self.volume.percent(),
+            self.volume.gain(),
+            self.volume.level_db(),
+        )
     }
 
     fn volume_mode(&self) -> &'static str {
@@ -1501,11 +1517,19 @@ impl Control {
     ///
     /// The card's mixer is written even when the percent is the same, so
     /// that asking again puts back a level another tool has changed. A
-    /// change made outside aas is not read back.
+    /// change made outside aas is followed on the next tick, see
+    /// `follow_card`.
     fn set_volume(&mut self, percent: u8, now: Instant) {
-        let changed = percent != self.volume.percent();
+        let before = self.volume_state();
         self.volume.set(percent);
-        if !changed {
+        self.volume_moved(before, now);
+    }
+
+    /// Passes on a volume that has moved from `before`, as `volume_state`
+    /// gave it: the gains to the engine, and a changed percent to the
+    /// subscribers, the outputs' state and the state file.
+    fn volume_moved(&mut self, before: (u8, f32, Option<f32>), now: Instant) {
+        if self.volume_state() == before {
             return;
         }
         let mut batch = vec![Command::SetGain(0, self.volume.gain())];
@@ -1513,12 +1537,30 @@ impl Control {
             batch.push(Command::SetGain(output.index, self.further_gain(output)));
         }
         self.send(batch);
+        let percent = self.volume.percent();
+        if percent == before.0 {
+            return;
+        }
         let subscribers = self.conns.iter().filter(|(_, c)| c.subscribed);
         let notice = Reply::VolumeChanged { percent };
         self.notices
             .extend(subscribers.map(|(&conn, _)| (conn, notice)));
         self.publish_output(0);
         self.save_later(now);
+    }
+
+    /// Takes a level another program set on the card's control as the
+    /// volume, checking the control every `volume_poll_ms`.
+    fn follow_card(&mut self, now: Instant) {
+        if self.follow_at.is_some_and(|at| now < at) {
+            return;
+        }
+        self.follow_at = Some(now + self.volume_poll);
+        if let Some(db) = self.volume.changed() {
+            let before = self.volume_state();
+            self.volume.follow(db);
+            self.volume_moved(before, now);
+        }
     }
 
     /// Has the state file written once changes have been left alone for a
@@ -2829,6 +2871,7 @@ impl Control {
     /// matrix that waited for its turn. Such a drain is not ended while the
     /// output is being opened.
     pub fn tick(&mut self, now: Instant) {
+        self.follow_card(now);
         let mut batch = Vec::new();
         let before = self.policy.current();
         self.policy.tick(now - self.epoch);
@@ -3123,7 +3166,7 @@ mod tests {
     fn the_same_volume_again_is_written_to_the_card_but_not_announced() {
         let (mut control, mut commands, now) = hello();
         let set = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        control.card_changed(Some(Box::new(FakeMixer::new(set.clone()))));
+        control.card_changed(Some(Box::new(FakeMixer::new(set.clone()))), now);
         let volume = |percent| Some(Request::SetVolume { percent });
         assert_eq!(
             control
@@ -3132,17 +3175,176 @@ mod tests {
             Some(Reply::Volume { percent: 100 })
         );
         assert_eq!(control.request(1, volume(50), now).reply, Some(Reply::Ok));
-        assert_eq!(*set.lock().unwrap(), [0.0, -30.0]);
+        assert_eq!(*set.lock().unwrap(), [-30.0]);
         assert_eq!(control.take_notices().len(), 1);
         while commands.pop().is_ok() {}
         // Someone moved the card's mixer with another tool meanwhile. The
         // same percent again puts it back.
         assert_eq!(control.request(1, volume(50), now).reply, Some(Reply::Ok));
-        assert_eq!(*set.lock().unwrap(), [0.0, -30.0, -30.0]);
+        assert_eq!(*set.lock().unwrap(), [-30.0, -30.0]);
         // Nothing changed for the subscribers, the engine or the state file.
         assert!(control.take_notices().is_empty());
         assert!(commands.pop().is_err());
         assert!(control.save_at.is_none());
+    }
+
+    type Writes = std::sync::Arc<std::sync::Mutex<Vec<f32>>>;
+    type Level = std::sync::Arc<std::sync::Mutex<f32>>;
+
+    fn mixer(level: f32) -> (Box<dyn HardwareVolume>, Writes, Level) {
+        let set = Writes::default();
+        let level = Level::new(std::sync::Mutex::new(level));
+        let mixer = FakeMixer::with_level(set.clone(), level.clone());
+        (Box::new(mixer), set, level)
+    }
+
+    fn subscribed() -> (Control, rtrb::Consumer<Command>, Instant, Writes, Level) {
+        let (mut control, mut commands, now) = hello();
+        let (fake, set, level) = mixer(0.0);
+        control.card_changed(Some(fake), now);
+        control.request(1, Some(Request::SubscribeVolume), now);
+        while commands.pop().is_ok() {}
+        (control, commands, now, set, level)
+    }
+
+    fn volume_notices(control: &mut Control) -> Vec<Reply> {
+        control.take_notices().into_iter().map(|(_, r)| r).collect()
+    }
+
+    #[test]
+    fn an_outside_change_waits_for_the_poll() {
+        let (mut control, _commands, now, _set, level) = subscribed();
+        control.tick(now);
+        *level.lock().unwrap() = -20.0;
+        control.tick(now + Duration::from_millis(50));
+        assert!(volume_notices(&mut control).is_empty());
+        control.tick(now + Duration::from_millis(100));
+        assert_eq!(
+            volume_notices(&mut control),
+            [Reply::VolumeChanged { percent: 67 }]
+        );
+    }
+
+    #[test]
+    fn an_outside_change_is_the_volume() {
+        let (mut output, rates) = further(&[]);
+        output.volume_db = -6.0;
+        let (mut control, mut engine, _logs, now) =
+            started_with(&Config::default(), vec![(output, rates)]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        let (fake, set, level) = mixer(0.0);
+        control.restore(
+            OutputVolume::new(Some(fake), config::BitPerfect::Auto),
+            path.clone(),
+            &[],
+        );
+        control.connected(1, "test".into());
+        let hello = Request::Hello {
+            version: proto::VERSION,
+        };
+        control.request(1, Some(hello), now);
+        control.request(1, Some(Request::SubscribeVolume), now);
+        engine.take(true);
+        engine.gains.clear();
+        *level.lock().unwrap() = -20.0;
+        control.tick(now);
+        assert_eq!(
+            volume_notices(&mut control),
+            [Reply::VolumeChanged { percent: 67 }]
+        );
+        engine.take(true);
+        let gains = std::mem::take(&mut engine.gains);
+        assert_eq!(gains.len(), 2, "{gains:?}");
+        assert_eq!(gains[0], (0, 1.0));
+        assert_eq!(gains[1].0, 1);
+        assert!((gains[1].1 - db_to_gain(-26.0)).abs() < 1e-6, "{gains:?}");
+        assert!(set.lock().unwrap().is_empty());
+        control.tick(now + SAVE_DELAY);
+        assert!(saved(&path, 67));
+    }
+
+    #[test]
+    fn aas_own_write_is_not_followed_back() {
+        let (mut control, mut commands, now, set, _level) = subscribed();
+        let volume = Some(Request::SetVolume { percent: 50 });
+        assert_eq!(control.request(1, volume, now).reply, Some(Reply::Ok));
+        assert_eq!(*set.lock().unwrap(), [-30.0]);
+        assert_eq!(volume_notices(&mut control).len(), 1);
+        while commands.pop().is_ok() {}
+        control.tick(now);
+        assert!(volume_notices(&mut control).is_empty());
+        assert!(commands.pop().is_err());
+    }
+
+    #[test]
+    fn an_outside_mute_reads_zero_and_unmute_restores() {
+        let (mut control, _commands, now, _set, level) = subscribed();
+        *level.lock().unwrap() = -30.0;
+        control.tick(now);
+        assert_eq!(
+            volume_notices(&mut control),
+            [Reply::VolumeChanged { percent: 50 }]
+        );
+        *level.lock().unwrap() = f32::NEG_INFINITY;
+        control.tick(now + Duration::from_millis(100));
+        assert_eq!(
+            volume_notices(&mut control),
+            [Reply::VolumeChanged { percent: 0 }]
+        );
+        *level.lock().unwrap() = -30.0;
+        control.tick(now + Duration::from_millis(200));
+        assert_eq!(
+            volume_notices(&mut control),
+            [Reply::VolumeChanged { percent: 50 }]
+        );
+    }
+
+    #[test]
+    fn an_outside_level_below_minus_60_reads_one() {
+        let (mut control, _commands, now, set, level) = subscribed();
+        *level.lock().unwrap() = -80.0;
+        control.tick(now);
+        assert_eq!(
+            volume_notices(&mut control),
+            [Reply::VolumeChanged { percent: 1 }]
+        );
+        assert!(set.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_card_is_the_truth_at_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        std::fs::write(&path, "output_percent = 30\n").unwrap();
+        for (card, expected) in [(-20.0, 67), (-42.0, 30)] {
+            let (mut control, _commands, _now) = hello();
+            let (fake, set, _level) = mixer(card);
+            control.restore(
+                OutputVolume::new(Some(fake), config::BitPerfect::Auto),
+                path.clone(),
+                &[],
+            );
+            assert_eq!(
+                control.volume_reply().reply,
+                Some(Reply::Volume { percent: expected })
+            );
+            assert!(set.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn a_card_back_at_another_level_is_announced() {
+        let (mut control, _commands, now) = hello();
+        control.request(1, Some(Request::SubscribeVolume), now);
+        control.request(1, Some(Request::SetVolume { percent: 50 }), now);
+        control.take_notices();
+        let (fake, _set, _level) = mixer(0.0);
+        control.card_changed(Some(fake), now);
+        assert_eq!(
+            volume_notices(&mut control),
+            [Reply::VolumeChanged { percent: 100 }]
+        );
     }
 
     #[test]
@@ -5331,7 +5533,7 @@ mod tests {
         // With the volume on the master's card, the master's samples are
         // left alone; the further output still follows, in software.
         let set = Arc::new(Mutex::new(Vec::new()));
-        control.card_changed(Some(Box::new(FakeMixer::new(set))));
+        control.card_changed(Some(Box::new(FakeMixer::new(set))), now);
         engine.take(true);
         engine.gains.clear();
         assert_eq!(control.request(1, volume(40), now).reply, Some(Reply::Ok));

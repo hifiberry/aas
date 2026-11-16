@@ -122,6 +122,7 @@ is kept in `/var/lib/aas/state.toml`.
 | `idle_delay_s` | whole seconds | 60 | The delay before `idle = "off"` closes the card. An error with `idle = "zeros"`. |
 | `volume_mode` | `"hardware"`, `"software"` | the card's control if it has one | Who applies the volume: the card's mixer, or the daemon. `hardware` on a card without a control warns and uses software. |
 | `volume_control` | a mixer control name | the first of `Digital`, `Master`, `PCM` | The card's control that carries the volume. |
+| `volume_poll_ms` | 50 to 5000 | 100 | How often, in ms, the card's volume control is checked for a change made by another program. |
 | `default_rate` | 8000 to 384000 | 48000 | The rate the output opens at before the first client plays. |
 | `api_port` | 0 to 65535 | 2718 | The port of the HTTP API, on 127.0.0.1. 0 turns the API off. |
 | `pulse_socket` | a path, or `""` | the client socket's directory plus `pulse` | The PulseAudio native-protocol socket. An empty value turns the endpoint off. |

@@ -173,6 +173,9 @@ pub struct Config {
     pub volume_control: Option<String>,
     /// Who applies the volume. None uses the card's control if it has one.
     pub volume_mode: Option<VolumeMode>,
+    /// How often, in ms, the card's volume control is checked for a change
+    /// made by another program, 50 to 5000.
+    pub volume_poll_ms: u32,
     /// The card's analog input.
     pub analog: Analog,
     /// The plugins, in the order of the file.
@@ -230,6 +233,7 @@ struct Raw {
     idle_delay_s: Option<u32>,
     volume_control: Option<String>,
     volume_mode: Option<VolumeMode>,
+    volume_poll_ms: Option<u32>,
     analog: Option<RawAnalog>,
     plugin: Option<Vec<toml::Table>>,
     matrix: Option<Vec<RawRoute>>,
@@ -367,6 +371,9 @@ fn plugin_from_table(n: usize, mut table: toml::Table) -> Result<PluginConfig, S
     })
 }
 
+/// The default of `volume_poll_ms`.
+const DEFAULT_VOLUME_POLL_MS: u32 = 100;
+
 /// The delay of `idle = "off"` without `idle_delay_s`.
 pub const DEFAULT_IDLE_DELAY_S: u32 = 60;
 
@@ -385,6 +392,7 @@ impl Default for Config {
             },
             volume_control: None,
             volume_mode: None,
+            volume_poll_ms: DEFAULT_VOLUME_POLL_MS,
             analog: Analog::default(),
             plugins: Vec::new(),
             matrix: None,
@@ -524,6 +532,13 @@ impl Config {
         let d = Config::default();
         let idle = idle_from(raw.idle, raw.idle_delay_s)
             .map_err(|e| format!("{}: {e}", path.display()))?;
+        let volume_poll_ms = raw.volume_poll_ms.unwrap_or(d.volume_poll_ms);
+        if !(50..=5000).contains(&volume_poll_ms) {
+            return Err(format!(
+                "{}: volume_poll_ms must be from 50 to 5000",
+                path.display()
+            ));
+        }
         let mut analog = d.analog;
         if let Some(a) = raw.analog {
             analog.enabled = a.enabled.unwrap_or(analog.enabled);
@@ -622,6 +637,7 @@ impl Config {
             idle,
             volume_control: raw.volume_control,
             volume_mode: raw.volume_mode,
+            volume_poll_ms,
             analog,
             plugins,
             matrix,
@@ -657,6 +673,19 @@ mod tests {
         assert_eq!(c.latency_ms, None);
         assert_eq!(c.volume_control, None);
         assert_eq!(c.volume_mode, None);
+        assert_eq!(c.volume_poll_ms, 100);
+    }
+
+    #[test]
+    fn volume_poll_ms_is_loaded_and_checked() {
+        assert_eq!(
+            load_str("volume_poll_ms = 250\n").unwrap().volume_poll_ms,
+            250
+        );
+        for bad in [49, 5001] {
+            let e = load_str(&format!("volume_poll_ms = {bad}\n")).unwrap_err();
+            assert!(e.contains("volume_poll_ms"), "{e}");
+        }
     }
 
     #[test]
@@ -1223,7 +1252,9 @@ type = "balance"
             Some(PathBuf::new())
         );
         assert_eq!(
-            load_str("pulse_socket = \"/tmp/pulse\"\n").unwrap().pulse_socket,
+            load_str("pulse_socket = \"/tmp/pulse\"\n")
+                .unwrap()
+                .pulse_socket,
             Some(PathBuf::from("/tmp/pulse"))
         );
     }
