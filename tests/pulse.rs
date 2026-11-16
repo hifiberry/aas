@@ -1677,19 +1677,19 @@ fn record_a_client_that_stops_reading_gets_an_overflow() {
 fn record_a_stalled_high_rate_recording_overflows_and_keeps_its_connection() {
     let daemon = Daemon::start();
     let mut recorder = pactl(&daemon);
-    // 192 kHz float stereo is 1.5 MB a second, and its default maxlength
-    // of 2 s is 3 MB: far beyond what a connection may queue.
+    // 192 kHz float stereo is 1.5 MB a second. A maxlength of 1.5 MiB,
+    // about a second, is beyond the 1 MiB a connection may queue.
     let spec = SampleSpec {
         format: wire::FORMAT_FLOAT32LE,
         channels: 2,
         rate: 192_000,
     };
-    let body = record_body(spec, 0, None, u32::MAX, false, 0);
+    let body = record_body(spec, 0, None, 3 << 19, false, 0);
     let (command, _, reply) = recorder.command(wire::CREATE_RECORD_STREAM, &body);
     assert_eq!(command, wire::REPLY);
     let reply = read_record_reply(&reply);
-    assert!(reply.maxlength > 2 << 20, "maxlength {}", reply.maxlength);
-    // Long enough to queue more than the 1 MiB a connection may hold.
+    assert_eq!(reply.maxlength, 3 << 19);
+    // Long enough to record more than the maxlength.
     std::thread::sleep(Duration::from_millis(1500));
     let (_, packets) = recorder.collect(reply.stream, Duration::from_millis(300));
     assert!(

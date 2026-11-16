@@ -117,6 +117,8 @@ pub struct Conn {
     subscribed: u32,
     streams: Vec<Stream>,
     records: Vec<Record>,
+    /// What record streams may let wait in the socket and `out`.
+    send_budget: usize,
     done: bool,
 }
 
@@ -133,6 +135,7 @@ impl Conn {
         registry.add_client(client_index, name.clone());
         let events = registry.subscribe();
         let inbox = registry.inbox(client_index);
+        let send_budget = crate::pulse::record::socket_budget(send_buffer(&stream));
         Conn {
             control: DaemonClient::connect(daemon_socket).ok(),
             stream,
@@ -151,6 +154,7 @@ impl Conn {
             inbox,
             subscribed: 0,
             streams: Vec::new(),
+            send_budget,
             records: Vec::new(),
             done: false,
         }
@@ -937,7 +941,7 @@ impl Conn {
         let queued = socket_queue(&self.stream);
         let mut dead = Vec::new();
         for record in &mut self.records {
-            let polled = record.poll(queued + self.out.len());
+            let polled = record.poll(queued + self.out.len(), self.send_budget);
             for frame in polled.packets {
                 self.out.extend(frame);
             }
@@ -1225,7 +1229,32 @@ fn peer_pid(stream: &UnixStream) -> Option<u32> {
     (rc == 0 && cred.pid > 0).then_some(cred.pid as u32)
 }
 
-/// Bytes written to the socket that the client has not read yet.
+/// The socket's send buffer, as `SO_SNDBUF` reports it, or the default
+/// cap if it cannot be read.
+fn send_buffer(stream: &UnixStream) -> usize {
+    use std::os::fd::AsRawFd;
+    let mut size: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: SO_SNDBUF writes one int, and at most len bytes.
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            (&raw mut size).cast(),
+            &mut len,
+        )
+    };
+    if rc == 0 && size > 0 {
+        size as usize
+    } else {
+        2 * crate::pulse::record::SEND_BUDGET
+    }
+}
+
+/// What the socket holds that the client has not read yet. For a Unix
+/// socket the kernel counts the memory its buffers take, somewhat more
+/// than their payload.
 fn socket_queue(stream: &UnixStream) -> usize {
     use std::os::fd::AsRawFd;
     let mut queued: libc::c_int = 0;

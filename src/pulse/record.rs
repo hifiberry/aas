@@ -32,10 +32,11 @@ const DEFAULT_MAXLENGTH_MS: u64 = 2_000;
 /// The most that ever waits to be sent, PulseAudio's own cap on a queue.
 const MAX_LENGTH: u32 = 4 << 20;
 /// The most a stream lets wait for the client on its way, in the
-/// connection's queue and the socket, whatever its maxlength. Well below
-/// the 1 MiB at which a connection is closed, so a stalled client
-/// overflows its stream instead of losing its connection.
-const SEND_BUDGET: usize = 256 << 10;
+/// connection's queue and the socket, whatever its maxlength and however
+/// large the socket's buffer. Well below the 1 MiB at which a connection
+/// is closed, so a stalled client overflows its stream instead of losing
+/// its connection.
+pub const SEND_BUDGET: usize = 256 << 10;
 /// Frames read from the daemon's ring at a time.
 const CHUNK: usize = 1024;
 /// Output frames of one resampler call.
@@ -282,8 +283,10 @@ impl Record {
     /// Polls the stream: reads what the daemon recorded, reopens it after
     /// a rate change, and returns the fragments ready to go, as long as
     /// what `backlog` says still waits for the client is below
-    /// `send_limit`. A new overrun sends one `OVERFLOW`.
-    pub fn poll(&mut self, backlog: usize) -> RecordPolled {
+    /// `send_limit` of its maxlength and the connection's `budget`. An
+    /// overrun sends one `OVERFLOW`, and the next only after a fragment
+    /// has gone out again, so a client that stays stalled gets one.
+    pub fn poll(&mut self, backlog: usize, budget: usize) -> RecordPolled {
         let gone = RecordPolled {
             packets: Vec::new(),
             gone: true,
@@ -310,11 +313,11 @@ impl Record {
         if ended && self.open().is_err() {
             return gone;
         }
-        if overrun {
+        if overrun && self.pending.overflowed() {
             packets.push(Encoder.packet(wire::INVALID_INDEX, &wire::overflow(self.index)));
         }
         let mut sent = backlog;
-        while sent < send_limit(self.pending.maxlength) {
+        while sent < send_limit(self.pending.maxlength, budget) {
             let Some(chunk) = self.pending.take(self.fragsize as usize) else {
                 break;
             };
@@ -431,6 +434,8 @@ struct Pending {
     maxlength: u32,
     write_index: u64,
     read_index: u64,
+    /// An overrun was reported and no fragment has gone out since.
+    overflowing: bool,
 }
 
 impl Pending {
@@ -440,6 +445,7 @@ impl Pending {
             maxlength,
             write_index: 0,
             read_index: 0,
+            overflowing: false,
         }
     }
 
@@ -460,7 +466,14 @@ impl Pending {
             return None;
         }
         self.read_index += size as u64;
+        self.overflowing = false;
         Some(self.bytes.drain(..size).collect())
+    }
+
+    /// Notes an overrun. True if it starts one the client has not heard
+    /// of: the first since a fragment last went out.
+    fn overflowed(&mut self) -> bool {
+        !std::mem::replace(&mut self.overflowing, true)
     }
 
     fn clear(&mut self) {
@@ -470,9 +483,21 @@ impl Pending {
 }
 
 /// How much may wait for the client on its way before a stream holds its
-/// fragments back: its maxlength, at most `SEND_BUDGET`.
-fn send_limit(maxlength: u32) -> usize {
-    (maxlength as usize).min(SEND_BUDGET)
+/// fragments back: its maxlength, at most the connection's `budget` and
+/// `SEND_BUDGET`.
+fn send_limit(maxlength: u32, budget: usize) -> usize {
+    (maxlength as usize).min(budget).min(SEND_BUDGET)
+}
+
+/// The budget of a connection whose socket has a send buffer of `sndbuf`,
+/// as `SO_SNDBUF` reports it: half of it, at most `SEND_BUDGET`. The
+/// socket's queue is counted as the kernel counts it for `SIOCOUTQ`, by
+/// the memory its buffers take rather than their payload, and the
+/// connection's replies need room too: within half, record data alone
+/// never fills the socket, so a stalled client does not make every write
+/// of the connection wait for its timeout.
+pub fn socket_budget(sndbuf: usize) -> usize {
+    (sndbuf / 2).min(SEND_BUDGET)
 }
 
 /// A fragment in bytes: `u32::MAX` or 0 is 25 ms, otherwise whole frames,
@@ -530,11 +555,40 @@ mod tests {
 
     #[test]
     fn what_waits_for_the_client_stays_within_the_budget() {
-        assert_eq!(send_limit(9600), 9600);
-        assert_eq!(send_limit(MAX_LENGTH), SEND_BUDGET);
+        assert_eq!(send_limit(9600, SEND_BUDGET), 9600);
+        assert_eq!(send_limit(MAX_LENGTH, SEND_BUDGET), SEND_BUDGET);
         // Each poll sends while below the limit, so at most a fragment
         // more; with the largest, still under the connection's 1 MiB.
-        assert!(send_limit(MAX_LENGTH) + MAX_FRAGMENT as usize <= 1 << 19);
+        assert!(send_limit(MAX_LENGTH, usize::MAX) + MAX_FRAGMENT as usize <= 1 << 19);
+        // A socket's budget smaller than the stream's limit wins.
+        assert_eq!(send_limit(MAX_LENGTH, 100_000), 100_000);
+        assert_eq!(send_limit(9600, 100_000), 9600);
+    }
+
+    #[test]
+    fn a_socket_budget_is_half_its_send_buffer() {
+        // Linux reports twice what was set, 212992 by default.
+        assert_eq!(socket_budget(212_992), 106_496);
+        assert_eq!(socket_budget(0), 0);
+        assert_eq!(socket_budget(8 << 20), SEND_BUDGET);
+    }
+
+    #[test]
+    fn a_long_stall_sends_one_overflow_until_a_fragment_goes_out() {
+        let mut pending = Pending::new(8);
+        let mut overflows = 0;
+        // A client that reads nothing: every poll drops, ten thousand times.
+        for _ in 0..10_000 {
+            if pending.push(&[0; 4]) && pending.overflowed() {
+                overflows += 1;
+            }
+        }
+        assert_eq!(overflows, 1);
+        // Once it reads again, the next overrun is news.
+        assert!(pending.take(4).is_some());
+        assert!(pending.push(&[0; 8]));
+        assert!(pending.overflowed());
+        assert!(!pending.overflowed());
     }
 
     #[test]
