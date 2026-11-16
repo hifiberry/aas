@@ -61,6 +61,8 @@ pub struct Stream {
     pub channels: u8,
     pub frame_bytes: usize,
     pub corked: bool,
+    /// The daemon's id of the stream, 0 if it did not say.
+    pub daemon_stream: u32,
     pub db_millis: i32,
     /// Set to PulseAudio's silence, volume 0. `aas` has no gain below
     /// -60 dB, so silence is the client's mute bit, while the stream reports
@@ -179,6 +181,7 @@ impl Stream {
         daemon
             .configure(spec.rate, format, spec.channels, frames)
             .map_err(|_| CreateError::new(wire::ERR_INVALID, "the daemon refused the stream"))?;
+        let daemon_stream = daemon.stream_id().unwrap_or(0);
         // An uncorked stream starts with its first write, not now: started
         // empty, it would underrun at once and hold the output's rate
         // before it has anything to play.
@@ -201,6 +204,7 @@ impl Stream {
             channels: spec.channels,
             frame_bytes,
             corked,
+            daemon_stream,
             db_millis,
             silent: false,
             mute: muted,
@@ -429,6 +433,7 @@ impl Stream {
             channels: self.channels,
             format: self.format,
             corked: self.corked,
+            stream: self.daemon_stream,
             db_millis: self.db_millis,
             silent: self.silent,
             mute: self.mute,

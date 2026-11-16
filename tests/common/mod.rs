@@ -54,17 +54,22 @@ impl Daemon {
 
     /// The same, with the master's idle rule `idle`.
     pub fn start_idle(api: Option<TcpListener>, plugins: Vec<PluginConfig>, idle: Idle) -> Daemon {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("aas.sock");
-        let state = dir.path().join("state.toml");
-        let port = api.as_ref().map(|l| l.local_addr().unwrap().port());
-        let shutdown = Arc::new(AtomicBool::new(false));
         let config = Config {
             latency_ms: Some(LATENCY_MS),
             idle,
             plugins,
             ..Config::default()
         };
+        Daemon::start_config(api, config)
+    }
+
+    /// The same, with the whole `config`.
+    pub fn start_config(api: Option<TcpListener>, config: Config) -> Daemon {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("aas.sock");
+        let state = dir.path().join("state.toml");
+        let port = api.as_ref().map(|l| l.local_addr().unwrap().port());
+        let shutdown = Arc::new(AtomicBool::new(false));
         let thread = {
             let (path, shutdown) = (path.clone(), shutdown.clone());
             thread::spawn(move || {

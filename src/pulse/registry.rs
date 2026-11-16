@@ -24,6 +24,8 @@ pub struct SinkInput {
     pub channels: u8,
     pub format: u8,
     pub corked: bool,
+    /// The daemon's id of its stream, 0 if unknown.
+    pub stream: u32,
     pub db_millis: i32,
     /// Set to PulseAudio's silence, volume 0: muted in `aas`, reported as
     /// volume 0 rather than as a mute.

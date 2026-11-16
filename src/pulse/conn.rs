@@ -991,6 +991,7 @@ impl Conn {
             self.client_index,
             index,
             self.registry.default_source(),
+            &self.registry,
             reader,
         );
         match created {

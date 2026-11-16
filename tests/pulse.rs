@@ -1880,3 +1880,112 @@ fn record_latency_is_answered() {
     assert!(r.eof());
     assert!(read > 0 && write >= read, "write {write}, read {read}");
 }
+
+/// A player of a constant `level` (S16, both channels). Returns its sink
+/// input index and what stops it: stopping deletes its playback stream.
+fn const_player(
+    daemon: &Daemon,
+    level: i16,
+) -> (u32, (Arc<AtomicBool>, std::thread::JoinHandle<()>)) {
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut player = RawPulse::connect(&daemon.pulse_socket());
+    player.auth();
+    player.set_name("constant");
+    let (stream, missing, _) = player.create_stream(48_000, wire::FORMAT_S16LE, 2, 200);
+    let flag = stop.clone();
+    let handle = std::thread::spawn(move || {
+        let fill = |bytes: usize| level.to_le_bytes().repeat(bytes / 2);
+        player.send_memblock(stream, &fill(missing));
+        while !flag.load(Ordering::Relaxed) {
+            if let Some((command, _, body)) = player.try_recv(Duration::from_millis(5))
+                && command == wire::REQUEST
+            {
+                player.send_memblock(stream, &fill(request_length(&body)));
+            }
+        }
+        let mut body = Builder::new();
+        body.u32(stream);
+        player.command(wire::DELETE_PLAYBACK_STREAM, &body.into_vec());
+    });
+    (stream, (stop, handle))
+}
+
+fn peak_meter_body(direct_on_input: u32) -> Vec<u8> {
+    let spec = SampleSpec {
+        format: wire::FORMAT_FLOAT32LE,
+        channels: 1,
+        rate: 144,
+    };
+    record_body(spec, wire::INVALID_INDEX, Some("aas.monitor"), u32::MAX, false, 4, true, direct_on_input)
+}
+
+#[test]
+fn record_direct_a_meter_hears_one_sink_input() {
+    let daemon = Daemon::start();
+    let (_, loud) = const_player(&daemon, 16_384);
+    let (quiet_index, quiet) = const_player(&daemon, 3_277);
+    let mut recorder = pactl(&daemon);
+    let body = peak_meter_body(quiet_index);
+    let (command, _, reply) = recorder.command(wire::CREATE_RECORD_STREAM, &body);
+    assert_eq!(command, wire::REPLY, "the meter is created");
+    let stream = read_record_reply(&reply).stream;
+    assert!(recorder.first_block(stream, Duration::from_secs(1)));
+    recorder.blocks.clear();
+    let (blocks, _) = recorder.collect(stream, Duration::from_secs(1));
+    stop_player(loud);
+    stop_player(quiet);
+    let values: Vec<f32> = blocks
+        .iter()
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+    assert!(!values.is_empty());
+    let near = values.iter().filter(|v| (0.08..0.12).contains(*v)).count();
+    assert!(near * 10 >= values.len() * 9, "values near 0.1: {values:?}");
+}
+
+#[test]
+fn record_direct_a_deleted_sink_input_kills_its_meter() {
+    let daemon = Daemon::start();
+    let (_, loud) = const_player(&daemon, 16_384);
+    let (index, quiet) = const_player(&daemon, 3_277);
+    let mut recorder = pactl(&daemon);
+    let body = peak_meter_body(index);
+    let (command, _, reply) = recorder.command(wire::CREATE_RECORD_STREAM, &body);
+    assert_eq!(command, wire::REPLY, "the meter is created");
+    let stream = read_record_reply(&reply).stream;
+    assert!(recorder.first_block(stream, Duration::from_secs(1)));
+    stop_player(quiet);
+    let (_, packets) = recorder.collect(stream, Duration::from_secs(1));
+    let killed = packets.iter().any(|(command, body)| {
+        *command == wire::RECORD_STREAM_KILLED && Reader::new(body).u32() == Some(stream)
+    });
+    assert!(killed, "the meter is told it is gone");
+    let (command, _, _) = recorder.command(wire::GET_SERVER_INFO, &[]);
+    assert_eq!(command, wire::REPLY);
+    stop_player(loud);
+}
+
+#[test]
+fn record_direct_errors() {
+    let config = aas::config::Config {
+        latency_ms: Some(LATENCY_MS),
+        analog: aas::config::Analog {
+            enabled: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let daemon = Daemon::start_config(None, config);
+    let (index, player) = const_player(&daemon, 3_277);
+    let mut client = pactl(&daemon);
+    let unknown = record_body(S16_STEREO_48K, wire::INVALID_INDEX, Some("aas.monitor"), u32::MAX, false, 0, false, 9_999);
+    let analog = record_body(S16_STEREO_48K, wire::INVALID_INDEX, Some("aas.analog"), u32::MAX, false, 0, false, index);
+    for (body, code) in [(unknown, wire::ERR_NOENTITY), (analog, wire::ERR_INVALID)] {
+        let (command, _, reply) = client.command(wire::CREATE_RECORD_STREAM, &body);
+        assert_eq!(command, wire::ERROR);
+        assert_eq!(Reader::new(&reply).u32(), Some(code));
+    }
+    let (command, _, _) = client.command(wire::GET_SERVER_INFO, &[]);
+    assert_eq!(command, wire::REPLY);
+    stop_player(player);
+}

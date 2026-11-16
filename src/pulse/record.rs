@@ -10,7 +10,7 @@ use crate::pulse::Settings;
 use crate::pulse::conn::{MAX_TICK, MIN_TICK};
 use crate::pulse::objects::{self, Source};
 use crate::pulse::packet::Encoder;
-use crate::pulse::registry::SourceOutput;
+use crate::pulse::registry::{Registry, SourceOutput};
 use crate::pulse::stream::{CreateError, client_spec, pcm_props};
 use crate::pulse::tagstruct::{Builder, Reader, SampleSpec};
 use crate::pulse::wire;
@@ -21,6 +21,7 @@ use aas_client::ring::Ring;
 use std::collections::VecDeque;
 use std::io;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// The fragment a client gets when it names none.
@@ -139,6 +140,8 @@ pub struct Record {
     /// Set for a peak-detect stream, which has no resampler.
     peaks: Option<Peaks>,
     peak_detect: bool,
+    /// The sink input a stream of one input records, and where to look it up.
+    direct: Option<(u32, Arc<Registry>)>,
     peak_frames: Vec<[i32; 2]>,
     frames: Vec<[i32; 2]>,
     period: Vec<[i32; 2]>,
@@ -151,6 +154,7 @@ pub struct Record {
 
 impl Record {
     /// Parses `CREATE_RECORD_STREAM` and sets up the daemon stream.
+    #[allow(clippy::too_many_arguments)]
     pub fn create(
         settings: Settings,
         daemon_socket: &Path,
@@ -158,6 +162,7 @@ impl Record {
         client_index: u32,
         index: u32,
         default: Source,
+        registry: &Arc<Registry>,
         reader: &mut Reader,
     ) -> Result<CreatedRecord, CreateError> {
         let protocol = |what| CreateError::new(wire::ERR_PROTOCOL, what);
@@ -180,7 +185,7 @@ impl Record {
         }
         let peak_detect = flags[7];
         let props = reader.proplist().ok_or_else(|| protocol("no proplist"))?;
-        reader.u32().ok_or_else(|| protocol("no direct_on_input"))?;
+        let direct_on_input = reader.u32().ok_or_else(|| protocol("no direct_on_input"))?;
         // early_requests, dont_inhibit_auto_suspend, fail_on_suspend.
         for _ in 0..3 {
             reader.boolean().ok_or_else(|| protocol("no stream flag"))?;
@@ -206,6 +211,18 @@ impl Record {
         let source =
             objects::find_source(Some(source_index), source_name, default, settings.analog)
                 .ok_or_else(|| CreateError::new(wire::ERR_NOENTITY, "no such source"))?;
+        let direct = (direct_on_input != wire::INVALID_INDEX).then_some(direct_on_input);
+        if direct.is_some() {
+            if source == Source::Analog {
+                return Err(CreateError::new(
+                    wire::ERR_INVALID,
+                    "the analog input has no sink inputs",
+                ));
+            }
+            if registry.sink_input(direct_on_input).is_none() {
+                return Err(CreateError::new(wire::ERR_NOENTITY, "no such sink input"));
+            }
+        }
         let frame_bytes = format.sample_bytes() as u32 * u32::from(spec.channels);
         let fragsize = fragment_bytes(fragsize, spec.rate, frame_bytes);
         let maxlength = max_length(maxlength, spec.rate, frame_bytes, fragsize);
@@ -232,6 +249,7 @@ impl Record {
             resampling: None,
             peaks: None,
             peak_detect,
+            direct: direct.map(|index| (index, registry.clone())),
             peak_frames: Vec::new(),
             frames: vec![[0; 2]; CHUNK],
             period: vec![[0; 2]; PERIOD as usize],
@@ -243,9 +261,13 @@ impl Record {
         if let Some(pid) = peer_pid {
             let _ = record.daemon.identify(pid);
         }
-        record
-            .open()
-            .map_err(|_| CreateError::new(wire::ERR_INVALID, "the daemon refused the stream"))?;
+        record.open().map_err(|e| {
+            if e.kind() == io::ErrorKind::NotFound {
+                CreateError::new(wire::ERR_NOENTITY, "no such sink input")
+            } else {
+                CreateError::new(wire::ERR_INVALID, "the daemon refused the stream")
+            }
+        })?;
         let mut reply = Builder::new();
         reply.u32(index);
         reply.u32(index);
@@ -276,7 +298,15 @@ impl Record {
             .unwrap_or(48_000);
         let frames = (u64::from(guess) * u64::from(self.settings.buffer_ms) / 1000).max(1) as u32;
         let rate = match self.source {
-            Source::Monitor => self.daemon.configure_monitor(frames)?,
+            Source::Monitor => match &self.direct {
+                Some((index, registry)) => {
+                    let input = registry
+                        .sink_input(*index)
+                        .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+                    self.daemon.configure_stream_monitor(frames, input.stream)?
+                }
+                None => self.daemon.configure_monitor(frames)?,
+            },
             Source::Analog => self.daemon.configure_capture(frames)?,
         };
         self.daemon_rate = rate;
