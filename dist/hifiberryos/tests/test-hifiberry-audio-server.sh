@@ -8,6 +8,13 @@ trap 'rm -rf "$ROOT"' EXIT
 mkdir -p "$ROOT/bin"
 cat > "$ROOT/bin/systemctl" <<'FAKE'
 #!/bin/sh
+# Every change is asked for quietly, so that what systemctl prints about
+# links it made does not reach the caller as a warning.
+case "$1" in
+    is-active) ;;
+    --quiet) shift ;;
+    *) echo "$*" >> "$AAS_SWITCH_ROOT/not-quiet.log" ;;
+esac
 echo "$*" >> "$AAS_SWITCH_ROOT/systemctl.log"
 if [ "$1" = is-active ]; then
     [ -f "$AAS_SWITCH_ROOT/active" ]
@@ -143,4 +150,5 @@ if [ "$(id -u)" -ne 0 ]; then
 else
     ok "skipped the non-root check (running as root)"
 fi
+[ ! -s "$ROOT/not-quiet.log" ] || fail "systemctl called without --quiet: $(cat "$ROOT/not-quiet.log")"
 echo "all ok"

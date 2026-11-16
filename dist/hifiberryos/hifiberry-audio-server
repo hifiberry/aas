@@ -114,7 +114,7 @@ cmd_set() {
             if mkdir -p "$(dirname "$MASKED")" &&
                 echo "$units" | tr ' ' '\n' | sed '/^$/d' > "$MASKED"; then
                 # shellcheck disable=SC2086
-                "$SYSTEMCTL" --global mask $units || {
+                "$SYSTEMCTL" --quiet --global mask $units || {
                     echo "hifiberry-audio-server: masking the PipeWire units failed" >&2; rc=1; }
             else
                 echo "hifiberry-audio-server: cannot record the masked units; not masking" >&2
@@ -122,7 +122,7 @@ cmd_set() {
             fi
         fi
         # shellcheck disable=SC2086
-        "$SYSTEMCTL" enable $SYSTEM_UNITS || {
+        "$SYSTEMCTL" --quiet enable $SYSTEM_UNITS || {
             echo "hifiberry-audio-server: enabling the aas units failed" >&2; rc=1; }
     else
         each_link drop_link
@@ -133,7 +133,7 @@ cmd_set() {
         fi
         if [ -n "${units% }" ]; then
             # shellcheck disable=SC2086
-            if "$SYSTEMCTL" --global unmask $units; then
+            if "$SYSTEMCTL" --quiet --global unmask $units; then
                 rm -f "$MASKED" || rc=1
             else
                 echo "hifiberry-audio-server: unmasking the PipeWire units failed" >&2; rc=1
@@ -142,7 +142,7 @@ cmd_set() {
             rm -f "$MASKED" || rc=1
         fi
         # shellcheck disable=SC2086
-        "$SYSTEMCTL" disable $SYSTEM_UNITS || {
+        "$SYSTEMCTL" --quiet disable $SYSTEM_UNITS || {
             echo "hifiberry-audio-server: disabling the aas units failed" >&2; rc=1; }
     fi
     # Last, so that a stored choice has been applied as far as it went.
