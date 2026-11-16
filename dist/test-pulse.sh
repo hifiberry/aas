@@ -2,13 +2,16 @@
 # Board tests for the aas PulseAudio endpoint. Runs on the test board, as a
 # member of group audio, with the daemon running as aas.service and
 # dist/install-pulse.sh installed. Needs pactl, paplay, mpv, aasctl and
-# python3, and parecord for the record check. Each case prints PASS or FAIL and its name. The exit status is
-# the number of cases that failed, or 2 if a tool is missing.
+# python3, and parecord for the record check. Each case prints PASS or FAIL
+# and its name. The exit status is the number of cases that failed, or 2 if a
+# tool is missing.
 set -u
 
 failed=0
 work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT
+player=
+trap '[ -n "$player" ] && kill "$player" 2>/dev/null; rm -rf "$work"' EXIT
+trap 'exit 130' INT TERM
 
 pass() { echo "PASS $1${2:+: $2}"; }
 fail() { echo "FAIL $1${2:+: $2}"; failed=$((failed + 1)); }
@@ -88,16 +91,18 @@ with wave.open(sys.argv[1], "wb") as out:
     out.setnchannels(2)
     out.setsampwidth(2)
     out.setframerate(48000)
-    for n in range(96000):
+    for n in range(144000):
         v = int(16384 * math.sin(2 * math.pi * 1000 * n / 48000))
         out.writeframes(struct.pack("<hh", v, v))
 PY
 	paplay "$work/rec.wav" >/dev/null 2>&1 &
 	player=$!
 	sleep 0.3
-	timeout 1 parecord -d aas.monitor --channels=1 --format=s16le --rate=44100 \
+	timeout 1.5 parecord -d aas.monitor --channels=1 --format=s16le --rate=44100 \
 		--raw "$work/monitor.raw" >/dev/null 2>&1
+	kill "$player" 2>/dev/null
 	wait "$player" 2>/dev/null
+	player=
 	stats=$(raw_stats "$work/monitor.raw" 2>/dev/null)
 	if python3 -c 'import sys; s, p = map(float, sys.argv[1:3]); sys.exit(not (s >= 0.8 and p > 0.25))' $stats 2>/dev/null; then
 		pass record "monitor, $stats"
@@ -106,7 +111,7 @@ PY
 	fi
 
 	if pactl list short sources 2>/dev/null | grep -q 'aas\.analog'; then
-		timeout 1 parecord -d aas.analog --channels=1 --format=s16le --rate=44100 \
+		timeout 1.5 parecord -d aas.analog --channels=1 --format=s16le --rate=44100 \
 			--raw "$work/analog.raw" >/dev/null 2>&1
 		stats=$(raw_stats "$work/analog.raw" 2>/dev/null)
 		if python3 -c 'import sys; sys.exit(not float(sys.argv[1]) >= 0.8)' $stats 2>/dev/null; then

@@ -202,9 +202,9 @@ The server advertises protocol 35 and implements this playback subset:
 | Volume | `SET_SINK_VOLUME`, `SET_SINK_MUTE`, `SET_SINK_INPUT_VOLUME`, `SET_SINK_INPUT_MUTE`, `SET_DEFAULT_SINK` |
 | Notifications | `SUBSCRIBE`, and the server-to-client `REQUEST`, `STARTED`, `SUBSCRIBE_EVENT`, `PLAYBACK_STREAM_KILLED`, `UNDERFLOW` |
 
-Every other command, including modules, moves, suspends and
-extensions, is answered with `PA_COMMAND_ERROR` and `PA_ERR_NOTSUPPORTED`, and
-the connection stays usable *(call)*. A command that cannot be carried out for
+Every other command, including modules, moves, suspends and extensions, is
+answered with `PA_COMMAND_ERROR` and `PA_ERR_NOTSUPPORTED`, and the connection
+stays usable *(call)*. A command that cannot be carried out for
 this stream is refused the same way rather than applied halfway.
 `PLAYBACK_BUFFER_ATTR_CHANGED` is never sent, because the endpoint never changes
 a stream's buffer on its own.
