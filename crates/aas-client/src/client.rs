@@ -414,7 +414,7 @@ impl Client {
         channels: u8,
         buffer_frames: u32,
     ) -> io::Result<()> {
-        self.set_up(rate, format, channels, buffer_frames, false)
+        self.set_up(rate, format, channels, buffer_frames, false, false)
             .map(drop)
     }
 
@@ -435,7 +435,18 @@ impl Client {
     /// the ring holds can still be read, and `start` fails with `ENODEV`. A new `configure_capture`
     /// gets the new rate.
     pub fn configure_capture(&mut self, buffer_frames: u32) -> io::Result<u32> {
-        self.set_up(0, ClientFormat::S32, 2, buffer_frames, true)
+        self.set_up(0, ClientFormat::S32, 2, buffer_frames, true, false)
+    }
+
+    /// Sets up a monitor stream, which records what the master card is
+    /// sent: S32 stereo at the rate this returns, the rate the daemon's
+    /// output runs at. It is a capture stream in every other respect, as
+    /// `configure_capture` describes: it replaces any stream set up
+    /// before, `buffer_frames` is what the ring holds at least, it ends
+    /// when the daemon's rate changes, and a ring that is full drops what
+    /// does not fit.
+    pub fn configure_monitor(&mut self, buffer_frames: u32) -> io::Result<u32> {
+        self.set_up(0, ClientFormat::S32, 2, buffer_frames, true, true)
     }
 
     /// Sends a configure and maps the ring it is answered with. Returns the
@@ -448,6 +459,7 @@ impl Client {
         channels: u8,
         buffer_frames: u32,
         capture: bool,
+        monitor: bool,
     ) -> io::Result<u32> {
         self.stream = None;
         let request = Request::Configure {
@@ -456,6 +468,7 @@ impl Client {
             channels,
             buffer_frames,
             capture,
+            monitor,
         };
         let (reply, fds) = self.call(&request)?;
         let bad = |m: &str| io::Error::new(io::ErrorKind::InvalidData, m.to_string());

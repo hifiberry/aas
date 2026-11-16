@@ -2018,6 +2018,7 @@ mod tests {
             channels: 2,
             buffer_frames: 4096,
             capture: true,
+            monitor: false,
         };
         let answer = control.request(conn, Some(capture), now);
         assert!(matches!(answer.reply, Some(Reply::Configured { .. })));

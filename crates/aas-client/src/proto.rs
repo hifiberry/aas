@@ -2,8 +2,9 @@
 //! `REQUEST_LEN` bytes and every reply `REPLY_LEN` bytes, little endian.
 //! A message is a u32 tag followed by u32 arguments. A sender sets the
 //! arguments a message does not use to zero. A receiver ignores them.
-//! `Configure` carries the direction of the stream in its channels word,
-//! as `CAPTURE` describes.
+//! `Configure` carries the direction of the stream and whether a capture
+//! stream records the output monitor in its channels word, as `CAPTURE`
+//! and `MONITOR` describe.
 //!
 //! Each request gets one reply, in order. A connection that has sent
 //! `SubscribeVolume` is also sent `Reply::VolumeChanged` when the output
@@ -34,10 +35,14 @@ pub const REPLY_LEN: usize = 8;
 /// Largest buffer a client may ask for. Bounds the ring memory.
 pub const MAX_BUFFER_FRAMES: u32 = 1 << 20;
 /// The bit of `Configure`'s channels word that asks for a capture stream.
-/// The word holds the channels in bits 0 to 7 and the capture flag in bit
-/// 31; every other bit is refused. The word had room to spare, so the
-/// request keeps its size.
+/// The word holds the channels in bits 0 to 7, the capture flag in bit 31
+/// and the monitor flag in bit 30; every other bit is refused. The word
+/// had room to spare, so the request keeps its size.
 const CAPTURE: u32 = 1 << 31;
+/// The bit of `Configure`'s channels word that makes a capture stream
+/// record what the master card is sent, instead of the analog input. It
+/// is only valid beside `CAPTURE`.
+const MONITOR: u32 = 1 << 30;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Request {
@@ -53,12 +58,16 @@ pub enum Request {
     /// stereo at the daemon's rate, so `rate`, `format` and `channels` are
     /// ignored, and the reply names the rate. `buffer_frames` is rounded up
     /// to what the daemon needs, never refused for being small.
+    ///
+    /// With `monitor`, which needs `capture`, the stream records what the
+    /// master card is sent instead of the analog input.
     Configure {
         rate: u32,
         format: ClientFormat,
         channels: u8,
         buffer_frames: u32,
         capture: bool,
+        monitor: bool,
     },
     /// For a capture stream, fails with `ENODEV` once the stream has ended.
     Start,
@@ -194,9 +203,10 @@ pub fn encode_request(r: &Request) -> [u8; REQUEST_LEN] {
             channels,
             buffer_frames,
             capture,
+            monitor,
         } => {
-            let flag = if capture { CAPTURE } else { 0 };
-            let channels = u32::from(channels) | flag;
+            let flags = if capture { CAPTURE } else { 0 } | if monitor { MONITOR } else { 0 };
+            let channels = u32::from(channels) | flags;
             pack(2, [rate, format_code(format), channels, buffer_frames])
         }
         Request::Start => pack(3, [0; 4]),
@@ -225,13 +235,22 @@ pub fn decode_request(b: &[u8]) -> Option<Request> {
         1 => Request::Hello {
             version: word(b, 1),
         },
-        2 => Request::Configure {
-            rate: word(b, 1),
-            format: format_from_code(word(b, 2))?,
-            channels: u8::try_from(word(b, 3) & !CAPTURE).ok()?,
-            buffer_frames: Some(word(b, 4)).filter(|&n| n <= MAX_BUFFER_FRAMES)?,
-            capture: word(b, 3) & CAPTURE != 0,
-        },
+        2 => {
+            let flags = word(b, 3);
+            let (capture, monitor) = (flags & CAPTURE != 0, flags & MONITOR != 0);
+            // A monitor is a kind of capture.
+            if monitor && !capture {
+                return None;
+            }
+            Request::Configure {
+                rate: word(b, 1),
+                format: format_from_code(word(b, 2))?,
+                channels: u8::try_from(flags & !(CAPTURE | MONITOR)).ok()?,
+                buffer_frames: Some(word(b, 4)).filter(|&n| n <= MAX_BUFFER_FRAMES)?,
+                capture,
+                monitor,
+            }
+        }
         3 => Request::Start,
         4 => Request::Stop,
         5 => Request::Drain,
@@ -338,6 +357,7 @@ mod tests {
                 channels: 2,
                 buffer_frames: 4096,
                 capture: false,
+                monitor: false,
             },
             Request::Start,
             Request::Stop,
@@ -373,6 +393,7 @@ mod tests {
                 channels: 1,
                 buffer_frames: 1,
                 capture: false,
+                monitor: false,
             };
             assert_eq!(decode_request(&encode_request(&r)), Some(r));
         }
@@ -386,6 +407,7 @@ mod tests {
             channels: 2,
             buffer_frames: 4096,
             capture: true,
+            monitor: false,
         };
         assert_eq!(decode_request(&encode_request(&capture)), Some(capture));
         // The flag is all that tells it from a playback request.
@@ -395,6 +417,7 @@ mod tests {
             channels: 2,
             buffer_frames: 4096,
             capture: false,
+            monitor: false,
         };
         assert_ne!(encode_request(&capture), encode_request(&playback));
         assert_eq!(decode_request(&encode_request(&playback)), Some(playback));
@@ -406,7 +429,37 @@ mod tests {
         let rate = Reply::Configured { rate: 44100 };
         assert_eq!(decode_reply(&encode_reply(&rate)), Some(rate));
         // Any other bit in the channels word is still refused.
-        assert_eq!(decode_request(&pack(2, [0, 3, 2 | 1 << 30, 64])), None);
+        assert_eq!(decode_request(&pack(2, [0, 3, 2 | 1 << 29, 64])), None);
+    }
+
+    #[test]
+    fn a_monitor_configure_round_trips_in_twenty_bytes() {
+        let r = Request::Configure {
+            rate: 0,
+            format: ClientFormat::S32,
+            channels: 2,
+            buffer_frames: 4800,
+            capture: true,
+            monitor: true,
+        };
+        let bytes = encode_request(&r);
+        assert_eq!(bytes.len(), REQUEST_LEN);
+        assert_eq!(word(&bytes, 3), 2 | (1 << 31) | (1 << 30));
+        assert_eq!(decode_request(&bytes), Some(r));
+    }
+
+    #[test]
+    fn a_monitor_without_capture_is_refused() {
+        let mut bytes = encode_request(&Request::Configure {
+            rate: 48000,
+            format: ClientFormat::S16,
+            channels: 2,
+            buffer_frames: 4800,
+            capture: false,
+            monitor: false,
+        });
+        bytes[12..16].copy_from_slice(&(2u32 | (1 << 30)).to_le_bytes());
+        assert_eq!(decode_request(&bytes), None);
     }
 
     #[test]

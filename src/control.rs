@@ -1349,6 +1349,7 @@ impl Control {
                 channels,
                 buffer_frames,
                 capture: false,
+                ..
             } => self.configure(conn, rate, format, channels, buffer_frames, now),
             Request::Start if recording => self.start_recorder(conn),
             Request::Stop if recording => self.stop_recorder(conn),
@@ -2930,6 +2931,7 @@ mod tests {
             channels: 2,
             buffer_frames: 4096,
             capture: false,
+            monitor: false,
         };
         let answer = control.request(1, Some(configure), now);
         assert_eq!(answer.reply, Some(Reply::Configured { rate: 0 }));
@@ -2982,6 +2984,7 @@ mod tests {
             channels: 2,
             buffer_frames,
             capture: false,
+            monitor: false,
         }
     }
 
@@ -3588,6 +3591,7 @@ mod tests {
             channels: 2,
             buffer_frames: 4096,
             capture: true,
+            monitor: false,
         };
         let answer = control.request(conn, Some(capture), now);
         let Some(Reply::Configured { rate }) = answer.reply else {
