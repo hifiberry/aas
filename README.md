@@ -567,7 +567,8 @@ The endpoint advertises protocol version 35 and implements playback
 introspection and control, and recording. SHM, loadable modules, moving or
 suspending streams and the native PipeWire protocol are not implemented; those
 commands get a PulseAudio error and the connection stays usable. A client
-that cannot be served is told why, alone: one malformed connection never affects another one or the audio thread.
+that cannot be served is told why, alone: one malformed connection never affects
+another one or the audio thread.
 
 `pactl info`, `paplay`, `parecord` and `mpv --ao=pulse` are the usual checks.
 On a board, `sh dist/test-pulse.sh` runs them, compares a `pactl` volume change
