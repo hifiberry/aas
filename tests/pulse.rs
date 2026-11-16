@@ -1989,3 +1989,44 @@ fn record_direct_errors() {
     assert_eq!(command, wire::REPLY);
     stop_player(player);
 }
+
+#[test]
+fn record_direct_a_meter_names_the_monitor_by_its_index() {
+    let daemon = Daemon::start();
+    let (index, player) = const_player(&daemon, 3_277);
+    let mut recorder = pactl(&daemon);
+    let spec = SampleSpec {
+        format: wire::FORMAT_FLOAT32LE,
+        channels: 1,
+        rate: 144,
+    };
+    // As libpulse sends pavucontrol's request: no index, the index as name.
+    let invalid = wire::INVALID_INDEX;
+    let body = record_body(spec, invalid, Some("0"), u32::MAX, false, 4, true, index);
+    let (command, _, reply) = recorder.command(wire::CREATE_RECORD_STREAM, &body);
+    assert_eq!(command, wire::REPLY, "the meter is created");
+    let reply = read_record_reply(&reply);
+    assert_eq!(reply.source, 0);
+    assert!(recorder.first_block(reply.stream, Duration::from_secs(1)));
+    stop_player(player);
+}
+
+#[test]
+fn a_decimal_name_names_the_sink_by_its_index() {
+    let daemon = Daemon::start();
+    let mut client = pactl(&daemon);
+    let mut body = Builder::new();
+    body.string("0");
+    let (command, _, reply) = client.command(wire::LOOKUP_SINK, &body.into_vec());
+    assert_eq!(command, wire::REPLY);
+    assert_eq!(Reader::new(&reply).u32(), Some(0));
+    let mut body = Builder::new();
+    body.u32(wire::INVALID_INDEX);
+    body.string("0");
+    let (command, _, _) = client.command(wire::GET_SINK_INFO, &body.into_vec());
+    assert_eq!(command, wire::REPLY);
+    let mut body = Builder::new();
+    body.string("1");
+    let (command, _, _) = client.command(wire::LOOKUP_SINK, &body.into_vec());
+    assert_eq!(command, wire::ERROR);
+}

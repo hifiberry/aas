@@ -54,7 +54,9 @@ pub fn sources(analog: bool) -> Vec<Source> {
 }
 
 /// The source an index and name pick. A valid index decides alone;
-/// otherwise the name does, and no name means the default source.
+/// otherwise the name does, and no name means the default source. A
+/// decimal name is an index, as PulseAudio reads it: libpulse sends
+/// pavucontrol's meters with no index and the index as the name.
 pub fn find_source(
     index: Option<u32>,
     name: Option<&str>,
@@ -70,7 +72,10 @@ pub fn find_source(
             Some("@DEFAULT_MONITOR@") => Some(Source::Monitor),
             Some(name) => sources(analog)
                 .into_iter()
-                .find(|source| source.name() == name),
+                .find(|source| match name.parse::<u32>() {
+                    Ok(index) => source.index() == index,
+                    Err(_) => source.name() == name,
+                }),
         },
     };
     found.filter(|&source| source == Source::Monitor || analog)
@@ -293,5 +298,16 @@ mod tests {
             None
         );
         assert_eq!(sources(false), vec![Source::Monitor]);
+    }
+
+    #[test]
+    fn a_decimal_name_is_an_index() {
+        let invalid = Some(wire::INVALID_INDEX);
+        for analog in [false, true] {
+            let found = |name| find_source(invalid, Some(name), Source::Monitor, analog);
+            assert_eq!(found("0"), Some(Source::Monitor));
+            assert_eq!(found("1"), analog.then_some(Source::Analog));
+            assert_eq!(found("2"), None);
+        }
     }
 }

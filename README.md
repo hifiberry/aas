@@ -608,7 +608,8 @@ value is the peak of the audio it covers (a mono stream takes the louder
 channel). Meters of the two sources show what they carry. The meter of one
 playing stream records that sink input alone, only on `aas.monitor`, after the
 stream's own volume and before the output volume, so it does not follow the
-volume of the output.
+volume of the output. Like PulseAudio, the endpoint takes a name that is a
+number for an index: pavucontrol names `aas.monitor` "0".
 
 ## Writing a plugin
 

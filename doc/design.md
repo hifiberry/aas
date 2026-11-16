@@ -428,8 +428,11 @@ runs the capture while it is open, as a PulseAudio source does.
 
 **Per-stream monitors.** A record stream whose `direct_on_input` names a sink
 input records that stream alone *(owner's call: in the daemon)*. Of any stream,
-peak or not; only on `aas.monitor`, the source pavucontrol names, else
-`PA_ERR_INVALID`.
+peak or not; only on `aas.monitor`, else `PA_ERR_INVALID`. pavucontrol names
+that source by its index: libpulse sends no index and the name "0", and a name
+that is a decimal number is read as an index, as PulseAudio reads it, for a
+source and for the sink alike. "1" is `aas.analog`, and `PA_ERR_NOENTITY`
+without an analog input.
 
 - *In the daemon.* A monitor tap may name a source stream. It then gets that
   stream's frames after its own gain, the per-client gain a sink input's volume

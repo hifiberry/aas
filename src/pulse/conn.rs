@@ -1198,10 +1198,11 @@ impl Conn {
     }
 }
 
-/// Whether a sink name is the one sink, under its own name or the alias
-/// PulseAudio clients use for the default sink.
+/// Whether a sink name is the one sink, under its own name, the alias
+/// PulseAudio clients use for the default sink, or its index in decimal,
+/// which PulseAudio takes for a name too.
 fn is_our_sink_name(name: &str) -> bool {
-    name == "aas" || name == "@DEFAULT_SINK@"
+    name == "aas" || name == "@DEFAULT_SINK@" || name.parse::<u32>() == Ok(0)
 }
 
 /// Whether an index and name pick the one sink. A valid index decides
