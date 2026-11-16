@@ -406,6 +406,58 @@ is never changed behind the other clients' backs *(call)*.
 A recording client is a client of the daemon like any other: it appears in the
 API by its process name, and `/metrics` counts its overruns.
 
+#### Peak meters
+
+Volume meters such as pavucontrol, and those of the GNOME and KDE settings,
+record with `PA_STREAM_PEAK_DETECT`. pavucontrol asks for float32 mono at 144 Hz
+(25 Hz in older versions), a `fragsize` of one sample, and reads only the last
+value of each fragment. It opens one such stream per source, and one per sink
+input with `direct_on_input` naming the sink input on the sink's monitor source.
+It does not handle a stream the server refuses: its meter stays empty.
+
+**Peak streams.** With `peak_detect` set, any rate from 1 Hz to 384 kHz is
+accepted. The stream is not resampled: each sample it sends is the largest
+absolute value of the daemon frames its interval covers, counted by the rate
+ratio so that the meter keeps real time at any rate. A mono stream gets the
+louder of the two channels, where PulseAudio averages them and under-reads a
+one-sided signal *(call)*. The value goes through the usual conversion, so every
+sample format works. A client rate above the daemon's repeats the last peak.
+Everything else is a record stream as above: `fragsize`, `maxlength`, cork,
+flush, overflow and the reopen after a rate change. A meter on `aas.analog`
+runs the capture while it is open, as a PulseAudio source does.
+
+**Per-stream monitors.** A record stream whose `direct_on_input` names a sink
+input records that stream alone *(owner's call: in the daemon)*. Of any stream,
+peak or not; only on `aas.monitor`, the source pavucontrol names, else
+`PA_ERR_INVALID`.
+
+- *In the daemon.* A monitor tap may name a source stream. It then gets that
+  stream's frames after its own gain, the per-client gain a sink input's volume
+  sets, at the output rate: before the matrix, the plugins and the output
+  volume, as PulseAudio's `direct_on_input` is before the sink volume. In time
+  with the mix, so a meter moves with the sound. A period in which the stream
+  is not mixed (stopped, short of frames, muted, held as possible DoP, or while
+  a DoP stream owns the output) gives zeros, so the tap keeps real time; in the
+  copy path the frames as copied. The tap ends as at a rate change when the
+  stream it names is removed or replaced, and `Configure` for a stream that
+  does not exist fails with `ENOENT`.
+- *In the protocol.* `Configure` for a monitor carries the stream's id in its
+  rate word, which a capture stream ignores today; zero is the master, as now.
+  A new request, `GetStreamId`, answers a connection with the id of its own
+  stream, zero for none. The request keeps its 20 bytes. The version stays at
+  3: only the endpoint sends either, and it ships with the daemon *(call)*.
+- *In the endpoint.* A playback stream asks for its id each time it sets up
+  its daemon stream and keeps it in its sink input entry, which every
+  connection can read. A record stream with `direct_on_input` looks the id up
+  when it opens and at each reopen. A sink input that does not exist gets
+  `PA_ERR_NOENTITY` at create; one that is gone at a reopen ends the record
+  stream with `RECORD_STREAM_KILLED`, as PulseAudio kills a direct output with
+  its sink input.
+
+Any client allowed on the daemon's socket can thereby record one other client
+alone. It could already record the whole mix, so nothing new is exposed to
+whom the socket admits *(call)*.
+
 ### Later
 
 SHM, the shared-ringbuffer channel and memfd pools, TCP
