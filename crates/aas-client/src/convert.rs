@@ -68,6 +68,44 @@ pub fn to_stereo_s32(
     n
 }
 
+fn put(format: ClientFormat, v: i32, out: &mut Vec<u8>) {
+    match format {
+        ClientFormat::S16 => out.extend_from_slice(&((v >> 16) as i16).to_le_bytes()),
+        // Sign extended into the container, which to_stereo_s32 drops again.
+        ClientFormat::S24 | ClientFormat::S24In32 => {
+            let w = v >> 8;
+            let w = if format == ClientFormat::S24In32 {
+                w & 0x00FF_FFFF
+            } else {
+                w
+            };
+            out.extend_from_slice(&w.to_le_bytes());
+        }
+        ClientFormat::S24Packed => out.extend_from_slice(&v.to_le_bytes()[1..]),
+        ClientFormat::S32 => out.extend_from_slice(&v.to_le_bytes()),
+        ClientFormat::Float => out.extend_from_slice(&(v as f32 / 2147483648.0).to_le_bytes()),
+    }
+}
+
+/// Appends `frames` to `out` as interleaved samples of `format`, the inverse
+/// of [`to_stereo_s32`]. One channel gets the average of left and right; two
+/// get both. Other channel counts append nothing. Samples are truncated, not
+/// dithered.
+pub fn from_stereo_s32(frames: &[[i32; 2]], format: ClientFormat, channels: u8, out: &mut Vec<u8>) {
+    if channels != 1 && channels != 2 {
+        return;
+    }
+    out.reserve(frames.len() * channels as usize * format.sample_bytes());
+    for &[l, r] in frames {
+        if channels == 1 {
+            put(format, ((l as i64 + r as i64) / 2) as i32, out);
+        } else {
+            put(format, l, out);
+            put(format, r, out);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,5 +185,38 @@ mod tests {
         assert!(one(ClientFormat::S16, 0, &input).is_empty());
         let mut out = [[0; 2]; 1];
         assert_eq!(to_stereo_s32(ClientFormat::S16, 1, &input, &mut out), 1);
+    }
+
+    #[test]
+    fn from_stereo_s32_inverts_to_stereo_s32() {
+        let cases = [
+            (ClientFormat::S16, !0u32 << 16),
+            (ClientFormat::S24, !0u32 << 8),
+            (ClientFormat::S24Packed, !0u32 << 8),
+            (ClientFormat::S24In32, !0u32 << 8),
+            (ClientFormat::S32, !0u32),
+            (ClientFormat::Float, !0u32 << 8),
+        ];
+        for (format, mask) in cases {
+            let mask = mask as i32;
+            let frames = [
+                [i32::MIN & mask, 0x1234_5600 & mask],
+                [-0x0102_0300 & mask, 0x7FFF_FF00 & mask],
+            ];
+            let mut bytes = Vec::new();
+            from_stereo_s32(&frames, format, 2, &mut bytes);
+            assert_eq!(bytes.len(), 2 * 2 * format.sample_bytes(), "{format:?}");
+            assert_eq!(one(format, 2, &bytes), frames, "{format:?}");
+        }
+    }
+
+    #[test]
+    fn mono_is_the_average_of_both_channels() {
+        let mut out = Vec::new();
+        from_stereo_s32(&[[100 << 16, 300 << 16]], ClientFormat::S16, 1, &mut out);
+        assert_eq!(out, 200i16.to_le_bytes());
+        out.clear();
+        from_stereo_s32(&[[i32::MAX, i32::MAX]], ClientFormat::S32, 1, &mut out);
+        assert_eq!(out, i32::MAX.to_le_bytes());
     }
 }
