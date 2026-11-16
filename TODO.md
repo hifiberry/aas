@@ -197,48 +197,49 @@ starve then shows it works.
 ## Stage 5: ship `aas` beside PipeWire, with the user choosing
 
 The owner decided (2026-11-15) that HiFiBerry OS ships both audio servers for
-some time, PipeWire and `aas`, and the user selects which one runs. See
-"Non-goals for the first version" and "API" in `doc/design.md`. Removing
-PipeWire, `pw-api` and `vu-meter` is a later stage, not this one.
+some time, PipeWire and `aas`, and the user selects which one runs. The design
+is `doc/switch.md`.
 
-Done: the daemon, the ALSA plugin, both parts of stage 4's API, `aasctl`,
-the `hifiberry-auth` manifest and the nginx location with their install
-script (`dist/install-api.sh`). See "The API in part 1" and "The API in part
-2" in `doc/design.md`, the API section of `README.md`, and "Stage 4 part 1"
-and "Stage 4 part 2" in `doc/measurements.md`.
+Done: the volume follow (`aas` follows the card's control), the Debian
+packages and the switch (`debian/`, `dist/hifiberryos/`), and branches in the
+HiFiBerry OS repositories, not pushed yet: `hifiberry-os` `feat/aas` (build
+script, meta packages), `configurator` `feat/audio-server` (the
+`/api/v1/audio-server` route, factory reset, `config-volume`, features,
+2.20.0) and `hbos-ui` `feat/audio-server` (the switch page, the sound page,
+the VU meter under `aas`). Plans in `doc/plans/2026-11-16-*`. On a test
+board with HiFiBerry OS (`hbos-full`) the switch was run both ways with a
+reboot each: PipeWire stays off under `aas`, players play through ALSA and
+PulseAudio, the card's level is followed, and switching back restores
+PipeWire.
 
-Missing, each needing a design before it is built:
+Missing:
 
-- How the switch works on a device. What it changes: which services run (the
-  PipeWire user services and WirePlumber, or the `aas` system service), which
-  ALSA `default` device `/etc/asound.conf` names (the `aas` plugin, or
-  PipeWire's), and whether a reboot is needed or a restart of the players is
-  enough. Both nginx locations and both auth manifests can stay installed.
-- Where the choice is kept and who applies it: a HiFiBerry OS setting, set
-  from the web UI through the config server, which already enables and
-  disables services by name.
-- How the web UI knows which server runs, and uses `/api/aas/v1` with the
-  `/levels` framing (one meter after another, each with its id, its channel
-  count, RMS and peak per channel and a byte of clip bits) under `aas`, and
-  `/api/pipewire` and `/api/vu-meter` under PipeWire.
-- What a device using speaker EQ or AES67 is told before it switches, since
-  `aas` has neither yet.
-- Debian packages that install `aas` beside PipeWire without either
-  conflicting: the daemon, `aasctl`, the ALSA plugin, the systemd unit,
-  `dist/90-aas.conf` and the two API files, restarting `hifiberry-auth` and
-  reloading nginx as `dist/install-api.sh` does. The `hifiberryos`
-  meta-package depends on both.
+- Push `aas`, then open pull requests for the three branches (their builds
+  clone `aas` from GitHub, so `aas` goes first). Owner's go needed.
+- Click through the web UI's Audio server page in a browser on a device:
+  the warning list, the switch, the reboot dialog, then the sound page's
+  balance and channel mode and the VU meter under `aas`.
+- Soloist: the binary carries both libpipewire and libpulse and loads them
+  at run time, and its help says `--pipewire-device` applies "if using
+  PipeWire", so under `aas` it likely falls back to libpulse and plays
+  through `/run/aas/pulse`. Check by enabling Soloist on a device switched
+  to `aas` and reading its log. If it plays, `soloist-wrapper` needs only
+  `aas.service` in its unit's `After=`.
+- Bluetooth audio under `aas` (`bluez-alsa`), the volume limit as an output
+  ceiling, and speaker EQ and the input processor as plugins: the next
+  phase, see `doc/switch.md`.
 
-Done since: `doc/pipewire-device.md` lists what a HiFiBerry OS device runs
-and has configured for audio under PipeWire, from a device and from the
-sources, and ends with the eight things a switch touches. It also found that
-Bluetooth audio is PipeWire's `bluez5` today, not `bluez-alsa`.
+Found on the test board, in the configurator, under both servers:
 
-The web UI and the services live in the HiFiBerry OS repositories, not here.
-First step: write the design of the switch from the end of
-`doc/pipewire-device.md`, starting with the ALSA default and the services,
-and settle with the owner how `aas` and the players share the card's
-hardware volume control.
+- `config-soundcard --json` run as root (as `aas-config` and the config
+  server run it) reports a DAC+ ADC Pro without a HAT EEPROM as "DAC+/Amp2"
+  with no ADC: I2C probing finds the DAC first. The non-root run, which
+  falls back to `aplay -l`, gets it right. The generated `aas.toml` then has
+  no `[analog]`; `/etc/aas/aas.local.toml` works around it.
+- `GET /api/v1/systeminfo` takes 11 to 25 s on that board (card detection
+  without an EEPROM), so `audiocontrol` gives up at boot after three 10 s
+  tries and disables its volume control. The `audiocontrol` volume path under
+  `aas` is therefore not tested yet.
 
 ## A reopen cuts the sound instead of fading it
 

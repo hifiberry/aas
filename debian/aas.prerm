@@ -1,0 +1,15 @@
+#!/bin/sh
+set -e
+
+# A device that was switched to aas goes back to PipeWire before the
+# package goes, so removing it leaves a working device.
+if [ "$1" = remove ]; then
+    choice=$(cat /etc/hifiberry/audio-server 2>/dev/null || true)
+    if [ "$choice" = aas ]; then
+        hifiberry-audio-server set pipewire || true
+    fi
+fi
+
+#DEBHELPER#
+
+exit 0

@@ -1,6 +1,6 @@
 [Unit]
 Description=Alternative audio server
-After=sound.target
+After=sound.target volume-restore.service aas-config.service
 
 [Service]
 Type=simple

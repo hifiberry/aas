@@ -1,0 +1,12 @@
+[Unit]
+Description=Write the aas configuration from the HiFiBerry system info
+After=sound.target config-detect.service
+Before=aas.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/lib/aas/aas-config
+
+[Install]
+WantedBy=aas.service

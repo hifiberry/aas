@@ -1,0 +1,222 @@
+#!/usr/bin/python3
+"""Write /etc/aas/aas.toml from the sound card data of config-soundcard --json.
+
+Run at every boot by aas-config.service. The user's /etc/aas/aas.local.toml
+is merged over the generated values. Always exits 0.
+"""
+import argparse
+import json
+import os
+import sys
+import tempfile
+import subprocess
+import tomllib
+
+COMMAND = ["/usr/bin/config-soundcard", "--json"]
+TIMEOUT = 20
+OUTPUT = "/etc/aas/aas.toml"
+LOCAL = "/etc/aas/aas.local.toml"
+
+HEADER = (
+    "# Generated at every boot by aas-config from the HiFiBerry sound card data.\n"
+    "# Do not edit: changes are overwritten. Put your own settings in\n"
+    "# /etc/aas/aas.local.toml, which is merged over this file.\n"
+)
+
+
+def log(msg):
+    print("aas-config: " + msg, file=sys.stderr)
+
+
+def config_from(systeminfo):
+    card = systeminfo.get("soundcard") if isinstance(systeminfo, dict) else None
+    if not isinstance(card, dict):
+        card = {}
+    cfg = {}
+    index = card.get("hardware_index")
+    if isinstance(index, int) and not isinstance(index, bool):
+        cfg["card"] = str(index)
+    if "card" in cfg:
+        control = card.get("volume_control")
+        if isinstance(control, str) and control:
+            cfg["volume_control"] = control
+        else:
+            cfg["volume_control"] = "Softvol"
+            cfg["volume_mode"] = "follow"
+    types = card.get("card_type")
+    if isinstance(types, str):
+        types = [types]
+    if not isinstance(types, list):
+        types = []
+    channels = card.get("input_channels")
+    if (isinstance(channels, int) and not isinstance(channels, bool)
+            and channels > 0 and "Digi" not in types):
+        cfg["analog"] = {"enabled": True}
+    cfg["plugin"] = [{"place": "output", "type": "balance", "balance": 0}]
+    return cfg
+
+
+def merge(generated, local):
+    out = dict(generated)
+    for key, value in local.items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = merge(out[key], value)
+        else:
+            out[key] = value
+    return out
+
+
+def _key(k):
+    if k and all(c.isalnum() and c.isascii() or c in "_-" for c in k):
+        return k
+    return _str(k)
+
+
+def _str(s):
+    out = ['"']
+    for c in s:
+        if c == '"':
+            out.append('\\"')
+        elif c == "\\":
+            out.append("\\\\")
+        elif c == "\n":
+            out.append("\\n")
+        elif c == "\t":
+            out.append("\\t")
+        elif c == "\r":
+            out.append("\\r")
+        elif ord(c) < 0x20 or ord(c) == 0x7F:
+            out.append("\\u%04x" % ord(c))
+        else:
+            out.append(c)
+    out.append('"')
+    return "".join(out)
+
+
+def _val(v):
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, int):
+        return str(v)
+    if isinstance(v, float):
+        return repr(v)
+    if isinstance(v, str):
+        return _str(v)
+    if isinstance(v, list):
+        return "[" + ", ".join(_val(x) for x in v) + "]"
+    raise TypeError("cannot write %r" % (v,))
+
+
+def _is_tables(v):
+    return isinstance(v, list) and v and all(isinstance(x, dict) for x in v)
+
+
+def _table(path, table, lines):
+    scalars = [(k, v) for k, v in table.items()
+               if not isinstance(v, dict) and not _is_tables(v)]
+    tables = [(k, v) for k, v in table.items() if isinstance(v, dict)]
+    arrays = [(k, v) for k, v in table.items() if _is_tables(v)]
+    for k, v in scalars:
+        lines.append("%s = %s" % (_key(k), _val(v)))
+    for k, v in tables:
+        sub = path + [_key(k)]
+        lines.append("")
+        lines.append("[%s]" % ".".join(sub))
+        _table(sub, v, lines)
+    for k, v in arrays:
+        sub = path + [_key(k)]
+        for item in v:
+            lines.append("")
+            lines.append("[[%s]]" % ".".join(sub))
+            _table(sub, item, lines)
+
+
+def dump(config):
+    lines = []
+    _table([], config, lines)
+    body = "\n".join(lines).strip("\n")
+    return HEADER + ("\n" + body + "\n" if body else "")
+
+
+def fetch(command=None):
+    """The sound card as {"soundcard": {...}}, or None if not available."""
+    command = command or COMMAND
+    try:
+        r = subprocess.run(command, stdin=subprocess.DEVNULL,
+                           capture_output=True, timeout=TIMEOUT, check=True)
+        data = json.loads(r.stdout)
+    except Exception as e:
+        log("no sound card data from %s: %s" % (command[0], e))
+        return None
+    if not isinstance(data, dict):
+        log("no sound card data from %s: not an object" % command[0])
+        return None
+    return {"soundcard": data}
+
+
+def read_local(path):
+    try:
+        with open(path, "rb") as f:
+            return tomllib.load(f)
+    except FileNotFoundError:
+        return {}
+    except (tomllib.TOMLDecodeError, OSError, UnicodeDecodeError) as e:
+        log("ignoring %s: %s" % (path, e))
+        return {}
+
+
+def write_atomic(path, text):
+    d = os.path.dirname(path) or "."
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".aas.toml.")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o644)
+        os.rename(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser()
+    p.add_argument("--systeminfo", help="read the system info from FILE "
+                   "instead of running config-soundcard")
+    p.add_argument("--output", default=OUTPUT)
+    p.add_argument("--local", default=LOCAL)
+    args = p.parse_args(argv)
+    try:
+        info = None
+        if args.systeminfo:
+            try:
+                with open(args.systeminfo) as f:
+                    info = json.load(f)
+            except (OSError, ValueError) as e:
+                log("cannot read %s: %s" % (args.systeminfo, e))
+        else:
+            info = fetch()
+        if info is None and os.path.exists(args.output):
+            log("keeping the existing %s" % args.output)
+            return 0
+        generated = config_from(info) if info is not None else {}
+        try:
+            text = dump(merge(generated, read_local(args.local)))
+        except Exception as e:
+            log("cannot write %s into the configuration: %s"
+                % (args.local, e))
+            text = dump(generated)
+        write_atomic(args.output, text)
+        log("wrote %s" % args.output)
+    except Exception as e:
+        log("failed: %s" % e)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

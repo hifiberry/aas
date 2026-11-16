@@ -1,0 +1,10 @@
+aas (0.1.0) trixie; urgency=medium
+
+  * First packaged release: the aas audio server and its command-line
+    client, and the ALSA plugin as libasound2-plugin-aas.
+  * hifiberry-audio-server switches a device between PipeWire and aas.
+    The packages are installed disabled and change nothing until it is run.
+  * aas-config writes /etc/aas/aas.toml from the HiFiBerry system info at
+    every boot; /etc/aas/aas.local.toml is merged over it.
+
+ -- HiFiBerry <info@hifiberry.com>  Mon, 16 Nov 2026 15:00:00 +0000

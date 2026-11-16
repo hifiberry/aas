@@ -78,14 +78,17 @@ Debian's presets. `set aas`:
 
 - masks globally, with `systemctl --global mask`, the user units `pipewire`,
   `pipewire-pulse` (socket and service), `wireplumber`, `filter-chain`,
-  `pipewire-api` and `vu-meter`;
-- masks the user units that only work under PipeWire: the AES67 units, the USB
-  gadget and the `analoginput` helper (under `aas` the analog input is the
-  daemon's own, `[analog]` in its config);
+  `pipewire-api` and `vu-meter`, and the user units that only work under
+  PipeWire: the AES67 units, the USB gadget and the `analoginput` helper
+  (under `aas` the analog input is the daemon's own, `[analog]` in its
+  config); only those not masked already, which it records in
+  `/var/lib/hifiberry/audio-server.masked` (merged with the record of an
+  earlier `set aas`);
 - enables the system unit `aas.service`.
 
-`set pipewire` unmasks the same units and disables `aas.service`. A global mask
-rather than a disable keeps whatever each unit's own enablement was, so
+`set pipewire` unmasks the units in that record, removes it, and disables
+`aas.service`. A unit that was masked before `set aas` stays masked. A global
+mask rather than a disable keeps whatever each unit's own enablement was, so
 switching back restores it exactly *(call)*.
 
 Players are not touched: they start after the reboot, find `default` pointing
@@ -100,8 +103,9 @@ PipeWire is late *(call; to verify per player)*.
 which they find through the config server's system info and
 `config-soundcard`, not through `aas`'s own list of names. So the device does
 not rely on `aas`'s detection: a oneshot unit, `aas-config.service`, ordered
-before `aas.service`, writes `/etc/aas/aas.toml` at every boot from the same
-system info: the card, its volume control by name, its channels, and the
+before `aas.service`, writes `/etc/aas/aas.toml` at every boot from the
+output of `config-soundcard --json`, the same data as the system info's
+`soundcard`, without waiting for the network: the card, its volume control by name, its channels, and the
 analog input only on a card that has one and is not a Digi, whose clock a
 capture would tie to its S/PDIF input. Rewriting it at every boot follows a
 change of card, as `config-soundcard` does. A user's own additions are kept
@@ -240,7 +244,7 @@ Neither package conflicts with a PipeWire package.
 - The volume follow above (done).
 - `debian/` for both packages, `hifiberry-audio-server`, and
   `aas-config.service` with its script, which writes `/etc/aas/aas.toml` from
-  the config server's `GET /api/v1/systeminfo`.
+  `config-soundcard --json`.
 
 In the HiFiBerry OS repositories:
 

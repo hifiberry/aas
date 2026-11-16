@@ -1,0 +1,165 @@
+#!/bin/sh
+# Switch a HiFiBerry OS device between PipeWire and aas.
+#   hifiberry-audio-server get
+#   hifiberry-audio-server set pipewire|aas
+# "set" stores the choice and applies it; the device then needs a reboot,
+# which this script does not do.
+set -eu
+
+ROOT="${AAS_SWITCH_ROOT:-}"
+SYSTEMCTL="${SYSTEMCTL:-systemctl}"
+CHOICE="$ROOT/etc/hifiberry/audio-server"
+# The user units set aas masked itself, one per line, for set pipewire to
+# unmask: a unit that was already masked is not ours to unmask.
+MASKED="$ROOT/var/lib/hifiberry/audio-server.masked"
+
+USER_UNITS="pipewire.service pipewire.socket pipewire-pulse.service pipewire-pulse.socket wireplumber.service filter-chain.service pipewire-api.service vu-meter.service aes67.service aes67-agent.service usbaudio.service usbaudio-state.service analoginput.service"
+SYSTEM_UNITS="aas.service aas-config.service"
+
+# link location (below $ROOT) and its target
+LINKS="/etc/alsa/conf.d/99-zz-aas.conf /usr/share/aas/asound.conf
+/etc/pulse/client.conf.d/90-aas.conf /usr/share/aas/pulse-client.conf
+/etc/sysctl.d/90-aas.conf /usr/share/aas/90-aas.conf"
+
+usage() {
+    echo "usage: hifiberry-audio-server get | set pipewire|aas" >&2
+    exit 2
+}
+
+chosen() {
+    c=
+    if [ -r "$CHOICE" ]; then
+        read -r c < "$CHOICE" || true
+    fi
+    case "$c" in
+        aas) echo aas ;;
+        *) echo pipewire ;;
+    esac
+}
+
+LINK_RC=0
+each_link() { # calls "$1 link target" for every pair; sets LINK_RC if one fails
+    LINK_RC=0
+    while read -r l t; do
+        "$1" "$l" "$t" || {
+            echo "hifiberry-audio-server: $l failed" >&2; LINK_RC=1; }
+    done <<LINKS_END
+$LINKS
+LINKS_END
+}
+
+make_link() {
+    mkdir -p "$(dirname "$ROOT$1")"
+    ln -sfn "$2" "$ROOT$1"
+}
+
+drop_link() {
+    if [ -L "$ROOT$1" ] && [ "$(readlink "$ROOT$1")" = "$2" ]; then
+        rm -f "$ROOT$1"
+    fi
+}
+
+cmd_get() {
+    if "$SYSTEMCTL" is-active --quiet aas.service 2>/dev/null; then
+        echo "running aas"
+    else
+        echo "running pipewire"
+    fi
+    echo "chosen $(chosen)"
+}
+
+globally_masked() {
+    [ -L "$ROOT/etc/systemd/user/$1" ] &&
+        [ "$(readlink "$ROOT/etc/systemd/user/$1")" = /dev/null ]
+}
+
+# The units set aas masks: the record of an earlier set aas, plus every
+# unit not masked already. Printed one per line.
+ours() {
+    for u in $USER_UNITS; do
+        if globally_masked "$u" && ! recorded "$u"; then
+            continue
+        fi
+        echo "$u"
+    done
+}
+
+recorded() {
+    [ -r "$MASKED" ] && grep -qxF -- "$1" "$MASKED"
+}
+
+warn_default() {
+    if [ -r "$ROOT/etc/asound.conf" ] &&
+        grep -Eq '^[[:space:]]*(pcm|ctl)\.!default' "$ROOT/etc/asound.conf"; then
+        echo "hifiberry-audio-server: warning: /etc/asound.conf defines" \
+            "pcm.!default or ctl.!default, which overrides the aas default" >&2
+    fi
+}
+
+cmd_set() {
+    if [ -z "${AAS_SWITCH_ROOT:-}" ] && [ "$(id -u)" -ne 0 ]; then
+        echo "hifiberry-audio-server: set needs root" >&2
+        exit 1
+    fi
+    server=$1
+    rc=0
+    if [ "$server" = aas ]; then
+        warn_default
+        each_link make_link
+        [ "$LINK_RC" -eq 0 ] || rc=1
+        # Record before masking, so a failure half way still leaves the
+        # record. A unit the record already holds stays in it.
+        units=$(ours | tr '\n' ' ')
+        if [ -n "$units" ]; then
+            if mkdir -p "$(dirname "$MASKED")" &&
+                echo "$units" | tr ' ' '\n' | sed '/^$/d' > "$MASKED"; then
+                # shellcheck disable=SC2086
+                "$SYSTEMCTL" --quiet --global mask $units || {
+                    echo "hifiberry-audio-server: masking the PipeWire units failed" >&2; rc=1; }
+            else
+                echo "hifiberry-audio-server: cannot record the masked units; not masking" >&2
+                rc=1
+            fi
+        fi
+        # shellcheck disable=SC2086
+        "$SYSTEMCTL" --quiet enable $SYSTEM_UNITS || {
+            echo "hifiberry-audio-server: enabling the aas units failed" >&2; rc=1; }
+    else
+        each_link drop_link
+        [ "$LINK_RC" -eq 0 ] || rc=1
+        units=
+        if [ -r "$MASKED" ]; then
+            units=$(tr '\n' ' ' < "$MASKED")
+        fi
+        if [ -n "${units% }" ]; then
+            # shellcheck disable=SC2086
+            if "$SYSTEMCTL" --quiet --global unmask $units; then
+                rm -f "$MASKED" || rc=1
+            else
+                echo "hifiberry-audio-server: unmasking the PipeWire units failed" >&2; rc=1
+            fi
+        else
+            rm -f "$MASKED" || rc=1
+        fi
+        # shellcheck disable=SC2086
+        "$SYSTEMCTL" --quiet disable $SYSTEM_UNITS || {
+            echo "hifiberry-audio-server: disabling the aas units failed" >&2; rc=1; }
+    fi
+    # Last, so that a stored choice has been applied as far as it went.
+    if mkdir -p "$(dirname "$CHOICE")" && echo "$server" > "$CHOICE"; then
+        echo "chosen $server; reboot to apply"
+    else
+        echo "hifiberry-audio-server: cannot store the choice" >&2
+        rc=1
+    fi
+    exit "$rc"
+}
+
+[ $# -ge 1 ] || usage
+case "$1" in
+    get) [ $# -eq 1 ] || usage; cmd_get ;;
+    set)
+        [ $# -eq 2 ] || usage
+        case "$2" in pipewire|aas) cmd_set "$2" ;; *) usage ;; esac ;;
+    *) usage ;;
+esac
