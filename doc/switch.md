@@ -43,10 +43,13 @@ writes the file, makes the changes below and returns; the reboot is separate.
 for the next boot, which differ between a `set` and the reboot. The command is
 idempotent: `set` to the server already chosen changes nothing *(call)*.
 
-The config server runs the command. A drop-in in `/etc/configserver/conf.d/`
-allows `set` and `get`, and the web UI changes the setting through it, then
-offers the reboot. The config server already reboots the device for other
-settings *(call)*.
+The config server runs the command, through its own route,
+`GET` and `POST /api/v1/audio-server`: its generic script route reads only the
+main `configserver.json` and no drop-in, so a route of its own is simpler than
+editing that file. `GET` answers what `get` prints; on a device without the
+command it answers `pipewire` for both, so the web UI works the same before
+`aas` is installed. The web UI changes the setting through it, then offers the
+reboot through the existing `POST /api/v1/system/reboot` *(call)*.
 
 ## What `set` changes
 
@@ -164,9 +167,11 @@ state *(call)*.
 
 ## Speaker EQ, input processor, volume limit, balance, mono (3, 4)
 
-Speaker EQ and the RIAA input processor are LADSPA chains inside PipeWire and
-stop working under `aas` until their native plugins exist. The web UI's sound
-page uses the speaker EQ for three more things:
+PipeWire's speaker EQ and the RIAA input processor are LADSPA chains inside
+PipeWire and stop working under `aas` until their native plugins exist. The web
+UI's speaker EQ page is not one of them: it runs on the DSP toolkit and works
+under both servers. The web UI shows no setting of PipeWire's speaker EQ bands;
+its sound page uses that chain for three things only:
 
 - **Balance:** under `aas`, the output's `balance` plugin, through `aas`'s API.
 - **Mono:** under `aas`, the matrix, through `aas`'s API.
@@ -176,9 +181,10 @@ page uses the speaker EQ for three more things:
 ## What the user is told before switching
 
 Before `set aas`, the web UI lists what will stop working on this device, and
-only what is in use there: a speaker EQ that is not flat, an active input
-processor, AES67 enabled, the USB gadget enabled, a paired Bluetooth device,
-a volume limit below 100 %. The user confirms or stays on PipeWire. The
+only what is in use there: the input processor enabled (`pipewire-api`'s RIAA
+state), AES67 or the USB gadget enabled (their units, through the config
+server), a paired Bluetooth device (the system info), a volume limit below
+100 %. The user confirms or stays on PipeWire. The
 settings stay, so switching back restores them *(call)*.
 
 Switching back to PipeWire needs no warning: nothing is lost.
@@ -188,7 +194,9 @@ Switching back to PipeWire needs no warning: nothing is lost.
 - The UI asks the config server which server runs (`get`) and uses
   `/api/aas/v1` under `aas`, `/api/pipewire` and `/api/vu-meter` under
   PipeWire. The VU meter in the sidebar reads `/api/aas/v1/levels` under
-  `aas`.
+  `aas`: the same bytes as the VU meter's frame, after the meter's id and its
+  channel count. The PipeWire filter-chain page and the system info's probes
+  of `pipewire-api` and `vu-meter` are left out under `aas`.
 - The configurator's factory reset calls `pipewire-api`'s `settings/reset`
   only when PipeWire runs, and resets `aas`'s state when `aas` runs. A factory
   reset sets the choice back to `pipewire` *(call)*.
@@ -201,40 +209,48 @@ Switching back to PipeWire needs no warning: nothing is lost.
 
 ## Soloist
 
-Soloist plays through libpulse instead of linking `pw_stream`. Under PipeWire
+Soloist is a closed binary that the device downloads; it plays to PipeWire
+on its own, and the wrapper passes it no output option. Whether it can play
+through libpulse is checked on a device first; until then it is on the list
+of what stops working under `aas`. If it can: Soloist plays through libpulse instead of linking `pw_stream`. Under PipeWire
 it reaches `pipewire-pulse`, which is installed and running already; under
 `aas` it reaches `/run/aas/pulse`. Its volume stays pinned at 100 % as now.
 Its user has to be in group `audio` for the socket *(to verify)*.
 
 ## Packages
 
+The packaging lives in this repository, in `debian/`, as it does for every Rust
+package of HiFiBerry OS (`acr`, `sendspin`): `hifiberry-os` only has
+`packages/aas/build.sh`, which clones this repository and builds it.
+
 - **`aas`:** the daemon, `aasctl`, `aas.service` (installed disabled),
-  `aas-config.service`, `dist/90-aas.conf` under `/usr/share/aas/` for `set`
-  to link into `/etc/sysctl.d/`, the API's nginx location
-  and auth manifest (restarting `hifiberry-auth` and reloading nginx as
-  `dist/install-api.sh` does), `asound.conf` and `pulse-client.conf` under
-  `/usr/share/aas/` for `set` to link, and `hifiberry-audio-server`. It
+  `hifiberry-audio-server`, `aas-config.service` and the script it runs, the
+  API's nginx location and auth manifest (restarting `hifiberry-auth` and
+  reloading nginx as `dist/install-api.sh` does), and under `/usr/share/aas/`
+  `asound.conf`, `pulse-client.conf` and `90-aas.conf` for `set` to link. It
   installs nothing that changes a device that stays on PipeWire *(call)*.
 - **`libasound2-plugin-aas`:** the ALSA plugin.
-- **`hifiberryos`** depends on both, beside the PipeWire packages it has.
+- **`hifiberryos`:** `hbos-minimal` and `hbos-full` depend on both, beside the
+  PipeWire packages they have *(call)*.
 
 Neither package conflicts with a PipeWire package.
 
 ## Work in this repository
 
-- The volume follow above, with tests: an outside change, an outside mute by
-  switch and by mute step, a value below -60 dB, `aas`'s own write not echoed,
-  the floor below the lowest step, the value at open, and a named user-space
-  control (`Softvol`) that `aas` follows and applies in software.
-- The files the packages install from `dist/`: `asound.conf`,
-  `pulse-client.conf`, `90-aas.conf` and the API's nginx and auth files, as
-  they are now.
+- The volume follow above (done).
+- `debian/` for both packages, `hifiberry-audio-server`, and
+  `aas-config.service` with its script, which writes `/etc/aas/aas.toml` from
+  the config server's `GET /api/v1/systeminfo`.
 
-Everything else is in the HiFiBerry OS repositories: `hifiberry-audio-server`,
-`aas-config.service` and the Debian packaging of `aas` and
-`libasound2-plugin-aas`, built from this repository's source, beside the
-other HiFiBerry OS packages *(call)*; the configurator drop-ins and factory
-reset, the web UI, Soloist, and `hifiberryos`.
+In the HiFiBerry OS repositories:
+
+- `hifiberry-os`: `packages/aas/build.sh`, and the two meta packages' Depends.
+- `configurator`: the `audio-server` route, factory reset by server,
+  `config-volume` skipping `Master` under `aas`, `volume-restore` before
+  `aas.service`, and `features.d/aas.json`.
+- `hbos-ui`: the server switch page and the rest of "The web UI and the
+  configurator".
+- `soloist-wrapper`: see "Soloist".
 
 ## Next phase
 
