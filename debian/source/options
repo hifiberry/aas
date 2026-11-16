@@ -1,0 +1,12 @@
+# Keep the checkout's own bookkeeping and build output out of the source
+# package.
+tar-ignore = */.git
+tar-ignore = */.git/*
+tar-ignore = */.worktrees
+tar-ignore = */.worktrees/*
+tar-ignore = */.superpowers
+tar-ignore = */.superpowers/*
+tar-ignore = */target
+tar-ignore = */target/*
+tar-ignore = */__pycache__
+tar-ignore = */__pycache__/*

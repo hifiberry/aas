@@ -62,6 +62,14 @@ still compile the crate and its tests, since neither links.
 
 ## Installing
 
+### Debian packages
+
+`./build.sh` builds `aas` and `libasound2-plugin-aas` (with `sbuild` when it
+is installed, else `dpkg-buildpackage`; it needs `libasound2-dev`). Installing
+them changes nothing on a device: `hifiberry-audio-server set aas` switches
+from PipeWire to aas and `set pipewire` back. The steps below are the manual
+install.
+
 On the board, from the repository root:
 
 ```sh

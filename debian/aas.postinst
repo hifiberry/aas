@@ -1,0 +1,19 @@
+#!/bin/sh
+set -e
+
+# Make nginx read the API location and hifiberry-auth the manifest this
+# package installed. Neither is required, so a failure is not an error.
+# aas itself is never enabled or started here: that is what
+# hifiberry-audio-server set aas does.
+if [ "$1" = configure ]; then
+    if systemctl is-active --quiet nginx.service 2>/dev/null; then
+        systemctl reload nginx.service || true
+    fi
+    if systemctl is-active --quiet hifiberry-auth.service 2>/dev/null; then
+        systemctl restart hifiberry-auth.service || true
+    fi
+fi
+
+#DEBHELPER#
+
+exit 0

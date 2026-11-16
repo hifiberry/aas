@@ -1,0 +1,88 @@
+#!/usr/bin/make -f
+
+export DH_VERBOSE=1
+export CARGO_HOME = $(CURDIR)/debian/cargo_home
+export RUSTUP_HOME = $(CURDIR)/debian/rustup_home
+
+# Minimum rustc that can compile these sources. Keep in sync with
+# rust-version in Cargo.toml.
+RUST_MIN_VERSION = 1.85
+
+export CARGO_BUILD_JOBS = 1
+export CARGO_INCREMENTAL = 0
+export RUST_BACKTRACE = 0
+
+include /usr/share/dpkg/architecture.mk
+
+PKG = debian/aas
+PLUGIN = debian/libasound2-plugin-aas
+ALSA_DIR = usr/lib/$(DEB_HOST_MULTIARCH)/alsa-lib
+
+%:
+	dh $@
+
+override_dh_auto_configure:
+	# Install Rust via rustup if the system toolchain is missing or too old.
+	# Check rustc, not cargo: rustc's version decides whether the sources
+	# compile, and the two can be a mismatched pair.
+	set -e; \
+	rustc_version=$$(rustc --version 2>/dev/null | awk '{print $$2}'); \
+	if [ -n "$$rustc_version" ] && \
+	   [ "$$(printf '%s\n%s\n' "$(RUST_MIN_VERSION)" "$$rustc_version" | sort -V | head -n1)" = "$(RUST_MIN_VERSION)" ]; then \
+		echo "Using system rustc $$rustc_version (>= $(RUST_MIN_VERSION))"; \
+	else \
+		echo "System rustc ($${rustc_version:-not found}) is older than $(RUST_MIN_VERSION); installing a toolchain via rustup"; \
+		mkdir -p $(RUSTUP_HOME) $(CARGO_HOME); \
+		curl https://sh.rustup.rs -sSf | \
+		RUSTUP_HOME=$(RUSTUP_HOME) CARGO_HOME=$(CARGO_HOME) \
+		sh -s -- -y --no-modify-path; \
+	fi
+
+# The daemon is built with its ALSA card output, and the plugin separately:
+# it is a cdylib of its own package.
+override_dh_auto_build:
+	export CARGO_TARGET_DIR=$(CURDIR)/target; \
+	export TMPDIR=$(CURDIR)/build_tmp; \
+	export HOME=$(CURDIR)/build_home; \
+	mkdir -p $(CURDIR)/build_tmp $(CURDIR)/build_home; \
+	PATH="$(CARGO_HOME)/bin:$(PATH)" cargo fetch || exit 1; \
+	PATH="$(CARGO_HOME)/bin:$(PATH)" cargo build --release --features alsa-output --bin aas --bin aasctl --jobs 1 || exit 1; \
+	PATH="$(CARGO_HOME)/bin:$(PATH)" cargo build --release -p aas-alsa --jobs 1 || exit 1; \
+	find $(CURDIR)/target -name "*.rlib" -delete 2>/dev/null || true; \
+	find $(CURDIR)/target -name "*.rmeta" -delete 2>/dev/null || true; \
+	rm -rf $(CURDIR)/build_tmp $(CURDIR)/build_home
+
+# The tests need no card but take long on a Pi; they run in CI.
+override_dh_auto_test:
+
+override_dh_auto_install:
+	install -D -m 0755 target/release/aas $(PKG)/usr/bin/aas
+	install -D -m 0755 target/release/aasctl $(PKG)/usr/bin/aasctl
+	install -D -m 0755 dist/hifiberryos/hifiberry-audio-server $(PKG)/usr/sbin/hifiberry-audio-server
+	install -D -m 0755 dist/hifiberryos/aas-config $(PKG)/usr/lib/aas/aas-config
+	install -D -m 0644 dist/aas.service $(PKG)/usr/lib/systemd/system/aas.service
+	install -D -m 0644 dist/hifiberryos/aas-config.service $(PKG)/usr/lib/systemd/system/aas-config.service
+	install -D -m 0644 dist/asound.conf $(PKG)/usr/share/aas/asound.conf
+	install -D -m 0644 dist/pulse-client.conf $(PKG)/usr/share/aas/pulse-client.conf
+	install -D -m 0644 dist/90-aas.conf $(PKG)/usr/share/aas/90-aas.conf
+	install -D -m 0644 dist/nginx/hifiberry-aas.nginx $(PKG)/etc/nginx/hifiberry-api.d/hifiberry-aas.nginx
+	install -D -m 0644 dist/auth.d/aas.json $(PKG)/etc/hifiberry/auth.d/aas.json
+	install -D -m 0644 target/release/libaas_alsa.so $(PLUGIN)/$(ALSA_DIR)/libasound_module_pcm_aas.so
+	ln -sf libasound_module_pcm_aas.so $(PLUGIN)/$(ALSA_DIR)/libasound_module_ctl_aas.so
+
+# Installed disabled and not started: a device stays on PipeWire until
+# hifiberry-audio-server set aas enables them.
+override_dh_installsystemd:
+	dh_installsystemd --no-enable --no-start --name=aas
+	dh_installsystemd --no-enable --no-start --name=aas-config
+
+override_dh_strip:
+	dh_strip --no-automatic-dbgsym
+
+override_dh_auto_clean:
+	dh_auto_clean
+	rm -rf target
+	rm -rf $(CARGO_HOME)
+	rm -rf $(RUSTUP_HOME)
+	rm -rf $(CURDIR)/build_tmp
+	rm -rf $(CURDIR)/build_home
