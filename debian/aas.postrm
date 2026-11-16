@@ -2,8 +2,19 @@
 set -e
 
 if [ "$1" = purge ]; then
-    rm -f /etc/hifiberry/audio-server /etc/aas/aas.toml
+    rm -f /etc/hifiberry/audio-server /etc/aas/aas.toml \
+        /var/lib/hifiberry/audio-server.masked
     rmdir /etc/aas 2>/dev/null || true
+    rm -rf /var/lib/private/aas
+    # The nginx location and the auth manifest are gone with the package.
+    if [ -d /run/systemd/system ]; then
+        if systemctl is-active --quiet nginx.service 2>/dev/null; then
+            deb-systemd-invoke reload nginx.service || true
+        fi
+        if systemctl is-active --quiet hifiberry-auth.service 2>/dev/null; then
+            deb-systemd-invoke restart hifiberry-auth.service || true
+        fi
+    fi
 fi
 
 #DEBHELPER#

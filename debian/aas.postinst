@@ -6,11 +6,13 @@ set -e
 # aas itself is never enabled or started here: that is what
 # hifiberry-audio-server set aas does.
 if [ "$1" = configure ]; then
-    if systemctl is-active --quiet nginx.service 2>/dev/null; then
-        systemctl reload nginx.service || true
-    fi
-    if systemctl is-active --quiet hifiberry-auth.service 2>/dev/null; then
-        systemctl restart hifiberry-auth.service || true
+    if [ -d /run/systemd/system ]; then
+        if systemctl is-active --quiet nginx.service 2>/dev/null; then
+            deb-systemd-invoke reload nginx.service || true
+        fi
+        if systemctl is-active --quiet hifiberry-auth.service 2>/dev/null; then
+            deb-systemd-invoke restart hifiberry-auth.service || true
+        fi
     fi
 fi
 

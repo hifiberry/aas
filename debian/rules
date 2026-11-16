@@ -46,8 +46,8 @@ override_dh_auto_build:
 	export HOME=$(CURDIR)/build_home; \
 	mkdir -p $(CURDIR)/build_tmp $(CURDIR)/build_home; \
 	PATH="$(CARGO_HOME)/bin:$(PATH)" cargo fetch || exit 1; \
-	PATH="$(CARGO_HOME)/bin:$(PATH)" cargo build --release --features alsa-output --bin aas --bin aasctl --jobs 1 || exit 1; \
-	PATH="$(CARGO_HOME)/bin:$(PATH)" cargo build --release -p aas-alsa --jobs 1 || exit 1; \
+	PATH="$(CARGO_HOME)/bin:$(PATH)" cargo build --locked --release --features alsa-output --bin aas --bin aasctl --jobs 1 || exit 1; \
+	PATH="$(CARGO_HOME)/bin:$(PATH)" cargo build --locked --release -p aas-alsa --jobs 1 || exit 1; \
 	find $(CURDIR)/target -name "*.rlib" -delete 2>/dev/null || true; \
 	find $(CURDIR)/target -name "*.rmeta" -delete 2>/dev/null || true; \
 	rm -rf $(CURDIR)/build_tmp $(CURDIR)/build_home
@@ -73,8 +73,8 @@ override_dh_auto_install:
 # Installed disabled and not started: a device stays on PipeWire until
 # hifiberry-audio-server set aas enables them.
 override_dh_installsystemd:
-	dh_installsystemd --no-enable --no-start --name=aas
 	dh_installsystemd --no-enable --no-start --name=aas-config
+	dh_installsystemd --no-enable --no-start --name=aas
 
 override_dh_strip:
 	dh_strip --no-automatic-dbgsym

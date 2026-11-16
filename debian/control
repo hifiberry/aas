@@ -3,12 +3,12 @@ Section: sound
 Priority: optional
 Maintainer: HiFiBerry <info@hifiberry.com>
 Build-Depends: debhelper-compat (= 13), curl, ca-certificates, pkgconf, libasound2-dev
-Standards-Version: 4.5.1
+Standards-Version: 4.7.0
 Homepage: https://github.com/hifiberry/aas
 
 Package: aas
 Architecture: any
-Depends: ${shlibs:Depends}, ${misc:Depends}, libasound2-plugin-aas (= ${binary:Version}), python3
+Depends: ${shlibs:Depends}, ${misc:Depends}, libasound2-plugin-aas (= ${binary:Version}), python3 (>= 3.11)
 Description: Alternative audio server
  A small audio server that owns the sound card and mixes the streams of
  its clients. It is an alternative to PipeWire on HiFiBerry OS.
@@ -25,6 +25,7 @@ Description: Alternative audio server
 
 Package: libasound2-plugin-aas
 Architecture: any
+Multi-Arch: same
 Depends: ${shlibs:Depends}, ${misc:Depends}
 Description: ALSA plugin for the aas audio server
  An ALSA PCM and control plugin that plays through the aas daemon and
