@@ -229,7 +229,11 @@ Missing:
   ceiling, and speaker EQ and the input processor as plugins: the next
   phase, see `doc/switch.md`.
 
-Found on the test board, in the configurator, under both servers:
+Found on the test board, in the configurator, under both servers. Both are
+fixed on `configurator` branch `fix/systeminfo-speed` (2.19.1, not pushed),
+checked on the board: `systeminfo` 0.44 s, then 0.03 s, and the card is a
+DAC+ ADC Pro as root and as a user. If `feat/audio-server` (2.20.0) merges
+after it, its changelog stanza goes above 2.19.1. What it fixed:
 
 - `config-soundcard --json` run as root (as `aas-config` and the config
   server run it) reports a DAC+ ADC Pro without a HAT EEPROM as "DAC+/Amp2"
