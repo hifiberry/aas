@@ -683,6 +683,11 @@ pub struct Tap {
     pub running: bool,
     /// Records what the master card gets instead of the analog input.
     pub monitor: bool,
+    /// For a monitor, the source whose stream it records instead, after
+    /// the source's own gain; 0 for what the master card gets.
+    pub source: ClientId,
+    /// Whether this cycle has written its source's stream.
+    delivered: bool,
     /// The position in the header's `wake_at` that has had its wake-up.
     woken_at: u64,
     /// The overruns the client has been woken for.
@@ -698,6 +703,8 @@ impl Tap {
             wake,
             running: false,
             monitor: false,
+            source: 0,
+            delivered: false,
             woken_at: 0,
             overruns_told: 0,
         }
@@ -822,14 +829,69 @@ impl Taps {
         }
     }
 
+    /// Whether a running monitor records a source's stream.
+    fn streams(&self) -> bool {
+        self.table
+            .iter()
+            .any(|t| t.running && t.monitor && t.source != 0)
+    }
+
+    /// Writes the period of the stream of source `id`, `frames` as it is
+    /// mixed or copied, along `gain`, to every running monitor of that
+    /// stream and wakes it as due.
+    fn deliver_stream(&mut self, id: ClientId, frames: &[[i32; 2]], gain: Fade) {
+        let Taps { table, buf } = self;
+        let of = |t: &Tap| t.running && t.monitor && t.source == id;
+        if !table.iter().any(|t| of(t)) {
+            return;
+        }
+        let block = &mut buf[..frames.len()];
+        for (frame, (out, f)) in block.iter_mut().zip(frames).enumerate() {
+            // Exact at unity, and saturating, as `as` converts.
+            let g = f64::from(gain.at(frame));
+            *out = f.map(|s| (f64::from(s) * g) as i32);
+        }
+        for tap in table.iter_mut().filter(|t| of(t)) {
+            let header = tap.ring.header();
+            header.output_delay_frames.store(0, Ordering::Relaxed);
+            tap.write(block);
+            tap.notify();
+            tap.delivered = true;
+        }
+    }
+
+    /// Writes a period of zeros to every running monitor of a stream that
+    /// was not mixed this cycle, so that it keeps real time while its
+    /// stream stops, runs short or is muted, while DoP plays and while the
+    /// master is parked.
+    fn finish_streams(&mut self, period: usize) {
+        let Taps { table, buf } = self;
+        let mut zeroed = false;
+        for tap in table.iter_mut() {
+            let delivered = std::mem::take(&mut tap.delivered);
+            if delivered || !tap.running || !tap.monitor || tap.source == 0 {
+                continue;
+            }
+            if !zeroed {
+                buf[..period].fill([0; 2]);
+                zeroed = true;
+            }
+            let header = tap.ring.header();
+            header.output_delay_frames.store(0, Ordering::Relaxed);
+            tap.write(&buf[..period]);
+            tap.notify();
+        }
+    }
+
     /// Writes what the master card gets this cycle to every running monitor
-    /// and wakes it as due: `samples` holds `channels` channels a frame, of
+    /// of it and wakes it as due: `samples` holds `channels` channels a frame, of
     /// which a monitor takes the first two, or the one twice. The first
     /// `silent` frames are not PCM, or not played, and are zeros instead,
     /// so that a monitor keeps real time through DoP and while parked.
     fn deliver_monitor(&mut self, samples: &[i32], channels: usize, silent: usize) {
         let Taps { table, buf } = self;
-        if !table.iter().any(|t| t.running && t.monitor) {
+        let master = |t: &Tap| t.running && t.monitor && t.source == 0;
+        if !table.iter().any(|t| master(t)) {
             return;
         }
         let frames = samples.len() / channels;
@@ -841,7 +903,7 @@ impl Taps {
         for (frame, out) in pcm.zip(block[silent..].iter_mut()) {
             *out = [frame[0], frame[right]];
         }
-        for tap in table.iter_mut().filter(|t| t.running && t.monitor) {
+        for tap in table.iter_mut().filter(|t| master(t)) {
             let header = tap.ring.header();
             header.output_delay_frames.store(0, Ordering::Relaxed);
             tap.write(block);
@@ -2333,6 +2395,8 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         };
         let channels = self.master.channels;
         self.taps.deliver_monitor(samples, channels, silent);
+        // A stream not mixed this cycle, also in DoP or parked, is zeros.
+        self.taps.finish_streams(self.period);
         let before_write = Instant::now();
         let result = if self.parked {
             self.timer.write(samples)
@@ -2539,6 +2603,8 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         if !copy {
             mix_clear::<P>(players);
         }
+        // Monitors of a stream get it as mixed, not while parked.
+        let streams = !self.parked && self.taps.streams();
         // An input's gain moves on in the cycles it is mixed in. Where it
         // is not, there is nothing to fade and it is where it was going.
         for source in self.table.iter_mut().filter(|s| s.running) {
@@ -2554,11 +2620,17 @@ impl<P: Processing, S: Sink> Engine<P, S> {
                 source.glide.finish();
             } else if copy {
                 source.read_raw(out);
+                if streams {
+                    self.taps.deliver_stream(source.id, out, Fade::flat(1.0));
+                }
                 source.glide.finish();
             } else {
                 source.read_resampled(scratch);
                 let step = source.glide.step(source.gain, period);
                 let level = if volumes { step } else { Fade::flat(1.0) };
+                if streams {
+                    self.taps.deliver_stream(source.id, scratch, level);
+                }
                 fade.add_moving(scratch, level, players, mix_add::<P>);
                 source.glide.advance(step);
             }
@@ -8232,6 +8304,136 @@ mod tests {
         assert_eq!(rig.log.frames().len(), written);
     }
 
+    /// A running monitor tap of the stream of `source`, with room for many
+    /// periods.
+    fn add_stream_tap<P: Processing>(rig: &mut Rig<P>, id: ClientId, source: ClientId) -> Recorder {
+        let (recorder, mut tap) = tap_of(id, 1 << 16);
+        tap.monitor = true;
+        tap.source = source;
+        rig.send(Command::AddTap(tap));
+        rig.send(Command::SetRunning(id, true));
+        recorder
+    }
+
+    #[test]
+    fn a_stream_tap_gets_its_stream_after_its_gain() {
+        fn check<P: Processing>() {
+            let mut rig = Rig::<P>::new(BitPerfect::Auto);
+            let tap = add_stream_tap(&mut rig, 5, 1);
+            let (mut a, mut b) = (client(1), client(2));
+            a.source.as_mut().unwrap().gain = 0.5;
+            rig.add(&mut a);
+            rig.add(&mut b);
+            a.ring.write(&frames(1000, 2 * PERIOD));
+            b.ring.write(&frames(234, 2 * PERIOD));
+            for _ in 0..2 {
+                rig.cycle();
+            }
+            assert_eq!(rig.last_periods(1), frames(734, PERIOD));
+            assert_eq!(
+                tap.take(),
+                frames(500, 2 * PERIOD),
+                "{:?}",
+                format_of::<P>()
+            );
+            assert_eq!(tap.wake_ups(), 2);
+            assert_eq!(tap.ring.header().output_delay_frames.load(Relaxed), 0);
+        }
+        check::<I32>();
+        check::<F32>();
+        check::<F64>();
+    }
+
+    #[test]
+    fn a_stream_tap_gets_zeros_while_its_stream_does_not_play() {
+        let mut rig = Rig::<I32>::new(BitPerfect::Auto);
+        let tap = add_stream_tap(&mut rig, 5, 1);
+        let mut a = client(1);
+        rig.add(&mut a);
+        a.ring.write(&frames(1000, PERIOD));
+        rig.cycle();
+        assert_eq!(tap.take(), frames(1000, PERIOD));
+        // Running, with an empty ring.
+        for _ in 0..3 {
+            rig.cycle();
+            assert_eq!(tap.take(), frames(0, PERIOD));
+        }
+        // Stopped.
+        a.ring.write(&frames(1000, 4 * PERIOD));
+        rig.send(Command::SetRunning(1, false));
+        for _ in 0..3 {
+            rig.cycle();
+            assert_eq!(tap.take(), frames(0, PERIOD));
+        }
+        // Running, but the master parked.
+        rig.send(Command::SetRunning(1, true));
+        rig.send(Command::ParkOutput {
+            rate: RATE,
+            period: PERIOD as u32,
+        });
+        for _ in 0..3 {
+            rig.cycle();
+            assert_eq!(tap.take(), frames(0, PERIOD));
+        }
+    }
+
+    #[test]
+    fn a_stream_tap_follows_the_copy_path_and_keeps_bit_perfect() {
+        let mut rig = Rig::<F32>::new(BitPerfect::Auto);
+        let tap = add_stream_tap(&mut rig, 5, 1);
+        let mut a = client(1);
+        rig.add(&mut a);
+        let input = ramp(3 * PERIOD)
+            .into_iter()
+            .map(|[l, r]| [l | ODD, r ^ ODD])
+            .collect::<Vec<_>>();
+        a.ring.write(&input);
+        for _ in 0..3 {
+            rig.cycle();
+        }
+        assert_eq!(rig.counters.bit_perfect.load(Relaxed), 0);
+        assert_eq!(rig.last_periods(3), input);
+        assert_eq!(tap.take(), input);
+    }
+
+    #[test]
+    fn the_master_monitor_ignores_stream_taps() {
+        let mut rig = Rig::<I32>::new(BitPerfect::Auto);
+        let monitor = add_monitor(&mut rig, 5);
+        let stream = add_stream_tap(&mut rig, 6, 1);
+        let idle = add_stream_tap(&mut rig, 7, 2);
+        rig.send(Command::SetGain(0, 0.5));
+        let (mut a, mut b) = (client(1), client(2));
+        rig.add(&mut a);
+        rig.add(&mut b);
+        a.ring.write(&frames(1000, PERIOD));
+        rig.cycle();
+        assert_eq!(rig.last_periods(1), frames(500, PERIOD));
+        assert_eq!(monitor.take(), frames(500, PERIOD));
+        // Before the output volume.
+        assert_eq!(stream.take(), frames(1000, PERIOD));
+        assert_eq!(idle.take(), frames(0, PERIOD));
+    }
+
+    #[test]
+    fn a_stream_tap_gets_zeros_while_dop_owns_the_output() {
+        let mut rig = Rig::<I32>::new(BitPerfect::Auto);
+        let dop_tap = add_stream_tap(&mut rig, 5, 2);
+        let pcm_tap = add_stream_tap(&mut rig, 6, 1);
+        let (mut a, mut d) = (client(1), client(2));
+        rig.add(&mut a);
+        rig.add(&mut d);
+        let dop = dop_frames(4 * PERIOD);
+        d.ring.write(&dop);
+        a.ring.write(&frames(1000, 4 * PERIOD));
+        for _ in 0..4 {
+            rig.cycle();
+        }
+        assert_eq!(rig.last_periods(4), dop);
+        assert_eq!(dop_tap.take(), frames(0, 4 * PERIOD));
+        assert_eq!(pcm_tap.take(), frames(0, 4 * PERIOD));
+    }
+
     #[test]
     fn the_analog_chains_latency_is_reported_to_recorders_and_in_the_counters() {
         let (mut rig, feed) = with_capture::<F32>(BitPerfect::Auto);
@@ -8469,6 +8671,10 @@ mod tests {
         let (monitor, mut tap) = tap_of(8, 1 << 12);
         tap.monitor = true;
         let mut monitor_tap = Some(tap);
+        let (stream, mut tap) = tap_of(9, 1 << 12);
+        tap.monitor = true;
+        tap.source = 1;
+        let mut stream_tap = Some(tap);
         let mut grown = Some(Vec::with_capacity(4 * INITIAL_TAPS));
         let input = frames(1 << 20, PERIOD);
         let mut out = vec![[0; 2]; 4 * PERIOD];
@@ -8487,6 +8693,8 @@ mod tests {
                     30 => {
                         let _ = commands.push(Command::AddTap(monitor_tap.take().unwrap()));
                         let _ = commands.push(Command::SetRunning(8, true));
+                        let _ = commands.push(Command::AddTap(stream_tap.take().unwrap()));
+                        let _ = commands.push(Command::SetRunning(9, true));
                     }
                     60 => {
                         let _ = commands.push(Command::Flush(5));
@@ -8499,6 +8707,7 @@ mod tests {
                     }
                     120 => {
                         let _ = commands.push(Command::RemoveTap(8));
+                        let _ = commands.push(Command::RemoveTap(9));
                     }
                     150 => feed.fail(),
                     _ => {}
@@ -8507,6 +8716,7 @@ mod tests {
                 reading.ring.read(&mut out);
                 late.ring.read(&mut out);
                 monitor.ring.read(&mut out);
+                stream.ring.read(&mut out);
             }
         });
         assert!(full.overruns() > 0);
@@ -8515,10 +8725,12 @@ mod tests {
         // Written from its add to its removal, the cycles in between.
         let written = monitor.ring.header().write_pos.load(Relaxed);
         assert_eq!(written, 90 * PERIOD as u64);
+        let written = stream.ring.header().write_pos.load(Relaxed);
+        assert_eq!(written, 90 * PERIOD as u64);
         // The returned items are freed here, off the audio thread.
         let events = rig.events();
         assert_eq!(count(&events, |e| matches!(e, Event::OldTaps(_))), 1);
-        assert_eq!(count(&events, |e| matches!(e, Event::DroppedTap(_))), 2);
+        assert_eq!(count(&events, |e| matches!(e, Event::DroppedTap(_))), 3);
     }
 
     #[test]
