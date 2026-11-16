@@ -1,7 +1,5 @@
 # PulseAudio recording and the output monitor Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
-
 **Goal:** libpulse clients can record two sources from `aas`: `aas.analog`, the analog input after its chain, and `aas.monitor`, what the master card is sent.
 
 **Architecture:** The daemon gets a second kind of capture tap, a monitor, fed from the master's final block where the `/levels` output meter reads, and asked for with a new flag bit in `Configure`. The PulseAudio endpoint gains record streams (`src/pulse/record.rs`) that open a capture or monitor stream on the daemon, convert stereo S32 at the daemon's rate into the client's spec on the connection thread, and send it as memblocks; plus the source and source-output objects.

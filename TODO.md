@@ -596,3 +596,28 @@ volume onto the output volume and the client gain. See "PulseAudio clients" in
   and a browser, but which players need more, and what latency they see, is
   not measured. First step: run `dist/test-pulse.sh` with the endpoint on a
   board and record `pactl list sink-inputs` latencies per player.
+
+## PulseAudio recording: what is left
+
+Record streams are built: `src/pulse/record.rs` records `aas.monitor` and
+`aas.analog` for libpulse clients, with the source outputs in
+`src/pulse/registry.rs` and `src/pulse/objects.rs`. Parked:
+
+- Peak-detect record streams are refused. Volume meters such as pavucontrol
+  open a record stream with `PA_STREAM_PEAK_DETECT`, typically float mono at a
+  very low rate such as 25 Hz. `Record::create` reads the `peak_detect` flag
+  and ignores it, and the rate check (`client_spec` in `src/pulse/stream.rs`)
+  allows only 8 to 384 kHz, so the stream gets an error and the meter stays
+  empty. Supporting them means accepting the low rate when `peak_detect` is
+  set and sending one value per fragment, the peak of the audio it covers,
+  instead of resampled audio. First step: record what pavucontrol sends in
+  `CREATE_RECORD_STREAM` (the flag, the spec, the fragsize).
+- Several record streams on one connection share one backlog check:
+  `Conn::poll_records` measures what waits for the client once and polls the
+  streams in order, so a stream with a small maxlength polled after one with
+  a large one finds the backlog already over its limit and is starved. Give
+  the connection one budget that the streams share, or poll them round-robin
+  starting at a different stream each tick.
+- `objects::source_output_info` reports a standard channel map (mono or
+  front-left, front-right) instead of the one the client created the stream
+  with. Keep the client's map in `SourceOutput` and report it.
