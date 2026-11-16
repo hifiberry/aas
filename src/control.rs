@@ -761,6 +761,26 @@ struct Stream {
     drained: bool,
 }
 
+/// Ends a recorder: marks it, clears `running` (its connection's name goes to
+/// `stopped` if it was) and has the audio thread remove the tap. Returns
+/// whether a tap was removed, which is false if it had ended already.
+fn end_recorder(
+    recorder: &mut Recorder,
+    name: &str,
+    stopped: &mut Vec<String>,
+    batch: &mut Vec<Command>,
+) -> bool {
+    if recorder.ended {
+        return false;
+    }
+    recorder.ended = true;
+    if std::mem::take(&mut recorder.running) {
+        stopped.push(name.to_string());
+    }
+    batch.push(Command::RemoveTap(recorder.id));
+    true
+}
+
 /// A capture stream as the control thread keeps it. It is no client of the
 /// rate rules, never counts as active and has no resampler.
 struct Recorder {
@@ -774,6 +794,8 @@ struct Recorder {
     /// remove the tap, and the client has to configure again. The ring is
     /// marked ended once the tap is back, when nothing writes it any more.
     ended: bool,
+    /// The playback stream a monitor records, 0 for the master mix.
+    watching: ClientId,
 }
 
 struct Conn {
@@ -1342,8 +1364,12 @@ impl Control {
                 buffer_frames,
                 capture: true,
                 monitor,
+                rate,
                 ..
-            } => self.configure_recorder(conn, buffer_frames, monitor, now),
+            } => {
+                let watch = ClientId::from(rate);
+                self.configure_recorder(conn, buffer_frames, monitor, watch, now)
+            }
             Request::Configure {
                 rate,
                 format,
@@ -1381,9 +1407,15 @@ impl Control {
             Request::GetOutputRate => Answer::reply(Reply::OutputRate {
                 rate: self.cycle_rate().unwrap_or(0),
             }),
-            // Stream ids come with the per-stream monitors: until then
-            // no connection has one.
-            Request::GetStreamId => Answer::reply(Reply::StreamId { id: 0 }),
+            Request::GetStreamId => {
+                let id = self
+                    .conns
+                    .get(&conn)
+                    .and_then(|c| c.stream.as_ref())
+                    .and_then(|s| u32::try_from(s.id).ok())
+                    .unwrap_or(0);
+                Answer::reply(Reply::StreamId { id })
+            }
         }
     }
 
@@ -1757,6 +1789,7 @@ impl Control {
         self.table_len -= 1;
         self.dop_claims.retain(|&(_, c)| c != stream.id);
         self.update_dop(now, batch);
+        self.end_watchers(stream.id, batch);
     }
 
     /// Sets up a capture stream: S32 stereo at the rate the output runs at,
@@ -1768,6 +1801,7 @@ impl Control {
         conn: ConnId,
         buffer_frames: u32,
         monitor: bool,
+        watch: ClientId,
         now: Instant,
     ) -> Answer {
         let rate = match self.output {
@@ -1788,6 +1822,11 @@ impl Control {
                 self.conn_changed(conn, "stopped");
             }
             self.remove_recorder(old, &mut batch);
+        }
+        let watch = if monitor { watch } else { 0 };
+        if watch != 0 && !self.streams().any(|s| s.id == watch) {
+            self.send(batch);
+            return Answer::error(libc::ENOENT);
         }
         let made = Ring::create(capacity).and_then(|(ring, memfd)| {
             let wake = eventfd()?;
@@ -1811,6 +1850,7 @@ impl Control {
         }
         let mut tap = Tap::new(id, ring, wake);
         tap.monitor = monitor;
+        tap.source = watch;
         batch.push(Command::AddTap(Box::new(tap)));
         self.taps_len += 1;
         let recorder = Recorder {
@@ -1819,6 +1859,7 @@ impl Control {
             memfd: Some(memfd),
             running: false,
             ended: false,
+            watching: watch,
         };
         if let Some(state) = self.conns.get_mut(&conn) {
             state.recorder = Some(recorder);
@@ -1902,15 +1943,32 @@ impl Control {
             let Some(recorder) = conn.recorder.as_mut() else {
                 continue;
             };
-            if recorder.ended || recorder.rate == rate {
+            if recorder.rate == rate {
                 continue;
             }
-            recorder.ended = true;
-            if std::mem::take(&mut recorder.running) {
-                stopped.push(conn.name.clone());
+            if end_recorder(recorder, &conn.name, &mut stopped, batch) {
+                self.taps_len -= 1;
             }
-            batch.push(Command::RemoveTap(recorder.id));
-            self.taps_len -= 1;
+        }
+        for name in stopped {
+            self.client_changed(&name, "stopped");
+        }
+    }
+
+    /// Ends every monitor of the playback stream `id`, which is gone: its
+    /// frames are no more. As at a rate change, the ring tells the client.
+    fn end_watchers(&mut self, id: ClientId, batch: &mut Vec<Command>) {
+        let mut stopped = Vec::new();
+        for conn in self.conns.values_mut() {
+            let Some(recorder) = conn.recorder.as_mut() else {
+                continue;
+            };
+            if recorder.watching != id {
+                continue;
+            }
+            if end_recorder(recorder, &conn.name, &mut stopped, batch) {
+                self.taps_len -= 1;
+            }
         }
         for name in stopped {
             self.client_changed(&name, "stopped");
@@ -3653,6 +3711,57 @@ mod tests {
         control.handle_events(now);
         assert_eq!(ring.header().ended.load(Ordering::Acquire), 1);
         assert_eq!(ask_start(&mut control, 2, now).reply, refused);
+    }
+
+    #[test]
+    fn a_stream_monitor_follows_its_stream() {
+        let (mut control, mut engine, now) = started(&Config::default(), None);
+        engine.take(true);
+        control.handle_events(now);
+        play(&mut control, 1, 48000, now);
+        let id = match control.request(1, Some(Request::GetStreamId), now).reply {
+            Some(Reply::StreamId { id }) => id,
+            other => panic!("no stream id: {other:?}"),
+        };
+        assert_ne!(id, 0);
+        control.connected(2, "idle".into());
+        let hello = Request::Hello {
+            version: proto::VERSION,
+        };
+        control.request(2, Some(hello), now);
+        let nobody = control.request(2, Some(Request::GetStreamId), now).reply;
+        assert_eq!(nobody, Some(Reply::StreamId { id: 0 }));
+        let monitor = |control: &mut Control, conn: ConnId, stream: u32| {
+            control.connected(conn, "monitor".into());
+            let hello = Request::Hello {
+                version: proto::VERSION,
+            };
+            control.request(conn, Some(hello), now);
+            let request = Request::Configure {
+                rate: stream,
+                format: ClientFormat::S32,
+                channels: 2,
+                buffer_frames: 4096,
+                capture: true,
+                monitor: true,
+            };
+            control.request(conn, Some(request), now)
+        };
+        // No such stream: no ring and no tap.
+        let enoent = Some(Reply::Error {
+            code: libc::ENOENT as u32,
+        });
+        assert_eq!(monitor(&mut control, 3, 999_999).reply, enoent);
+        let seen = engine.take(false);
+        assert!(!has(&seen, "AddTap"), "{seen:?}");
+        let answer = monitor(&mut control, 4, id);
+        assert_eq!(answer.reply, Some(Reply::Configured { rate: 48000 }));
+        let seen = engine.take(false);
+        assert!(has(&seen, "AddTap"), "{seen:?}");
+        // The stream goes: so does the tap.
+        control.disconnected(1, now);
+        let seen = engine.take(false);
+        assert!(has(&seen, "RemoveTap"), "{seen:?}");
     }
 
     #[test]

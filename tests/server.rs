@@ -1659,6 +1659,86 @@ fn a_monitor_records_what_a_player_plays() {
     assert!(peak > amplitude / 2, "the monitor heard a peak of {peak}");
 }
 
+/// Plays a constant `value` on both channels at 48 kHz until `done` is set.
+fn play_constant(
+    mut player: Client,
+    value: i32,
+    done: Arc<AtomicBool>,
+) -> JoinHandle<Client> {
+    thread::spawn(move || {
+        let data = bytes(&vec![[value, value]; 48]);
+        player.start().unwrap();
+        while !done.load(Ordering::Relaxed) {
+            if player.write(&data).unwrap() == 0 {
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+        player
+    })
+}
+
+#[test]
+fn a_stream_monitor_records_only_its_stream() {
+    let (sink, _log) = memory_sink();
+    let daemon = Daemon::start(default_config(), sink);
+    let (first, second) = (1i32 << 28, 1i32 << 26);
+    let done = Arc::new(AtomicBool::new(false));
+    let mut one = daemon.client_at(48000, 4096);
+    let mut two = daemon.client_at(48000, 4096);
+    let id = one.stream_id().unwrap();
+    assert_ne!(id, 0);
+    assert_ne!(id, two.stream_id().unwrap());
+    let feeders = [
+        play_constant(one, first, done.clone()),
+        play_constant(two, second, done.clone()),
+    ];
+    let mut monitor = daemon.client();
+    assert_eq!(monitor.configure_stream_monitor(4096, id).unwrap(), 48000);
+    monitor.start().unwrap();
+    let mut peak = 0;
+    let mut loudest = 0;
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while peak < first && Instant::now() < deadline {
+        for f in record(&mut monitor, 256) {
+            peak = peak.max(f[0].abs().max(f[1].abs()));
+            loudest = loudest.max(f[0].abs());
+        }
+    }
+    done.store(true, Ordering::Relaxed);
+    for feeder in feeders {
+        feeder.join().unwrap();
+    }
+    // Only the first stream: its level, not the sum of both.
+    assert_eq!(peak, first, "the monitor heard a peak of {peak}");
+    assert_eq!(loudest, first);
+}
+
+#[test]
+fn a_stream_monitor_ends_when_its_stream_goes() {
+    let (sink, _log) = memory_sink();
+    let daemon = Daemon::start(default_config(), sink);
+    let mut player = daemon.client_at(48000, 4096);
+    let id = player.stream_id().unwrap();
+    let mut monitor = daemon.client();
+    monitor.configure_stream_monitor(4096, id).unwrap();
+    monitor.start().unwrap();
+    assert!(!monitor.ended());
+    drop(player);
+    assert!(wait_for(|| monitor.ended()));
+    let start = monitor.start().err().and_then(|e| e.raw_os_error());
+    assert_eq!(start, Some(libc::ENODEV));
+}
+
+#[test]
+fn a_stream_monitor_of_no_stream_is_enoent() {
+    let (sink, _log) = memory_sink();
+    let daemon = Daemon::start(default_config(), sink);
+    let mut monitor = daemon.client();
+    assert_eq!(monitor.stream_id().unwrap(), 0);
+    let err = monitor.configure_stream_monitor(4096, 999_999).unwrap_err();
+    assert_eq!(err.raw_os_error(), Some(libc::ENOENT));
+}
+
 #[test]
 fn a_rate_change_ends_an_open_capture_stream() {
     let (sink, log) = memory_sink();
