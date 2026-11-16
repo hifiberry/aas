@@ -2030,3 +2030,44 @@ fn a_decimal_name_names_the_sink_by_its_index() {
     let (command, _, _) = client.command(wire::LOOKUP_SINK, &body.into_vec());
     assert_eq!(command, wire::ERROR);
 }
+
+#[test]
+fn record_a_source_output_carries_its_clients_application() {
+    let daemon = Daemon::start();
+    let mut recorder = RawPulse::connect(&daemon.pulse_socket());
+    recorder.auth();
+    let app = [
+        ("application.name", "Volume Control"),
+        ("application.id", "org.PulseAudio.pavucontrol"),
+        ("application.process.binary", "pavucontrol"),
+        ("window.x11.display", ":0"),
+    ];
+    let mut body = Builder::new();
+    body.proplist(&app.map(|(k, v)| (k.to_string(), v.to_string())));
+    let (command, _, _) = recorder.command(wire::SET_CLIENT_NAME, &body.into_vec());
+    assert_eq!(command, wire::REPLY);
+    let stream = create_record_stream(&mut recorder, S16_STEREO_48K, "aas.monitor", 0);
+    let mut body = Builder::new();
+    body.u32(stream);
+    let (command, _, reply) = recorder.command(wire::GET_SOURCE_OUTPUT_INFO, &body.into_vec());
+    assert_eq!(command, wire::REPLY);
+    let mut r = Reader::new(&reply);
+    r.u32();
+    r.string();
+    r.u32();
+    r.u32();
+    r.u32();
+    r.sample_spec();
+    r.channel_map();
+    r.usec();
+    r.usec();
+    r.string();
+    r.string();
+    let props = r.proplist().expect("a proplist");
+    let get = |key: &str| props.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str());
+    assert_eq!(get("media.name"), Some("a test recording"));
+    assert_eq!(get("application.id"), Some("org.PulseAudio.pavucontrol"));
+    assert_eq!(get("application.name"), Some("Volume Control"));
+    assert_eq!(get("application.process.binary"), Some("pavucontrol"));
+    assert_eq!(get("window.x11.display"), None, "only the application's");
+}

@@ -235,7 +235,8 @@ pub fn sink_input_info(input: &SinkInput) -> Vec<u8> {
 
 /// A record stream's info body, in the order of
 /// `source_output_fill_tagstruct` for protocol 35. Its volume is fixed at
-/// unity and it is never muted.
+/// unity and it is never muted. Its proplist is its name and its client's
+/// application, as PulseAudio merges the client's proplist into a stream's.
 pub fn source_output_info(output: &SourceOutput) -> Vec<u8> {
     let spec = SampleSpec {
         format: output.format,
@@ -255,7 +256,9 @@ pub fn source_output_info(output: &SourceOutput) -> Vec<u8> {
     b.usec(output.source_usec);
     b.string(if output.resampled { "aas" } else { "trivial" });
     b.string("aas");
-    b.proplist(&[("media.name".into(), output.name.clone())]);
+    let mut props = vec![("media.name".to_string(), output.name.clone())];
+    props.extend(output.application.iter().cloned());
+    b.proplist(&props);
     b.boolean(output.corked);
     b.cvolume(&vec![wire::VOLUME_NORM; usize::from(output.channels)]);
     b.boolean(false);

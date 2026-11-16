@@ -401,7 +401,10 @@ Commands added: `CREATE_RECORD_STREAM`, `DELETE_RECORD_STREAM`,
 overrun. Subscriptions add NEW, CHANGE and REMOVE for sources and source
 outputs. A source's volume and mute, and a source output's, are fixed at 100
 percent and unmuted: setting them gets `PA_ERR_NOTSUPPORTED`, so a recording
-is never changed behind the other clients' backs *(call)*.
+is never changed behind the other clients' backs *(call)*. A source output's
+proplist is its media name and the `application.*` entries of its client's
+proplist, as PulseAudio merges them: pavucontrol and the GNOME and KDE volume
+controls hide their own meters by `application.id`.
 
 A recording client is a client of the daemon like any other: it appears in the
 API by its process name, and `/metrics` counts its overruns.

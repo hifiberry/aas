@@ -47,6 +47,9 @@ pub struct SourceOutput {
     pub channels: u8,
     pub format: u8,
     pub corked: bool,
+    /// The `application.*` entries of its client's proplist, by which
+    /// volume controls tell their own meters apart.
+    pub application: Vec<(String, String)>,
     /// Whether it is resampled from the daemon's rate.
     pub resampled: bool,
     /// What waits to be sent and what the source holds before it, as last
@@ -359,6 +362,7 @@ mod tests {
             channels: 2,
             format: wire::FORMAT_S16LE,
             corked: false,
+            application: Vec::new(),
             resampled: false,
             buffer_usec: 0,
             source_usec: 0,

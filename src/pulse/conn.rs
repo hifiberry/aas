@@ -287,6 +287,11 @@ impl Conn {
         }
         self.registry.rename_client(self.client_index, self.name.clone());
         self.proplist = props;
+        let application = self.application();
+        for record in &mut self.records {
+            // Listed anew at the next poll.
+            record.application = application.clone();
+        }
         let mut body = Builder::new();
         if self.version >= 13 {
             body.u32(self.client_index);
@@ -978,6 +983,15 @@ impl Conn {
         }
     }
 
+    /// The `application.*` entries of the client's proplist.
+    fn application(&self) -> Vec<(String, String)> {
+        self.proplist
+            .iter()
+            .filter(|(key, _)| key.starts_with("application."))
+            .cloned()
+            .collect()
+    }
+
     fn record_mut(&mut self, index: u32) -> Option<&mut Record> {
         self.records.iter_mut().find(|record| record.index == index)
     }
@@ -995,7 +1009,8 @@ impl Conn {
             reader,
         );
         match created {
-            Ok(created) => {
+            Ok(mut created) => {
+                created.record.application = self.application();
                 self.registry.add_source_output(created.record.entry());
                 self.records.push(created.record);
                 self.send_reply(tag, created.reply);
