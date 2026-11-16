@@ -629,8 +629,6 @@ fn fragment_bytes(asked: u32, rate: u32, frame: u32) -> u32 {
     (bytes / frame).clamp(1, MAX_FRAGMENT / frame) * frame
 }
 
-/// The most that waits to be sent, in bytes: `u32::MAX` or 0 is 2 s,
-/// otherwise whole frames, at least `fragsize` and at most 4 MiB.
 /// The daemon id a meter of one sink input records. A sink input that is
 /// gone, or whose id is unknown (0 is the master), is not found: it must
 /// never fall back to recording the mix.
@@ -639,6 +637,8 @@ fn monitored_stream(id: Option<u32>) -> io::Result<u32> {
         .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
 }
 
+/// The most that waits to be sent, in bytes: `u32::MAX` or 0 is 2 s,
+/// otherwise whole frames, at least `fragsize` and at most 4 MiB.
 fn max_length(asked: u32, rate: u32, frame: u32, fragsize: u32) -> u32 {
     let frame = frame.max(1);
     let bytes = if asked == 0 || asked == u32::MAX {
