@@ -603,13 +603,14 @@ supported", so a recording is never changed behind another client's back. A
 recording client appears in the API by its process name, like a player.
 
 Volume meters work: pavucontrol, and the GNOME and KDE settings, open record
-streams with peak detection, which may run at any rate from 1 Hz, and each
-value is the peak of the audio it covers (a mono stream takes the louder
-channel). Meters of the two sources show what they carry. The meter of one
-playing stream records that sink input alone, only on `aas.monitor`, after the
-stream's own volume and before the output volume, so it does not follow the
-volume of the output. Like PulseAudio, the endpoint takes a name that is a
-number for an index: pavucontrol names `aas.monitor` "0".
+streams with peak detection. Such a stream may run at any rate from 1 Hz to
+384 kHz, and each value is the peak of the audio it covers (a mono stream
+takes the louder channel). Meters of the two sources show what they carry. The
+meter of one playing stream records that sink input alone, only on
+`aas.monitor`, after the stream's own volume and before the output volume, so
+it does not follow the volume of the output. Like PulseAudio, the endpoint
+takes a name that is a number for an index: pavucontrol names `aas.monitor`
+"0".
 
 ## Writing a plugin
 
