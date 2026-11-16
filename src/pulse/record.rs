@@ -70,6 +70,58 @@ struct Resampling {
     bounce: Ring,
 }
 
+/// The peak of each interval of daemon frames, for a client's rate that
+/// may be far below the daemon's. No filter: each output frame is the
+/// largest magnitude per channel of the frames its interval covers, the
+/// intervals counted by the rate ratio so any ratio keeps real time.
+struct Peaks {
+    daemon_rate: u32,
+    client_rate: u32,
+    acc: u64,
+    peak: [i32; 2],
+}
+
+impl Peaks {
+    fn new(daemon_rate: u32, client_rate: u32) -> Peaks {
+        Peaks {
+            daemon_rate: daemon_rate.max(1),
+            client_rate,
+            acc: 0,
+            peak: [0; 2],
+        }
+    }
+
+    /// Feeds `frames` and appends the frames that completes to `out`:
+    /// `[left, right]`, or the louder of the two twice for mono.
+    fn push(&mut self, frames: &[[i32; 2]], channels: u8, out: &mut Vec<[i32; 2]>) {
+        let magnitude = |v: i32| v.unsigned_abs().min(i32::MAX as u32) as i32;
+        let daemon = u64::from(self.daemon_rate);
+        for f in frames {
+            self.peak[0] = self.peak[0].max(magnitude(f[0]));
+            self.peak[1] = self.peak[1].max(magnitude(f[1]));
+            self.acc += u64::from(self.client_rate);
+            if self.acc >= daemon {
+                let frame = if channels == 1 {
+                    let m = self.peak[0].max(self.peak[1]);
+                    [m, m]
+                } else {
+                    self.peak
+                };
+                while self.acc >= daemon {
+                    out.push(frame);
+                    self.acc -= daemon;
+                }
+                self.peak = [0; 2];
+            }
+        }
+    }
+
+    fn reset(&mut self) {
+        self.acc = 0;
+        self.peak = [0; 2];
+    }
+}
+
 pub struct Record {
     pub index: u32,
     pub client: u32,
@@ -84,6 +136,10 @@ pub struct Record {
     daemon: Client,
     daemon_rate: u32,
     resampling: Option<Resampling>,
+    /// Set for a peak-detect stream, which has no resampler.
+    peaks: Option<Peaks>,
+    peak_detect: bool,
+    peak_frames: Vec<[i32; 2]>,
     frames: Vec<[i32; 2]>,
     period: Vec<[i32; 2]>,
     converted: Vec<u8>,
@@ -118,9 +174,11 @@ impl Record {
         let fragsize = reader.u32().ok_or_else(|| protocol("no fragsize"))?;
         // From no_remap to variable_rate, then peak_detect and
         // adjust_latency.
-        for _ in 0..9 {
-            reader.boolean().ok_or_else(|| protocol("no stream flag"))?;
+        let mut flags = [false; 9];
+        for flag in &mut flags {
+            *flag = reader.boolean().ok_or_else(|| protocol("no stream flag"))?;
         }
+        let peak_detect = flags[7];
         let props = reader.proplist().ok_or_else(|| protocol("no proplist"))?;
         reader.u32().ok_or_else(|| protocol("no direct_on_input"))?;
         // early_requests, dont_inhibit_auto_suspend, fail_on_suspend.
@@ -144,7 +202,7 @@ impl Record {
         if !reader.eof() {
             return Err(protocol("trailing stream data"));
         }
-        let (spec, map, format) = client_spec(spec, map, &formats)?;
+        let (spec, map, format) = client_spec(spec, map, &formats, peak_detect)?;
         let source =
             objects::find_source(Some(source_index), source_name, default, settings.analog)
                 .ok_or_else(|| CreateError::new(wire::ERR_NOENTITY, "no such source"))?;
@@ -172,6 +230,9 @@ impl Record {
             daemon,
             daemon_rate: 0,
             resampling: None,
+            peaks: None,
+            peak_detect,
+            peak_frames: Vec::new(),
             frames: vec![[0; 2]; CHUNK],
             period: vec![[0; 2]; PERIOD as usize],
             converted: Vec::new(),
@@ -220,7 +281,10 @@ impl Record {
         };
         self.daemon_rate = rate;
         self.underruns = 0;
-        self.resampling = if rate == self.spec.rate {
+        self.peaks = self
+            .peak_detect
+            .then(|| Peaks::new(rate, self.spec.rate));
+        self.resampling = if self.peak_detect || rate == self.spec.rate {
             None
         } else {
             let resampler = Resampler::new(
@@ -252,6 +316,17 @@ impl Record {
             let n = self.daemon.read(&mut self.frames[..room])?;
             if n == 0 {
                 break;
+            }
+            if let Some(p) = &mut self.peaks {
+                self.peak_frames.clear();
+                p.push(&self.frames[..n], self.spec.channels, &mut self.peak_frames);
+                from_stereo_s32(
+                    &self.peak_frames,
+                    self.format,
+                    self.spec.channels,
+                    &mut self.converted,
+                );
+                continue;
             }
             match &mut self.resampling {
                 None => from_stereo_s32(
@@ -358,6 +433,9 @@ impl Record {
             return self.open();
         }
         self.daemon.reset()?;
+        if let Some(p) = &mut self.peaks {
+            p.reset();
+        }
         if let Some(r) = &mut self.resampling {
             r.bounce.consume(usize::MAX);
             r.resampler.reset();
@@ -529,6 +607,54 @@ fn max_length(asked: u32, rate: u32, frame: u32, fragsize: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn peaks_take_the_largest_magnitude_per_interval() {
+        let mut peaks = Peaks::new(48_000, 25);
+        let mut out = Vec::new();
+        let mut frames = vec![[1, 2]; 1920];
+        frames[700] = [-9, 3];
+        frames[1000] = [4, -20];
+        peaks.push(&frames, 2, &mut out);
+        assert_eq!(out, vec![[9, 20]]);
+        out.clear();
+        peaks.push(&vec![[5, 6]; 3840], 2, &mut out);
+        assert_eq!(out, vec![[5, 6], [5, 6]]);
+    }
+
+    #[test]
+    fn peaks_of_i32_min_are_i32_max() {
+        let mut peaks = Peaks::new(48_000, 48_000);
+        let mut out = Vec::new();
+        peaks.push(&[[i32::MIN, i32::MIN + 1]], 2, &mut out);
+        assert_eq!(out, vec![[i32::MAX, i32::MAX]]);
+    }
+
+    #[test]
+    fn mono_peaks_take_the_louder_channel() {
+        let mut peaks = Peaks::new(48_000, 48_000);
+        let mut out = Vec::new();
+        peaks.push(&[[100, -300]], 1, &mut out);
+        assert_eq!(out, vec![[300, 300]]);
+    }
+
+    #[test]
+    fn peaks_above_the_daemon_rate_repeat() {
+        let mut peaks = Peaks::new(8_000, 16_000);
+        let mut out = Vec::new();
+        peaks.push(&[[1, 1], [2, 2], [3, 3]], 2, &mut out);
+        assert_eq!(out, vec![[1, 1], [1, 1], [2, 2], [2, 2], [3, 3], [3, 3]]);
+    }
+
+    #[test]
+    fn peaks_keep_real_time_at_an_uneven_ratio() {
+        let mut peaks = Peaks::new(44_100, 144);
+        let mut out = Vec::new();
+        for _ in 0..441 {
+            peaks.push(&[[7, 7]; 100], 2, &mut out);
+        }
+        assert_eq!(out.len(), 144);
+    }
 
     #[test]
     fn a_fragment_is_whole_frames_within_bounds() {

@@ -1349,6 +1349,7 @@ const S16_STEREO_48K: SampleSpec = SampleSpec {
 const TONE: i32 = 16_000;
 
 /// `CREATE_RECORD_STREAM` for protocol 35, as libpulse sends it.
+#[allow(clippy::too_many_arguments)]
 fn record_body(
     spec: SampleSpec,
     source_index: u32,
@@ -1356,6 +1357,8 @@ fn record_body(
     maxlength: u32,
     corked: bool,
     fragsize: u32,
+    peak_detect: bool,
+    direct_on_input: u32,
 ) -> Vec<u8> {
     let mut body = Builder::new();
     body.sample_spec(spec);
@@ -1372,10 +1375,10 @@ fn record_body(
     for _ in 0..7 {
         body.boolean(false);
     }
-    body.boolean(false); // peak_detect
+    body.boolean(peak_detect);
     body.boolean(false); // adjust_latency
     body.proplist(&[("media.name".to_string(), "a test recording".to_string())]);
-    body.u32(wire::INVALID_INDEX); // direct_on_input
+    body.u32(direct_on_input);
     body.boolean(false); // early_requests
     body.boolean(false); // dont_inhibit_auto_suspend
     body.boolean(false); // fail_on_suspend
@@ -1426,7 +1429,7 @@ fn create_record_stream(
     source_name: &str,
     fragsize: u32,
 ) -> u32 {
-    let body = record_body(spec, wire::INVALID_INDEX, Some(source_name), u32::MAX, false, fragsize);
+    let body = record_body(spec, wire::INVALID_INDEX, Some(source_name), u32::MAX, false, fragsize, false, wire::INVALID_INDEX);
     let (command, _, reply) = conn.command(wire::CREATE_RECORD_STREAM, &body);
     assert_eq!(command, wire::REPLY, "the record stream is created");
     read_record_reply(&reply).stream
@@ -1543,6 +1546,54 @@ fn record_a_monitor_recording_hears_a_player() {
 }
 
 #[test]
+fn record_peak_a_meter_at_144_hz_reads_the_monitor() {
+    let daemon = Daemon::start();
+    let player = tone_player(&daemon, 48_000);
+    let mut recorder = pactl(&daemon);
+    let spec = SampleSpec {
+        format: wire::FORMAT_FLOAT32LE,
+        channels: 1,
+        rate: 144,
+    };
+    let body = record_body(spec, wire::INVALID_INDEX, Some("aas.monitor"), u32::MAX, false, 4, true, wire::INVALID_INDEX);
+    let (command, _, reply) = recorder.command(wire::CREATE_RECORD_STREAM, &body);
+    assert_eq!(command, wire::REPLY, "the meter is created");
+    let stream = read_record_reply(&reply).stream;
+    assert!(recorder.first_block(stream, Duration::from_secs(1)));
+    recorder.blocks.clear();
+    let start = Instant::now();
+    let (blocks, _) = recorder.collect(stream, Duration::from_secs(1));
+    let elapsed = start.elapsed().as_secs_f64();
+    stop_player(player);
+    assert!(blocks.iter().all(|block| block.len() == 4), "each is one value");
+    let values: Vec<f32> = blocks
+        .iter()
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+    let rate = values.len() as f64 / elapsed;
+    assert!((rate - 144.0).abs() < 144.0 * 0.15, "{rate} values a second");
+    let loud = values.iter().filter(|v| (0.4..0.55).contains(*v)).count();
+    assert!(loud * 10 >= values.len() * 9, "values near 0.5: {values:?}");
+}
+
+#[test]
+fn record_peak_low_rates_need_peak_detect() {
+    let daemon = Daemon::start();
+    let mut client = pactl(&daemon);
+    let spec = SampleSpec {
+        format: wire::FORMAT_FLOAT32LE,
+        channels: 1,
+        rate: 25,
+    };
+    let plain = record_body(spec, wire::INVALID_INDEX, Some("aas.monitor"), u32::MAX, false, 4, false, wire::INVALID_INDEX);
+    let (command, _, _) = client.command(wire::CREATE_RECORD_STREAM, &plain);
+    assert_eq!(command, wire::ERROR);
+    let peak = record_body(spec, wire::INVALID_INDEX, Some("aas.monitor"), u32::MAX, false, 4, true, wire::INVALID_INDEX);
+    let (command, _, _) = client.command(wire::CREATE_RECORD_STREAM, &peak);
+    assert_eq!(command, wire::REPLY);
+}
+
+#[test]
 fn record_a_recording_is_converted_to_the_clients_spec() {
     let daemon = Daemon::start();
     let player = tone_player(&daemon, 48_000);
@@ -1572,7 +1623,7 @@ fn record_fragsize_is_rounded_and_clamped() {
     let daemon = Daemon::start();
     let mut client = pactl(&daemon);
     for (asked, got) in [(0, 4800), (u32::MAX, 4800), (1001, 1000), (1 << 20, 65_536)] {
-        let body = record_body(S16_STEREO_48K, 0, None, u32::MAX, true, asked);
+        let body = record_body(S16_STEREO_48K, 0, None, u32::MAX, true, asked, false, wire::INVALID_INDEX);
         let (command, _, reply) = client.command(wire::CREATE_RECORD_STREAM, &body);
         assert_eq!(command, wire::REPLY);
         let reply = read_record_reply(&reply);
@@ -1588,8 +1639,8 @@ fn record_an_unknown_source_is_noentity() {
     let daemon = Daemon::start();
     let mut client = pactl(&daemon);
     for body in [
-        record_body(S16_STEREO_48K, wire::INVALID_INDEX, Some("aas.analog"), u32::MAX, false, 0),
-        record_body(S16_STEREO_48K, 7, None, u32::MAX, false, 0),
+        record_body(S16_STEREO_48K, wire::INVALID_INDEX, Some("aas.analog"), u32::MAX, false, 0, false, wire::INVALID_INDEX),
+        record_body(S16_STEREO_48K, 7, None, u32::MAX, false, 0, false, wire::INVALID_INDEX),
     ] {
         let (command, _, reply) = client.command(wire::CREATE_RECORD_STREAM, &body);
         assert_eq!(command, wire::ERROR);
@@ -1603,7 +1654,7 @@ fn record_an_unknown_source_is_noentity() {
 fn record_a_corked_recording_sends_nothing() {
     let daemon = Daemon::start();
     let mut client = pactl(&daemon);
-    let body = record_body(S16_STEREO_48K, 0, None, u32::MAX, true, 0);
+    let body = record_body(S16_STEREO_48K, 0, None, u32::MAX, true, 0, false, wire::INVALID_INDEX);
     let (command, _, reply) = client.command(wire::CREATE_RECORD_STREAM, &body);
     assert_eq!(command, wire::REPLY);
     let stream = read_record_reply(&reply).stream;
@@ -1648,7 +1699,7 @@ fn record_a_recording_survives_a_rate_change() {
 fn record_a_client_that_stops_reading_gets_an_overflow() {
     let daemon = Daemon::start();
     let mut recorder = pactl(&daemon);
-    let body = record_body(S16_STEREO_48K, 0, None, 9600, false, 0);
+    let body = record_body(S16_STEREO_48K, 0, None, 9600, false, 0, false, wire::INVALID_INDEX);
     let (command, _, reply) = recorder.command(wire::CREATE_RECORD_STREAM, &body);
     assert_eq!(command, wire::REPLY);
     let reply = read_record_reply(&reply);
@@ -1684,7 +1735,7 @@ fn record_a_stalled_high_rate_recording_overflows_and_keeps_its_connection() {
         channels: 2,
         rate: 192_000,
     };
-    let body = record_body(spec, 0, None, 3 << 19, false, 0);
+    let body = record_body(spec, 0, None, 3 << 19, false, 0, false, wire::INVALID_INDEX);
     let (command, _, reply) = recorder.command(wire::CREATE_RECORD_STREAM, &body);
     assert_eq!(command, wire::REPLY);
     let reply = read_record_reply(&reply);

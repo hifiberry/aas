@@ -160,7 +160,7 @@ impl Stream {
         if !reader.eof() {
             return Err(CreateError::new(wire::ERR_PROTOCOL, "trailing stream data"));
         }
-        let (spec, map, format) = client_spec(spec, map, &formats)?;
+        let (spec, map, format) = client_spec(spec, map, &formats, false)?;
         let frame_bytes = format.sample_bytes() * usize::from(spec.channels);
         let min_frames = (spec.rate / 1000 * 20).max(1);
         let cap_frames = (spec.rate / 1000 * buffer_ms).max(min_frames);
@@ -518,11 +518,12 @@ impl Stream {
 
 /// Checks the sample spec and channel map a stream is created with, or the
 /// first PCM entry of its format list, and returns what is used and the
-/// format to convert to or from.
+/// format to convert to or from. With `peak`, a rate from 1 Hz is accepted.
 pub(crate) fn client_spec(
     mut spec: SampleSpec,
     mut map: Vec<u8>,
     formats: &[(u8, Vec<(String, String)>)],
+    peak: bool,
 ) -> Result<(SampleSpec, Vec<u8>, ClientFormat), CreateError> {
     // A stream made with pa_stream_new_extended, as mpv and GStreamer
     // make theirs, sends a placeholder sample spec and its real format
@@ -557,7 +558,8 @@ pub(crate) fn client_spec(
             "more than two channels",
         ));
     }
-    if !(8_000..=384_000).contains(&spec.rate) {
+    let lowest = if peak { 1 } else { 8_000 };
+    if !(lowest..=384_000).contains(&spec.rate) {
         return Err(CreateError::new(wire::ERR_INVALID, "that rate is out of range"));
     }
     if map.len() != usize::from(spec.channels) {
