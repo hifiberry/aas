@@ -680,6 +680,8 @@ pub struct Tap {
     /// An eventfd, non-blocking, written as `notify` decides.
     pub wake: OwnedFd,
     pub running: bool,
+    /// Records what the master card gets instead of the analog input.
+    pub monitor: bool,
     /// The position in the header's `wake_at` that has had its wake-up.
     woken_at: u64,
     /// The overruns the client has been woken for.
@@ -694,6 +696,7 @@ impl Tap {
             ring,
             wake,
             running: false,
+            monitor: false,
             woken_at: 0,
             overruns_told: 0,
         }
@@ -792,10 +795,10 @@ impl Taps {
     /// Writes this cycle's analog period to every running tap and wakes
     /// it as due: the period after the chain while the input has signal,
     /// in forced bit-perfect too, else zeros, so that a tap keeps real time
-    /// without a signal or a capture. Never the mix.
+    /// without a signal or a capture. Never the mix, and never a monitor.
     fn deliver<P: Processing>(&mut self, analog: &Analog<P>, period: usize) {
         let Taps { table, buf } = self;
-        if !table.iter().any(|t| t.running) {
+        if !table.iter().any(|t| t.running && !t.monitor) {
             return;
         }
         let block = if !analog.signal {
@@ -810,9 +813,37 @@ impl Taps {
         };
         // As the sink's delay for a player: what the chain holds back.
         let latency = if analog.signal { analog.latency } else { 0 };
-        for tap in table.iter_mut().filter(|t| t.running) {
+        for tap in table.iter_mut().filter(|t| t.running && !t.monitor) {
             let header = tap.ring.header();
             header.output_delay_frames.store(latency, Ordering::Relaxed);
+            tap.write(block);
+            tap.notify();
+        }
+    }
+
+    /// Writes what the master card gets this cycle to every running monitor
+    /// and wakes it as due: `samples` holds `channels` channels a frame, of
+    /// which a monitor takes the first two, or the one twice. Zeros when
+    /// `silent`, so that a monitor keeps real time while the card plays
+    /// what is not PCM or is parked.
+    fn deliver_monitor(&mut self, samples: &[i32], channels: usize, silent: bool) {
+        let Taps { table, buf } = self;
+        if !table.iter().any(|t| t.running && t.monitor) {
+            return;
+        }
+        let frames = samples.len() / channels;
+        let block = &mut buf[..frames];
+        if silent {
+            block.fill([0; 2]);
+        } else {
+            let right = if channels > 1 { 1 } else { 0 };
+            for (frame, out) in samples.chunks_exact(channels).zip(block.iter_mut()) {
+                *out = [frame[0], frame[right]];
+            }
+        }
+        for tap in table.iter_mut().filter(|t| t.running && t.monitor) {
+            let header = tap.ring.header();
+            header.output_delay_frames.store(0, Ordering::Relaxed);
             tap.write(block);
             tap.notify();
         }
@@ -2291,6 +2322,10 @@ impl<P: Processing, S: Sink> Engine<P, S> {
                 metering.add(&*samples, meter, self.levels_ns);
             }
         }
+        // Monitors keep real time while parked, unlike the meter.
+        let silent = self.parked || owner.is_some();
+        let channels = self.master.channels;
+        self.taps.deliver_monitor(samples, channels, silent);
         let before_write = Instant::now();
         let result = if self.parked {
             self.timer.write(samples)
@@ -8044,6 +8079,125 @@ mod tests {
         check::<F64>();
     }
 
+    /// A running monitor tap with room for many periods.
+    fn add_monitor<P: Processing>(rig: &mut Rig<P>, id: ClientId) -> Recorder {
+        let (recorder, mut tap) = tap_of(id, 1 << 16);
+        tap.monitor = true;
+        rig.send(Command::AddTap(tap));
+        rig.send(Command::SetRunning(id, true));
+        recorder
+    }
+
+    #[test]
+    fn a_monitor_gets_what_the_master_card_gets() {
+        fn check<P: Processing>() {
+            let mut rig = Rig::<P>::new(BitPerfect::Auto);
+            let monitor = add_monitor(&mut rig, 5);
+            // After the software volume.
+            rig.send(Command::SetGain(0, 0.5));
+            let mut a = client(1);
+            rig.add(&mut a);
+            a.ring.write(&frames(1000, PERIOD));
+            rig.cycle();
+            let card = rig.last_periods(1);
+            assert_eq!(card, frames(500, PERIOD), "{:?}", format_of::<P>());
+            assert_eq!(monitor.take(), card, "{:?}", format_of::<P>());
+            assert_eq!(monitor.wake_ups(), 1);
+            assert_eq!(monitor.ring.header().output_delay_frames.load(Relaxed), 0);
+        }
+        check::<I32>();
+        check::<F32>();
+        check::<F64>();
+    }
+
+    #[test]
+    fn a_monitor_never_gets_the_analog_input() {
+        let (mut rig, feed) = with_capture::<I32>(BitPerfect::Auto);
+        rig.send(Command::SetAnalogGain(0.0));
+        let monitor = add_monitor(&mut rig, 5);
+        let recorder = add_tap(&mut rig, 6);
+        feed.push(&frames(1000, PERIOD));
+        rig.cycle();
+        assert_eq!(rig.last_periods(1), frames(0, PERIOD));
+        assert_eq!(monitor.take(), frames(0, PERIOD));
+        assert_eq!(recorder.take(), frames(1000, PERIOD));
+    }
+
+    #[test]
+    fn a_monitor_takes_the_first_two_channels_of_a_wide_card() {
+        fn check<P: Processing>() {
+            // The card's last two channels swapped, to tell them apart.
+            let swapped = matrix(
+                &[
+                    route(0, 1, 0.0),
+                    route(1, 2, 0.0),
+                    route(1, 3, 0.0),
+                    route(0, 4, 0.0),
+                ],
+                4,
+            );
+            let mut rig = Rig::<P>::wide(BitPerfect::Auto, swapped, 4);
+            let monitor = add_monitor(&mut rig, 5);
+            let mut a = client(1);
+            rig.add(&mut a);
+            a.ring.write(&frames(1000, PERIOD));
+            rig.cycle();
+            let out = rig.last_wide(1);
+            assert_eq!(out, vec![vec![1000, -1000, -1000, 1000]; PERIOD]);
+            let want: Vec<[i32; 2]> = out.iter().map(|f| [f[0], f[1]]).collect();
+            assert_eq!(monitor.take(), want, "{:?}", format_of::<P>());
+            // A one-channel card is heard on both.
+            let sum = matrix(&[route(0, 1, 0.0)], 1);
+            let mut rig = Rig::<P>::wide(BitPerfect::Auto, sum, 1);
+            let monitor = add_monitor(&mut rig, 5);
+            let mut a = client(1);
+            rig.add(&mut a);
+            a.ring.write(&frames(1000, PERIOD));
+            rig.cycle();
+            assert_eq!(rig.last_wide(1), vec![vec![1000]; PERIOD]);
+            assert_eq!(monitor.take(), vec![[1000, 1000]; PERIOD]);
+        }
+        check::<I32>();
+        check::<F32>();
+        check::<F64>();
+    }
+
+    #[test]
+    fn a_monitor_gets_zeros_during_dop() {
+        let mut rig = Rig::<I32>::new(BitPerfect::Auto);
+        let monitor = add_monitor(&mut rig, 5);
+        let mut d = client(2);
+        rig.add(&mut d);
+        let dop = dop_frames(4 * PERIOD);
+        d.ring.write(&dop);
+        for _ in 0..4 {
+            rig.cycle();
+        }
+        assert_eq!(rig.last_periods(4), dop);
+        assert_eq!(monitor.take(), frames(0, 4 * PERIOD));
+    }
+
+    #[test]
+    fn a_monitor_gets_zeros_while_parked() {
+        let mut rig = Rig::<F32>::new(BitPerfect::Auto);
+        let monitor = add_monitor(&mut rig, 5);
+        let mut a = client(1);
+        rig.add(&mut a);
+        a.ring.write(&frames(1000, 8 * PERIOD));
+        rig.cycle();
+        assert_eq!(monitor.take(), frames(1000, PERIOD));
+        let written = rig.log.frames().len();
+        rig.send(Command::ParkOutput {
+            rate: RATE,
+            period: PERIOD as u32,
+        });
+        for _ in 0..4 {
+            rig.cycle();
+            assert_eq!(monitor.take(), frames(0, PERIOD));
+        }
+        assert_eq!(rig.log.frames().len(), written);
+    }
+
     #[test]
     fn the_analog_chains_latency_is_reported_to_recorders_and_in_the_counters() {
         let (mut rig, feed) = with_capture::<F32>(BitPerfect::Auto);
@@ -8278,6 +8432,9 @@ mod tests {
         rig.events();
         let (late, tap) = tap_of(7, 1 << 12);
         let mut late_tap = Some(tap);
+        let (monitor, mut tap) = tap_of(8, 1 << 12);
+        tap.monitor = true;
+        let mut monitor_tap = Some(tap);
         let mut grown = Some(Vec::with_capacity(4 * INITIAL_TAPS));
         let input = frames(1 << 20, PERIOD);
         let mut out = vec![[0; 2]; 4 * PERIOD];
@@ -8293,6 +8450,10 @@ mod tests {
                         let _ = commands.push(Command::AddTap(late_tap.take().unwrap()));
                         let _ = commands.push(Command::SetRunning(7, true));
                     }
+                    30 => {
+                        let _ = commands.push(Command::AddTap(monitor_tap.take().unwrap()));
+                        let _ = commands.push(Command::SetRunning(8, true));
+                    }
                     60 => {
                         let _ = commands.push(Command::Flush(5));
                     }
@@ -8302,20 +8463,28 @@ mod tests {
                     100 => {
                         let _ = commands.push(Command::RemoveTap(6));
                     }
+                    120 => {
+                        let _ = commands.push(Command::RemoveTap(8));
+                    }
                     150 => feed.fail(),
                     _ => {}
                 }
                 engine.cycle().unwrap();
                 reading.ring.read(&mut out);
                 late.ring.read(&mut out);
+                monitor.ring.read(&mut out);
             }
         });
         assert!(full.overruns() > 0);
         assert_eq!(reading.overruns(), 0);
+        assert_eq!(monitor.overruns(), 0);
+        // Written from its add to its removal, the cycles in between.
+        let written = monitor.ring.header().write_pos.load(Relaxed);
+        assert_eq!(written, 90 * PERIOD as u64);
         // The returned items are freed here, off the audio thread.
         let events = rig.events();
         assert_eq!(count(&events, |e| matches!(e, Event::OldTaps(_))), 1);
-        assert_eq!(count(&events, |e| matches!(e, Event::DroppedTap(_))), 1);
+        assert_eq!(count(&events, |e| matches!(e, Event::DroppedTap(_))), 2);
     }
 
     #[test]
