@@ -286,7 +286,7 @@ fn pactl_style_introspection_sees_one_sink() {
     assert_eq!(spec.channels, 2);
     assert!(spec.rate >= 8000);
     assert_eq!(reader.string(), Some("aas"));
-    assert_eq!(reader.string(), None, "no default source");
+    assert_eq!(reader.string(), Some("aas.monitor"), "the default source");
     assert!(reader.u32().is_some(), "a cookie");
     assert_eq!(reader.channel_map(), Some(vec![1, 2]));
 
@@ -303,7 +303,6 @@ fn pactl_style_introspection_sees_one_sink() {
         wire::GET_CARD_INFO_LIST,
         wire::GET_MODULE_INFO_LIST,
         wire::GET_SAMPLE_INFO_LIST,
-        wire::GET_SOURCE_INFO_LIST,
         wire::GET_SINK_INPUT_INFO_LIST,
     ] {
         let (reply, _, body) = client.command(command, &[]);
@@ -1122,4 +1121,190 @@ fn connections_beyond_the_cap_are_closed() {
     std::thread::sleep(Duration::from_millis(400));
     let mut again = RawPulse::connect(&daemon.pulse_socket());
     again.auth();
+}
+
+/// What a source info reply says, read field by field as libpulse 17 reads
+/// it for protocol 35.
+struct SourceInfo {
+    index: u32,
+    name: String,
+    monitor_of: u32,
+    monitor_of_name: Option<String>,
+    flags: u32,
+    volume: Vec<u32>,
+    mute: bool,
+}
+
+/// Reads one source info from `r`, panicking where libpulse would fail the
+/// connection with a protocol error.
+fn read_source_info_as_libpulse(r: &mut Reader) -> SourceInfo {
+    let index = r.u32().expect("index");
+    let name = r.string().expect("name").to_string();
+    r.string().expect("description");
+    let spec = r.sample_spec().expect("sample spec");
+    assert_eq!((spec.format, spec.channels), (wire::FORMAT_S32LE, 2));
+    assert_eq!(r.channel_map(), Some(vec![1, 2]));
+    assert_eq!(r.u32(), Some(wire::INVALID_INDEX), "no owner module");
+    let volume = r.cvolume().expect("volume");
+    let mute = r.boolean().expect("mute");
+    let monitor_of = r.u32().expect("monitor of sink");
+    let monitor_of_name = r.string().map(str::to_string);
+    r.usec().expect("latency");
+    r.string().expect("driver");
+    let flags = r.u32().expect("flags");
+    r.proplist().expect("proplist");
+    r.usec().expect("configured latency");
+    assert_eq!(r.volume(), Some(wire::VOLUME_NORM), "base volume");
+    r.u32().expect("state");
+    r.u32().expect("volume steps");
+    assert_eq!(r.u32(), Some(wire::INVALID_INDEX), "no card");
+    assert_eq!(r.u32(), Some(0), "no ports");
+    let _ = r.string(); // active port, may be null
+    let formats = r.u8().expect("format count");
+    assert_eq!(formats, 1, "libpulse refuses a source without formats");
+    r.format_info().expect("a format");
+    SourceInfo {
+        index,
+        name,
+        monitor_of,
+        monitor_of_name,
+        flags,
+        volume,
+        mute,
+    }
+}
+
+fn pactl(daemon: &Daemon) -> RawPulse {
+    let mut client = RawPulse::connect(&daemon.pulse_socket());
+    client.auth();
+    client.set_name("pactl");
+    client
+}
+
+#[test]
+fn the_sources_are_listed() {
+    let daemon = Daemon::start();
+    let mut client = pactl(&daemon);
+    let (command, _, body) = client.command(wire::GET_SOURCE_INFO_LIST, &[]);
+    assert_eq!(command, wire::REPLY);
+    let mut r = Reader::new(&body);
+    let source = read_source_info_as_libpulse(&mut r);
+    assert!(r.eof(), "one source without an analog input");
+    assert_eq!((source.index, source.name.as_str()), (0, "aas.monitor"));
+    assert_eq!(source.monitor_of, 0);
+    assert_eq!(source.monitor_of_name.as_deref(), Some("aas"));
+    assert_eq!(source.volume, vec![wire::VOLUME_NORM; 2]);
+    assert!(!source.mute);
+    assert_eq!(source.flags, 0x2, "PA_SOURCE_LATENCY");
+
+    let mut body = Builder::new();
+    body.u32(wire::INVALID_INDEX);
+    body.string("aas.monitor");
+    let (command, _, reply) = client.command(wire::GET_SOURCE_INFO, &body.into_vec());
+    assert_eq!(command, wire::REPLY);
+    let mut r = Reader::new(&reply);
+    assert_eq!(read_source_info_as_libpulse(&mut r).index, 0);
+    assert!(r.eof());
+
+    let mut body = Builder::new();
+    body.u32(1);
+    body.null_string();
+    let (command, _, reply) = client.command(wire::GET_SOURCE_INFO, &body.into_vec());
+    assert_eq!(command, wire::ERROR);
+    assert_eq!(Reader::new(&reply).u32(), Some(wire::ERR_NOENTITY));
+
+    let (command, _, body) = client.command(wire::GET_SOURCE_OUTPUT_INFO_LIST, &[]);
+    assert_eq!(command, wire::REPLY);
+    assert!(body.is_empty(), "no record streams yet");
+}
+
+#[test]
+fn the_sink_names_its_monitor() {
+    let daemon = Daemon::start();
+    let mut client = pactl(&daemon);
+    let (command, _, body) = client.command(wire::GET_SINK_INFO_LIST, &[]);
+    assert_eq!(command, wire::REPLY);
+    let mut r = Reader::new(&body);
+    r.u32().unwrap();
+    r.string().unwrap();
+    r.string().unwrap();
+    r.sample_spec().unwrap();
+    r.channel_map().unwrap();
+    r.u32().unwrap();
+    r.cvolume().unwrap();
+    r.boolean().unwrap();
+    assert_eq!(r.u32(), Some(0), "monitor source");
+    assert_eq!(r.string(), Some("aas.monitor"), "monitor source name");
+    assert_eq!(read_sink_info_as_libpulse(&body), 1);
+}
+
+fn lookup_source(client: &mut RawPulse, name: &str) -> Result<u32, u32> {
+    let mut body = Builder::new();
+    body.string(name);
+    let (command, _, reply) = client.command(wire::LOOKUP_SOURCE, &body.into_vec());
+    let value = Reader::new(&reply).u32().expect("an index or a code");
+    if command == wire::REPLY {
+        Ok(value)
+    } else {
+        Err(value)
+    }
+}
+
+#[test]
+fn the_default_source_is_the_monitor_without_an_analog_input() {
+    let daemon = Daemon::start();
+    let mut client = pactl(&daemon);
+    let (command, _, body) = client.command(wire::GET_SERVER_INFO, &[]);
+    assert_eq!(command, wire::REPLY);
+    let mut r = Reader::new(&body);
+    for _ in 0..4 {
+        r.string();
+    }
+    r.sample_spec().unwrap();
+    assert_eq!(r.string(), Some("aas"), "default sink");
+    assert_eq!(r.string(), Some("aas.monitor"), "default source");
+    assert_eq!(lookup_source(&mut client, "@DEFAULT_SOURCE@"), Ok(0));
+    assert_eq!(lookup_source(&mut client, "@DEFAULT_MONITOR@"), Ok(0));
+    assert_eq!(lookup_source(&mut client, "aas.monitor"), Ok(0));
+    assert_eq!(
+        lookup_source(&mut client, "aas.analog"),
+        Err(wire::ERR_NOENTITY)
+    );
+}
+
+#[test]
+fn source_volume_is_fixed() {
+    let daemon = Daemon::start();
+    let mut client = pactl(&daemon);
+    let mut body = Builder::new();
+    body.u32(0);
+    body.null_string();
+    body.cvolume(&[wire::VOLUME_NORM / 2; 2]);
+    let (command, _, reply) = client.command(wire::SET_SOURCE_VOLUME, &body.into_vec());
+    assert_eq!(command, wire::ERROR);
+    assert_eq!(Reader::new(&reply).u32(), Some(wire::ERR_NOTSUPPORTED));
+    let mut body = Builder::new();
+    body.u32(0);
+    body.null_string();
+    body.boolean(true);
+    let (command, _, reply) = client.command(wire::SET_SOURCE_MUTE, &body.into_vec());
+    assert_eq!(command, wire::ERROR);
+    assert_eq!(Reader::new(&reply).u32(), Some(wire::ERR_NOTSUPPORTED));
+    let (command, _, _) = client.command(wire::GET_SERVER_INFO, &[]);
+    assert_eq!(command, wire::REPLY);
+}
+
+#[test]
+fn set_default_source_names_one_of_ours() {
+    let daemon = Daemon::start();
+    let mut client = pactl(&daemon);
+    let mut body = Builder::new();
+    body.string("aas.monitor");
+    let (command, _, _) = client.command(wire::SET_DEFAULT_SOURCE, &body.into_vec());
+    assert_eq!(command, wire::REPLY);
+    let mut body = Builder::new();
+    body.string("nonsense");
+    let (command, _, reply) = client.command(wire::SET_DEFAULT_SOURCE, &body.into_vec());
+    assert_eq!(command, wire::ERROR);
+    assert_eq!(Reader::new(&reply).u32(), Some(wire::ERR_NOENTITY));
 }

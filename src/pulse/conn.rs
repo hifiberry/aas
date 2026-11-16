@@ -1,6 +1,7 @@
 //! One PulseAudio connection: its handshake, state and command dispatch.
 
-use crate::pulse::objects;
+use crate::pulse::Settings;
+use crate::pulse::objects::{self, Source};
 use crate::pulse::packet::{Encoder, Frame, Reader as Framer};
 use crate::pulse::registry::{Event, Registry, Remote};
 use crate::pulse::stream::{Stream, now_timeval};
@@ -32,7 +33,7 @@ static NEXT_CLIENT: AtomicU32 = AtomicU32::new(1);
 pub fn serve(
     stream: UnixStream,
     daemon_socket: &std::path::Path,
-    buffer_ms: u32,
+    settings: Settings,
     stop: &AtomicBool,
     shutdown: &AtomicBool,
     registry: Arc<Registry>,
@@ -40,7 +41,7 @@ pub fn serve(
     let peer_pid = peer_pid(&stream);
     let _ = stream.set_read_timeout(Some(IDLE_TICK));
     let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
-    let mut conn = Conn::new(stream, daemon_socket, buffer_ms, peer_pid, registry);
+    let mut conn = Conn::new(stream, daemon_socket, settings, peer_pid, registry);
     let mut buf = [0u8; 8192];
     let mut tick = IDLE_TICK;
     while !stop.load(Ordering::Relaxed) && !shutdown.load(Ordering::Relaxed) && !conn.done {
@@ -97,7 +98,7 @@ pub struct Conn {
     framer: Framer,
     out: Vec<u8>,
     daemon_socket: std::path::PathBuf,
-    buffer_ms: u32,
+    settings: Settings,
     peer_pid: Option<u32>,
     authorized: bool,
     version: u32,
@@ -117,7 +118,7 @@ impl Conn {
     fn new(
         stream: UnixStream,
         daemon_socket: &std::path::Path,
-        buffer_ms: u32,
+        settings: Settings,
         peer_pid: Option<u32>,
         registry: Arc<Registry>,
     ) -> Conn {
@@ -132,7 +133,7 @@ impl Conn {
             framer: Framer::new(),
             out: Vec::new(),
             daemon_socket: daemon_socket.to_path_buf(),
-            buffer_ms,
+            settings,
             peer_pid,
             authorized: false,
             version: 0,
@@ -200,10 +201,23 @@ impl Conn {
             wire::SET_SINK_INPUT_VOLUME => self.set_sink_input_volume(&mut reader, tag),
             wire::SET_SINK_INPUT_MUTE => self.set_sink_input_mute(&mut reader, tag),
             wire::SET_DEFAULT_SINK => self.set_default_sink(&mut reader, tag),
+            wire::GET_SOURCE_INFO => self.source_info(&mut reader, tag),
+            wire::GET_SOURCE_INFO_LIST => self.source_info_list(tag),
+            wire::LOOKUP_SOURCE => self.lookup_source(&mut reader, tag),
+            wire::SET_DEFAULT_SOURCE => self.set_default_source(&mut reader, tag),
+            wire::SET_SOURCE_VOLUME
+            | wire::SET_SOURCE_MUTE
+            | wire::SET_SOURCE_OUTPUT_VOLUME
+            | wire::SET_SOURCE_OUTPUT_MUTE => {
+                self.send_error(tag, wire::ERR_NOTSUPPORTED, "a source's volume is fixed")
+            }
+            wire::GET_SOURCE_OUTPUT_INFO => {
+                self.send_error(tag, wire::ERR_NOENTITY, "no such record stream")
+            }
             wire::GET_CARD_INFO_LIST
             | wire::GET_MODULE_INFO_LIST
             | wire::GET_SAMPLE_INFO_LIST
-            | wire::GET_SOURCE_INFO_LIST => self.send_reply(tag, Vec::new()),
+            | wire::GET_SOURCE_OUTPUT_INFO_LIST => self.send_reply(tag, Vec::new()),
             wire::STAT => self.stat(tag),
             wire::LOOKUP_SINK => self.lookup_sink(&mut reader, tag),
             wire::SUBSCRIBE => self.subscribe(&mut reader, tag),
@@ -283,7 +297,7 @@ impl Conn {
         let host = std::fs::read_to_string("/proc/sys/kernel/hostname")
             .map(|name| name.trim_end().to_string())
             .unwrap_or_else(|_| "aas".into());
-        let body = objects::server_info(rate, &user, &host);
+        let body = objects::server_info(rate, &user, &host, self.registry.default_source());
         self.send_reply(tag, body);
     }
 
@@ -319,6 +333,74 @@ impl Conn {
         };
         let latency = self.registry.sink_latency();
         objects::sink_info(rate, level, mute, latency, state)
+    }
+
+    fn find_source(&self, index: Option<u32>, name: Option<&str>) -> Option<Source> {
+        let default = self.registry.default_source();
+        objects::find_source(index, name, default, self.settings.analog)
+    }
+
+    fn source_info_body(&mut self, source: Source) -> Vec<u8> {
+        let rate = self.daemon_rate();
+        // The monitor hears what the sink plays, so it lags as the sink
+        // does; nothing measures the analog input's latency yet.
+        let latency = match source {
+            Source::Monitor => self.registry.sink_latency(),
+            Source::Analog => 0,
+        };
+        objects::source_info(source, rate, latency)
+    }
+
+    fn source_info(&mut self, reader: &mut Reader, tag: u32) {
+        let index = reader.u32();
+        let name = reader.string();
+        let Some(source) = self.find_source(index, name) else {
+            self.send_error(tag, wire::ERR_NOENTITY, "no such source");
+            return;
+        };
+        let body = self.source_info_body(source);
+        self.send_reply(tag, body);
+    }
+
+    fn source_info_list(&mut self, tag: u32) {
+        let mut body = Vec::new();
+        for source in objects::sources(self.settings.analog) {
+            body.extend(self.source_info_body(source));
+        }
+        self.send_reply(tag, body);
+    }
+
+    fn lookup_source(&mut self, reader: &mut Reader, tag: u32) {
+        let Some(name) = reader.string() else {
+            self.send_error(tag, wire::ERR_INVALID, "no source name");
+            return;
+        };
+        match self.find_source(None, Some(name)) {
+            Some(source) => {
+                let mut body = Builder::new();
+                body.u32(source.index());
+                self.send_reply(tag, body.into_vec());
+            }
+            None => self.send_error(tag, wire::ERR_NOENTITY, "no such source"),
+        }
+    }
+
+    fn set_default_source(&mut self, reader: &mut Reader, tag: u32) {
+        let Some(name) = reader.string() else {
+            self.send_error(tag, wire::ERR_INVALID, "no source name");
+            return;
+        };
+        if name == "@NONE@" {
+            self.send_reply(tag, Vec::new());
+            return;
+        }
+        match self.find_source(None, Some(name)) {
+            Some(source) => {
+                self.registry.set_default_source(source);
+                self.send_reply(tag, Vec::new());
+            }
+            None => self.send_error(tag, wire::ERR_NOENTITY, "no such source"),
+        }
     }
 
     fn client_info(&mut self, reader: &mut Reader, tag: u32) {
@@ -388,7 +470,7 @@ impl Conn {
         let created = Stream::create(
             &self.daemon_socket,
             self.peer_pid,
-            self.buffer_ms,
+            self.settings.buffer_ms,
             self.client_index,
             index,
             reader,

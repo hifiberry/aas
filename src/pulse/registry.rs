@@ -1,5 +1,6 @@
 //! The objects a PulseAudio context can see, and the events about them.
 
+use crate::pulse::objects::Source;
 use crate::pulse::wire;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -52,11 +53,13 @@ pub struct Registry {
     /// measured it.
     sink_latency: AtomicU64,
     next_stream: AtomicU32,
+    default_source: Mutex<Source>,
     events: Mutex<Vec<Sender<Event>>>,
 }
 
-impl Default for Registry {
-    fn default() -> Self {
+impl Registry {
+    /// An empty registry. With an analog input, it is the default source.
+    pub fn new(analog: bool) -> Self {
         Registry {
             clients: Mutex::new(BTreeMap::new()),
             inboxes: Mutex::new(BTreeMap::new()),
@@ -64,12 +67,15 @@ impl Default for Registry {
             sink_mute: Mutex::new(None),
             sink_latency: AtomicU64::new(0),
             next_stream: AtomicU32::new(1),
+            default_source: Mutex::new(if analog {
+                Source::Analog
+            } else {
+                Source::Monitor
+            }),
             events: Mutex::new(Vec::new()),
         }
     }
-}
 
-impl Registry {
     pub fn next_stream(&self) -> u32 {
         self.next_stream.fetch_add(1, Ordering::Relaxed)
     }
@@ -200,6 +206,23 @@ impl Registry {
         *self.sink_mute.lock().unwrap() = percent;
     }
 
+    pub fn default_source(&self) -> Source {
+        *self.default_source.lock().unwrap()
+    }
+
+    /// Makes `source` the default, and tells subscribers the server
+    /// changed if it did.
+    pub fn set_default_source(&self, source: Source) {
+        let previous = std::mem::replace(&mut *self.default_source.lock().unwrap(), source);
+        if previous != source {
+            self.notify(Event {
+                facility: wire::EVENT_SERVER,
+                change: wire::EVENT_CHANGE,
+                index: wire::INVALID_INDEX,
+            });
+        }
+    }
+
     pub fn subscribe(self: &Arc<Self>) -> Receiver<Event> {
         let (sender, receiver) = channel();
         self.events.lock().unwrap().push(sender);
@@ -220,7 +243,7 @@ mod tests {
 
     #[test]
     fn a_subscriber_hears_membership() {
-        let registry = Arc::new(Registry::default());
+        let registry = Arc::new(Registry::new(false));
         let events = registry.subscribe();
         registry.add_client(1, "mpv".into());
         registry.rename_client(1, "mpv-2".into());
@@ -231,5 +254,22 @@ mod tests {
         assert_eq!(heard[1].change, wire::EVENT_CHANGE);
         assert_eq!(heard[2].change, wire::EVENT_REMOVE);
         assert!(registry.clients().is_empty());
+    }
+
+    #[test]
+    fn the_default_source_is_the_analog_input_when_there_is_one() {
+        assert_eq!(Registry::new(false).default_source(), Source::Monitor);
+        let registry = Arc::new(Registry::new(true));
+        assert_eq!(registry.default_source(), Source::Analog);
+        let events = registry.subscribe();
+        registry.set_default_source(Source::Monitor);
+        registry.set_default_source(Source::Monitor);
+        assert_eq!(registry.default_source(), Source::Monitor);
+        let heard: Vec<Event> = events.try_iter().collect();
+        assert_eq!(heard.len(), 1, "only a change is announced");
+        assert_eq!(
+            heard[0].facility | heard[0].change,
+            wire::EVENT_SERVER | wire::EVENT_CHANGE
+        );
     }
 }

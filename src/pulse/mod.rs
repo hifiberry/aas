@@ -13,7 +13,7 @@ pub mod volume;
 pub mod tagstruct;
 pub mod wire;
 
-use crate::config::Config;
+use crate::config::{self, Config};
 use crate::pulse::registry::Registry;
 use std::fs;
 use std::io;
@@ -29,6 +29,17 @@ const ACCEPT_PAUSE: Duration = Duration::from_millis(100);
 /// The most PulseAudio connections served at once, as the HTTP API caps
 /// its own. One more is closed at once and logged.
 const MAX_CONNECTIONS: usize = 32;
+
+/// What every connection needs from the config.
+#[derive(Clone, Copy, Debug)]
+pub struct Settings {
+    /// A playback stream's ring, in milliseconds.
+    pub buffer_ms: u32,
+    /// Whether the analog input is a source.
+    pub analog: bool,
+    pub quality: config::Quality,
+    pub format: config::Format,
+}
 
 /// A running endpoint. Dropping it stops the listener and removes the
 /// socket.
@@ -91,11 +102,16 @@ pub fn spawn(
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = stop.clone();
     let daemon = daemon_socket.to_path_buf();
-    let buffer_ms = config.pulse_buffer_ms.map(u32::from).unwrap_or(200);
-    let registry = Arc::new(Registry::default());
+    let settings = Settings {
+        buffer_ms: config.pulse_buffer_ms.map(u32::from).unwrap_or(200),
+        analog: config.analog.enabled,
+        quality: config.resampling,
+        format: config.format,
+    };
+    let registry = Arc::new(Registry::new(settings.analog));
     let listener = thread::Builder::new()
         .name("aas-pulse".into())
-        .spawn(move || accept_loop(listener, daemon, buffer_ms, thread_stop, shutdown, registry))?;
+        .spawn(move || accept_loop(listener, daemon, settings, thread_stop, shutdown, registry))?;
     eprintln!("aas: PulseAudio on {}", path.display());
     Ok(Some(Pulse {
         path,
@@ -119,7 +135,7 @@ fn socket_path(config: &Config, daemon_socket: &Path) -> Option<PathBuf> {
 fn accept_loop(
     listener: UnixListener,
     daemon: PathBuf,
-    buffer_ms: u32,
+    settings: Settings,
     stop: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
     registry: Arc<Registry>,
@@ -140,7 +156,7 @@ fn accept_loop(
                     .name("aas-pulse-conn".into())
                     .spawn(move || {
                         let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            conn::serve(stream, &daemon, buffer_ms, &stop, &shutdown, registry);
+                            conn::serve(stream, &daemon, settings, &stop, &shutdown, registry);
                         }));
                         if ran.is_err() {
                             eprintln!("aas: pulse: a connection failed");
