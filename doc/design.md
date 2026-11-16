@@ -34,7 +34,6 @@ built for them now.
 - Network audio, including AES67
 - USB audio gadget
 - Porting `speakereq` to a native plugin
-- Recording through the PulseAudio endpoint
 
 For some time HiFiBerry OS ships both audio servers, PipeWire and `aas`, and the
 user selects which one runs *(owner's call)*. So the first shipped version is an
@@ -159,8 +158,8 @@ is also how most players that advertise PipeWire support emit audio: they link
 itself, and PipeWire is neither required nor started *(call)*. This is the form
 "PipeWire support" takes under `aas`.
 
-Playback is in this stage. Recording, and with it source objects, comes later
-*(call)*.
+Playback came first; recording, from the analog input and from a monitor of the
+output, follows in "Recording" below *(owner's call)*.
 
 The front end runs inside the daemon, one thread per PulseAudio connection. Each
 playback stream is a client of the daemon over its own connection to the client
@@ -269,8 +268,9 @@ A playback stream is negotiated with the client:
   mixer does: a change for a stream of another connection is handed to that
   connection, which applies it on its next check and answers at once.
   One client object per PulseAudio connection.
-- Card, module, sample and source lists are empty. The card is `aas`'s to own, and
-  a client that lists them sees nothing rather than a graph *(call)*.
+- Card, module and sample lists are empty. The card is `aas`'s to own, and a
+  client that lists them sees nothing rather than a graph *(call)*. Sources are
+  in "Recording" below.
 - Subscriptions receive NEW, CHANGE and REMOVE for clients, sink inputs and the
   sink. Output volume changes made through ALSA, the API or another PulseAudio
   client are sent on as sink volume events, and changes to a client's gain,
@@ -347,9 +347,63 @@ the 20-byte request and 8-byte reply and need no version change:
   aside while a reply is awaited, as the ALSA control plugin already does by
   hand. One subscription serves every PulseAudio subscriber.
 
+### Recording
+
+A PulseAudio client can record two sources *(owner's call)*:
+
+- `aas.analog`, the analog input after its chain, exactly what an ALSA capture
+  client of `aas` gets today. It exists only with an analog input configured.
+- `aas.monitor`, the monitor of the sink `aas`: what the master card gets, at
+  the same point the output meter of `/levels` reads, after the mix, the
+  plugins and a software volume, before the card's conversion. With a hardware
+  volume it is therefore before the volume, as PulseAudio's own monitors are.
+  Only the master output is monitored; of a card with more than two channels,
+  the first two. While the master plays DoP the monitor carries zeros, since
+  DoP is not PCM *(call)*.
+
+The default source is `aas.analog` where there is one, otherwise
+`aas.monitor`, and the sink reports `aas.monitor` as its monitor source *(call)*.
+
+**In the daemon.** A monitor is a capture tap like a recorder's: a ring per
+client that the audio thread writes each period, never waiting and never
+allocating, with frames lost to a full ring counted as overruns. It is fed from
+the master's final block instead of the analog period. `Configure` asks for it
+with a second flag bit beside the capture bit, so the request keeps its 20 bytes
+and the protocol its version. Like a recorder it gets the cycle's rate, ends
+when that rate changes, and receives zeros while the master is parked and
+nothing while the output is off. A monitor tap never holds the output open,
+never sets its rate and never touches bit-perfect: it only reads *(call)*.
+
+**In the endpoint.** `CREATE_RECORD_STREAM` opens a capture or monitor stream on
+the daemon, the same one-connection-per-stream rule as playback. The endpoint
+converts what the ring delivers, stereo S32 at the daemon's rate, into the
+client's spec: mono by averaging the two channels, the client's sample format,
+and its rate with the daemon's own resampler. This runs on the connection's
+thread, not the audio thread. Data goes to the client as memblocks of its
+`fragsize`, by default 25 ms, checked as often as a playing stream is. When the
+daemon's rate changes the ring ends; the endpoint opens a new one at the new
+rate and goes on, so the client sees a short gap, not an error *(call)*.
+
+Commands added: `CREATE_RECORD_STREAM`, `DELETE_RECORD_STREAM`,
+`CORK_RECORD_STREAM`, `FLUSH_RECORD_STREAM`, `GET_RECORD_LATENCY`,
+`SET_RECORD_STREAM_BUFFER_ATTR`, `SET_RECORD_STREAM_NAME`,
+`UPDATE_RECORD_STREAM_PROPLIST`, `REMOVE_RECORD_STREAM_PROPLIST`,
+`GET_SOURCE_INFO`, `GET_SOURCE_INFO_LIST`, `LOOKUP_SOURCE`,
+`GET_SOURCE_OUTPUT_INFO`, `GET_SOURCE_OUTPUT_INFO_LIST`, and
+`SET_DEFAULT_SOURCE` for the two names and `@DEFAULT_SOURCE@` and
+`@DEFAULT_MONITOR@`; server to client, the audio as memblocks,
+`RECORD_STREAM_KILLED` when the daemon connection ends, and `OVERFLOW` for a new
+overrun. Subscriptions add NEW, CHANGE and REMOVE for sources and source
+outputs. A source's volume and mute, and a source output's, are fixed at 100
+percent and unmuted: setting them gets `PA_ERR_NOTSUPPORTED`, so a recording
+is never changed behind the other clients' backs *(call)*.
+
+A recording client is a client of the daemon like any other: it appears in the
+API by its process name, and `/metrics` counts its overruns.
+
 ### Later
 
-Recording and `parec`, SHM, the shared-ringbuffer channel and memfd pools, TCP
+SHM, the shared-ringbuffer channel and memfd pools, TCP
 and network PulseAudio, loadable modules, moving or suspending streams,
 per-channel volume, and the native PipeWire protocol or a `libpipewire` shim.
 
