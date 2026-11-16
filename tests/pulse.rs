@@ -1653,9 +1653,11 @@ fn record_a_client_that_stops_reading_gets_an_overflow() {
     assert_eq!(command, wire::REPLY);
     let reply = read_record_reply(&reply);
     assert_eq!(reply.maxlength, 9600);
+    // 300 ms is about 58 KB, which the socket alone would hold: only the
+    // stream's own limit makes this an overflow.
     let mut other = pactl(&daemon);
     let start = Instant::now();
-    while start.elapsed() < Duration::from_secs(1) {
+    while start.elapsed() < Duration::from_millis(300) {
         let asked = Instant::now();
         let (command, _, _) = other.command(wire::GET_SERVER_INFO, &[]);
         assert_eq!(command, wire::REPLY);
@@ -1669,6 +1671,35 @@ fn record_a_client_that_stops_reading_gets_an_overflow() {
         "no OVERFLOW among {} packets",
         packets.len()
     );
+}
+
+#[test]
+fn record_a_stalled_high_rate_recording_overflows_and_keeps_its_connection() {
+    let daemon = Daemon::start();
+    let mut recorder = pactl(&daemon);
+    // 192 kHz float stereo is 1.5 MB a second, and its default maxlength
+    // of 2 s is 3 MB: far beyond what a connection may queue.
+    let spec = SampleSpec {
+        format: wire::FORMAT_FLOAT32LE,
+        channels: 2,
+        rate: 192_000,
+    };
+    let body = record_body(spec, 0, None, u32::MAX, false, 0);
+    let (command, _, reply) = recorder.command(wire::CREATE_RECORD_STREAM, &body);
+    assert_eq!(command, wire::REPLY);
+    let reply = read_record_reply(&reply);
+    assert!(reply.maxlength > 2 << 20, "maxlength {}", reply.maxlength);
+    // Long enough to queue more than the 1 MiB a connection may hold.
+    std::thread::sleep(Duration::from_millis(1500));
+    let (_, packets) = recorder.collect(reply.stream, Duration::from_millis(300));
+    assert!(
+        packets.iter().any(|(command, body)| *command == wire::OVERFLOW
+            && Reader::new(body).u32() == Some(reply.stream)),
+        "no OVERFLOW among {} packets",
+        packets.len()
+    );
+    let (command, _, _) = recorder.command(wire::GET_SERVER_INFO, &[]);
+    assert_eq!(command, wire::REPLY, "the connection is still served");
 }
 
 /// Reads one source output info as libpulse 17 reads it for protocol 35

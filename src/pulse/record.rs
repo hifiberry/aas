@@ -31,6 +31,11 @@ const MAX_FRAGMENT: u32 = 65_536;
 const DEFAULT_MAXLENGTH_MS: u64 = 2_000;
 /// The most that ever waits to be sent, PulseAudio's own cap on a queue.
 const MAX_LENGTH: u32 = 4 << 20;
+/// The most a stream lets wait for the client on its way, in the
+/// connection's queue and the socket, whatever its maxlength. Well below
+/// the 1 MiB at which a connection is closed, so a stalled client
+/// overflows its stream instead of losing its connection.
+const SEND_BUDGET: usize = 256 << 10;
 /// Frames read from the daemon's ring at a time.
 const CHUNK: usize = 1024;
 /// Output frames of one resampler call.
@@ -277,7 +282,7 @@ impl Record {
     /// Polls the stream: reads what the daemon recorded, reopens it after
     /// a rate change, and returns the fragments ready to go, as long as
     /// what `backlog` says still waits for the client is below
-    /// `maxlength`. A new overrun sends one `OVERFLOW`.
+    /// `send_limit`. A new overrun sends one `OVERFLOW`.
     pub fn poll(&mut self, backlog: usize) -> RecordPolled {
         let gone = RecordPolled {
             packets: Vec::new(),
@@ -309,7 +314,7 @@ impl Record {
             packets.push(Encoder.packet(wire::INVALID_INDEX, &wire::overflow(self.index)));
         }
         let mut sent = backlog;
-        while sent < self.pending.maxlength as usize {
+        while sent < send_limit(self.pending.maxlength) {
             let Some(chunk) = self.pending.take(self.fragsize as usize) else {
                 break;
             };
@@ -464,6 +469,12 @@ impl Pending {
     }
 }
 
+/// How much may wait for the client on its way before a stream holds its
+/// fragments back: its maxlength, at most `SEND_BUDGET`.
+fn send_limit(maxlength: u32) -> usize {
+    (maxlength as usize).min(SEND_BUDGET)
+}
+
 /// A fragment in bytes: `u32::MAX` or 0 is 25 ms, otherwise whole frames,
 /// at least one and at most 64 KiB.
 fn fragment_bytes(asked: u32, rate: u32, frame: u32) -> u32 {
@@ -515,6 +526,15 @@ mod tests {
         assert_eq!(max_length(9601, 48_000, 4, 4800), 9600);
         assert_eq!(max_length(100, 48_000, 4, 4800), 4800);
         assert_eq!(max_length(u32::MAX - 1, 48_000, 4, 4800), MAX_LENGTH);
+    }
+
+    #[test]
+    fn what_waits_for_the_client_stays_within_the_budget() {
+        assert_eq!(send_limit(9600), 9600);
+        assert_eq!(send_limit(MAX_LENGTH), SEND_BUDGET);
+        // Each poll sends while below the limit, so at most a fragment
+        // more; with the largest, still under the connection's 1 MiB.
+        assert!(send_limit(MAX_LENGTH) + MAX_FRAGMENT as usize <= 1 << 19);
     }
 
     #[test]

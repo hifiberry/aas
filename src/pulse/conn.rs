@@ -930,8 +930,9 @@ impl Conn {
 
     /// Polls the record streams after the playback ones. Each sends only
     /// while what the client has not read yet, here and in the socket, is
-    /// below its `maxlength`, so a client that stops reading overflows its
-    /// stream rather than this connection's memory.
+    /// below its `maxlength` and a budget well under this connection's
+    /// limit, so a client that stops reading overflows its stream rather
+    /// than losing its connection.
     fn poll_records(&mut self) {
         let queued = socket_queue(&self.stream);
         let mut dead = Vec::new();
