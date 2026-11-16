@@ -236,9 +236,12 @@ Found on the test board, in the configurator, under both servers:
   with no ADC: I2C probing finds the DAC first. The non-root run, which
   falls back to `aplay -l`, gets it right. The generated `aas.toml` then has
   no `[analog]`; `/etc/aas/aas.local.toml` works around it.
-- `GET /api/v1/systeminfo` takes 11 to 25 s on that board (card detection
-  without an EEPROM), so `audiocontrol` gives up at boot after three 10 s
-  tries and disables its volume control. The `audiocontrol` volume path under
+- `GET /api/v1/systeminfo` takes 11 to 25 s on that board, so
+  `audiocontrol` gives up at boot after three 10 s tries and disables its
+  volume control. Profiled: card detection takes under 0.4 s; the time is the
+  Bluetooth status, whose `get_object("org.bluez")` makes D-Bus try to start
+  BlueZ on a board without Bluetooth hardware (`bluetooth.service` skipped by
+  its condition) and wait for the activation timeout. The `audiocontrol` volume path under
   `aas` is therefore not tested yet.
 
 ## A reopen cuts the sound instead of fading it
