@@ -140,13 +140,19 @@ def dump(config):
 
 def fetch():
     deadline = time.monotonic() + RETRY_SECONDS
+    failed = None
     while True:
         try:
             with urllib.request.urlopen(URL, timeout=5) as r:
                 return json.load(r)
         except Exception as e:
-            log("config server not reachable: %s" % e)
+            # Logged once when it starts failing, not on every retry.
+            if failed is None:
+                log("config server not reachable: %s, retrying for %d s"
+                    % (e, RETRY_SECONDS))
+            failed = e
         if time.monotonic() >= deadline:
+            log("config server still not reachable: %s" % failed)
             return None
         time.sleep(1)
 
