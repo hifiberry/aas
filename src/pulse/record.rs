@@ -300,10 +300,9 @@ impl Record {
         let rate = match self.source {
             Source::Monitor => match &self.direct {
                 Some((index, registry)) => {
-                    let input = registry
-                        .sink_input(*index)
-                        .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
-                    self.daemon.configure_stream_monitor(frames, input.stream)?
+                    let id = registry.sink_input(*index).map(|input| input.stream);
+                    let id = monitored_stream(id)?;
+                    self.daemon.configure_stream_monitor(frames, id)?
                 }
                 None => self.daemon.configure_monitor(frames)?,
             },
@@ -623,6 +622,14 @@ fn fragment_bytes(asked: u32, rate: u32, frame: u32) -> u32 {
 
 /// The most that waits to be sent, in bytes: `u32::MAX` or 0 is 2 s,
 /// otherwise whole frames, at least `fragsize` and at most 4 MiB.
+/// The daemon id a meter of one sink input records. A sink input that is
+/// gone, or whose id is unknown (0 is the master), is not found: it must
+/// never fall back to recording the mix.
+fn monitored_stream(id: Option<u32>) -> io::Result<u32> {
+    id.filter(|&id| id != 0)
+        .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
+}
+
 fn max_length(asked: u32, rate: u32, frame: u32, fragsize: u32) -> u32 {
     let frame = frame.max(1);
     let bytes = if asked == 0 || asked == u32::MAX {
@@ -637,6 +644,15 @@ fn max_length(asked: u32, rate: u32, frame: u32, fragsize: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_sink_input_without_a_daemon_id_is_not_found() {
+        assert_eq!(monitored_stream(Some(7)).unwrap(), 7);
+        for id in [None, Some(0)] {
+            let e = monitored_stream(id).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::NotFound);
+        }
+    }
 
     #[test]
     fn peaks_take_the_largest_magnitude_per_interval() {
