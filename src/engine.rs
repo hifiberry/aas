@@ -884,10 +884,11 @@ impl Taps {
     }
 
     /// Writes what the master card gets this cycle to every running monitor
-    /// of it and wakes it as due: `samples` holds `channels` channels a frame, of
-    /// which a monitor takes the first two, or the one twice. The first
-    /// `silent` frames are not PCM, or not played, and are zeros instead,
-    /// so that a monitor keeps real time through DoP and while parked.
+    /// of it and wakes it as due: `samples` holds `channels` channels a
+    /// frame, of which a monitor takes the first two, or the one twice. The
+    /// first `silent` frames are not PCM, or not played, and are zeros
+    /// instead, so that a monitor keeps real time through DoP and while
+    /// parked.
     fn deliver_monitor(&mut self, samples: &[i32], channels: usize, silent: usize) {
         let Taps { table, buf } = self;
         let master = |t: &Tap| t.running && t.monitor && t.source == 0;
