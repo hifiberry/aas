@@ -1206,10 +1206,10 @@ impl HardwareVolume for FakeVolume {
         self.watch.known(db);
     }
 
-    fn read_db(&mut self) -> f32 {
+    fn read_db(&mut self) -> Option<f32> {
         let level = *self.level.lock().unwrap();
         self.watch.known(level);
-        level
+        Some(level)
     }
 
     fn changed(&mut self) -> Option<f32> {

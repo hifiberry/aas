@@ -469,7 +469,9 @@ mod mixer {
                 }
             }
             // What the control took, so it is not taken back in as a
-            // change another program made.
+            // change another program made. A change by another program
+            // landing between the write and this read is taken as aas's own
+            // and not followed; the window is one mixer call.
             if let Some(level) = self.level() {
                 self.watch.known(level);
             }
@@ -483,20 +485,13 @@ mod mixer {
             self.switch || self.floor_mutes
         }
 
-        fn read_db(&mut self) -> f32 {
-            match self.level() {
-                Some(db) => {
-                    self.watch.known(db);
-                    db
-                }
-                None => {
-                    eprintln!(
-                        "aas: taking the hardware volume as {} dB, it could not be read",
-                        self.range.1
-                    );
-                    self.range.1
-                }
+        fn read_db(&mut self) -> Option<f32> {
+            let level = self.level();
+            match level {
+                Some(db) => self.watch.known(db),
+                None => eprintln!("aas: the hardware volume could not be read"),
             }
+            level
         }
 
         fn changed(&mut self) -> Option<f32> {

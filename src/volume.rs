@@ -85,8 +85,9 @@ pub trait HardwareVolume: Send {
     /// Whether `set_db(f32::NEG_INFINITY)` silences the card. A control
     /// without a switch whose lowest step is not a mute cannot.
     fn can_mute(&self) -> bool;
-    /// The level now, `f32::NEG_INFINITY` when muted. It counts as known.
-    fn read_db(&mut self) -> f32;
+    /// The level now, `f32::NEG_INFINITY` when muted, none when the control
+    /// cannot be read. A level read counts as known.
+    fn read_db(&mut self) -> Option<f32>;
     /// A level someone else set since the last write, read or change.
     fn changed(&mut self) -> Option<f32>;
     /// False for a control `aas` follows but applies itself.
@@ -180,9 +181,19 @@ impl OutputVolume {
             self.set(percent);
             return;
         };
-        let read = hardware.read_db();
+        let Some(read) = hardware.read_db() else {
+            // Unreadable: the control is set to a known level instead.
+            self.set(percent);
+            return;
+        };
         let expected = level_for(percent, hardware.as_ref());
-        let same = if read.is_finite() && expected.is_finite() {
+        // A control that cannot mute sits at its lowest step at 0 percent,
+        // which reads as a finite level.
+        let at_floor =
+            percent == 0 && !hardware.can_mute() && read <= hardware.range_db().0 + SAME_DB;
+        let same = if at_floor {
+            true
+        } else if read.is_finite() && expected.is_finite() {
             (read - expected).abs() <= SAME_DB
         } else {
             read == expected
@@ -204,6 +215,10 @@ impl OutputVolume {
     /// on it. Without one the volume is carried in software from now on.
     pub fn replace_hardware(&mut self, hardware: Option<Box<dyn HardwareVolume>>) {
         self.hardware = hardware;
+        if self.hardware.is_none() && self.outside.is_some() {
+            // The software level stays the one that was followed.
+            return;
+        }
         self.adopt(self.percent);
     }
 
@@ -277,6 +292,7 @@ mod tests {
         level: Arc<Mutex<f32>>,
         watch: Watch,
         carries: bool,
+        unreadable: bool,
     }
 
     impl HardwareVolume for FakeHardware {
@@ -286,10 +302,13 @@ mod tests {
             self.watch.known(db);
         }
 
-        fn read_db(&mut self) -> f32 {
+        fn read_db(&mut self) -> Option<f32> {
+            if self.unreadable {
+                return None;
+            }
             let level = *self.level.lock().unwrap();
             self.watch.known(level);
-            level
+            Some(level)
         }
 
         fn changed(&mut self) -> Option<f32> {
@@ -338,6 +357,7 @@ mod tests {
             level: level.clone(),
             watch: Watch::default(),
             carries,
+            unreadable: false,
         };
         (Box::new(fake), set, level)
     }
@@ -642,6 +662,50 @@ mod tests {
         assert_eq!(volume.percent(), 0);
         volume.adopt(50);
         assert_eq!(volume.percent(), 0);
+    }
+
+    #[test]
+    fn adopt_of_the_floor_of_a_card_that_cannot_mute() {
+        for carries in [true, false] {
+            let (hw, set, level) = fake((-51.5, 0.0), false, carries);
+            *level.lock().unwrap() = -51.5;
+            let mut volume = OutputVolume::new(Some(hw), BitPerfect::Auto);
+            volume.adopt(0);
+            assert_eq!(volume.percent(), 0);
+            assert_eq!(volume.level_db(), None);
+            assert_eq!(volume.gain(), 0.0);
+            assert!(set.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn adopt_of_a_control_that_cannot_be_read_sets_it() {
+        let set = Arc::new(Mutex::new(Vec::new()));
+        let fake = FakeHardware {
+            range: (-103.5, 0.0),
+            mutes: true,
+            set: set.clone(),
+            level: Arc::new(Mutex::new(0.0)),
+            watch: Watch::default(),
+            carries: true,
+            unreadable: true,
+        };
+        let mut volume = OutputVolume::new(Some(Box::new(fake)), BitPerfect::Auto);
+        volume.adopt(40);
+        assert_eq!(volume.percent(), 40);
+        assert_eq!(last(&set), Some(-36.0));
+    }
+
+    #[test]
+    fn the_card_going_away_keeps_a_followed_level() {
+        let (hw, _) = reading((-103.5, 0.0), -80.0);
+        let mut volume = OutputVolume::new(Some(hw), BitPerfect::Auto);
+        volume.adopt(100);
+        assert_eq!(volume.level_db(), Some(-80.0));
+        volume.replace_hardware(None);
+        assert_eq!(volume.level_db(), Some(-80.0));
+        assert_eq!(volume.further_gain(-6.0), db_to_gain(-86.0));
+        assert_eq!(volume.gain(), db_to_gain(-80.0));
     }
 
     #[test]

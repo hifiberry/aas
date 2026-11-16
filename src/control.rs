@@ -1138,6 +1138,7 @@ impl Control {
     pub fn restore(&mut self, mut volume: OutputVolume, state: PathBuf, cards: &[String]) {
         let stored = State::load(&state);
         volume.adopt(stored.output_percent);
+        let followed = volume.percent() != stored.output_percent;
         self.volume = volume;
         self.analog_input = api::resolve_input(stored.analog.as_ref(), &self.analog_config);
         if let Some(card) = cards.first() {
@@ -1157,6 +1158,10 @@ impl Control {
         self.restore_plugins(&stored);
         self.state = stored;
         self.saver = Some(Saver::new(state));
+        if followed {
+            // The state file holds the level of the card's control.
+            self.save_later(Instant::now());
+        }
         eprintln!(
             "aas: output volume {}%, in {}",
             self.volume.percent(),
@@ -3142,10 +3147,10 @@ mod tests {
             self.watch.known(db);
         }
 
-        fn read_db(&mut self) -> f32 {
+        fn read_db(&mut self) -> Option<f32> {
             let level = *self.level.lock().unwrap();
             self.watch.known(level);
-            level
+            Some(level)
         }
 
         fn changed(&mut self) -> Option<f32> {
@@ -3261,6 +3266,28 @@ mod tests {
         assert!((gains[1].1 - db_to_gain(-26.0)).abs() < 1e-6, "{gains:?}");
         assert!(set.lock().unwrap().is_empty());
         control.tick(now + SAVE_DELAY);
+        assert!(saved(&path, 67));
+    }
+
+    #[test]
+    fn a_followed_level_at_restore_is_saved() {
+        let (mut control, _engine, _logs, _now) = started_with(&Config::default(), vec![]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        State {
+            output_percent: 30,
+            ..State::default()
+        }
+        .save(&path)
+        .unwrap();
+        let (fake, _set, _level) = mixer(-20.0);
+        control.restore(
+            OutputVolume::new(Some(fake), config::BitPerfect::Auto),
+            path.clone(),
+            &[],
+        );
+        assert_eq!(control.volume.percent(), 67);
+        control.tick(Instant::now() + SAVE_DELAY * 2);
         assert!(saved(&path, 67));
     }
 
