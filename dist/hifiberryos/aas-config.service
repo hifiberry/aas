@@ -1,6 +1,6 @@
 [Unit]
 Description=Write the aas configuration from the HiFiBerry system info
-After=config-server.service
+After=sound.target config-detect.service
 Before=aas.service
 
 [Service]

@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Write /etc/aas/aas.toml from the HiFiBerry config server's system info.
+"""Write /etc/aas/aas.toml from the sound card data of config-soundcard --json.
 
 Run at every boot by aas-config.service. The user's /etc/aas/aas.local.toml
 is merged over the generated values. Always exits 0.
@@ -9,17 +9,16 @@ import json
 import os
 import sys
 import tempfile
-import time
+import subprocess
 import tomllib
-import urllib.request
 
-URL = "http://127.0.0.1:1081/api/v1/systeminfo"
+COMMAND = ["/usr/bin/config-soundcard", "--json"]
+TIMEOUT = 20
 OUTPUT = "/etc/aas/aas.toml"
 LOCAL = "/etc/aas/aas.local.toml"
-RETRY_SECONDS = 30
 
 HEADER = (
-    "# Generated at every boot by aas-config from the HiFiBerry system info.\n"
+    "# Generated at every boot by aas-config from the HiFiBerry sound card data.\n"
     "# Do not edit: changes are overwritten. Put your own settings in\n"
     "# /etc/aas/aas.local.toml, which is merged over this file.\n"
 )
@@ -37,12 +36,13 @@ def config_from(systeminfo):
     index = card.get("hardware_index")
     if isinstance(index, int) and not isinstance(index, bool):
         cfg["card"] = str(index)
-    control = card.get("volume_control")
-    if isinstance(control, str) and control:
-        cfg["volume_control"] = control
-    else:
-        cfg["volume_control"] = "Softvol"
-        cfg["volume_mode"] = "follow"
+    if "card" in cfg:
+        control = card.get("volume_control")
+        if isinstance(control, str) and control:
+            cfg["volume_control"] = control
+        else:
+            cfg["volume_control"] = "Softvol"
+            cfg["volume_mode"] = "follow"
     types = card.get("card_type")
     if isinstance(types, str):
         types = [types]
@@ -138,23 +138,20 @@ def dump(config):
     return HEADER + ("\n" + body + "\n" if body else "")
 
 
-def fetch():
-    deadline = time.monotonic() + RETRY_SECONDS
-    failed = None
-    while True:
-        try:
-            with urllib.request.urlopen(URL, timeout=5) as r:
-                return json.load(r)
-        except Exception as e:
-            # Logged once when it starts failing, not on every retry.
-            if failed is None:
-                log("config server not reachable: %s, retrying for %d s"
-                    % (e, RETRY_SECONDS))
-            failed = e
-        if time.monotonic() >= deadline:
-            log("config server still not reachable: %s" % failed)
-            return None
-        time.sleep(1)
+def fetch(command=None):
+    """The sound card as {"soundcard": {...}}, or None if not available."""
+    command = command or COMMAND
+    try:
+        r = subprocess.run(command, stdin=subprocess.DEVNULL,
+                           capture_output=True, timeout=TIMEOUT, check=True)
+        data = json.loads(r.stdout)
+    except Exception as e:
+        log("no sound card data from %s: %s" % (command[0], e))
+        return None
+    if not isinstance(data, dict):
+        log("no sound card data from %s: not an object" % command[0])
+        return None
+    return {"soundcard": data}
 
 
 def read_local(path):
@@ -175,6 +172,8 @@ def write_atomic(path, text):
     try:
         with os.fdopen(fd, "w") as f:
             f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
         os.chmod(tmp, 0o644)
         os.rename(tmp, path)
     except BaseException:
@@ -187,7 +186,8 @@ def write_atomic(path, text):
 
 def main(argv=None):
     p = argparse.ArgumentParser()
-    p.add_argument("--systeminfo", help="read the system info from FILE")
+    p.add_argument("--systeminfo", help="read the system info from FILE "
+                   "instead of running config-soundcard")
     p.add_argument("--output", default=OUTPUT)
     p.add_argument("--local", default=LOCAL)
     args = p.parse_args(argv)
@@ -205,8 +205,13 @@ def main(argv=None):
             log("keeping the existing %s" % args.output)
             return 0
         generated = config_from(info) if info is not None else {}
-        merged = merge(generated, read_local(args.local))
-        write_atomic(args.output, dump(merged))
+        try:
+            text = dump(merge(generated, read_local(args.local)))
+        except Exception as e:
+            log("cannot write %s into the configuration: %s"
+                % (args.local, e))
+            text = dump(generated)
+        write_atomic(args.output, text)
         log("wrote %s" % args.output)
     except Exception as e:
         log("failed: %s" % e)

@@ -53,7 +53,10 @@ class ConfigFrom(unittest.TestCase):
         self.assertNotIn("analog", c)
 
     def test_no_card(self):
-        self.assertNotIn("card", mod.config_from(load("no-card")))
+        c = mod.config_from(load("no-card"))
+        self.assertNotIn("card", c)
+        self.assertNotIn("volume_control", c)
+        self.assertNotIn("volume_mode", c)
 
 
 class Merge(unittest.TestCase):
@@ -140,6 +143,53 @@ class Main(unittest.TestCase):
         c = tomllib.loads(self.read())
         self.assertEqual(c["card"], "1")
         self.assertEqual(c["analog"], {"enabled": True, "volume_db": -6})
+
+    def test_unwritable_local_value_dropped(self):
+        with open(self.local, "w") as f:
+            f.write("when = 2026-11-16T10:00:00\nlatency_ms = 8\n")
+        self.run_main(fixture_path("dacplus-adc-pro"))
+        self.assertEqual(tomllib.loads(self.read()),
+                         mod.config_from(load("dacplus-adc-pro")))
+
+    def test_failed_write_leaves_no_temp_file(self):
+        os.mkdir(self.out)  # the rename onto a directory fails
+        self.run_main(fixture_path("dacplus-adc-pro"))
+        self.assertEqual(os.listdir(self.tmp.name), ["aas.toml"])
+
+
+class Fetch(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def script(self, body):
+        path = os.path.join(self.tmp.name, "config-soundcard")
+        with open(path, "w") as f:
+            f.write("#!/bin/sh\n" + body + "\n")
+        os.chmod(path, 0o755)
+        return [path, "--json"]
+
+    def test_ok(self):
+        cmd = self.script("echo '{\"hardware_index\": 2}'")
+        self.assertEqual(mod.fetch(cmd), {"soundcard": {"hardware_index": 2}})
+
+    def test_missing(self):
+        self.assertIsNone(mod.fetch([os.path.join(self.tmp.name, "none")]))
+
+    def test_failure(self):
+        self.assertIsNone(mod.fetch(self.script("echo '{}'; exit 1")))
+
+    def test_bad_json(self):
+        self.assertIsNone(mod.fetch(self.script("echo nope")))
+
+    def test_not_an_object(self):
+        self.assertIsNone(mod.fetch(self.script("echo '[1]'")))
+
+    def test_timeout(self):
+        old = mod.TIMEOUT
+        mod.TIMEOUT = 0.2
+        self.addCleanup(setattr, mod, "TIMEOUT", old)
+        self.assertIsNone(mod.fetch(self.script("sleep 5")))
 
 
 if __name__ == "__main__":
