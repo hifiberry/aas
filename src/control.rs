@@ -1341,8 +1341,9 @@ impl Control {
             Request::Configure {
                 buffer_frames,
                 capture: true,
+                monitor,
                 ..
-            } => self.configure_recorder(conn, buffer_frames, now),
+            } => self.configure_recorder(conn, buffer_frames, monitor, now),
             Request::Configure {
                 rate,
                 format,
@@ -1759,7 +1760,13 @@ impl Control {
     /// or opens at next if it is closed. The ring holds what is asked for,
     /// and at least a few periods. Sends the tap to the audio thread, which
     /// writes it once it is started.
-    fn configure_recorder(&mut self, conn: ConnId, buffer_frames: u32, now: Instant) -> Answer {
+    fn configure_recorder(
+        &mut self,
+        conn: ConnId,
+        buffer_frames: u32,
+        monitor: bool,
+        now: Instant,
+    ) -> Answer {
         let rate = match self.output {
             Some((rate, _)) => rate,
             None => self.policy.current(),
@@ -1799,7 +1806,9 @@ impl Control {
             self.taps_capacity *= 2;
             batch.push(Command::GrowTaps(Vec::with_capacity(self.taps_capacity)));
         }
-        batch.push(Command::AddTap(Box::new(Tap::new(id, ring, wake))));
+        let mut tap = Tap::new(id, ring, wake);
+        tap.monitor = monitor;
+        batch.push(Command::AddTap(Box::new(tap)));
         self.taps_len += 1;
         let recorder = Recorder {
             id,
@@ -3580,6 +3589,11 @@ mod tests {
     /// Connects a client on `conn` and configures a capture stream.
     /// Returns the client's mapping of the ring.
     fn record(control: &mut Control, conn: ConnId, now: Instant) -> (Ring, u32) {
+        record_as(control, conn, false, now)
+    }
+
+    /// The same, for a monitor if `monitor` is set.
+    fn record_as(control: &mut Control, conn: ConnId, monitor: bool, now: Instant) -> (Ring, u32) {
         control.connected(conn, "recorder".into());
         let hello = Request::Hello {
             version: proto::VERSION,
@@ -3591,7 +3605,7 @@ mod tests {
             channels: 2,
             buffer_frames: 4096,
             capture: true,
-            monitor: false,
+            monitor,
         };
         let answer = control.request(conn, Some(capture), now);
         let Some(Reply::Configured { rate }) = answer.reply else {
@@ -3636,6 +3650,66 @@ mod tests {
         control.handle_events(now);
         assert_eq!(ring.header().ended.load(Ordering::Acquire), 1);
         assert_eq!(ask_start(&mut control, 2, now).reply, refused);
+    }
+
+    #[test]
+    fn a_monitor_does_not_open_the_output() {
+        let config = Config {
+            idle: Idle::Off { delay_s: 1 },
+            ..Config::default()
+        };
+        let (mut control, mut engine, now) = started(&config, None);
+        control.tick(now + Duration::from_secs(120));
+        assert!(has(&engine.take(true), "CloseOutput"));
+        control.handle_events(now);
+        assert!(!control.output_is_open());
+        let (_ring, rate) = record_as(&mut control, 2, true, now);
+        assert_eq!(rate, control.policy.current());
+        assert_eq!(ask_start(&mut control, 2, now).reply, Some(Reply::Ok));
+        let seen = engine.take(true);
+        assert!(!has(&seen, "Reconfigure"), "{seen:?}");
+        assert!(!has(&seen, "OpenOutput"), "{seen:?}");
+        assert!(!control.output_is_open());
+        assert_eq!(control.policy.current(), rate);
+    }
+
+    #[test]
+    fn a_monitor_ends_when_the_rate_changes() {
+        let (mut control, mut engine, now) = started(&Config::default(), None);
+        engine.take(true);
+        control.handle_events(now);
+        let (ring, _) = record_as(&mut control, 2, true, now);
+        let mut tap = None;
+        while let Ok(command) = engine.commands.pop() {
+            if let Command::AddTap(t) = command {
+                tap = Some(t);
+            }
+        }
+        let tap = tap.expect("no tap added");
+        assert_eq!(ask_start(&mut control, 2, now).reply, Some(Reply::Ok));
+        play(&mut control, 1, 44100, now);
+        let seen = engine.take(false);
+        assert!(has(&seen, &format!("RemoveTap {}", tap.id)), "{seen:?}");
+        assert_eq!(ring.header().ended.load(Ordering::Acquire), 0);
+        engine.send(Event::DroppedTap(tap));
+        control.handle_events(now);
+        assert_eq!(ring.header().ended.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn a_monitor_tap_is_sent_as_a_monitor() {
+        let (mut control, mut engine, now) = started(&Config::default(), None);
+        engine.take(true);
+        control.handle_events(now);
+        record_as(&mut control, 2, true, now);
+        record(&mut control, 3, now);
+        let mut monitors = Vec::new();
+        while let Ok(command) = engine.commands.pop() {
+            if let Command::AddTap(t) = command {
+                monitors.push(t.monitor);
+            }
+        }
+        assert_eq!(monitors, [true, false]);
     }
 
     /// The count an eventfd holds, which a read takes. Zero if it is not

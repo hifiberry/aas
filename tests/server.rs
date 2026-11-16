@@ -1615,6 +1615,51 @@ fn a_recorder_reads_what_the_capture_delivers() {
 }
 
 #[test]
+fn a_monitor_records_what_a_player_plays() {
+    let (sink, _log) = memory_sink();
+    let daemon = Daemon::start(default_config(), sink);
+    let amplitude = 1i32 << 28;
+    // A 1 kHz tone at the daemon's rate, until the monitor has heard it.
+    let done = Arc::new(AtomicBool::new(false));
+    let mut player = daemon.client_at(48000, 4096);
+    let feeder = {
+        let done = done.clone();
+        thread::spawn(move || {
+            let tone: Vec<[i32; 2]> = (0..48)
+                .map(|i| {
+                    let phase = i as f64 * std::f64::consts::TAU / 48.0;
+                    let v = (phase.sin() * amplitude as f64) as i32;
+                    [v, v]
+                })
+                .collect();
+            let data = bytes(&tone);
+            player.start().unwrap();
+            while !done.load(Ordering::Relaxed) {
+                if player.write(&data).unwrap() == 0 {
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+        })
+    };
+    let mut monitor = daemon.client();
+    assert_eq!(monitor.configure_monitor(4096).unwrap(), 48000);
+    monitor.start().unwrap();
+    let mut peak = 0;
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while peak <= amplitude / 2 && Instant::now() < deadline {
+        let got = record(&mut monitor, 256);
+        peak = got
+            .iter()
+            .map(|f| f[0].abs().max(f[1].abs()))
+            .max()
+            .unwrap_or(0);
+    }
+    done.store(true, Ordering::Relaxed);
+    feeder.join().unwrap();
+    assert!(peak > amplitude / 2, "the monitor heard a peak of {peak}");
+}
+
+#[test]
 fn a_rate_change_ends_an_open_capture_stream() {
     let (sink, log) = memory_sink();
     let daemon = Daemon::start(default_config(), sink);
