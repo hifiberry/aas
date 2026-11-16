@@ -1,0 +1,98 @@
+#!/bin/sh
+# Switch a HiFiBerry OS device between PipeWire and aas.
+#   hifiberry-audio-server get
+#   hifiberry-audio-server set pipewire|aas
+# "set" stores the choice and applies it; the device then needs a reboot,
+# which this script does not do.
+set -eu
+
+ROOT="${AAS_SWITCH_ROOT:-}"
+SYSTEMCTL="${SYSTEMCTL:-systemctl}"
+CHOICE="$ROOT/etc/hifiberry/audio-server"
+
+USER_UNITS="pipewire.service pipewire.socket pipewire-pulse.service pipewire-pulse.socket wireplumber.service filter-chain.service pipewire-api.service vu-meter.service aes67.service aes67-agent.service usbaudio.service usbaudio-state.service analoginput.service"
+SYSTEM_UNITS="aas.service aas-config.service"
+
+# link location (below $ROOT) and its target
+LINKS="/etc/alsa/conf.d/99-zz-aas.conf /usr/share/aas/asound.conf
+/etc/pulse/client.conf.d/90-aas.conf /usr/share/aas/pulse-client.conf
+/etc/sysctl.d/90-aas.conf /usr/share/aas/90-aas.conf"
+
+usage() {
+    echo "usage: hifiberry-audio-server get | set pipewire|aas" >&2
+    exit 2
+}
+
+chosen() {
+    c=
+    if [ -r "$CHOICE" ]; then
+        read -r c < "$CHOICE" || true
+    fi
+    case "$c" in
+        aas) echo aas ;;
+        *) echo pipewire ;;
+    esac
+}
+
+each_link() { # calls "$1 link target" for every pair
+    echo "$LINKS" | while read -r l t; do "$1" "$l" "$t"; done
+}
+
+make_link() {
+    mkdir -p "$(dirname "$ROOT$1")"
+    ln -sfn "$2" "$ROOT$1"
+}
+
+drop_link() {
+    if [ -L "$ROOT$1" ] && [ "$(readlink "$ROOT$1")" = "$2" ]; then
+        rm -f "$ROOT$1"
+    fi
+}
+
+cmd_get() {
+    if "$SYSTEMCTL" is-active --quiet aas.service 2>/dev/null; then
+        echo "running aas"
+    else
+        echo "running pipewire"
+    fi
+    echo "chosen $(chosen)"
+}
+
+cmd_set() {
+    if [ -z "${AAS_SWITCH_ROOT:-}" ] && [ "$(id -u)" -ne 0 ]; then
+        echo "hifiberry-audio-server: set needs root" >&2
+        exit 1
+    fi
+    server=$1
+    rc=0
+    mkdir -p "$(dirname "$CHOICE")"
+    echo "$server" > "$CHOICE"
+    if [ "$server" = aas ]; then
+        each_link make_link
+        # shellcheck disable=SC2086
+        "$SYSTEMCTL" --global mask $USER_UNITS || {
+            echo "hifiberry-audio-server: masking the PipeWire units failed" >&2; rc=1; }
+        # shellcheck disable=SC2086
+        "$SYSTEMCTL" enable $SYSTEM_UNITS || {
+            echo "hifiberry-audio-server: enabling the aas units failed" >&2; rc=1; }
+    else
+        each_link drop_link
+        # shellcheck disable=SC2086
+        "$SYSTEMCTL" --global unmask $USER_UNITS || {
+            echo "hifiberry-audio-server: unmasking the PipeWire units failed" >&2; rc=1; }
+        # shellcheck disable=SC2086
+        "$SYSTEMCTL" disable $SYSTEM_UNITS || {
+            echo "hifiberry-audio-server: disabling the aas units failed" >&2; rc=1; }
+    fi
+    echo "chosen $server; reboot to apply"
+    exit "$rc"
+}
+
+[ $# -ge 1 ] || usage
+case "$1" in
+    get) [ $# -eq 1 ] || usage; cmd_get ;;
+    set)
+        [ $# -eq 2 ] || usage
+        case "$2" in pipewire|aas) cmd_set "$2" ;; *) usage ;; esac ;;
+    *) usage ;;
+esac
