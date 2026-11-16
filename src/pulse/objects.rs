@@ -1,7 +1,7 @@
 //! The replies for the one sink, its clients and this daemon's fixed
 //! objects.
 
-use crate::pulse::registry::SinkInput;
+use crate::pulse::registry::{SinkInput, SourceOutput};
 use crate::pulse::volume;
 use crate::pulse::tagstruct::{Builder, SampleSpec};
 use crate::pulse::wire;
@@ -221,6 +221,41 @@ pub fn sink_input_info(input: &SinkInput) -> Vec<u8> {
         channels: input.channels,
         rate: input.rate,
     };
+    b.format_info(
+        wire::ENCODING_PCM,
+        &crate::pulse::stream::pcm_props(spec, map),
+    );
+    b.into_vec()
+}
+
+/// A record stream's info body, in the order of
+/// `source_output_fill_tagstruct` for protocol 35. Its volume is fixed at
+/// unity and it is never muted.
+pub fn source_output_info(output: &SourceOutput) -> Vec<u8> {
+    let spec = SampleSpec {
+        format: output.format,
+        channels: output.channels,
+        rate: output.rate,
+    };
+    let map: &[u8] = if output.channels == 1 { &[0] } else { &[1, 2] };
+    let mut b = Builder::new();
+    b.u32(output.index);
+    b.string(&output.name);
+    b.u32(wire::INVALID_INDEX);
+    b.u32(output.client);
+    b.u32(output.source.index());
+    b.sample_spec(spec);
+    b.channel_map(map);
+    b.usec(output.buffer_usec);
+    b.usec(output.source_usec);
+    b.string(if output.resampled { "aas" } else { "trivial" });
+    b.string("aas");
+    b.proplist(&[("media.name".into(), output.name.clone())]);
+    b.boolean(output.corked);
+    b.cvolume(&vec![wire::VOLUME_NORM; usize::from(output.channels)]);
+    b.boolean(false);
+    b.boolean(true);
+    b.boolean(false);
     b.format_info(
         wire::ENCODING_PCM,
         &crate::pulse::stream::pcm_props(spec, map),

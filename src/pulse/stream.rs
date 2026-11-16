@@ -24,7 +24,7 @@ pub struct CreateError {
 }
 
 impl CreateError {
-    fn new(code: u32, message: &'static str) -> Self {
+    pub(crate) fn new(code: u32, message: &'static str) -> Self {
         CreateError { code, message }
     }
 }
@@ -98,10 +98,10 @@ impl Stream {
         index: u32,
         reader: &mut Reader,
     ) -> Result<Created, CreateError> {
-        let mut spec = reader
+        let spec = reader
             .sample_spec()
             .ok_or_else(|| CreateError::new(wire::ERR_INVALID, "no sample spec"))?;
-        let mut map = reader
+        let map = reader
             .channel_map()
             .ok_or_else(|| CreateError::new(wire::ERR_INVALID, "no channel map"))?;
         let _sink_index = reader
@@ -160,45 +160,7 @@ impl Stream {
         if !reader.eof() {
             return Err(CreateError::new(wire::ERR_PROTOCOL, "trailing stream data"));
         }
-        // A stream made with pa_stream_new_extended, as mpv and GStreamer
-        // make theirs, sends a placeholder sample spec and its real format
-        // as a list. The first PCM entry is played; encoded ones are not.
-        if !formats.is_empty() {
-            let pcm = formats
-                .iter()
-                .find(|(encoding, _)| *encoding == wire::ENCODING_PCM)
-                .ok_or_else(|| {
-                    CreateError::new(wire::ERR_NOTSUPPORTED, "encoded formats are not supported")
-                })?;
-            (spec, map) = pcm_spec(&pcm.1).ok_or_else(|| {
-                CreateError::new(wire::ERR_NOTSUPPORTED, "that PCM format is not supported")
-            })?;
-        }
-        let format = match spec.format {
-            wire::FORMAT_S16LE => ClientFormat::S16,
-            wire::FORMAT_FLOAT32LE => ClientFormat::Float,
-            wire::FORMAT_S32LE => ClientFormat::S32,
-            wire::FORMAT_S24LE => ClientFormat::S24Packed,
-            wire::FORMAT_S24_32LE => ClientFormat::S24In32,
-            _ => {
-                return Err(CreateError::new(
-                    wire::ERR_NOTSUPPORTED,
-                    "that sample format is not supported",
-                ));
-            }
-        };
-        if !(1..=2).contains(&spec.channels) {
-            return Err(CreateError::new(
-                wire::ERR_NOTSUPPORTED,
-                "more than two channels",
-            ));
-        }
-        if !(8_000..=384_000).contains(&spec.rate) {
-            return Err(CreateError::new(wire::ERR_INVALID, "that rate is out of range"));
-        }
-        if map.len() != usize::from(spec.channels) {
-            return Err(CreateError::new(wire::ERR_INVALID, "the channel map is wrong"));
-        }
+        let (spec, map, format) = client_spec(spec, map, &formats)?;
         let frame_bytes = format.sample_bytes() * usize::from(spec.channels);
         let min_frames = (spec.rate / 1000 * 20).max(1);
         let cap_frames = (spec.rate / 1000 * buffer_ms).max(min_frames);
@@ -552,6 +514,56 @@ impl Stream {
     pub fn release(&mut self) {
         self.daemon.release();
     }
+}
+
+/// Checks the sample spec and channel map a stream is created with, or the
+/// first PCM entry of its format list, and returns what is used and the
+/// format to convert to or from.
+pub(crate) fn client_spec(
+    mut spec: SampleSpec,
+    mut map: Vec<u8>,
+    formats: &[(u8, Vec<(String, String)>)],
+) -> Result<(SampleSpec, Vec<u8>, ClientFormat), CreateError> {
+    // A stream made with pa_stream_new_extended, as mpv and GStreamer
+    // make theirs, sends a placeholder sample spec and its real format
+    // as a list. The first PCM entry is used; encoded ones are not.
+    if !formats.is_empty() {
+        let pcm = formats
+            .iter()
+            .find(|(encoding, _)| *encoding == wire::ENCODING_PCM)
+            .ok_or_else(|| {
+                CreateError::new(wire::ERR_NOTSUPPORTED, "encoded formats are not supported")
+            })?;
+        (spec, map) = pcm_spec(&pcm.1).ok_or_else(|| {
+            CreateError::new(wire::ERR_NOTSUPPORTED, "that PCM format is not supported")
+        })?;
+    }
+    let format = match spec.format {
+        wire::FORMAT_S16LE => ClientFormat::S16,
+        wire::FORMAT_FLOAT32LE => ClientFormat::Float,
+        wire::FORMAT_S32LE => ClientFormat::S32,
+        wire::FORMAT_S24LE => ClientFormat::S24Packed,
+        wire::FORMAT_S24_32LE => ClientFormat::S24In32,
+        _ => {
+            return Err(CreateError::new(
+                wire::ERR_NOTSUPPORTED,
+                "that sample format is not supported",
+            ));
+        }
+    };
+    if !(1..=2).contains(&spec.channels) {
+        return Err(CreateError::new(
+            wire::ERR_NOTSUPPORTED,
+            "more than two channels",
+        ));
+    }
+    if !(8_000..=384_000).contains(&spec.rate) {
+        return Err(CreateError::new(wire::ERR_INVALID, "that rate is out of range"));
+    }
+    if map.len() != usize::from(spec.channels) {
+        return Err(CreateError::new(wire::ERR_INVALID, "the channel map is wrong"));
+    }
+    Ok((spec, map, format))
 }
 
 /// The sample spec and channel map of a PCM `format_info`. PulseAudio

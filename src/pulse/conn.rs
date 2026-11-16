@@ -3,6 +3,7 @@
 use crate::pulse::Settings;
 use crate::pulse::objects::{self, Source};
 use crate::pulse::packet::{Encoder, Frame, Reader as Framer};
+use crate::pulse::record::Record;
 use crate::pulse::registry::{Event, Registry, Remote};
 use crate::pulse::stream::{Stream, now_timeval};
 use crate::pulse::volume;
@@ -23,8 +24,8 @@ const IDLE_TICK: Duration = Duration::from_millis(200);
 /// The bounds of the wait while a stream plays. Between them the wait is an
 /// eighth of the smallest ring, so room is offered well before a ring that
 /// was full runs out.
-const MIN_TICK: Duration = Duration::from_millis(2);
-const MAX_TICK: Duration = Duration::from_millis(20);
+pub(crate) const MIN_TICK: Duration = Duration::from_millis(2);
+pub(crate) const MAX_TICK: Duration = Duration::from_millis(20);
 /// How long a write may block before the connection gives up on it.
 const WRITE_TIMEOUT: Duration = Duration::from_millis(200);
 
@@ -90,6 +91,10 @@ impl Drop for Conn {
         for stream in &self.streams {
             self.registry.remove_sink_input(stream.index);
         }
+        for record in &mut self.records {
+            record.release();
+            self.registry.remove_source_output(record.index);
+        }
     }
 }
 
@@ -111,6 +116,7 @@ pub struct Conn {
     inbox: Receiver<Remote>,
     subscribed: u32,
     streams: Vec<Stream>,
+    records: Vec<Record>,
     done: bool,
 }
 
@@ -145,6 +151,7 @@ impl Conn {
             inbox,
             subscribed: 0,
             streams: Vec::new(),
+            records: Vec::new(),
             done: false,
         }
     }
@@ -211,13 +218,21 @@ impl Conn {
             | wire::SET_SOURCE_OUTPUT_MUTE => {
                 self.send_error(tag, wire::ERR_NOTSUPPORTED, "a source's volume is fixed")
             }
-            wire::GET_SOURCE_OUTPUT_INFO => {
-                self.send_error(tag, wire::ERR_NOENTITY, "no such record stream")
+            wire::GET_SOURCE_OUTPUT_INFO => self.source_output_info(&mut reader, tag),
+            wire::GET_SOURCE_OUTPUT_INFO_LIST => self.source_output_info_list(tag),
+            wire::CREATE_RECORD_STREAM => self.create_record(&mut reader, tag),
+            wire::DELETE_RECORD_STREAM => self.delete_record(&mut reader, tag),
+            wire::CORK_RECORD_STREAM => self.cork_record(&mut reader, tag),
+            wire::FLUSH_RECORD_STREAM => self.flush_record(&mut reader, tag),
+            wire::GET_RECORD_LATENCY => self.record_latency(&mut reader, tag),
+            wire::SET_RECORD_STREAM_BUFFER_ATTR => self.record_buffer_attr(&mut reader, tag),
+            wire::SET_RECORD_STREAM_NAME => self.set_record_name(&mut reader, tag),
+            wire::UPDATE_RECORD_STREAM_PROPLIST | wire::REMOVE_RECORD_STREAM_PROPLIST => {
+                self.record_proplist(command, &mut reader, tag)
             }
-            wire::GET_CARD_INFO_LIST
-            | wire::GET_MODULE_INFO_LIST
-            | wire::GET_SAMPLE_INFO_LIST
-            | wire::GET_SOURCE_OUTPUT_INFO_LIST => self.send_reply(tag, Vec::new()),
+            wire::GET_CARD_INFO_LIST | wire::GET_MODULE_INFO_LIST | wire::GET_SAMPLE_INFO_LIST => {
+                self.send_reply(tag, Vec::new())
+            }
             wire::STAT => self.stat(tag),
             wire::LOOKUP_SINK => self.lookup_sink(&mut reader, tag),
             wire::SUBSCRIBE => self.subscribe(&mut reader, tag),
@@ -829,12 +844,17 @@ impl Conn {
     /// How long the next read may wait: short while a stream plays, so
     /// its ring is refilled in time, and long otherwise.
     fn tick_interval(&self) -> Duration {
-        self.streams
+        let playing = self
+            .streams
             .iter()
             .filter(|stream| !stream.corked)
-            .map(|stream| (stream.capacity_duration() / 8).clamp(MIN_TICK, MAX_TICK))
-            .min()
-            .unwrap_or(IDLE_TICK)
+            .map(|stream| (stream.capacity_duration() / 8).clamp(MIN_TICK, MAX_TICK));
+        let recording = self
+            .records
+            .iter()
+            .filter(|record| !record.corked())
+            .map(Record::interval);
+        playing.chain(recording).min().unwrap_or(IDLE_TICK)
     }
 
     fn set_default_sink(&mut self, reader: &mut Reader, tag: u32) {
@@ -904,7 +924,238 @@ impl Conn {
             self.streams.retain(|stream| stream.index != index);
             self.registry.remove_sink_input(index);
         }
+        self.poll_records();
         Ok(())
+    }
+
+    /// Polls the record streams after the playback ones. Each sends only
+    /// while what the client has not read yet, here and in the socket, is
+    /// below its `maxlength`, so a client that stops reading overflows its
+    /// stream rather than this connection's memory.
+    fn poll_records(&mut self) {
+        let queued = socket_queue(&self.stream);
+        let mut dead = Vec::new();
+        for record in &mut self.records {
+            let polled = record.poll(queued + self.out.len());
+            for frame in polled.packets {
+                self.out.extend(frame);
+            }
+            if polled.gone {
+                dead.push(record.index);
+                continue;
+            }
+            let latency = record.latency();
+            self.registry.set_source_output_latency(
+                record.index,
+                latency.buffer_usec,
+                latency.source_usec,
+            );
+            // A reopen at another rate may start or stop resampling.
+            let entry = record.entry();
+            let listed = self.registry.source_output(record.index).map(|mut listed| {
+                listed.buffer_usec = 0;
+                listed.source_usec = 0;
+                listed
+            });
+            if listed.as_ref() != Some(&entry) {
+                self.registry.update_source_output(entry);
+            }
+        }
+        for index in dead {
+            if let Some(position) = self.records.iter().position(|r| r.index == index) {
+                self.records.remove(position).release();
+            }
+            self.registry.remove_source_output(index);
+            self.send_packet(wire::record_killed(index));
+        }
+        if self.out.len() > 1 << 20 {
+            self.done = true;
+        }
+    }
+
+    fn record_mut(&mut self, index: u32) -> Option<&mut Record> {
+        self.records.iter_mut().find(|record| record.index == index)
+    }
+
+    fn create_record(&mut self, reader: &mut Reader, tag: u32) {
+        let index = self.registry.next_stream();
+        let created = Record::create(
+            self.settings,
+            &self.daemon_socket,
+            self.peer_pid,
+            self.client_index,
+            index,
+            self.registry.default_source(),
+            reader,
+        );
+        match created {
+            Ok(created) => {
+                self.registry.add_source_output(created.record.entry());
+                self.records.push(created.record);
+                self.send_reply(tag, created.reply);
+            }
+            Err(e) => {
+                eprintln!("aas: pulse: create record: {}", e.message);
+                self.send_error(tag, e.code, e.message)
+            }
+        }
+    }
+
+    /// The record stream a command names, or the error sent for it.
+    fn record_index(&mut self, reader: &mut Reader, tag: u32) -> Option<u32> {
+        let Some(index) = reader.u32() else {
+            self.send_error(tag, wire::ERR_INVALID, "no stream index");
+            return None;
+        };
+        if self.record_mut(index).is_none() {
+            self.send_error(tag, wire::ERR_NOENTITY, "no such record stream");
+            return None;
+        }
+        Some(index)
+    }
+
+    fn delete_record(&mut self, reader: &mut Reader, tag: u32) {
+        let Some(index) = self.record_index(reader, tag) else {
+            return;
+        };
+        if let Some(position) = self.records.iter().position(|r| r.index == index) {
+            self.records.remove(position).release();
+        }
+        self.registry.remove_source_output(index);
+        self.send_reply(tag, Vec::new());
+    }
+
+    fn cork_record(&mut self, reader: &mut Reader, tag: u32) {
+        let Some(index) = self.record_index(reader, tag) else {
+            return;
+        };
+        let Some(corked) = reader.boolean() else {
+            self.send_error(tag, wire::ERR_INVALID, "no cork flag");
+            return;
+        };
+        let Some(record) = self.record_mut(index) else {
+            return;
+        };
+        match record.cork(corked) {
+            Ok(()) => {
+                let entry = record.entry();
+                self.registry.update_source_output(entry);
+                self.send_reply(tag, Vec::new());
+            }
+            Err(_) => self.send_error(tag, wire::ERR_NOENTITY, "the stream is gone"),
+        }
+    }
+
+    fn flush_record(&mut self, reader: &mut Reader, tag: u32) {
+        let Some(index) = self.record_index(reader, tag) else {
+            return;
+        };
+        let flushed = self.record_mut(index).map(Record::flush);
+        match flushed {
+            Some(Ok(())) => self.send_reply(tag, Vec::new()),
+            _ => self.send_error(tag, wire::ERR_NOENTITY, "the stream is gone"),
+        }
+    }
+
+    fn record_latency(&mut self, reader: &mut Reader, tag: u32) {
+        let Some(index) = self.record_index(reader, tag) else {
+            return;
+        };
+        let Some((sec, usec)) = reader.timeval() else {
+            self.send_error(tag, wire::ERR_PROTOCOL, "no request time");
+            return;
+        };
+        let Some(record) = self.record_mut(index) else {
+            return;
+        };
+        let latency = record.latency();
+        let (now_sec, now_usec) = now_timeval();
+        let mut body = Builder::new();
+        body.usec(0);
+        body.usec(latency.source_usec);
+        body.boolean(latency.playing);
+        body.timeval(sec, usec);
+        body.timeval(now_sec, now_usec);
+        body.i64(latency.write_index);
+        body.i64(latency.read_index);
+        self.send_reply(tag, body.into_vec());
+    }
+
+    fn record_buffer_attr(&mut self, reader: &mut Reader, tag: u32) {
+        let Some(index) = self.record_index(reader, tag) else {
+            return;
+        };
+        let (Some(maxlength), Some(fragsize)) = (reader.u32(), reader.u32()) else {
+            self.send_error(tag, wire::ERR_PROTOCOL, "a short buffer attr");
+            return;
+        };
+        let Some(record) = self.record_mut(index) else {
+            return;
+        };
+        let [maxlength, fragsize] = record.set_buffer_attr(maxlength, fragsize);
+        let mut body = Builder::new();
+        body.u32(maxlength);
+        body.u32(fragsize);
+        body.usec(record.configured_usec());
+        self.send_reply(tag, body.into_vec());
+    }
+
+    fn rename_record(&mut self, index: u32, name: String) {
+        if let Some(record) = self.record_mut(index) {
+            record.name = name;
+            let entry = record.entry();
+            self.registry.update_source_output(entry);
+        }
+    }
+
+    fn set_record_name(&mut self, reader: &mut Reader, tag: u32) {
+        let Some(index) = self.record_index(reader, tag) else {
+            return;
+        };
+        let Some(name) = reader.string() else {
+            self.send_error(tag, wire::ERR_INVALID, "no name");
+            return;
+        };
+        self.rename_record(index, name.to_string());
+        self.send_reply(tag, Vec::new());
+    }
+
+    /// Accepts a proplist change. Only `media.name` means anything here:
+    /// it is the stream's name.
+    fn record_proplist(&mut self, command: u32, reader: &mut Reader, tag: u32) {
+        let Some(index) = self.record_index(reader, tag) else {
+            return;
+        };
+        if command == wire::UPDATE_RECORD_STREAM_PROPLIST {
+            let _mode = reader.u32();
+            if let Some(name) = reader
+                .proplist()
+                .and_then(|props| props.into_iter().find(|(key, _)| key == "media.name"))
+                .map(|(_, value)| value)
+            {
+                self.rename_record(index, name);
+            }
+        }
+        self.send_reply(tag, Vec::new());
+    }
+
+    fn source_output_info(&mut self, reader: &mut Reader, tag: u32) {
+        let Some(index) = reader.u32() else {
+            self.send_error(tag, wire::ERR_INVALID, "no stream index");
+            return;
+        };
+        match self.registry.source_output(index) {
+            Some(output) => self.send_reply(tag, objects::source_output_info(&output)),
+            None => self.send_error(tag, wire::ERR_NOENTITY, "no such record stream"),
+        }
+    }
+
+    fn source_output_info_list(&mut self, tag: u32) {
+        let mut body = Vec::new();
+        for output in self.registry.source_outputs() {
+            body.extend(objects::source_output_info(&output));
+        }
+        self.send_reply(tag, body);
     }
 
     fn send_reply(&mut self, tag: u32, body: Vec<u8>) {
@@ -971,6 +1222,15 @@ fn peer_pid(stream: &UnixStream) -> Option<u32> {
         )
     };
     (rc == 0 && cred.pid > 0).then_some(cred.pid as u32)
+}
+
+/// Bytes written to the socket that the client has not read yet.
+fn socket_queue(stream: &UnixStream) -> usize {
+    use std::os::fd::AsRawFd;
+    let mut queued: libc::c_int = 0;
+    // SAFETY: TIOCOUTQ (SIOCOUTQ) writes one int.
+    let rc = unsafe { libc::ioctl(stream.as_raw_fd(), libc::TIOCOUTQ, &mut queued) };
+    if rc == 0 { queued.max(0) as usize } else { 0 }
 }
 
 fn invalid(message: &str) -> io::Error {

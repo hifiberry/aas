@@ -52,6 +52,8 @@ fn create_body(rate: u32, format: u8, channels: u8, tlength_ms: u32) -> Vec<u8> 
 struct RawPulse {
     stream: UnixStream,
     tag: u32,
+    /// Memblocks read while a packet was awaited: the stream and the data.
+    blocks: Vec<(u32, Vec<u8>)>,
 }
 
 impl RawPulse {
@@ -63,7 +65,11 @@ impl RawPulse {
         stream
             .set_write_timeout(Some(Duration::from_secs(5)))
             .unwrap();
-        RawPulse { stream, tag: 2 }
+        RawPulse {
+            stream,
+            tag: 2,
+            blocks: Vec::new(),
+        }
     }
 
     fn send(&mut self, payload: &[u8]) {
@@ -74,17 +80,33 @@ impl RawPulse {
         self.stream.write_all(payload).unwrap();
     }
 
+    /// The next packet. Memblocks before it are kept in `blocks`.
     fn recv(&mut self) -> (u32, u32, Vec<u8>) {
+        loop {
+            if let Some(packet) = self.read_frame().unwrap() {
+                return packet;
+            }
+        }
+    }
+
+    /// Reads one frame: a packet, or None for a memblock, which goes to
+    /// `blocks`.
+    fn read_frame(&mut self) -> std::io::Result<Option<(u32, u32, Vec<u8>)>> {
         let mut head = [0u8; 20];
-        self.stream.read_exact(&mut head).unwrap();
+        self.stream.read_exact(&mut head)?;
         let length = u32::from_be_bytes(head[..4].try_into().unwrap()) as usize;
+        let channel = u32::from_be_bytes(head[4..8].try_into().unwrap());
         let mut payload = vec![0u8; length];
         self.stream.read_exact(&mut payload).unwrap();
+        if channel != u32::MAX {
+            self.blocks.push((channel, payload));
+            return Ok(None);
+        }
         let mut reader = Reader::new(&payload);
         let command = reader.u32().unwrap();
         let tag = reader.u32().unwrap();
         let body = payload[reader.position()..].to_vec();
-        (command, tag, body)
+        Ok(Some((command, tag, body)))
     }
 
     fn next_tag(&mut self) -> u32 {
@@ -105,7 +127,7 @@ impl RawPulse {
         assert_eq!(reader.u32(), Some(wire::PROTOCOL_VERSION));
     }
 
-    fn set_name(&mut self, name: &str) {
+    fn set_name(&mut self, name: &str) -> u32 {
         let mut body = Builder::new();
         body.u32(wire::SET_CLIENT_NAME);
         body.u32(2);
@@ -114,7 +136,7 @@ impl RawPulse {
         let (command, tag, body) = self.recv();
         assert_eq!((command, tag), (wire::REPLY, 2));
         let mut reader = Reader::new(&body);
-        assert!(reader.u32().is_some(), "a client index");
+        reader.u32().expect("a client index")
     }
 
     fn command(&mut self, command: u32, body: &[u8]) -> (u32, u32, Vec<u8>) {
@@ -621,21 +643,24 @@ fn a_volume_race_leaves_the_last_value_and_no_deadlock() {
 
 impl RawPulse {
     /// The next packet, or None if none comes within `wait`.
+    /// Memblocks go to `blocks` and do not end the wait.
     fn try_recv(&mut self, wait: Duration) -> Option<(u32, u32, Vec<u8>)> {
-        self.stream.set_read_timeout(Some(wait)).unwrap();
-        let mut head = [0u8; 20];
-        let got = self.stream.read_exact(&mut head);
-        self.stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        got.ok()?;
-        let length = u32::from_be_bytes(head[..4].try_into().unwrap()) as usize;
-        let mut payload = vec![0u8; length];
-        self.stream.read_exact(&mut payload).unwrap();
-        let mut reader = Reader::new(&payload);
-        let command = reader.u32().unwrap();
-        let tag = reader.u32().unwrap();
-        Some((command, tag, payload[reader.position()..].to_vec()))
+        let deadline = std::time::Instant::now() + wait;
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            self.stream
+                .set_read_timeout(Some(left.max(Duration::from_millis(1))))
+                .unwrap();
+            let got = self.read_frame();
+            self.stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            match got {
+                Ok(Some(packet)) => return Some(packet),
+                Ok(None) if std::time::Instant::now() < deadline => {}
+                _ => return None,
+            }
+        }
     }
 }
 
@@ -1307,4 +1332,469 @@ fn set_default_source_names_one_of_ours() {
     let (command, _, reply) = client.command(wire::SET_DEFAULT_SOURCE, &body.into_vec());
     assert_eq!(command, wire::ERROR);
     assert_eq!(Reader::new(&reply).u32(), Some(wire::ERR_NOENTITY));
+}
+
+use aas::pulse::tagstruct::SampleSpec;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
+
+const S16_STEREO_48K: SampleSpec = SampleSpec {
+    format: wire::FORMAT_S16LE,
+    channels: 2,
+    rate: 48_000,
+};
+
+/// The amplitude of the test tone, in S16.
+const TONE: i32 = 16_000;
+
+/// `CREATE_RECORD_STREAM` for protocol 35, as libpulse sends it.
+fn record_body(
+    spec: SampleSpec,
+    source_index: u32,
+    source_name: Option<&str>,
+    maxlength: u32,
+    corked: bool,
+    fragsize: u32,
+) -> Vec<u8> {
+    let mut body = Builder::new();
+    body.sample_spec(spec);
+    let map: &[u8] = if spec.channels == 1 { &[0] } else { &[1, 2] };
+    body.channel_map(map);
+    body.u32(source_index);
+    match source_name {
+        Some(name) => body.string(name),
+        None => body.null_string(),
+    }
+    body.u32(maxlength);
+    body.boolean(corked);
+    body.u32(fragsize);
+    for _ in 0..7 {
+        body.boolean(false);
+    }
+    body.boolean(false); // peak_detect
+    body.boolean(false); // adjust_latency
+    body.proplist(&[("media.name".to_string(), "a test recording".to_string())]);
+    body.u32(wire::INVALID_INDEX); // direct_on_input
+    body.boolean(false); // early_requests
+    body.boolean(false); // dont_inhibit_auto_suspend
+    body.boolean(false); // fail_on_suspend
+    body.u8(0);
+    body.cvolume(&[wire::VOLUME_NORM; 2]);
+    for _ in 0..5 {
+        body.boolean(false); // muted … passthrough
+    }
+    body.into_vec()
+}
+
+/// What a `CREATE_RECORD_STREAM` reply says.
+struct RecordReply {
+    stream: u32,
+    maxlength: u32,
+    fragsize: u32,
+    spec: SampleSpec,
+    source: u32,
+}
+
+fn read_record_reply(body: &[u8]) -> RecordReply {
+    let mut r = Reader::new(body);
+    let stream = r.u32().expect("a stream index");
+    assert_eq!(r.u32(), Some(stream), "the source output index");
+    let maxlength = r.u32().expect("maxlength");
+    let fragsize = r.u32().expect("fragsize");
+    let spec = r.sample_spec().expect("a sample spec");
+    r.channel_map().expect("a channel map");
+    let source = r.u32().expect("a source index");
+    r.string().expect("a source name");
+    assert_eq!(r.boolean(), Some(false), "not suspended");
+    r.usec().expect("the configured latency");
+    r.format_info().expect("a format");
+    assert!(r.eof(), "nothing after the format");
+    RecordReply {
+        stream,
+        maxlength,
+        fragsize,
+        spec,
+        source,
+    }
+}
+
+/// Creates a record stream and returns its index.
+fn create_record_stream(
+    conn: &mut RawPulse,
+    spec: SampleSpec,
+    source_name: &str,
+    fragsize: u32,
+) -> u32 {
+    let body = record_body(spec, wire::INVALID_INDEX, Some(source_name), u32::MAX, false, fragsize);
+    let (command, _, reply) = conn.command(wire::CREATE_RECORD_STREAM, &body);
+    assert_eq!(command, wire::REPLY, "the record stream is created");
+    read_record_reply(&reply).stream
+}
+
+/// Memblocks of one stream, and packets as command and body.
+type Collected = (Vec<Vec<u8>>, Vec<(u32, Vec<u8>)>);
+
+impl RawPulse {
+    /// Reads for `wait` and returns the memblocks of `stream` and every
+    /// packet that came, the memblocks read before included.
+    fn collect(&mut self, stream: u32, wait: Duration) -> Collected {
+        let deadline = Instant::now() + wait;
+        let mut packets = Vec::new();
+        while Instant::now() < deadline {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if let Some((command, _, body)) = self.try_recv(left) {
+                packets.push((command, body));
+            }
+        }
+        let blocks = std::mem::take(&mut self.blocks)
+            .into_iter()
+            .filter(|(channel, _)| *channel == stream)
+            .map(|(_, data)| data)
+            .collect();
+        (blocks, packets)
+    }
+
+    /// Waits up to `wait` for the first memblock of `stream`.
+    fn first_block(&mut self, stream: u32, wait: Duration) -> bool {
+        let deadline = Instant::now() + wait;
+        while Instant::now() < deadline {
+            if self.blocks.iter().any(|(channel, _)| *channel == stream) {
+                return true;
+            }
+            self.try_recv(Duration::from_millis(10));
+        }
+        self.blocks.iter().any(|(channel, _)| *channel == stream)
+    }
+}
+
+/// The loudest S16 sample of `blocks`.
+fn s16_peak(blocks: &[Vec<u8>]) -> i32 {
+    blocks
+        .iter()
+        .flat_map(|block| block.chunks_exact(2))
+        .map(|s| i32::from(i16::from_le_bytes([s[0], s[1]])).abs())
+        .max()
+        .unwrap_or(0)
+}
+
+/// A PulseAudio player of a 1 kHz S16 stereo tone at `rate`, on its own
+/// connection, until the flag is set.
+fn tone_player(daemon: &Daemon, rate: u32) -> (Arc<AtomicBool>, std::thread::JoinHandle<()>) {
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut player = RawPulse::connect(&daemon.pulse_socket());
+    player.auth();
+    player.set_name("tone");
+    let (stream, missing, _) = player.create_stream(rate, wire::FORMAT_S16LE, 2, 200);
+    let flag = stop.clone();
+    let handle = std::thread::spawn(move || {
+        let mut n = 0u64;
+        let mut tone = |bytes: usize| {
+            let mut out = Vec::with_capacity(bytes);
+            for _ in 0..bytes / 4 {
+                let phase = n as f64 * 1000.0 / f64::from(rate) * std::f64::consts::TAU;
+                let v = (phase.sin() * f64::from(TONE)) as i16;
+                out.extend_from_slice(&v.to_le_bytes());
+                out.extend_from_slice(&v.to_le_bytes());
+                n += 1;
+            }
+            out
+        };
+        player.send_memblock(stream, &tone(missing));
+        while !flag.load(Ordering::Relaxed) {
+            if let Some((command, _, body)) = player.try_recv(Duration::from_millis(5))
+                && command == wire::REQUEST
+            {
+                player.send_memblock(stream, &tone(request_length(&body)));
+            }
+        }
+    });
+    (stop, handle)
+}
+
+fn stop_player((stop, handle): (Arc<AtomicBool>, std::thread::JoinHandle<()>)) {
+    stop.store(true, Ordering::Relaxed);
+    handle.join().unwrap();
+}
+
+/// The daemon's rate, as GET_SERVER_INFO gives it.
+fn server_rate(conn: &mut RawPulse) -> u32 {
+    let (command, _, body) = conn.command(wire::GET_SERVER_INFO, &[]);
+    assert_eq!(command, wire::REPLY);
+    let mut r = Reader::new(&body);
+    for _ in 0..4 {
+        r.string();
+    }
+    r.sample_spec().expect("a sample spec").rate
+}
+
+#[test]
+fn record_a_monitor_recording_hears_a_player() {
+    let daemon = Daemon::start();
+    let player = tone_player(&daemon, 48_000);
+    let mut recorder = pactl(&daemon);
+    let stream = create_record_stream(&mut recorder, S16_STEREO_48K, "@DEFAULT_MONITOR@", 0);
+    let (blocks, _) = recorder.collect(stream, Duration::from_secs(1));
+    stop_player(player);
+    assert!(!blocks.is_empty(), "no memblock within 1 s");
+    assert!(blocks.iter().all(|block| block.len() == 4800), "each is fragsize");
+    let peak = s16_peak(&blocks);
+    assert!(peak > TONE / 2, "the monitor heard a peak of {peak}");
+}
+
+#[test]
+fn record_a_recording_is_converted_to_the_clients_spec() {
+    let daemon = Daemon::start();
+    let player = tone_player(&daemon, 48_000);
+    let mut recorder = pactl(&daemon);
+    assert_eq!(server_rate(&mut recorder), 48_000);
+    let spec = SampleSpec {
+        format: wire::FORMAT_S16LE,
+        channels: 1,
+        rate: 44_100,
+    };
+    let stream = create_record_stream(&mut recorder, spec, "aas.monitor", 0);
+    assert!(recorder.first_block(stream, Duration::from_secs(1)));
+    recorder.blocks.clear();
+    let start = Instant::now();
+    let (blocks, _) = recorder.collect(stream, Duration::from_secs(1));
+    let elapsed = start.elapsed().as_secs_f64();
+    stop_player(player);
+    let frames = blocks.iter().map(Vec::len).sum::<usize>() as f64 / 2.0;
+    let rate = frames / elapsed;
+    assert!((rate - 44_100.0).abs() < 44_100.0 * 0.05, "{rate} frames a second");
+    let peak = s16_peak(&blocks);
+    assert!(peak > TONE / 2, "the recording peaks at {peak}");
+}
+
+#[test]
+fn record_fragsize_is_rounded_and_clamped() {
+    let daemon = Daemon::start();
+    let mut client = pactl(&daemon);
+    for (asked, got) in [(0, 4800), (u32::MAX, 4800), (1001, 1000), (1 << 20, 65_536)] {
+        let body = record_body(S16_STEREO_48K, 0, None, u32::MAX, true, asked);
+        let (command, _, reply) = client.command(wire::CREATE_RECORD_STREAM, &body);
+        assert_eq!(command, wire::REPLY);
+        let reply = read_record_reply(&reply);
+        assert_eq!(reply.fragsize, got, "fragsize {asked}");
+        assert!(reply.maxlength >= reply.fragsize);
+        assert_eq!(reply.spec, S16_STEREO_48K);
+        assert_eq!(reply.source, 0);
+    }
+}
+
+#[test]
+fn record_an_unknown_source_is_noentity() {
+    let daemon = Daemon::start();
+    let mut client = pactl(&daemon);
+    for body in [
+        record_body(S16_STEREO_48K, wire::INVALID_INDEX, Some("aas.analog"), u32::MAX, false, 0),
+        record_body(S16_STEREO_48K, 7, None, u32::MAX, false, 0),
+    ] {
+        let (command, _, reply) = client.command(wire::CREATE_RECORD_STREAM, &body);
+        assert_eq!(command, wire::ERROR);
+        assert_eq!(Reader::new(&reply).u32(), Some(wire::ERR_NOENTITY));
+    }
+    let (command, _, _) = client.command(wire::GET_SERVER_INFO, &[]);
+    assert_eq!(command, wire::REPLY);
+}
+
+#[test]
+fn record_a_corked_recording_sends_nothing() {
+    let daemon = Daemon::start();
+    let mut client = pactl(&daemon);
+    let body = record_body(S16_STEREO_48K, 0, None, u32::MAX, true, 0);
+    let (command, _, reply) = client.command(wire::CREATE_RECORD_STREAM, &body);
+    assert_eq!(command, wire::REPLY);
+    let stream = read_record_reply(&reply).stream;
+    let (blocks, _) = client.collect(stream, Duration::from_millis(300));
+    assert!(blocks.is_empty(), "a corked stream sent {} memblocks", blocks.len());
+    let mut body = Builder::new();
+    body.u32(stream);
+    body.boolean(false);
+    let (command, _, _) = client.command(wire::CORK_RECORD_STREAM, &body.into_vec());
+    assert_eq!(command, wire::REPLY);
+    assert!(client.first_block(stream, Duration::from_secs(1)), "nothing once uncorked");
+}
+
+#[test]
+fn record_a_recording_survives_a_rate_change() {
+    let daemon = Daemon::start();
+    let mut recorder = pactl(&daemon);
+    let stream = create_record_stream(&mut recorder, S16_STEREO_48K, "aas.monitor", 0);
+    let player = tone_player(&daemon, 48_000);
+    assert!(recorder.first_block(stream, Duration::from_secs(1)));
+    assert_eq!(server_rate(&mut recorder), 48_000);
+    stop_player(player);
+    let player = tone_player(&daemon, 44_100);
+    let start = Instant::now();
+    while server_rate(&mut recorder) != 44_100 {
+        assert!(start.elapsed() < Duration::from_secs(2), "the rate never changed");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    recorder.blocks.clear();
+    let (blocks, packets) = recorder.collect(stream, Duration::from_millis(500));
+    stop_player(player);
+    assert!(
+        packets.iter().all(|(command, _)| *command != wire::RECORD_STREAM_KILLED),
+        "the stream was killed"
+    );
+    assert!(blocks.len() >= 5, "{} memblocks after the change", blocks.len());
+    let peak = s16_peak(&blocks);
+    assert!(peak > TONE / 2, "the recording peaks at {peak} after the change");
+}
+
+#[test]
+fn record_a_client_that_stops_reading_gets_an_overflow() {
+    let daemon = Daemon::start();
+    let mut recorder = pactl(&daemon);
+    let body = record_body(S16_STEREO_48K, 0, None, 9600, false, 0);
+    let (command, _, reply) = recorder.command(wire::CREATE_RECORD_STREAM, &body);
+    assert_eq!(command, wire::REPLY);
+    let reply = read_record_reply(&reply);
+    assert_eq!(reply.maxlength, 9600);
+    let mut other = pactl(&daemon);
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(1) {
+        let asked = Instant::now();
+        let (command, _, _) = other.command(wire::GET_SERVER_INFO, &[]);
+        assert_eq!(command, wire::REPLY);
+        assert!(asked.elapsed() < Duration::from_millis(200));
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let (_, packets) = recorder.collect(reply.stream, Duration::from_millis(500));
+    assert!(
+        packets.iter().any(|(command, body)| *command == wire::OVERFLOW
+            && Reader::new(body).u32() == Some(reply.stream)),
+        "no OVERFLOW among {} packets",
+        packets.len()
+    );
+}
+
+/// Reads one source output info as libpulse 17 reads it for protocol 35
+/// and returns its index, name, client and source.
+fn read_source_output_as_libpulse(r: &mut Reader) -> (u32, String, u32, u32) {
+    let index = r.u32().expect("index");
+    let name = r.string().expect("name").to_string();
+    assert_eq!(r.u32(), Some(wire::INVALID_INDEX), "no owner module");
+    let client = r.u32().expect("client");
+    let source = r.u32().expect("source");
+    let spec = r.sample_spec().expect("sample spec");
+    let map = r.channel_map().expect("channel map");
+    assert_eq!(map.len(), usize::from(spec.channels));
+    r.usec().expect("buffer latency");
+    r.usec().expect("source latency");
+    r.string().expect("resample method");
+    assert_eq!(r.string(), Some("aas"), "driver");
+    r.proplist().expect("proplist");
+    r.boolean().expect("corked");
+    assert_eq!(r.cvolume(), Some(vec![wire::VOLUME_NORM; usize::from(spec.channels)]));
+    assert_eq!(r.boolean(), Some(false), "not muted");
+    assert_eq!(r.boolean(), Some(true), "has volume");
+    assert_eq!(r.boolean(), Some(false), "volume not writable");
+    r.format_info().expect("format");
+    (index, name, client, source)
+}
+
+/// The next subscription event of `facility`, as (change, index).
+fn next_event(conn: &mut RawPulse, facility: u32) -> (u32, u32) {
+    let start = Instant::now();
+    loop {
+        assert!(start.elapsed() < Duration::from_secs(2), "no event");
+        let Some((command, _, body)) = conn.try_recv(Duration::from_millis(100)) else {
+            continue;
+        };
+        if command != wire::SUBSCRIBE_EVENT {
+            continue;
+        }
+        let mut r = Reader::new(&body);
+        let event = r.u32().unwrap();
+        let index = r.u32().unwrap();
+        if event & 0xf == facility {
+            return (event & 0x30, index);
+        }
+    }
+}
+
+#[test]
+fn record_source_outputs_are_listed_and_announced() {
+    let daemon = Daemon::start();
+    let mut listener = pactl(&daemon);
+    let mut mask = Builder::new();
+    mask.u32(wire::MASK_SOURCE_OUTPUT);
+    let (command, _, _) = listener.command(wire::SUBSCRIBE, &mask.into_vec());
+    assert_eq!(command, wire::REPLY);
+    let mut recorder = RawPulse::connect(&daemon.pulse_socket());
+    recorder.auth();
+    let client = recorder.set_name("recorder");
+    let stream = create_record_stream(&mut recorder, S16_STEREO_48K, "aas.monitor", 0);
+    assert_eq!(
+        next_event(&mut listener, wire::EVENT_SOURCE_OUTPUT),
+        (wire::EVENT_NEW, stream)
+    );
+    let (command, _, body) = listener.command(wire::GET_SOURCE_OUTPUT_INFO_LIST, &[]);
+    assert_eq!(command, wire::REPLY);
+    let mut r = Reader::new(&body);
+    let entry = read_source_output_as_libpulse(&mut r);
+    assert!(r.eof(), "one source output");
+    assert_eq!(entry, (stream, "a test recording".to_string(), client, 0));
+    let mut body = Builder::new();
+    body.u32(stream);
+    let (command, _, reply) = listener.command(wire::GET_SOURCE_OUTPUT_INFO, &body.into_vec());
+    assert_eq!(command, wire::REPLY);
+    assert_eq!(read_source_output_as_libpulse(&mut Reader::new(&reply)).0, stream);
+    let mut body = Builder::new();
+    body.u32(stream);
+    let (command, _, _) = recorder.command(wire::DELETE_RECORD_STREAM, &body.into_vec());
+    assert_eq!(command, wire::REPLY);
+    assert_eq!(
+        next_event(&mut listener, wire::EVENT_SOURCE_OUTPUT),
+        (wire::EVENT_REMOVE, stream)
+    );
+    let mut body = Builder::new();
+    body.u32(stream);
+    let (command, _, _) = listener.command(wire::GET_SOURCE_OUTPUT_INFO, &body.into_vec());
+    assert_eq!(command, wire::ERROR);
+}
+
+#[test]
+fn record_source_output_volume_is_fixed() {
+    let daemon = Daemon::start();
+    let mut client = pactl(&daemon);
+    let stream = create_record_stream(&mut client, S16_STEREO_48K, "aas.monitor", 0);
+    let mut body = Builder::new();
+    body.u32(stream);
+    body.cvolume(&[wire::VOLUME_NORM / 2; 2]);
+    let (command, _, reply) = client.command(wire::SET_SOURCE_OUTPUT_VOLUME, &body.into_vec());
+    assert_eq!(command, wire::ERROR);
+    assert_eq!(Reader::new(&reply).u32(), Some(wire::ERR_NOTSUPPORTED));
+    let mut body = Builder::new();
+    body.u32(stream);
+    body.boolean(true);
+    let (command, _, reply) = client.command(wire::SET_SOURCE_OUTPUT_MUTE, &body.into_vec());
+    assert_eq!(command, wire::ERROR);
+    assert_eq!(Reader::new(&reply).u32(), Some(wire::ERR_NOTSUPPORTED));
+}
+
+#[test]
+fn record_latency_is_answered() {
+    let daemon = Daemon::start();
+    let mut client = pactl(&daemon);
+    let stream = create_record_stream(&mut client, S16_STEREO_48K, "aas.monitor", 0);
+    assert!(client.first_block(stream, Duration::from_secs(1)));
+    let mut body = Builder::new();
+    body.u32(stream);
+    body.timeval(12, 34);
+    let (command, _, reply) = client.command(wire::GET_RECORD_LATENCY, &body.into_vec());
+    assert_eq!(command, wire::REPLY);
+    let mut r = Reader::new(&reply);
+    assert_eq!(r.usec(), Some(0), "monitor latency");
+    r.usec().expect("source latency");
+    assert_eq!(r.boolean(), Some(true), "playing");
+    assert_eq!(r.timeval(), Some((12, 34)), "the request's time");
+    r.timeval().expect("now");
+    let write = r.i64().expect("write index");
+    let read = r.i64().expect("read index");
+    assert!(r.eof());
+    assert!(read > 0 && write >= read, "write {write}, read {read}");
 }

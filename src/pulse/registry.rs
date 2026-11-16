@@ -34,6 +34,25 @@ pub struct SinkInput {
     pub sink_usec: u64,
 }
 
+/// A record stream as every context sees it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SourceOutput {
+    pub index: u32,
+    pub client: u32,
+    pub name: String,
+    pub source: Source,
+    pub rate: u32,
+    pub channels: u8,
+    pub format: u8,
+    pub corked: bool,
+    /// Whether it is resampled from the daemon's rate.
+    pub resampled: bool,
+    /// What waits to be sent and what the source holds before it, as last
+    /// measured.
+    pub buffer_usec: u64,
+    pub source_usec: u64,
+}
+
 /// A change to a stream that another connection asked for. Only the
 /// connection that owns the stream holds its daemon client, so it applies
 /// the change.
@@ -48,6 +67,7 @@ pub struct Registry {
     clients: Mutex<BTreeMap<u32, String>>,
     inboxes: Mutex<BTreeMap<u32, Sender<Remote>>>,
     sink_inputs: Mutex<BTreeMap<u32, SinkInput>>,
+    source_outputs: Mutex<BTreeMap<u32, SourceOutput>>,
     sink_mute: Mutex<Option<u8>>,
     /// The output's delay after a stream's ring, as a playing stream last
     /// measured it.
@@ -64,6 +84,7 @@ impl Registry {
             clients: Mutex::new(BTreeMap::new()),
             inboxes: Mutex::new(BTreeMap::new()),
             sink_inputs: Mutex::new(BTreeMap::new()),
+            source_outputs: Mutex::new(BTreeMap::new()),
             sink_mute: Mutex::new(None),
             sink_latency: AtomicU64::new(0),
             next_stream: AtomicU32::new(1),
@@ -195,6 +216,48 @@ impl Registry {
         self.sink_inputs.lock().unwrap().get(&index).cloned()
     }
 
+    pub fn add_source_output(&self, output: SourceOutput) {
+        let index = output.index;
+        self.source_outputs.lock().unwrap().insert(index, output);
+        self.notify(source_output_event(wire::EVENT_NEW, index));
+    }
+
+    pub fn update_source_output(&self, mut output: SourceOutput) {
+        let index = output.index;
+        let mut outputs = self.source_outputs.lock().unwrap();
+        if let Some(old) = outputs.get(&index) {
+            // A stream's entry carries no measurement; keep the last one.
+            output.buffer_usec = old.buffer_usec;
+            output.source_usec = old.source_usec;
+        }
+        outputs.insert(index, output);
+        drop(outputs);
+        self.notify(source_output_event(wire::EVENT_CHANGE, index));
+    }
+
+    pub fn remove_source_output(&self, index: u32) {
+        if self.source_outputs.lock().unwrap().remove(&index).is_some() {
+            self.notify(source_output_event(wire::EVENT_REMOVE, index));
+        }
+    }
+
+    /// Records a record stream's latency, without an event, as
+    /// `set_latency` does for playback.
+    pub fn set_source_output_latency(&self, index: u32, buffer_usec: u64, source_usec: u64) {
+        if let Some(output) = self.source_outputs.lock().unwrap().get_mut(&index) {
+            output.buffer_usec = buffer_usec;
+            output.source_usec = source_usec;
+        }
+    }
+
+    pub fn source_outputs(&self) -> Vec<SourceOutput> {
+        self.source_outputs.lock().unwrap().values().cloned().collect()
+    }
+
+    pub fn source_output(&self, index: u32) -> Option<SourceOutput> {
+        self.source_outputs.lock().unwrap().get(&index).cloned()
+    }
+
     /// The output percent remembered before a mute, while the sink is
     /// muted. Shared, because a client's connection may close between the
     /// mute and the unmute.
@@ -237,6 +300,14 @@ impl Registry {
     }
 }
 
+fn source_output_event(change: u32, index: u32) -> Event {
+    Event {
+        facility: wire::EVENT_SOURCE_OUTPUT,
+        change,
+        index,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,6 +341,49 @@ mod tests {
         assert_eq!(
             heard[0].facility | heard[0].change,
             wire::EVENT_SERVER | wire::EVENT_CHANGE
+        );
+    }
+
+    #[test]
+    fn source_outputs_are_announced_and_keep_their_latency() {
+        let registry = Arc::new(Registry::new(false));
+        let events = registry.subscribe();
+        let output = SourceOutput {
+            index: 4,
+            client: 1,
+            name: "rec".into(),
+            source: Source::Monitor,
+            rate: 48_000,
+            channels: 2,
+            format: wire::FORMAT_S16LE,
+            corked: false,
+            resampled: false,
+            buffer_usec: 0,
+            source_usec: 0,
+        };
+        registry.add_source_output(output.clone());
+        registry.set_source_output_latency(4, 10, 20);
+        registry.update_source_output(SourceOutput {
+            corked: true,
+            ..output
+        });
+        let kept = registry.source_output(4).unwrap();
+        assert_eq!((kept.corked, kept.buffer_usec, kept.source_usec), (true, 10, 20));
+        assert_eq!(registry.source_outputs().len(), 1);
+        registry.remove_source_output(4);
+        registry.remove_source_output(4);
+        let heard: Vec<u32> = events
+            .try_iter()
+            .map(|event| event.facility | event.change)
+            .collect();
+        let facility = wire::EVENT_SOURCE_OUTPUT;
+        assert_eq!(
+            heard,
+            [
+                facility | wire::EVENT_NEW,
+                facility | wire::EVENT_CHANGE,
+                facility | wire::EVENT_REMOVE
+            ]
         );
     }
 }

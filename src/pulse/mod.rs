@@ -7,6 +7,7 @@
 pub mod conn;
 pub mod objects;
 pub mod packet;
+pub mod record;
 pub mod registry;
 pub mod stream;
 pub mod volume;
