@@ -584,9 +584,6 @@ The playback endpoint is built: `src/pulse/` serves protocol 35 on
 volume onto the output volume and the client gain. See "PulseAudio clients" in
 `doc/design.md` and the board script `dist/test-pulse.sh`. Parked:
 
-- Recording: `CREATE_RECORD_STREAM`, `parec`, source objects and the analog
-  input as a source. The design says later; the endpoint answers these with
-  `PA_ERR_NOTSUPPORTED` now.
 - Native `libpipewire` clients. They do not use the PulseAudio API, so they
   need the native PipeWire protocol or a `libpipewire` shim. Neither is
   planned; players that link `pw_stream` stay on PipeWire until one exists.

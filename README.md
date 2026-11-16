@@ -564,15 +564,42 @@ is the output volume: `pactl set-sink-volume`, `GET /outputs/1` and `amixer`
 show the same number.
 
 The endpoint advertises protocol version 35 and implements playback
-introspection and control. Recording and `parec`, SHM, loadable modules,
-moving or suspending streams and the native PipeWire protocol are not
-implemented; those commands get a PulseAudio error and the connection stays
+introspection and control, and recording. SHM, loadable modules, moving or
+suspending streams and the native PipeWire protocol are not implemented; those commands get a PulseAudio error and the connection stays
 usable. A client that cannot be served is told why, alone: one malformed
 connection never affects another one or the audio thread.
 
-`pactl info`, `paplay` and `mpv --ao=pulse` are the usual checks. On a board,
-`sh dist/test-pulse.sh` runs them and compares a `pactl` volume change with
-`aasctl outputs`.
+`pactl info`, `paplay`, `parecord` and `mpv --ao=pulse` are the usual checks.
+On a board, `sh dist/test-pulse.sh` runs them, compares a `pactl` volume change
+with `aasctl outputs` and records from the sources.
+
+### Recording through PulseAudio
+
+Two sources can be recorded, for example with `parecord`:
+
+- `aas.monitor`, the monitor of the sink `aas`: what the master card gets, after
+  the mix, the plugins and the software volume. It carries the first two
+  channels of the card, zeros while the output plays DoP or is parked, and it
+  is also the sink's monitor source.
+- `aas.analog`, the analog input after its chain, what an ALSA recorder gets
+  from `default`. It exists only while the analog input is enabled.
+
+The default source is `aas.analog` where it exists, otherwise `aas.monitor`:
+
+```sh
+parecord -d aas.monitor --channels=2 --format=s16le --rate=48000 take.wav
+```
+
+A recording asks for its own format: mono or stereo, S16, S24, S24_32, S32 or
+float, at any rate; the daemon converts and resamples. The default fragment is
+25 ms. When the daemon's rate changes, a recording goes on after a short gap
+and is not ended with an error. A client that stops reading gets overflows, and
+loses its oldest frames, instead of making the daemon buffer without limit.
+
+The volume and mute of a source and of a recording stream are fixed at 100
+percent and unmuted. `pactl set-source-volume` and the like answer "not
+supported", so a recording is never changed behind another client's back. A
+recording client appears in the API by its process name, like a player.
 
 ## Writing a plugin
 
@@ -662,7 +689,8 @@ catch the panic with `std::panic::catch_unwind`. The crate's documentation
 - `cargo test --test pulse` on any machine, for the endpoint against a daemon
   with a null sink, and `sh dist/test-pulse.sh` on the board, with the unit
   running and `/etc/pulse/client.conf` installed. It needs `pactl`, `paplay`,
-  `mpv`, `aasctl` and `python3`, and prints PASS or FAIL for each case.
+  `mpv`, `aasctl` and `python3`, and prints PASS or FAIL for each case. With
+  `parecord` it also checks recording.
 - `bit-check` proves that what a player sends reaches the card unchanged. Load
   `snd-aloop`, set `card = "Loopback"` and `latency_ms = 48` in the daemon's
   config, then run for example

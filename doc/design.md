@@ -202,7 +202,7 @@ The server advertises protocol 35 and implements this playback subset:
 | Volume | `SET_SINK_VOLUME`, `SET_SINK_MUTE`, `SET_SINK_INPUT_VOLUME`, `SET_SINK_INPUT_MUTE`, `SET_DEFAULT_SINK` |
 | Notifications | `SUBSCRIBE`, and the server-to-client `REQUEST`, `STARTED`, `SUBSCRIBE_EVENT`, `PLAYBACK_STREAM_KILLED`, `UNDERFLOW` |
 
-Every other command, including record streams, modules, moves, suspends and
+Every other command, including modules, moves, suspends and
 extensions, is answered with `PA_COMMAND_ERROR` and `PA_ERR_NOTSUPPORTED`, and
 the connection stays usable *(call)*. A command that cannot be carried out for
 this stream is refused the same way rather than applied halfway.
@@ -380,7 +380,12 @@ converts what the ring delivers, stereo S32 at the daemon's rate, into the
 client's spec: mono by averaging the two channels, the client's sample format,
 and its rate with the daemon's own resampler. This runs on the connection's
 thread, not the audio thread. Data goes to the client as memblocks of its
-`fragsize`, by default 25 ms, checked as often as a playing stream is. When the
+`fragsize`, by default 25 ms, checked as often as a playing stream is. What
+waits to be sent is capped at the client's `maxlength`, by default 2 s, and in
+any case at a send budget of 256 KiB between the stream and the client's
+socket, well below the size at which a connection is closed: a client that
+stops reading gets `OVERFLOW` and loses its oldest frames, never an unbounded
+queue and never its connection. When the
 daemon's rate changes the ring ends; the endpoint opens a new one at the new
 rate and goes on, so the client sees a short gap, not an error *(call)*.
 
