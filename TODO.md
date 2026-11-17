@@ -217,9 +217,15 @@ under `aas` (switch, balance, channel mode, VU meter, volume through
 
 Missing:
 
-- Bluetooth audio under `aas` (`bluez-alsa`), the volume limit as an output
-  ceiling, and speaker EQ and the input processor as plugins: the next
-  phase, see `doc/switch.md`.
+- Bluetooth audio under `aas` (`doc/switch.md`, "Bluetooth"): bluez-alsa's
+  units with drop-ins from `aas` 0.1.1, on branches `feat/bluetooth` here,
+  `feat/aas-bluetooth` in hifiberry-os (meta 0.16) and hbos-ui (no warning).
+  Checked on the Pi 4 without a phone: sink only, skipped under PipeWire.
+  Missing: a phone streaming to a device under `aas`, its volume slider
+  moving `Master`, and `audiocontrol`'s Bluetooth player under `aas`; then
+  pushes and pull requests.
+- The volume limit as an output ceiling, and speaker EQ and the input
+  processor as plugins: the next phase, see `doc/switch.md`.
 
 ## A reopen cuts the sound instead of fading it
 
