@@ -22,6 +22,8 @@ Description: Alternative audio server
   * aasctl - command-line client for the daemon
   * hifiberry-audio-server - switch between PipeWire and aas
   * aas-config - writes the daemon's configuration at boot
+  * drop-ins that run bluez-alsa, when installed, as the Bluetooth sink
+    under aas only
 
 Package: libasound2-plugin-aas
 Architecture: any

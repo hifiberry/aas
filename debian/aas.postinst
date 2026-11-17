@@ -13,6 +13,13 @@ if [ "$1" = configure ]; then
         if systemctl is-active --quiet hifiberry-auth.service 2>/dev/null; then
             deb-systemd-invoke restart hifiberry-auth.service || true
         fi
+        # bluez-alsa may have been started by its own package before these
+        # drop-ins were in place. A restart applies them: under PipeWire
+        # the condition skips the start, which leaves the units stopped;
+        # under aas they run with the drop-ins' options.
+        systemctl daemon-reload || true
+        systemctl try-restart bluealsa.service bluealsa-aplay.service \
+            2>/dev/null || true
     fi
 fi
 
