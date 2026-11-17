@@ -201,11 +201,12 @@ some time, PipeWire and `aas`, and the user selects which one runs. The design
 is `doc/switch.md`.
 
 Done: the volume follow (`aas` follows the card's control), the Debian
-packages and the switch (`debian/`, `dist/hifiberryos/`), and branches in the
-HiFiBerry OS repositories, not pushed yet: `hifiberry-os` `feat/aas` (build
-script, meta packages), `configurator` `feat/audio-server` (the
-`/api/v1/audio-server` route, factory reset, `config-volume`, features,
-2.20.0) and `hbos-ui` `feat/audio-server` (the switch page, the sound page,
+packages and the switch (`debian/`, `dist/hifiberryos/`), and the
+configurator side, merged into its `main` as 2.20.0 (the
+`/api/v1/audio-server` route, factory reset, `config-volume`, features; with
+2.19.1 below it, the fast `systeminfo` and the card detection fix). Pushed
+but without pull requests: `hifiberry-os` `feat/aas` (build script, meta
+packages) and `hbos-ui` `feat/audio-server` (the switch page, the sound page,
 the VU meter under `aas`). Plans in `doc/plans/2026-11-16-*`. On a test
 board with HiFiBerry OS (`hbos-full`) the switch was run both ways with a
 reboot each: PipeWire stays off under `aas`, players play through ALSA and
@@ -214,8 +215,12 @@ PipeWire.
 
 Missing:
 
-- Push `aas`, then open pull requests for the three branches (their builds
-  clone `aas` from GitHub, so `aas` goes first). Owner's go needed.
+- Open pull requests for `hifiberry-os` `feat/aas` and `hbos-ui`
+  `feat/audio-server`. Owner's go needed.
+- The `audiocontrol` volume path under `aas`: untested so far, because
+  `audiocontrol` gave up on its volume control at boot while `systeminfo`
+  was slow. With configurator 2.19.1 or later, reboot a device switched to
+  `aas` and check that the web UI's volume moves the card's control.
 - Click through the web UI's Audio server page in a browser on a device:
   the warning list, the switch, the reboot dialog, then the sound page's
   balance and channel mode and the VU meter under `aas`.
@@ -228,25 +233,6 @@ Missing:
 - Bluetooth audio under `aas` (`bluez-alsa`), the volume limit as an output
   ceiling, and speaker EQ and the input processor as plugins: the next
   phase, see `doc/switch.md`.
-
-Found on the test board, in the configurator, under both servers. Both are
-fixed on `configurator` branch `fix/systeminfo-speed` (2.19.1, not pushed),
-checked on the board: `systeminfo` 0.44 s, then 0.03 s, and the card is a
-DAC+ ADC Pro as root and as a user. If `feat/audio-server` (2.20.0) merges
-after it, its changelog stanza goes above 2.19.1. What it fixed:
-
-- `config-soundcard --json` run as root (as `aas-config` and the config
-  server run it) reports a DAC+ ADC Pro without a HAT EEPROM as "DAC+/Amp2"
-  with no ADC: I2C probing finds the DAC first. The non-root run, which
-  falls back to `aplay -l`, gets it right. The generated `aas.toml` then has
-  no `[analog]`; `/etc/aas/aas.local.toml` works around it.
-- `GET /api/v1/systeminfo` takes 11 to 25 s on that board, so
-  `audiocontrol` gives up at boot after three 10 s tries and disables its
-  volume control. Profiled: card detection takes under 0.4 s; the time is the
-  Bluetooth status, whose `get_object("org.bluez")` makes D-Bus try to start
-  BlueZ on a board without Bluetooth hardware (`bluetooth.service` skipped by
-  its condition) and wait for the activation timeout. The `audiocontrol` volume path under
-  `aas` is therefore not tested yet.
 
 ## A reopen cuts the sound instead of fading it
 
