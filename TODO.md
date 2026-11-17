@@ -206,7 +206,7 @@ configurator side, merged into its `main` as 2.20.0 (the
 `/api/v1/audio-server` route, factory reset, `config-volume`, features; with
 2.19.1 below it, the fast `systeminfo` and the card detection fix). Merged
 2026-11-17: hifiberry/hifiberry-os#678 (build script, meta packages 0.15)
-and hifiberry/hbos-ui#48 into `dev` (the switch page in System Tools, the
+and hifiberry/hbos-ui#48 into `dev`, released as 0.29.0 (the switch page in System Tools, the
 sound page, the VU meter under `aas`). Plans in `doc/plans/2026-11-16-*`. On a test
 board with HiFiBerry OS (`hbos-full`) the switch was run both ways with a
 reboot each: PipeWire stays off under `aas`, players play through ALSA and
@@ -217,9 +217,6 @@ under `aas` (switch, balance, channel mode, VU meter, volume through
 
 Missing:
 
-- hbos-ui: merge hifiberry/hbos-ui#49 (`chore(release): 0.29.0`, the
-  version and changelog entry for the aas work), then build and install it
-  on the test devices, which carry a branch build labelled 0.28.0.
 - Bluetooth audio under `aas` (`bluez-alsa`), the volume limit as an output
   ceiling, and speaker EQ and the input processor as plugins: the next
   phase, see `doc/switch.md`.
