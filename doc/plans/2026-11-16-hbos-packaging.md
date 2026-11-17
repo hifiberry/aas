@@ -97,7 +97,7 @@
 
 ### Task 4: `hifiberry-os`
 
-**Repository:** `/home/matuschd/localdev/hifiberry-os`, new branch `feat/aas` from `main`.
+**Repository:** `hifiberry/hifiberry-os` (a checkout beside this one, `../hifiberry-os`), new branch `feat/aas` from `main`.
 
 **Files:**
 - Create: `packages/aas/build.sh` (from `packages/sendspin/build.sh`: `PACKAGE="aas"`, `REPO_URL="https://github.com/hifiberry/aas"`, moves both `aas_*.deb` and `libasound2-plugin-aas_*.deb`, `--clean` removes both), `packages/aas/clean.sh` if siblings have one

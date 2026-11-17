@@ -6,7 +6,7 @@
 
 **Tech Stack:** Python 3, Flask, pytest. No new dependencies.
 
-**Repository:** `https://github.com/hifiberry/configurator`, checked out at `/home/matuschd/localdev/configurator`; branch `feat/audio-server` from `main`.
+**Repository:** `https://github.com/hifiberry/configurator`, checked out beside this one at `../configurator`; branch `feat/audio-server` from `main`.
 
 **Spec:** `aas` repository, `doc/switch.md`: "The choice", "The web UI and the configurator (7)", "Volume" (the `config-volume` paragraph).
 

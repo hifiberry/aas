@@ -6,7 +6,7 @@
 
 **Tech Stack:** Vue 3, TypeScript, Pinia setup stores, Vitest with happy-dom. No new dependencies.
 
-**Repository:** `https://github.com/hifiberry/hbos-ui`, checked out at `/home/matuschd/localdev/hbos-ui`; branch `feat/audio-server` from `dev`.
+**Repository:** `https://github.com/hifiberry/hbos-ui`, checked out beside this one at `../hbos-ui`; branch `feat/audio-server` from `dev`.
 
 **Spec:** `aas` repository, `doc/switch.md`: "The choice", "Speaker EQ, input processor, volume limit, balance, mono", "What the user is told before switching", "The web UI and the configurator (7)". The `aas` API: `aas` `README.md`, "The API".
 
