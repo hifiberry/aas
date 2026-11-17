@@ -204,10 +204,10 @@ Done: the volume follow (`aas` follows the card's control), the Debian
 packages and the switch (`debian/`, `dist/hifiberryos/`), and the
 configurator side, merged into its `main` as 2.20.0 (the
 `/api/v1/audio-server` route, factory reset, `config-volume`, features; with
-2.19.1 below it, the fast `systeminfo` and the card detection fix). In open
-pull requests: `hifiberry-os` `feat/aas` (build script, meta
-packages) and `hbos-ui` `feat/audio-server` (the switch page, the sound page,
-the VU meter under `aas`; the switch is in System Tools). Plans in `doc/plans/2026-11-16-*`. On a test
+2.19.1 below it, the fast `systeminfo` and the card detection fix). Merged
+2026-11-17: hifiberry/hifiberry-os#678 (build script, meta packages 0.15)
+and hifiberry/hbos-ui#48 into `dev` (the switch page in System Tools, the
+sound page, the VU meter under `aas`). Plans in `doc/plans/2026-11-16-*`. On a test
 board with HiFiBerry OS (`hbos-full`) the switch was run both ways with a
 reboot each: PipeWire stays off under `aas`, players play through ALSA and
 PulseAudio, the card's level is followed, and switching back restores
@@ -217,9 +217,9 @@ under `aas` (switch, balance, channel mode, VU meter, volume through
 
 Missing:
 
-- Merge hifiberry/hifiberry-os#678 (`feat/aas`) and hifiberry/hbos-ui#48
-  (`feat/audio-server`, into `dev`, with a release commit). Opened
-  2026-11-17; the owner decides the merge.
+- hbos-ui: `dev` carries the aas work without a version bump (still
+  0.28.0). The next `chore(release)` (0.29.0, `debian/changelog` and
+  `package.json`) needs an entry for it, through a pull request.
 - configurator: `volume-store` runs after `volume-restore` even when the
   restore failed, and then saves the card's power-on level (0 dB on pcm512x)
   over the stored volume. Skip the store when the restore failed, e.g.
