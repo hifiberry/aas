@@ -220,10 +220,6 @@ Missing:
 - hbos-ui: `dev` carries the aas work without a version bump (still
   0.28.0). The next `chore(release)` (0.29.0, `debian/changelog` and
   `package.json`) needs an entry for it, through a pull request.
-- configurator: merge hifiberry/configurator#39 (2.20.2), which skips
-  `volume-store` while `volume-restore` has failed, so a failed restore no
-  longer stores the card's power-on level over the saved volume. Then build
-  and install it on the test devices.
 - Bluetooth audio under `aas` (`bluez-alsa`), the volume limit as an output
   ceiling, and speaker EQ and the input processor as plugins: the next
   phase, see `doc/switch.md`.
