@@ -217,9 +217,9 @@ under `aas` (switch, balance, channel mode, VU meter, volume through
 
 Missing:
 
-- hbos-ui: `dev` carries the aas work without a version bump (still
-  0.28.0). The next `chore(release)` (0.29.0, `debian/changelog` and
-  `package.json`) needs an entry for it, through a pull request.
+- hbos-ui: merge hifiberry/hbos-ui#49 (`chore(release): 0.29.0`, the
+  version and changelog entry for the aas work), then build and install it
+  on the test devices, which carry a branch build labelled 0.28.0.
 - Bluetooth audio under `aas` (`bluez-alsa`), the volume limit as an output
   ceiling, and speaker EQ and the input processor as plugins: the next
   phase, see `doc/switch.md`.
