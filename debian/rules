@@ -73,10 +73,13 @@ override_dh_auto_install:
 	ln -sf libasound_module_pcm_aas.so $(PLUGIN)/$(ALSA_DIR)/libasound_module_ctl_aas.so
 
 # Installed disabled and not started: a device stays on PipeWire until
-# hifiberry-audio-server set aas enables them.
+# hifiberry-audio-server set aas enables them. Not stopped on upgrade
+# either: with --no-start nothing would start aas again, and a device
+# running it would be silent until the next boot. postinst restarts it
+# instead, if it runs.
 override_dh_installsystemd:
-	dh_installsystemd --no-enable --no-start --name=aas-config
-	dh_installsystemd --no-enable --no-start --name=aas
+	dh_installsystemd --no-enable --no-start --no-stop-on-upgrade --name=aas-config
+	dh_installsystemd --no-enable --no-start --no-stop-on-upgrade --name=aas
 
 override_dh_strip:
 	dh_strip --no-automatic-dbgsym
