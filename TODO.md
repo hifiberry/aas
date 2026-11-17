@@ -207,29 +207,22 @@ configurator side, merged into its `main` as 2.20.0 (the
 2.19.1 below it, the fast `systeminfo` and the card detection fix). Pushed
 but without pull requests: `hifiberry-os` `feat/aas` (build script, meta
 packages) and `hbos-ui` `feat/audio-server` (the switch page, the sound page,
-the VU meter under `aas`). Plans in `doc/plans/2026-11-16-*`. On a test
+the VU meter under `aas`; the switch is in System Tools). Plans in `doc/plans/2026-11-16-*`. On a test
 board with HiFiBerry OS (`hbos-full`) the switch was run both ways with a
 reboot each: PipeWire stays off under `aas`, players play through ALSA and
 PulseAudio, the card's level is followed, and switching back restores
-PipeWire.
+PipeWire. Checked by the owner on a second device (2026-11-17): the web UI
+under `aas` (switch, balance, channel mode, VU meter, volume through
+`audiocontrol`) and Soloist.
 
 Missing:
 
 - Open pull requests for `hifiberry-os` `feat/aas` and `hbos-ui`
   `feat/audio-server`. Owner's go needed.
-- The `audiocontrol` volume path under `aas`: untested so far, because
-  `audiocontrol` gave up on its volume control at boot while `systeminfo`
-  was slow. With configurator 2.19.1 or later, reboot a device switched to
-  `aas` and check that the web UI's volume moves the card's control.
-- Click through the web UI's Audio server page in a browser on a device:
-  the warning list, the switch, the reboot dialog, then the sound page's
-  balance and channel mode and the VU meter under `aas`.
-- Soloist: the binary carries both libpipewire and libpulse and loads them
-  at run time, and its help says `--pipewire-device` applies "if using
-  PipeWire", so under `aas` it likely falls back to libpulse and plays
-  through `/run/aas/pulse`. Check by enabling Soloist on a device switched
-  to `aas` and reading its log. If it plays, `soloist-wrapper` needs only
-  `aas.service` in its unit's `After=`.
+- configurator: `volume-store` runs after `volume-restore` even when the
+  restore failed, and then saves the card's power-on level (0 dB on pcm512x)
+  over the stored volume. Skip the store when the restore failed, e.g.
+  `Requires=volume-restore.service` or a check in `config-volume --store`.
 - Bluetooth audio under `aas` (`bluez-alsa`), the volume limit as an output
   ceiling, and speaker EQ and the input processor as plugins: the next
   phase, see `doc/switch.md`.
