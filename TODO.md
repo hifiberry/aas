@@ -225,9 +225,11 @@ Missing:
   source: A2DP plays into `aas` as client `bluealsa-aplay` at 48 kHz, the
   source's volume moves `Master` and `Master` moves the source's slider.
   While the source stays connected but idle the client stays open and
-  running (seen for 50 s); a disconnect removes it. Missing: whether a
-  phone that pauses releases the client, `audiocontrol`'s Bluetooth player
-  under `aas` (needs a phone's AVRCP), then pushes and pull requests.
+  running (seen for 50 s); a disconnect removes it. The owner paired an
+  iPhone with the Pi 4 under `aas` (2026-11-20), after the pairing-mode fix
+  in hbos-bluetooth 1.0.11 (branch `fix/busy-adapter-changes`). In pull
+  requests. Missing: whether a phone that pauses releases the client, and
+  `audiocontrol`'s Bluetooth player under `aas`.
 - The volume limit as an output ceiling, and speaker EQ and the input
   processor as plugins: the next phase, see `doc/switch.md`.
 
