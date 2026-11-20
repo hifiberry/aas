@@ -221,9 +221,13 @@ Missing:
   units with drop-ins from `aas` 0.1.1, on branches `feat/bluetooth` here,
   `feat/aas-bluetooth` in hifiberry-os (meta 0.16) and hbos-ui (no warning).
   Checked on the Pi 4 without a phone: sink only, skipped under PipeWire.
-  Missing: a phone streaming to a device under `aas`, its volume slider
-  moving `Master`, and `audiocontrol`'s Bluetooth player under `aas`; then
-  pushes and pull requests.
+  Checked 2026-11-20 with the CM5 (PipeWire, a USB Bluetooth stick) as the
+  source: A2DP plays into `aas` as client `bluealsa-aplay` at 48 kHz, the
+  source's volume moves `Master` and `Master` moves the source's slider.
+  While the source stays connected but idle the client stays open and
+  running (seen for 50 s); a disconnect removes it. Missing: whether a
+  phone that pauses releases the client, `audiocontrol`'s Bluetooth player
+  under `aas` (needs a phone's AVRCP), then pushes and pull requests.
 - The volume limit as an output ceiling, and speaker EQ and the input
   processor as plugins: the next phase, see `doc/switch.md`.
 
