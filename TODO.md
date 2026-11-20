@@ -218,7 +218,7 @@ under `aas` (switch, balance, channel mode, VU meter, volume through
 Missing:
 
 - Bluetooth audio under `aas` (`doc/switch.md`, "Bluetooth"): bluez-alsa's
-  units with drop-ins from `aas` 0.1.1, on branches `feat/bluetooth` here,
+  units with drop-ins from `aas` 0.2.0, on branches `feat/bluetooth` here,
   `feat/aas-bluetooth` in hifiberry-os (meta 0.16) and hbos-ui (no warning).
   Checked on the Pi 4 without a phone: sink only, skipped under PipeWire.
   Checked 2026-11-20 with the CM5 (PipeWire, a USB Bluetooth stick) as the

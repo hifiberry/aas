@@ -1,4 +1,4 @@
-aas (0.1.1) trixie; urgency=medium
+aas (0.2.0) trixie; urgency=medium
 
   * Bluetooth audio under aas: drop-ins for bluez-alsa's bluealsa and
     bluealsa-aplay units run them only when aas is chosen, as the A2DP
