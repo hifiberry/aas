@@ -217,19 +217,17 @@ under `aas` (switch, balance, channel mode, VU meter, volume through
 
 Missing:
 
-- Bluetooth audio under `aas` (`doc/switch.md`, "Bluetooth"): bluez-alsa's
-  units with drop-ins from `aas` 0.2.0, on branches `feat/bluetooth` here,
-  `feat/aas-bluetooth` in hifiberry-os (meta 0.16) and hbos-ui (no warning).
-  Checked on the Pi 4 without a phone: sink only, skipped under PipeWire.
-  Checked 2026-11-20 with the CM5 (PipeWire, a USB Bluetooth stick) as the
-  source: A2DP plays into `aas` as client `bluealsa-aplay` at 48 kHz, the
-  source's volume moves `Master` and `Master` moves the source's slider.
-  While the source stays connected but idle the client stays open and
-  running (seen for 50 s); a disconnect removes it. The owner paired an
-  iPhone with the Pi 4 under `aas` (2026-11-20), after the pairing-mode fix
-  in hbos-bluetooth 1.0.11 (branch `fix/busy-adapter-changes`). In pull
-  requests. Missing: whether a phone that pauses releases the client, and
-  `audiocontrol`'s Bluetooth player under `aas`.
+- Bluetooth audio under `aas` (`doc/switch.md`, "Bluetooth"): merged
+  2026-11-20 as aas 0.2.0 (#1), with hifiberry/hifiberry-os#679 (meta 0.16,
+  `bluez-alsa-utils`), hifiberry/hbos-ui#50, and in hifiberry/hbos-bluetooth
+  the pairing-mode fix (#7, 1.1.0) and the adapter choice for a built-in
+  adapter plus a USB stick (#8, 1.2.0; configurator#41 2.21.0, hbos-ui#51).
+  Checked with the CM5 as a Bluetooth source and an iPhone on the Pi 4:
+  A2DP plays into `aas` as `bluealsa-aplay`, volume follows both ways.
+  Missing: whether a phone that pauses releases the client (an idle but
+  connected source keeps it open and running), and `audiocontrol`'s
+  Bluetooth player under `aas`. First step: pause the iPhone and read
+  `/api/aas/v1/state` on the Pi 4.
 - The volume limit as an output ceiling, and speaker EQ and the input
   processor as plugins: the next phase, see `doc/switch.md`.
 
