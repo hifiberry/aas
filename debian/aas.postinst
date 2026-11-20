@@ -4,7 +4,7 @@ set -e
 # Make nginx read the API location and hifiberry-auth the manifest this
 # package installed. Neither is required, so a failure is not an error.
 # aas itself is never enabled or started here: that is what
-# hifiberry-audio-server set aas does.
+# hifiberry-audio-server set aas does. It is only restarted if it runs.
 if [ "$1" = configure ]; then
     if [ -d /run/systemd/system ]; then
         if systemctl is-active --quiet nginx.service 2>/dev/null; then
@@ -13,6 +13,17 @@ if [ "$1" = configure ]; then
         if systemctl is-active --quiet hifiberry-auth.service 2>/dev/null; then
             deb-systemd-invoke restart hifiberry-auth.service || true
         fi
+        # Read the units and drop-ins this package installed first.
+        systemctl daemon-reload || true
+        # On an upgrade the running daemon is the old binary; try-restart
+        # starts the new one and does nothing on a device on PipeWire.
+        systemctl try-restart aas.service 2>/dev/null || true
+        # bluez-alsa may have been started by its own package before these
+        # drop-ins were in place. A restart applies them: under PipeWire
+        # the condition skips the start, which leaves the units stopped;
+        # under aas they run with the drop-ins' options.
+        systemctl try-restart bluealsa.service bluealsa-aplay.service \
+            2>/dev/null || true
     fi
 fi
 

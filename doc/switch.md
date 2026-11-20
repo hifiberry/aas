@@ -21,7 +21,7 @@ The owner decided on 2026-11-16:
 - **Soloist moves to the PulseAudio interface,** under both servers, instead of
   linking `pw_stream`.
 - **Bluetooth audio under `aas` is the next phase.** Until then it is on the
-  list of what stops working.
+  list of what stops working. It is designed under "Bluetooth".
 
 From before (`doc/design.md`, "Non-goals for the first version"): both servers
 are installed side by side, exactly one runs, a switch works in both directions
@@ -187,8 +187,8 @@ its sound page uses that chain for three things only:
 Before `set aas`, the web UI lists what will stop working on this device, and
 only what is in use there: the input processor enabled (`pipewire-api`'s RIAA
 state), AES67 or the USB gadget enabled (their units, through the config
-server), a paired Bluetooth device (the system info), a volume limit below
-100 %. The user confirms or stays on PipeWire. The
+server), a volume limit below 100 %. A paired Bluetooth device was on the
+list until Bluetooth worked under `aas` ("Bluetooth"). The user confirms or stays on PipeWire. The
 settings stay, so switching back restores them *(call)*.
 
 Switching back to PipeWire needs no warning: nothing is lost.
@@ -256,10 +256,59 @@ In the HiFiBerry OS repositories:
   configurator".
 - `soloist-wrapper`: see "Soloist".
 
+## Bluetooth
+
+Under PipeWire, a phone streams to the device through PipeWire's `bluez5`
+(`libspa-0.2-bluetooth`), which WirePlumber registers with BlueZ as the A2DP
+sink. `hifiberry-bluetooth` is only the pairing agent, and `audiocontrol`'s
+Bluetooth player talks to BlueZ's AVRCP `MediaPlayer1`; neither touches the
+audio. Under `aas`, WirePlumber is masked, BlueZ has no A2DP endpoint, and a
+phone finds nothing to stream to.
+
+Under `aas` the sink is `bluez-alsa`, Debian's `bluez-alsa-utils` 4.3.1:
+
+- **`bluealsa.service`** registers the A2DP sink with BlueZ. Only the sink:
+  the device is a speaker, not a source *(call)*. Its codecs are Debian's
+  defaults.
+- **`bluealsa-aplay.service`** plays each connected phone into `default`,
+  which under `aas` is the plugin, so a phone is one more `aas` client. Two
+  phones are two clients, mixed, as PipeWire mixes them *(call)*.
+- **Volume.** The phone's slider (AVRCP absolute volume) drives `aas`'s
+  `Master` on the `default` ctl, with `--volume=mixer`: `bluealsa-aplay` takes
+  the phone's volume requests to the mixer and leaves the samples alone, and
+  when a stream starts it sends the phone the mixer's current volume. So the
+  phone, the web UI, the players and the card's control share one volume, as
+  AirPlay's does through Shairport Sync *(call)*. `Master` reports its range
+  in dB, which `bluealsa-aplay` needs. A change from the phone while nothing
+  plays is ignored by `bluealsa-aplay`; a phone without absolute volume plays
+  at the device's volume.
+
+Both units are Debian's, enabled by its package on install. `aas` ships a
+drop-in for each, `/usr/lib/systemd/system/<unit>.d/aas.conf`, that sets the
+options above and an `ExecCondition` that the choice file reads `aas`. Under
+PipeWire both are then skipped, which systemd does not count as a failure,
+and PipeWire's `bluez5` is the only sink. Nothing is enabled or disabled by
+`set`, so the switch command does not change, and an install or upgrade of
+`bluez-alsa-utils` on a PipeWire device starts nothing: its maintainer
+script's start is skipped the same way *(call)*. If `bluez-alsa-utils` is
+configured before `aas`, it starts once without the drop-in: `aas`'s
+`postinst` reloads systemd and runs `try-restart` on both units, which under
+PipeWire stops them (the restart is skipped) and under `aas` restarts them
+with the drop-in's options. Removing `aas` and keeping `bluez-alsa-utils`
+leaves both sinks at the next boot; that is not handled. The units' own sandboxing
+stays; `bluealsa-aplay` as packaged (user root, group `audio`, private users)
+reaches `/run/aas/aas.sock`, which is group `audio`, and `Master`; checked on
+the Pi 4.
+
+`hbos-minimal`, which has `bluez` and `libspa-0.2-bluetooth`, also depends on
+`bluez-alsa-utils`. The web UI no longer lists a paired Bluetooth device as
+something that stops working under `aas`.
+
+Not in this part: HFP and HSP (calls), the device as a Bluetooth source to
+headphones, and a per-client volume for the phone instead of `Master`.
+
 ## Next phase
 
-- Bluetooth audio under `aas` through `bluez-alsa`, installed beside
-  PipeWire's `bluez5` and switched with the same command.
 - The volume limit as an `aas` output ceiling.
 - Speaker EQ and the input processor as native plugins, and AES67, as their
   stages in `doc/design.md`.

@@ -1,3 +1,14 @@
+aas (0.2.0) trixie; urgency=medium
+
+  * Bluetooth audio under aas: drop-ins for bluez-alsa's bluealsa and
+    bluealsa-aplay units run them only when aas is chosen, as the A2DP
+    sink, playing into aas with the phone's volume on Master. Under
+    PipeWire both are skipped and PipeWire's bluez5 stays the sink.
+  * An upgrade no longer stops a running aas without starting it again:
+    the device was silent until the next boot. It is restarted instead.
+
+ -- HiFiBerry <info@hifiberry.com>  Tue, 17 Nov 2026 13:51:53 +0000
+
 aas (0.1.0) trixie; urgency=medium
 
   * First packaged release: the aas audio server and its command-line
