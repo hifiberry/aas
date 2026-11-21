@@ -23,7 +23,7 @@ impl Group {
     }
 
     /// The length of N in bytes, which `k` and `u` pad their operands to.
-    pub fn len(&self) -> usize {
+    pub fn width(&self) -> usize {
         self.n.to_bytes_be().len()
     }
 }
@@ -95,7 +95,7 @@ impl<'a> Client<'a> {
         if salt.is_empty() {
             return Err(SrpError("an empty salt".into()));
         }
-        if b.len() > group.len() {
+        if b.len() > group.width() {
             return Err(SrpError(format!("a B of {} bytes", b.len())));
         }
         let b_num = BigUint::from_bytes_be(b);
@@ -140,7 +140,7 @@ impl<'a> Client<'a> {
 
 /// `H(PAD(x) | PAD(y))`, both padded to the length of N.
 fn hash_padded<D: Digest>(group: &Group, x: &BigUint, y: &BigUint) -> BigUint {
-    let len = group.len();
+    let len = group.width();
     let mut h = D::new();
     for v in [x, y] {
         let bytes = v.to_bytes_be();
@@ -336,7 +336,7 @@ pub mod tests {
     #[test]
     fn the_3072_bit_group_with_sha512_agrees_with_the_receiver() {
         let group = Group::rfc5054_3072();
-        assert_eq!(group.len(), 384);
+        assert_eq!(group.width(), 384);
         let salt = [0x42u8; 16];
         let client = Client::new(&group, "Pair-Setup", b"3939", &[7u8; 32]);
         let server = Server::new::<Sha512>(&group, "Pair-Setup", b"3939", &salt, &[9u8; 32]);
