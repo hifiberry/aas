@@ -9,6 +9,7 @@
 //! the system clock taking 352 frames a packet. The delay is read when
 //! each packet is made, in frames at the master's rate.
 
+use super::ap2::audio::AudioSealer;
 use super::rtp::{self, FRAMES, History, RATE, SYNC_EVERY};
 use crate::adaptive::Adaptive;
 use crate::config::{Format, Quality};
@@ -54,6 +55,8 @@ pub struct Stream {
     /// The path's delay as the drift last read it.
     measured: f64,
     out: Vec<i32>,
+    /// AirPlay 2's: seals each packet's payload.
+    sealer: Option<AudioSealer>,
 }
 
 impl Stream {
@@ -83,7 +86,14 @@ impl Stream {
             padded: 0,
             measured: 0.0,
             out: vec![0; FRAMES * 2],
+            sealer: None,
         }
+    }
+
+    /// The stream with its packets sealed under `shk`, for AirPlay 2.
+    pub fn sealed(mut self, shk: &[u8; 32]) -> Stream {
+        self.sealer = Some(AudioSealer::new(shk));
+        self
     }
 
     /// Takes master-rate stereo frames from the tap.
@@ -127,8 +137,11 @@ impl Stream {
             let frames = self.frames();
             let mut payload = Vec::with_capacity(FRAMES * 4 + 8);
             rtp::alac_escape(&frames, &mut payload);
-            let mut packet = Vec::with_capacity(12 + payload.len());
+            let mut packet = Vec::with_capacity(12 + payload.len() + 24);
             rtp::audio_packet(first, seq, rtptime, self.ssrc, &payload, &mut packet);
+            if let Some(sealer) = &mut self.sealer {
+                sealer.seal(&mut packet);
+            }
             self.history.push(seq, &packet);
             out.push(Outgoing::Audio(packet));
             self.made += 1;
@@ -458,6 +471,31 @@ mod tests {
         }
         assert!(packets.len() > before + 240);
         assert_eq!(s.padded(), 0);
+    }
+
+    #[test]
+    fn a_sealed_stream_seals_each_packet_once_and_resends_it_as_sent() {
+        let shk = [3u8; 32];
+        let mut clear = stream(48000);
+        let mut sealed = stream(48000).sealed(&shk);
+        sealed.ssrc = clear.ssrc;
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        clear.due(Duration::from_millis(50), &mut a);
+        sealed.due(Duration::from_millis(50), &mut b);
+        let (a, b) = (audio(&a), audio(&b));
+        assert_eq!(a.len(), b.len());
+        for (i, (c, s)) in a.iter().zip(&b).enumerate() {
+            // The header as it is; the payload sealed, with the tag and
+            // the packet's count after it.
+            assert_eq!(c[..12], s[..12]);
+            assert_eq!(s.len(), c.len() + 24);
+            assert_ne!(c[12..], s[12..c.len()]);
+            assert_eq!(s[s.len() - 8..], (i as u64).to_le_bytes());
+        }
+        // Syncs stay in the clear.
+        let mut again = Vec::new();
+        sealed.resend(101, 1, &mut again);
+        assert_eq!(again[0], *b[1]);
     }
 
     #[test]

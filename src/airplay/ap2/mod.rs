@@ -7,3 +7,4 @@ pub mod channel;
 pub mod pair;
 pub mod srp;
 pub mod tlv;
+pub mod audio;
