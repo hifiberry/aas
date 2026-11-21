@@ -98,7 +98,12 @@ mod tests {
             let tag = Tag::clone_from_slice(&packet[n - 24..n - 8]);
             let mut body = packet[12..n - 24].to_vec();
             ChaCha20Poly1305::new(Key::from_slice(&shk))
-                .decrypt_in_place_detached(Nonce::from_slice(&nonce), &header[4..12], &mut body, &tag)
+                .decrypt_in_place_detached(
+                    Nonce::from_slice(&nonce),
+                    &header[4..12],
+                    &mut body,
+                    &tag,
+                )
                 .unwrap();
             assert_eq!(body, payload);
         }
