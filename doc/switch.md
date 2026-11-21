@@ -321,7 +321,8 @@ a sink for each receiver, a `stream.rules` entry links the speaker EQ's output
 to the one wanted, and a helper script unlinks the stream after a silence so
 the receiver's input is free again. Under `aas` that is one `[[airplay]]`
 table with `connect = "signal"` (README, "AirPlay"), on the capture clock that
-`clock = "auto"` picks for such a card. Nothing carries the PipeWire setup
+`clock = "auto"` picks for such a card; a sound bar that takes both is played
+to with `protocol = "airplay1"` or `"airplay2"`. Nothing carries the PipeWire setup
 over yet: `aas-config` would have to name the receiver from the `stream.rules`
 entry.
 

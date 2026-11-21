@@ -380,7 +380,7 @@ pub mod tests {
             match (seen.method.as_str(), seen.url.as_str()) {
                 ("GET", "/info") => plist(&dict(&[
                     ("statusFlags", Value::Int(status_flags)),
-                    ("features", Value::Int(0x1_c340_445f_8a00)),
+                    ("features", Value::Int(1 << 48)),
                 ])),
                 ("SETUP", _) => {
                     let body = bplist::decode(&seen.body).unwrap();

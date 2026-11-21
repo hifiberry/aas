@@ -307,7 +307,7 @@ volume_db = -20           # the receiver's volume, sent once a session
 | `host` | a name or an address | none, it is needed | The receiver. A name that does not resolve is retried like any failure. |
 | `port` | 1 to 65535 | 7000 | Its RTSP port. Older receivers, such as an AirPort Express, take 5000. |
 | `name` | text | the host | How the API and the log name it. |
-| `protocol` | `"airplay1"`, `"airplay2"` | `"airplay1"` | AirPlay 2 is not in this build yet: such a receiver fails with a message saying so. |
+| `protocol` | `"airplay1"`, `"airplay2"` | `"airplay1"` | AirPlay 2 as third-party receivers take it: transient pairing with the PIN 3939. A receiver that asks for a PIN of its own or HomeKit pairing, as an Apple TV or a HomePod does, is refused with a message saying so. |
 | `connect` | `"signal"`, `"always"` | `"signal"` | When to connect: on the first 50 ms window above `threshold_dbfs`, or from the start and again after any failure. |
 | `threshold_dbfs` | -90 to 0 | -50 | The level that counts as a signal: the RMS of both channels, as `detect` measures it. |
 | `idle_s` | 1 to 86400 | 120 | Seconds without a signal after which the session ends with TEARDOWN, which frees the receiver's input. Time in which the master sends nothing at all, closed when idle, counts as silence too. |
@@ -317,9 +317,12 @@ volume_db = -20           # the receiver's volume, sent once a session
 What is sent is what the master card gets, as `aas.monitor` records it: after
 the mix, the plugins, the master gain and the volume limit. A master that plays
 nowhere, on a [capture clock](#a-card-that-only-captures), sends its mix all the
-same. The audio goes as AirPlay 1 (RAOP): 44.1 kHz, 16 bits, stereo,
-uncompressed, in the clear, after the `auth-setup` that sound bars ask for; a
-receiver that refuses that step is played to without it. The master's clock and
+same. The audio goes as 44.1 kHz, 16 bits, stereo, uncompressed. With AirPlay
+1 (RAOP) it goes in the clear, after the `auth-setup` that sound bars ask for; a
+receiver that refuses that step is played to without it. With AirPlay 2 `aas`
+pairs first, then seals the control connection, the event connection the
+receiver opens a port for, and every audio packet with ChaCha20-Poly1305, and
+tells the receiver every 2 s that it is still there. The master's clock and
 the receiver's are kept together as a further output's are, by a resampler
 whose ratio follows the frames waiting.
 
