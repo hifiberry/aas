@@ -136,8 +136,55 @@ struct Session {
     raop: Raop,
     data: UdpSocket,
     control: UdpSocket,
-    timing: UdpSocket,
     stream: Stream,
+    /// Answers the receiver's timing requests for as long as the session
+    /// lasts.
+    _timing: Timing,
+}
+
+/// A thread that answers timing requests on its own socket, from before
+/// SETUP on: a receiver may ask the time before it answers SETUP, while
+/// the output's thread waits for that answer.
+struct Timing {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Timing {
+    /// How long a wait for a request lasts before the thread looks
+    /// whether it should stop.
+    const POLL: Duration = Duration::from_millis(100);
+
+    fn start(socket: UdpSocket) -> Timing {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopped = stop.clone();
+        let thread = std::thread::Builder::new()
+            .name("aas-airplay-ntp".into())
+            .spawn(move || {
+                let _ = socket.set_read_timeout(Some(Timing::POLL));
+                let mut buf = [0u8; 64];
+                while !stopped.load(Ordering::Relaxed) {
+                    let Ok((n, from)) = socket.recv_from(&mut buf) else {
+                        continue;
+                    };
+                    let received = ntp_now();
+                    if let Some(reply) = rtp::timing_reply(&buf[..n], received, ntp_now()) {
+                        let _ = socket.send_to(&reply, from);
+                    }
+                }
+            })
+            .ok();
+        Timing { stop, thread }
+    }
+}
+
+impl Drop for Timing {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 struct Output {
@@ -340,9 +387,13 @@ impl Output {
         let bind = || UdpSocket::bind(any).map_err(|e| format!("a UDP socket: {e}"));
         let (control, timing, data) = (bind()?, bind()?, bind()?);
         let port = |s: &UdpSocket| s.local_addr().map(|a| a.port()).unwrap_or(0);
+        let first_timing = timing
+            .try_clone()
+            .map_err(|e| format!("a UDP socket: {e}"))?;
+        let responder = Timing::start(timing);
         let setup = Setup {
             control_port: port(&control),
-            timing_port: port(&timing),
+            timing_port: port(&first_timing),
             first_seq: u16::from_be_bytes(raop::random()),
             first_rtptime: u32::from_be_bytes(raop::random()),
             volume_db: c.volume_db,
@@ -360,12 +411,12 @@ impl Output {
         let udp = |e: std::io::Error| format!("UDP to {peer}: {e}");
         data.connect((peer, ports.server)).map_err(udp)?;
         control.connect((peer, ports.control)).map_err(udp)?;
-        for s in [&data, &control, &timing] {
+        for s in [&data, &control] {
             s.set_nonblocking(true).map_err(udp)?;
         }
         if let Some(t) = ports.timing {
             let ntp = ntp_now();
-            let _ = timing.send_to(&rtp::timing_packet(ntp, ntp, ntp), (peer, t));
+            let _ = first_timing.send_to(&rtp::timing_packet(ntp, ntp, ntp), (peer, t));
         }
         let wanted = u64::from(c.latency_ms) * u64::from(rtp::RATE) / 1000;
         let latency = (wanted as u32).max(raop.audio_latency.unwrap_or(0));
@@ -381,8 +432,8 @@ impl Output {
             raop,
             data,
             control,
-            timing,
             stream,
+            _timing: responder,
         })
     }
 
@@ -406,12 +457,6 @@ impl Output {
             };
         }
         let mut buf = [0u8; 64];
-        while let Ok((n, from)) = s.timing.recv_from(&mut buf) {
-            let received = ntp_now();
-            if let Some(reply) = rtp::timing_reply(&buf[..n], received, ntp_now()) {
-                let _ = s.timing.send_to(&reply, from);
-            }
-        }
         let mut again = Vec::new();
         while let Ok(n) = s.control.recv(&mut buf) {
             if let Some((first, count)) = rtp::retransmit_request(&buf[..n]) {
@@ -613,6 +658,42 @@ mod tests {
         handle.stop();
         assert!(started.elapsed() < Duration::from_secs(1));
         assert_eq!(receiver.finish().last().unwrap().method, "TEARDOWN");
+    }
+
+    #[test]
+    fn a_receiver_that_asks_the_time_during_setup_is_answered_then() {
+        // As a sound bar does: SETUP is answered only once a timing
+        // request to the sender's timing port has had its reply.
+        let receiver = FakeReceiver::serving(1, |port| {
+            let accept = accepting_on(port);
+            move |s: &Seen| {
+                if s.method != "SETUP" {
+                    return accept(s);
+                }
+                let ours = s.header("Transport").unwrap_or_default();
+                let timing: u16 = ours
+                    .split(';')
+                    .find_map(|p| p.strip_prefix("timing_port="))
+                    .and_then(|p| p.parse().ok())
+                    .unwrap_or(0);
+                let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+                let mut request = [0u8; 32];
+                request[..4].copy_from_slice(&[0x80, 0xd2, 0x00, 0x07]);
+                let _ = socket.send_to(&request, ("127.0.0.1", timing));
+                let mut reply = [0u8; 64];
+                match socket.recv(&mut reply) {
+                    Ok(32) => accept(s),
+                    _ => Answer::Status(453, Vec::new()),
+                }
+            }
+        });
+        let handle = spawn(config(receiver.port, Connect::Always));
+        let (_ring, reader) = tap();
+        handle.tap(reader);
+        assert!(until(&handle, 3.0, playing), "{:?}", handle.status());
     }
 
     #[test]
