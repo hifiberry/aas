@@ -2449,3 +2449,19 @@ capture.
 
 At the default `detect` threshold the tone, at -53 dBFS, counted as no signal
 and the mix stayed silent, as it should.
+
+On a board whose card only captures, a CM5 with a HiFiBerry ADC under HiFiBerry
+OS, 2026-11-21, with `clock = "auto"` and the analog input on, at 48 kHz and
+64-frame periods, PipeWire stopped for the run:
+
+- `auto` chose the capture: `the output is clocked by the capture of
+  hw:sndrpihifiberry; it plays nowhere`, rates 44.1 to 192 kHz.
+- 42760 cycles in about 57 s, 750 a second. No xrun, no frame padded or
+  dropped, worst cycle 0.047 ms; 2 wake gaps, the worst 3.1 ms, on a board
+  without `dist/90-aas.conf`.
+- No record played: the input's peaks stayed near -58 dBFS and `detect` held
+  it quiet.
+
+Run as a user, the start failed with `memory allocation of 262144 bytes
+failed`: that user may lock 8 MB, and `aas` locks its memory. The service has
+`LimitMEMLOCK=infinity`; the run was repeated as root.
