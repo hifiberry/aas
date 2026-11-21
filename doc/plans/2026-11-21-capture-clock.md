@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** `aas` runs on a card that only captures, such as vinyl's HiFiBerry
+**Goal:** `aas` runs on a card that only captures, such as the HiFiBerry
 ADC. The capture's clock drives the audio thread. The master's mix plays
 nowhere, but reaches the monitor, the further outputs and, later, AirPlay.
 
@@ -17,10 +17,9 @@ already reads "the latest period" each cycle.
 - The `FallbackSink` around the master keeps time with its timer while the
   card is gone, as for a playback card.
 
-**Spec:** this conversation, 2026-11-21: "clock on a capture card must also be
-possible. implement this first" (before the AirPlay output,
-`doc/plans/2026-11-21-airplay-output.md`). The evidence is vinyl's
-`/proc/asound/pcm`: `02-00: HiFiBerry ADC HiFi pcm1863-aif-0 : … : capture 1`,
+**Spec:** the owner's requirement of 2026-11-21: a master clocked by a capture
+card, done before the AirPlay output (`doc/plans/2026-11-21-airplay-output.md`).
+The evidence is the `/proc/asound/pcm` of a CM5 with a HiFiBerry ADC: `02-00: HiFiBerry ADC HiFi pcm1863-aif-0 : … : capture 1`,
 with no playback device on the card.
 
 ## Global Constraints
@@ -39,7 +38,7 @@ with no playback device on the card.
   32 bits, else S16, a buffer of four periods, and the first `SETTLE_MS` read
   as zeros.
 - `snd_rpi_hifiberry_adc` joins `cards::CARDS` with `adc: true`, taken from
-  vinyl's `/proc/asound/cards`.
+  the ADC board's `/proc/asound/cards`.
 - `GET /outputs/1` gains `"clock": "capture"`, which is left out under the
   playback clock.
 - The log at start reads `aas: the output is clocked by the capture of hw:<card>; it plays nowhere`.
@@ -106,7 +105,7 @@ then starts over.
   - `Config.clock: Clock`
 
 - [ ] Tests, written first:
-  - `card_directions_reads_vinyls_pcm_list` and `…_a_dacplus`, from the real texts of vinyl and the Pi 4.
+  - `card_directions_reads_an_adc_only_board` and `…_a_card_that_does_both`, from real texts of an ADC-only CM5 and a DAC+.
   - `auto_is_capture_only_on_a_capture_only_card`, `forced_capture_on_a_card_with_both`, `an_absent_card_is_played_to`.
   - `clock_is_parsed_and_checked`.
   - `the_hifiberry_adc_has_an_adc`.
@@ -124,7 +123,7 @@ then starts over.
   - the meters move;
   - no xruns in 10 minutes;
   - a further output, if one is there, plays in time.
-- [ ] On vinyl, with the owner's go only, since it is the household's turntable:
+- [ ] On an ADC-only board (a CM5 with a HiFiBerry ADC), with the owner's go:
   - `aas` with `clock = "auto"` picks the capture;
   - the monitor carries the record.
 - [ ] Record the results in `doc/measurements.md`.

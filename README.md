@@ -393,7 +393,8 @@ and any player, reaches `aas.monitor` and every further output, which follow
 the capture's clock as they follow a DAC's. The volume is software, since
 there is no control to play through. `GET /outputs/1` then says `"clock":
 "capture"`. `clock = "capture"` does the same on a card that also plays,
-whose DAC then stays closed.
+whose DAC then stays closed. `auto` decides once, at the start, from the kernel's list of
+PCM devices: a card that is not there yet is played to.
 
 #### The volume limit
 

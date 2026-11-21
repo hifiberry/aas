@@ -1332,8 +1332,26 @@ mod capture {
     impl ClockDevice for AlsaClock {
         fn open(&mut self, rate: u32, period: u32) -> Result<(), SinkError> {
             self.close();
+            // Rates not read at the start, the card absent or busy then,
+            // are read before the open holds the device; the fallback
+            // passes them on to the rate rules.
+            if self.rates.is_empty()
+                && let Ok(rates) = capture_rates(&self.card)
+            {
+                eprintln!("aas: capture hw:{} takes {rates:?}", self.card);
+                self.rates = rates;
+            }
             match AlsaCapture::open(&self.card, rate, period) {
                 Ok(capture) => {
+                    // The wait wakes when an engine period is there, also
+                    // on a card that granted a smaller one, rather than
+                    // spinning on each of the card's.
+                    if let Some(pcm) = capture.pcm.as_ref()
+                        && let Ok(sw) = pcm.sw_params_current()
+                    {
+                        let _ = sw.set_avail_min(Frames::from(period));
+                        let _ = pcm.sw_params(&sw);
+                    }
                     self.capture = Some(capture);
                     self.failed = None;
                     Ok(())
@@ -1394,8 +1412,8 @@ mod tests {
         names.iter().map(|s| s.to_string()).collect()
     }
 
-    /// vinyl's `/proc/asound/pcm`: the ADC captures only.
-    const VINYL_PCM: &str = "00-00: MAI PCM i2s-hifi-0 : MAI PCM i2s-hifi-0 : playback 1\n\
+    /// `/proc/asound/pcm` of a CM5 with a HiFiBerry ADC: it captures only.
+    const ADC_ONLY_PCM: &str = "00-00: MAI PCM i2s-hifi-0 : MAI PCM i2s-hifi-0 : playback 1\n\
         01-00: MAI PCM i2s-hifi-0 : MAI PCM i2s-hifi-0 : playback 1\n\
         02-00: HiFiBerry ADC HiFi pcm1863-aif-0 : HiFiBerry ADC HiFi pcm1863-aif-0 : capture 1\n";
 
@@ -1404,10 +1422,10 @@ mod tests {
         HiFiBerry DAC+ADC HiFi multicodec-0 : playback 1 : capture 1\n";
 
     #[test]
-    fn card_directions_reads_vinyls_pcm_list() {
-        assert_eq!(card_directions(VINYL_PCM, 2), (false, true));
-        assert_eq!(card_directions(VINYL_PCM, 0), (true, false));
-        assert_eq!(card_directions(VINYL_PCM, 5), (false, false));
+    fn card_directions_reads_an_adc_only_board() {
+        assert_eq!(card_directions(ADC_ONLY_PCM, 2), (false, true));
+        assert_eq!(card_directions(ADC_ONLY_PCM, 0), (true, false));
+        assert_eq!(card_directions(ADC_ONLY_PCM, 5), (false, false));
     }
 
     #[test]

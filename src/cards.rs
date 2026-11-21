@@ -60,7 +60,7 @@ mod tests {
 
     #[test]
     fn the_hifiberry_adc_has_an_adc() {
-        // vinyl's card, which only captures.
+        // An ADC-only board: the master runs on its capture clock.
         assert!(has_adc("snd_rpi_hifiberry_adc"));
     }
 

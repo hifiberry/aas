@@ -12,7 +12,8 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use crate::capture::Capture;
+use crate::capture::{Capture, OpenError};
+use crate::control::OpenCapture;
 use crate::sink::{Sink, SinkError};
 
 /// A capture device that can be waited on.
@@ -145,6 +146,28 @@ impl Capture for ClockCapture {
 
     /// The sink owns the device: it closes it when the output closes.
     fn close(&mut self) {}
+}
+
+/// The analog input's open under the capture clock: the clock's device,
+/// once the card is there with an ADC `aas` knows. `driver` names the
+/// card's driver, `None` while the card is not there yet, so that a card
+/// that probes after the start is picked up when the control thread tries
+/// again.
+pub fn analog_open(
+    capture: ClockCapture,
+    mut driver: impl FnMut() -> Option<String> + 'static,
+) -> OpenCapture {
+    Box::new(move |_rate, _period| {
+        let Some(driver) = driver() else {
+            return Err(OpenError::Again("the card is not there yet".into()));
+        };
+        if !crate::cards::has_adc(&driver) {
+            return Err(OpenError::Never(format!(
+                "the card {driver} has no analog input aas knows"
+            )));
+        }
+        Ok(Box::new(capture.clone()) as Box<dyn Capture>)
+    })
 }
 
 #[cfg(test)]
@@ -399,6 +422,24 @@ mod tests {
         assert!(fake.state().open.is_some());
         sink.close();
         assert!(fake.state().open.is_none());
+    }
+
+    #[test]
+    fn the_analog_input_waits_for_a_card_that_is_not_there_yet() {
+        let sink = ClockSink::new(Box::new(Fake::default()), 2);
+        let found = Arc::new(Mutex::new(None::<String>));
+        let seen = found.clone();
+        let mut open = analog_open(sink.capture(), move || seen.lock().unwrap().clone());
+        assert!(matches!(open(48000, 64), Err(OpenError::Again(_))));
+        *found.lock().unwrap() = Some("snd_rpi_hifiberry_adc".to_string());
+        assert!(open(48000, 64).is_ok());
+    }
+
+    #[test]
+    fn a_card_without_an_adc_ends_the_analog_input() {
+        let sink = ClockSink::new(Box::new(Fake::default()), 2);
+        let mut open = analog_open(sink.capture(), || Some("snd_rpi_hifiberry_digi".into()));
+        assert!(matches!(open(48000, 64), Err(OpenError::Never(_))));
     }
 
     #[test]

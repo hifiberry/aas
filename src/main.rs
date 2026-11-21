@@ -145,28 +145,38 @@ fn clocked_output(
 }
 
 /// The analog input under the capture clock: it reads the clock's device,
-/// which the master's sink opens and closes.
+/// which the master's sink opens and closes. A card that is there is
+/// decided on now, by its driver; one that is not is looked for at each
+/// try, as for a card played to.
 fn clocked_analog_input(
     config: &Config,
     card: &str,
     capture: aas::clock_sink::ClockCapture,
 ) -> Option<aas::control::OpenCapture> {
-    use aas::capture::Capture;
-    let driver = clock_card_driver(card);
-    let open: aas::control::OpenCapture =
-        Box::new(move |_rate, _period| Ok(Box::new(capture.clone()) as Box<dyn Capture>));
-    server::analog_capture(config, &driver, open)
+    let lookup = {
+        let card = card.to_string();
+        move || clock_card_driver(&card)
+    };
+    let open = aas::clock_sink::analog_open(capture, lookup);
+    match clock_card_driver(card) {
+        Some(driver) => server::analog_capture(config, &driver, open),
+        None if config.analog.enabled => {
+            eprintln!("aas: analog input on, its card is not there yet");
+            Some(open)
+        }
+        None => None,
+    }
 }
 
 #[cfg(feature = "alsa-output")]
-fn clock_card_driver(card: &str) -> String {
+fn clock_card_driver(card: &str) -> Option<String> {
     use aas::sink_alsa::{card_driver, cards_text};
-    card_driver(&cards_text(), Some(card)).map_or_else(String::new, |(_, driver)| driver)
+    card_driver(&cards_text(), Some(card)).map(|(_, driver)| driver)
 }
 
 #[cfg(not(feature = "alsa-output"))]
-fn clock_card_driver(_card: &str) -> String {
-    String::new()
+fn clock_card_driver(_card: &str) -> Option<String> {
+    None
 }
 
 /// A card for each `[[output]]` table, buffering `further::BUFFERED`
