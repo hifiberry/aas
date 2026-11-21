@@ -561,15 +561,22 @@ impl Output {
     fn pump(&mut self, now: Instant) {
         let mono = self.mono(now);
         let Some(s) = &mut self.session else { return };
-        if s.rtsp.closed() {
+        let closed = if s.rtsp.closed() {
+            Some("the connection")
+        } else if let Control::Two(ap2) = &mut s.rtsp
+            && !ap2.poll_events()
+        {
+            Some("the event channel")
+        } else {
+            None
+        };
+        if let Some(what) = closed {
             let summary = self
                 .session
                 .take()
                 .map(|s| self.summary(&s))
                 .unwrap_or_default();
-            self.fail(format!(
-                "the receiver closed the connection, after {summary}"
-            ));
+            self.fail(format!("the receiver closed {what}, after {summary}"));
             return;
         }
         if let (Some(at), Control::Two(ap2)) = (s.feedback_at, &mut s.rtsp)
@@ -749,6 +756,26 @@ mod tests {
             seen.iter().map(|s| &s.url).collect::<Vec<_>>()
         );
         assert_eq!(seen.last().unwrap().method, "TEARDOWN");
+    }
+
+    #[test]
+    fn an_airplay2_receiver_that_closes_its_event_channel_is_retried() {
+        use super::super::ap2::session::tests::{EventPort, ap2_receiver_with};
+        let receiver =
+            FakeReceiver::serving(1, |port| ap2_receiver_with(port, 0x4, EventPort::Closing).0);
+        let mut c = config(receiver.port, Connect::Always);
+        c.protocol = Protocol::AirPlay2;
+        let handle = spawn(c);
+        let (_ring, reader) = tap();
+        handle.tap(reader);
+        assert!(until(&handle, 3.0, playing), "{:?}", handle.status());
+        assert!(
+            until(&handle, 3.0, |s| matches!(s, AirplayState::Retrying { .. })),
+            "{:?}",
+            handle.status()
+        );
+        let error = handle.status().error.unwrap();
+        assert!(error.contains("event channel"), "{error}");
     }
 
     #[test]

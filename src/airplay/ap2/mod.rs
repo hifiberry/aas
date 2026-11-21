@@ -5,6 +5,7 @@
 pub mod audio;
 pub mod bplist;
 pub mod channel;
+pub mod events;
 pub mod pair;
 pub mod session;
 pub mod srp;

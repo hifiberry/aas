@@ -40,6 +40,16 @@ pub struct Keys {
 }
 
 impl Keys {
+    /// The keys of the event channel. The receiver sends the requests on
+    /// it, so the sender writes with the "read" key and reads with the
+    /// "write" key, as OwnTone and pyatv do.
+    pub fn events(secret: &[u8]) -> Keys {
+        Keys {
+            write: derive(secret, "Events-Salt", "Events-Read-Encryption-Key"),
+            read: derive(secret, "Events-Salt", "Events-Write-Encryption-Key"),
+        }
+    }
+
     pub fn control(secret: &[u8]) -> Keys {
         Keys {
             write: derive(secret, "Control-Salt", "Control-Write-Encryption-Key"),
@@ -167,6 +177,19 @@ mod tests {
         let keys = Keys::control(&SECRET);
         assert_eq!(keys.write.to_vec(), unhex(WRITE));
         assert_eq!(keys.read.to_vec(), unhex(READ));
+    }
+
+    #[test]
+    fn the_event_keys_are_the_other_way_round() {
+        let keys = Keys::events(&SECRET);
+        assert_eq!(
+            keys.write.to_vec(),
+            unhex("11954fc3044c580a9a64ed0b699039dfd0e7dd476eb78366ae160f2962708e18")
+        );
+        assert_eq!(
+            keys.read.to_vec(),
+            unhex("4ab337f2edc98d6a5dcdebc107b1aa174f3b24908a3780294fc94dc6983ee353")
+        );
     }
 
     #[test]

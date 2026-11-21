@@ -6,6 +6,7 @@
 
 use super::bplist::{self, Value};
 use super::channel::Keys;
+use super::events::Events;
 use super::pair::pair_transient;
 use crate::airplay::raop::{MIN_LATENCY, Ports, Setup, random};
 use crate::airplay::rtp::{FRAMES, RATE};
@@ -26,6 +27,8 @@ const LATENCY_MAX: i64 = 88200;
 const PIN_REQUIRED: i64 = 1 << 3;
 const ONE_TIME_PAIRING_REQUIRED: i64 = 1 << 9;
 const BPLIST: &str = "application/x-apple-binary-plist";
+/// For the connect to the event port.
+const EVENTS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// A session after RECORD.
 pub struct Ap2 {
@@ -36,6 +39,8 @@ pub struct Ap2 {
     pub audio_latency: Option<u32>,
     /// The key the audio is sealed with.
     pub shk: [u8; 32],
+    /// The event channel, when the receiver has an event port.
+    events: Option<Events>,
 }
 
 impl Ap2 {
@@ -73,6 +78,7 @@ impl Ap2 {
             headers,
             audio_latency: None,
             shk: random(),
+            events: None,
         };
         let uuid: String = random::<16>()
             .iter()
@@ -96,6 +102,21 @@ impl Ap2 {
         check(&answer, "SETUP")?;
         if let Some(s) = answer.header("Session") {
             ap2.headers.push(("Session", s.to_string()));
+        }
+        // The event channel, which the receiver may wait for before it
+        // answers RECORD, as a sound bar does.
+        let session_answer =
+            bplist::decode(&answer.body).map_err(|e| RtspError::Malformed(e.to_string()))?;
+        let event_port = session_answer
+            .get("eventPort")
+            .and_then(Value::as_int)
+            .and_then(|p| u16::try_from(p).ok())
+            .unwrap_or(0);
+        if event_port != 0 {
+            let addr = std::net::SocketAddr::new(peer, event_port);
+            let events = Events::connect(addr, &secret, EVENTS_TIMEOUT)
+                .map_err(|e| RtspError::Io(format!("the event port {event_port}: {e}")))?;
+            ap2.events = Some(events);
         }
         // Receivers that do not take SETPEERS play all the same.
         let peers = Value::Array(vec![
@@ -182,6 +203,12 @@ impl Ap2 {
         self.conn.closed()
     }
 
+    /// Answers what the receiver sent on the event channel. False once it
+    /// has closed the channel.
+    pub fn poll_events(&mut self) -> bool {
+        self.events.as_mut().is_none_or(Events::poll)
+    }
+
     /// Keeps the session alive, without waiting for the answer.
     pub fn feedback(&mut self) -> Result<(), RtspError> {
         self.conn.send(&Request {
@@ -246,8 +273,12 @@ fn stream_ports(answer: &Response) -> Result<Ports, RtspError> {
 #[cfg(test)]
 pub mod tests {
     use super::*;
+    use crate::airplay::ap2::channel::{Opener, Sealer};
     use crate::airplay::ap2::pair::{PIN, tests::pairing};
     use crate::airplay::fake::{Answer, FakeReceiver, Seen};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     fn dict(items: &[(&str, Value)]) -> Value {
@@ -267,14 +298,83 @@ pub mod tests {
         )
     }
 
+    /// The event side of a fake receiver: whether the sender connected,
+    /// and the answers it gave to the event sent on connecting.
+    #[derive(Default)]
+    pub struct FakeEvents {
+        pub connected: bool,
+        pub answers: String,
+    }
+
     /// A third-party AirPlay 2 receiver that takes everything: its audio
-    /// at `data_port`, `status_flags` in `/info`.
+    /// at `data_port`, `status_flags` in `/info`. Like a sound bar, it
+    /// answers RECORD only once the sender has opened its event port.
     pub fn ap2_receiver(
         data_port: u16,
         status_flags: i64,
     ) -> impl Fn(&Seen) -> Answer + Send + 'static {
-        move |seen: &Seen| {
+        ap2_receiver_with(data_port, status_flags, EventPort::Open).0
+    }
+
+    /// What a fake receiver does with its event port.
+    #[derive(Clone, Copy, PartialEq)]
+    pub enum EventPort {
+        None,
+        /// It sends one event on it and keeps it open.
+        Open,
+        /// It sends one event and closes it half a second later.
+        Closing,
+    }
+
+    /// As `ap2_receiver`, with or without an event port; on connecting,
+    /// the receiver sends one event on it.
+    pub fn ap2_receiver_with(
+        data_port: u16,
+        status_flags: i64,
+        port: EventPort,
+    ) -> (
+        impl Fn(&Seen) -> Answer + Send + 'static,
+        Arc<Mutex<FakeEvents>>,
+    ) {
+        let events = Arc::new(Mutex::new(FakeEvents::default()));
+        let key: Arc<Mutex<Option<Vec<u8>>>> = Arc::default();
+        let mut event_port = 0;
+        if port != EventPort::None {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            event_port = listener.local_addr().unwrap().port();
+            let (events, key) = (events.clone(), key.clone());
+            std::thread::spawn(move || {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                events.lock().unwrap().connected = true;
+                let secret = key.lock().unwrap().clone().expect("paired before");
+                let keys = Keys::events(&secret);
+                let (mut sealer, mut opener) = (Sealer::new(&keys.read), Opener::new(&keys.write));
+                let mut out = Vec::new();
+                sealer.seal(b"POST /command RTSP/1.0\r\nCSeq: 1\r\n\r\n", &mut out);
+                let _ = stream.write_all(&out);
+                if port == EventPort::Closing {
+                    std::thread::sleep(Duration::from_millis(500));
+                    return;
+                }
+                let (mut raw, mut plain, mut buf) = (Vec::new(), Vec::new(), [0u8; 512]);
+                while let Ok(n) = stream.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    raw.extend_from_slice(&buf[..n]);
+                    opener.open(&mut raw, &mut plain).unwrap();
+                    events.lock().unwrap().answers = String::from_utf8_lossy(&plain).into();
+                }
+            });
+        }
+        let shared = events.clone();
+        let script = move |seen: &Seen| {
             if let Some(answer) = pairing(seen, PIN) {
+                if let Answer::SealAfter(_, secret) = &answer {
+                    *key.lock().unwrap() = Some(secret.clone());
+                }
                 return answer;
             }
             match (seen.method.as_str(), seen.url.as_str()) {
@@ -295,7 +395,7 @@ pub mod tests {
                         )]))
                     } else {
                         let Answer::Body(status, mut headers, body) = plist(&dict(&[
-                            ("eventPort", Value::Int(0)),
+                            ("eventPort", Value::Int(i64::from(event_port))),
                             ("timingPort", Value::Int(0)),
                         ])) else {
                             unreachable!()
@@ -304,10 +404,14 @@ pub mod tests {
                         Answer::Body(status, headers, body)
                     }
                 }
+                ("RECORD", _) if event_port != 0 && !shared.lock().unwrap().connected => {
+                    Answer::Status(503, Vec::new())
+                }
                 ("RECORD", _) => Answer::Status(200, vec![("Audio-Latency", "11025".into())]),
                 _ => Answer::Status(200, Vec::new()),
             }
-        }
+        };
+        (script, events)
     }
 
     fn setup() -> Setup {
@@ -470,6 +574,54 @@ pub mod tests {
             base(seen)
         });
         assert!(matches!(opened, Err(RtspError::Malformed(_))));
+    }
+
+    #[test]
+    fn the_event_channel_is_open_before_record_and_its_events_are_answered() {
+        let (script, events) = ap2_receiver_with(6000, 0x4, EventPort::Open);
+        let (opened, _receiver) = open_with(script);
+        let (mut ap2, _) = opened.unwrap();
+        assert!(events.lock().unwrap().connected);
+        for _ in 0..100 {
+            assert!(ap2.poll_events());
+            if !events.lock().unwrap().answers.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            events.lock().unwrap().answers,
+            "RTSP/1.0 200 OK\r\nServer: aas\r\nCSeq: 1\r\n\r\n"
+        );
+    }
+
+    #[test]
+    fn a_receiver_without_an_event_port_plays_all_the_same() {
+        let (script, events) = ap2_receiver_with(6000, 0x4, EventPort::None);
+        let (opened, _receiver) = open_with(script);
+        let (mut ap2, _) = opened.unwrap();
+        assert!(!events.lock().unwrap().connected);
+        assert!(ap2.poll_events());
+    }
+
+    #[test]
+    fn an_event_port_that_refuses_is_an_error() {
+        let gone = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = gone.local_addr().unwrap().port();
+        drop(gone);
+        let base = ap2_receiver(6000, 0x4);
+        let (opened, _receiver) = open_with(move |seen: &Seen| {
+            if seen.method == "SETUP"
+                && bplist::decode(&seen.body).unwrap().get("streams").is_none()
+            {
+                return plist(&dict(&[("eventPort", Value::Int(i64::from(port)))]));
+            }
+            base(seen)
+        });
+        let Err(RtspError::Io(why)) = opened else {
+            panic!("opened");
+        };
+        assert!(why.contains("event port"), "{why}");
     }
 
     #[test]
