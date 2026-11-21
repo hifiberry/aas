@@ -200,6 +200,8 @@ pub struct OutputMix<P: Processing> {
     /// DoP, the copy path, a mute or in forced bit-perfect. They are reset
     /// before they run again.
     pub(crate) chains_idle: bool,
+    /// A volume limit is set: no DoP stream reaches the sink.
+    pub(crate) limited: bool,
 }
 
 impl<P: Processing> OutputMix<P> {
@@ -228,6 +230,7 @@ impl<P: Processing> OutputMix<P> {
             fade_left: 0,
             unmute_left: 0,
             chains_idle: false,
+            limited: false,
         }
     }
 
@@ -423,9 +426,9 @@ impl<P: Processing> OutputMix<P> {
     /// copy path could play. The routing must also keep the sink's pairs of
     /// channels whole, as `keeps_pairs` says. There is none while a change
     /// of matrix ramps: the matrix in effect is then neither the old one
-    /// nor the new one.
+    /// nor the new one. Nor is there while a volume limit is set.
     pub(crate) fn routing_for_dop(&self) -> Option<Routing> {
-        if self.ramp_left > 0 || !self.copy_allowed() {
+        if self.limited || self.ramp_left > 0 || !self.copy_allowed() {
             return None;
         }
         self.routes.dop

@@ -481,17 +481,18 @@ impl Control {
     }
 
     fn output_view(&self, index: usize) -> Option<OutputView> {
-        let (card, volume, volume_db, idle) = if index == 0 {
+        let (card, volume, volume_db, limit_db, idle) = if index == 0 {
             (
                 self.card.clone(),
                 Some(self.volume.percent()),
                 None,
+                Some(self.volume.limit_db()),
                 self.idle,
             )
         } else {
             let output = self.further.get(index - 1)?;
             let volume_db = Some(output.volume_db);
-            (output.card.clone(), None, volume_db, output.idle)
+            (output.card.clone(), None, volume_db, None, output.idle)
         };
         let (kind, delay) = idle_parts(idle);
         Some(OutputView {
@@ -499,6 +500,7 @@ impl Control {
             card,
             volume,
             volume_db,
+            limit_db,
             idle: kind.to_string(),
             idle_delay_s: (idle != Idle::Zeros).then_some(delay),
             state: self.output_state(index).to_string(),
@@ -524,7 +526,18 @@ impl Control {
             if patch.volume.is_some_and(|v| !(0..=100).contains(&v)) {
                 return Err(ApiError::unprocessable("volume must be from 0 to 100"));
             }
+            if patch
+                .limit_db
+                .is_some_and(|db| !(db.is_finite() && (-60.0..=0.0).contains(&db)))
+            {
+                return Err(ApiError::unprocessable("limit_db must be from -60 to 0"));
+            }
         } else {
+            if patch.limit_db.is_some() {
+                return Err(ApiError::unprocessable(
+                    "limit_db is only for the master; a further output has volume_db",
+                ));
+            }
             if patch.volume.is_some() {
                 return Err(ApiError::unprocessable(
                     "volume is only for the master; a further output has volume_db",
@@ -549,6 +562,12 @@ impl Control {
             self.set_volume(percent, now);
         }
         let mut changed = false;
+        if let Some(db) = patch.limit_db
+            && db != self.volume.limit_db()
+        {
+            self.set_limit(db);
+            changed = true;
+        }
         if let Some(db) = patch.volume_db
             && db != self.further[index - 1].volume_db
         {
@@ -571,6 +590,21 @@ impl Control {
             self.save_later(now);
         }
         self.output_answer(index)
+    }
+
+    /// Sets the master's volume limit, stored with what the config says,
+    /// and gives the engine every output's gain under it.
+    fn set_limit(&mut self, db: f32) {
+        self.volume.set_limit(db);
+        let mut batch = vec![Command::SetLimited(self.volume.limited())];
+        batch.push(Command::SetGain(0, self.volume.gain()));
+        for output in &self.further {
+            batch.push(Command::SetGain(output.index, self.further_gain(output)));
+        }
+        self.send(batch);
+        let config = self.config_limit_db;
+        let entry = self.state.outputs.entry(self.card.clone()).or_default();
+        entry.limit_db = Some(Stored { value: db, config });
     }
 
     /// Sets an output's idle rule, which applies at its next idle decision,
@@ -1264,6 +1298,13 @@ mod tests {
         }
     }
 
+    fn limit(db: f32) -> OutputPatch {
+        OutputPatch {
+            limit_db: Some(db),
+            ..OutputPatch::default()
+        }
+    }
+
     fn input_db(db: f32) -> InputPatch {
         InputPatch {
             volume_db: Some(db),
@@ -1443,6 +1484,96 @@ mod tests {
         let answer = control.call(Call::PatchOutput(2, offset(f32::NAN)), now);
         assert_eq!(status(answer), 422);
         assert!(engine.take(true).is_empty());
+    }
+
+    #[test]
+    fn a_limit_lowers_every_gain_tells_the_engine_and_is_published() {
+        let (mut control, mut engine, _logs, now) =
+            started_with(&Config::default(), vec![further(&[])]);
+        let mut published = subscribe(&mut control);
+        engine.take(true);
+        engine.gains.clear();
+        let view = control
+            .call(Call::PatchOutput(1, limit(-10.0)), now)
+            .unwrap();
+        assert_eq!(view["limit_db"], json!(-10.0));
+        assert_eq!(view["volume"], json!(100));
+        let seen = engine.take(true);
+        assert!(seen.contains(&"SetLimited true".to_string()), "{seen:?}");
+        // The master and the further output, both below the limit.
+        assert_eq!(engine.gains.len(), 2, "{:?}", engine.gains);
+        assert!(close(engine.gains[0].1, db_to_gain(-10.0)));
+        assert!(close(engine.gains[1].1, db_to_gain(-10.0)));
+        let told = events(&mut published).into_iter().any(
+            |e| matches!(e, ApiEvent::Output { id: 1, limit_db: Some(db), .. } if db == -10.0),
+        );
+        assert!(told);
+        let stored = control.state.outputs[&control.card]
+            .limit_db
+            .as_ref()
+            .unwrap();
+        assert_eq!((stored.value, stored.config), (-10.0, 0.0));
+        // Lifted, the engine hears of it as well.
+        control.call(Call::PatchOutput(1, limit(0.0)), now).unwrap();
+        let seen = engine.take(true);
+        assert!(seen.contains(&"SetLimited false".to_string()), "{seen:?}");
+        // The same limit again changes nothing.
+        control.call(Call::PatchOutput(1, limit(0.0)), now).unwrap();
+        assert!(engine.take(true).is_empty());
+    }
+
+    #[test]
+    fn a_limit_out_of_range_or_on_a_further_output_is_422() {
+        let (mut control, mut engine, _logs, now) =
+            started_with(&Config::default(), vec![further(&[])]);
+        engine.take(true);
+        for db in [-61.0, 0.5, f32::NAN] {
+            let answer = control.call(Call::PatchOutput(1, limit(db)), now);
+            assert_eq!(message(answer), "limit_db must be from -60 to 0");
+        }
+        let answer = control.call(Call::PatchOutput(2, limit(-6.0)), now);
+        assert_eq!(status(answer), 422);
+        assert!(engine.take(true).is_empty());
+        assert!(!control.volume.limited());
+    }
+
+    #[test]
+    fn a_limit_in_the_config_is_sent_at_start() {
+        let config = Config {
+            volume_limit_db: -6.0,
+            ..Config::default()
+        };
+        let (mut control, mut engine, _logs, now) = started_with(&config, Vec::new());
+        let seen = engine.take(true);
+        assert!(seen.contains(&"SetLimited true".to_string()), "{seen:?}");
+        assert!(close(engine.gains[0].1, db_to_gain(-6.0)));
+        let view = control.call(Call::Output(1), now).unwrap();
+        assert_eq!(view["limit_db"], json!(-6.0));
+    }
+
+    #[test]
+    fn a_stored_limit_applies_while_the_config_says_what_it_said() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        let mut state = State::default();
+        state.outputs.entry("master".into()).or_default().limit_db = Some(Stored {
+            value: -12.0,
+            config: 0.0,
+        });
+        state.save(&path).unwrap();
+        let restore = |config_db: f32| {
+            let config = Config {
+                volume_limit_db: config_db,
+                ..Config::default()
+            };
+            let (mut control, _engine, _logs) = unstarted_with(&config, Vec::new());
+            let volume = OutputVolume::new(None, config::BitPerfect::Auto);
+            control.restore(volume, path.clone(), &["master".to_string()]);
+            control.volume.limit_db()
+        };
+        assert_eq!(restore(0.0), -12.0);
+        // The config's limit edited since: it wins.
+        assert_eq!(restore(-3.0), -3.0);
     }
 
     #[test]

@@ -20,6 +20,8 @@ pub enum NotBitPerfect {
     NoSource,
     /// The matrix scales the one source, or sums its channels.
     Routing,
+    /// A volume limit is set: its gain applies in every mode.
+    Limit,
 }
 
 impl NotBitPerfect {
@@ -34,6 +36,7 @@ impl NotBitPerfect {
             NotBitPerfect::Plugin => 5,
             NotBitPerfect::NoSource => 6,
             NotBitPerfect::Routing => 7,
+            NotBitPerfect::Limit => 8,
         }
     }
 
@@ -49,6 +52,7 @@ impl NotBitPerfect {
             5 => NotBitPerfect::Plugin,
             6 => NotBitPerfect::NoSource,
             7 => NotBitPerfect::Routing,
+            8 => NotBitPerfect::Limit,
             _ => return None,
         };
         Some(Err(reason))
@@ -64,6 +68,7 @@ impl NotBitPerfect {
             NotBitPerfect::Plugin => "plugin",
             NotBitPerfect::NoSource => "no source",
             NotBitPerfect::Routing => "routing",
+            NotBitPerfect::Limit => "limit",
         }
     }
 }
@@ -94,6 +99,9 @@ pub struct Situation {
     /// of matrix ramps, since the gains are then between two matrices, and
     /// otherwise true with no source active.
     pub routing_pure: bool,
+    /// A volume limit is set. Its gain applies in forced mode too, so no
+    /// mode copies the samples untouched.
+    pub limited: bool,
 }
 
 /// Returns `Ok(())` when samples can be copied to the card untouched.
@@ -105,7 +113,7 @@ pub struct Situation {
 /// there. A client at another rate than the output is still resampled, so
 /// it is not bit-perfect in either mode. Both modes take pure routing of
 /// the source's bus through the matrix, which forced mode judges with
-/// every route at 0 dB.
+/// every route at 0 dB. A volume limit rules out both modes.
 pub fn decide(s: &Situation) -> Result<(), NotBitPerfect> {
     if s.mode == BitPerfect::Off {
         return Err(NotBitPerfect::Disabled);
@@ -114,6 +122,9 @@ pub fn decide(s: &Situation) -> Result<(), NotBitPerfect> {
         0 => return Err(NotBitPerfect::NoSource),
         1 => {}
         _ => return Err(NotBitPerfect::SeveralSources),
+    }
+    if s.limited {
+        return Err(NotBitPerfect::Limit);
     }
     if s.resampled {
         return Err(NotBitPerfect::Resampled);
@@ -164,7 +175,44 @@ mod tests {
             resampled,
             plugins_neutral,
             routing_pure: true,
+            limited: false,
         }
+    }
+
+    #[test]
+    fn a_volume_limit_stops_bit_perfect_in_every_mode() {
+        let limited = |mode, active, resampled| {
+            decide(&Situation {
+                limited: true,
+                ..sit(mode, active, true, resampled)
+            })
+        };
+        assert_eq!(
+            limited(BitPerfect::Auto, 1, false),
+            Err(NotBitPerfect::Limit)
+        );
+        // Forced bit-perfect sets the volumes aside, never the limit.
+        assert_eq!(
+            limited(BitPerfect::Forced, 1, false),
+            Err(NotBitPerfect::Limit)
+        );
+        // After the setting and the count of sources, before the rest.
+        assert_eq!(
+            limited(BitPerfect::Off, 1, false),
+            Err(NotBitPerfect::Disabled)
+        );
+        assert_eq!(
+            limited(BitPerfect::Auto, 0, false),
+            Err(NotBitPerfect::NoSource)
+        );
+        assert_eq!(
+            limited(BitPerfect::Auto, 2, false),
+            Err(NotBitPerfect::SeveralSources)
+        );
+        assert_eq!(
+            limited(BitPerfect::Auto, 1, true),
+            Err(NotBitPerfect::Limit)
+        );
     }
 
     #[test]
@@ -356,6 +404,7 @@ mod tests {
             Plugin,
             NoSource,
             Routing,
+            Limit,
         ];
         let names = [
             "disabled",
@@ -365,6 +414,7 @@ mod tests {
             "plugin",
             "no source",
             "routing",
+            "limit",
         ];
         for (i, (reason, name)) in all.into_iter().zip(names).enumerate() {
             // 1 and up in the order of the declaration.
@@ -373,7 +423,7 @@ mod tests {
             assert_eq!(reason.name(), name);
         }
         assert_eq!(NotBitPerfect::from_code(0), Some(Ok(())));
-        assert_eq!(NotBitPerfect::from_code(8), None);
+        assert_eq!(NotBitPerfect::from_code(9), None);
         assert_eq!(NotBitPerfect::from_code(200), None);
     }
 }

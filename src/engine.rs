@@ -1245,6 +1245,11 @@ pub enum Command {
     /// going in or out, is never heard. In forced bit-perfect the master's
     /// routes are taken at 0 dB, as `SetMatrix` takes them.
     SetMode(BitPerfect),
+    /// Whether a volume limit is set. While it is, the master's gain
+    /// applies in forced bit-perfect too, the master is never bit-perfect,
+    /// and a DoP stream is muted: it cannot be scaled, and unscaled it would
+    /// play past the limit. A change fades as one of `SetMode` does.
+    SetLimited(bool),
     Shutdown,
 }
 
@@ -1508,6 +1513,8 @@ pub struct Engine<P: Processing, S: Sink> {
     events: Producer<Event>,
     counters: Arc<Counters>,
     mode: BitPerfect,
+    /// A volume limit is set, as `Command::SetLimited` says.
+    limited: bool,
     /// In the order the sources were added.
     #[allow(clippy::vec_box)] // Moving a boxed source moves only a pointer.
     table: Vec<Box<Source>>,
@@ -1590,6 +1597,7 @@ impl<P: Processing, S: Sink> Engine<P, S> {
             events,
             counters,
             mode,
+            limited: false,
             table: Vec::with_capacity(INITIAL_SOURCES),
             backlog: VecDeque::with_capacity(BACKLOG),
             master: OutputMix::new(matrix, channels, forced, frames),
@@ -1807,6 +1815,7 @@ impl<P: Processing, S: Sink> Engine<P, S> {
                     close = true;
                 }
                 Command::SetMode(m) => mode |= *m != self.mode,
+                Command::SetLimited(l) => mode |= *l != self.limited,
                 _ => {}
             }
         }
@@ -1938,6 +1947,7 @@ impl<P: Processing, S: Sink> Engine<P, S> {
                 self.delay.set(frames, faded.then_some(fade));
             }
             Command::SetMode(mode) => self.set_mode(mode),
+            Command::SetLimited(limited) => self.set_limited(limited),
             Command::Shutdown => {
                 self.cancel_reopen();
                 self.close();
@@ -2295,6 +2305,28 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         }
     }
 
+    /// Takes a volume limit, or its end, as `Command::SetLimited` says. A
+    /// period faded out ahead of it, as ahead of a change of mode.
+    fn set_limited(&mut self, limited: bool) {
+        if limited == self.limited {
+            return;
+        }
+        self.limited = limited;
+        self.master.limited = limited;
+        if std::mem::take(&mut self.faded) {
+            let rate = self.rate;
+            for mix in self.mixes_mut() {
+                mix.fade_in(rate);
+            }
+        }
+    }
+
+    /// Whether the master's gain applies: where volumes do, and wherever a
+    /// limit is set, which no mode sets aside.
+    fn master_gain_applies(&self) -> bool {
+        volumes_apply(self.mode) || self.limited
+    }
+
     /// Running sources that are heard this cycle.
     fn audible(&self) -> impl Iterator<Item = &Source> {
         let (rate, routed) = (self.rate, self.master.dop_routing.is_some());
@@ -2547,6 +2579,7 @@ impl<P: Processing, S: Sink> Engine<P, S> {
             plugins_neutral: self.master.neutral() && (!analog || self.analog.chain.neutral()),
             routing_pure: !self.master.ramping()
                 && (active == 0 || self.master.copy_allowed() && self.copy_routing().is_some()),
+            limited: self.limited,
         }
     }
 
@@ -2587,7 +2620,7 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         // straight into the players' bus, which is then the mix itself.
         // Not while other outputs read the buses too.
         let direct = !feeding && self.master.direct(period);
-        let (from, to) = if volumes && !feeding {
+        let (from, to) = if self.master_gain_applies() && !feeding {
             (self.master.gain, next_gain)
         } else {
             (1.0, 1.0)
@@ -2689,7 +2722,7 @@ impl<P: Processing, S: Sink> Engine<P, S> {
     #[inline(never)]
     fn mix_outputs(&mut self, copy_routing: Option<Routing>, fade_step: (f32, usize)) -> bool {
         let (rate, period, channels) = (self.rate, self.period, self.master.channels);
-        let volumes = volumes_apply(self.mode);
+        let master_gain = self.master_gain_applies();
         let plugins = plugins_apply(self.mode);
         let woke = self.stamp();
         let out = &self.out[..period];
@@ -2717,7 +2750,7 @@ impl<P: Processing, S: Sink> Engine<P, S> {
             }
             None => self
                 .master
-                .mix_shared(players, analog, samples, rate, plugins, volumes),
+                .mix_shared(players, analog, samples, rate, plugins, master_gain),
         };
         for (slot, output) in self.further.iter_mut().enumerate() {
             let Some(output) = output else { continue };
@@ -3528,6 +3561,42 @@ mod tests {
         rig.cycle();
         rig.cycle();
         assert_eq!(rig.last_periods(2), frames(ODD, 2 * PERIOD));
+    }
+
+    #[test]
+    fn a_limit_applies_the_master_gain_in_forced_bit_perfect() {
+        let mut rig = Rig::<F64>::new(BitPerfect::Forced);
+        let mut a = client(1);
+        // Forced bit-perfect still sets the client's volume aside.
+        a.source.as_mut().unwrap().gain = 0.25;
+        rig.add(&mut a);
+        const LEVEL: f64 = (1 << 24) as f64;
+        a.ring.write(&frames(1 << 24, PERIOD));
+        rig.send(Command::SetLimited(true));
+        rig.send(Command::SetGain(0, 0.5));
+        rig.cycle();
+        for (i, f) in rig.last_periods(1).iter().enumerate() {
+            let error = (f64::from(f[0]) - 0.5 * LEVEL).abs();
+            assert!(error < 64.0, "frame {i}: {}", f[0]);
+        }
+        let published = rig.counters.bit_perfect.load(Relaxed);
+        assert_eq!(published, NotBitPerfect::Limit.code());
+    }
+
+    #[test]
+    fn a_limit_mutes_dop_until_it_is_lifted() {
+        let mut rig = Rig::<I32>::new(BitPerfect::Auto);
+        let mut dop = client(1);
+        rig.add(&mut dop);
+        rig.send(Command::SetLimited(true));
+        dop.ring.write(&dop_frames(PERIOD));
+        rig.cycle();
+        // Scaled it would be no DoP, and unscaled it would pass the limit.
+        assert_eq!(rig.last_periods(1), frames(0, PERIOD));
+        rig.send(Command::SetLimited(false));
+        dop.ring.write(&dop_frames(PERIOD));
+        rig.cycle();
+        assert_eq!(rig.last_periods(1), dop_frames(PERIOD));
     }
 
     #[test]
@@ -11647,6 +11716,22 @@ mod tests {
         assert_eq!(got[0], frames(1 << 18, PERIOD));
         let want = (f64::from(1 << 20) * f64::from(db_to_gain(-6.0))).round() as i32;
         assert_eq!(got[1], frames(want, PERIOD));
+    }
+
+    #[test]
+    fn with_further_outputs_a_limit_applies_the_master_gain_in_forced_bit_perfect() {
+        let mut rig = Rig::<F64>::new(BitPerfect::Forced);
+        let mut one = add_output(&mut rig, 1, stereo());
+        rig.send(Command::SetLimited(true));
+        rig.send(Command::SetGain(0, 0.5));
+        let mut a = client(1);
+        a.source.as_mut().unwrap().gain = 0.5;
+        rig.add(&mut a);
+        a.ring.write(&frames(1 << 20, PERIOD));
+        let got = cycle_outputs(&mut rig, &mut [&mut one]);
+        // The master at its gain, the client's volume still set aside.
+        assert_eq!(rig.last_periods(1), frames(1 << 19, PERIOD));
+        assert_eq!(got[0], frames(1 << 20, PERIOD));
     }
 
     /// Meter `meter`'s newest window.

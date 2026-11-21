@@ -129,6 +129,7 @@ fn level_for(percent: u8, hardware: &dyn HardwareVolume) -> f32 {
 /// The output volume. With a hardware control it is in hardware mode and
 /// the engine gain stays at 0 dB, so bit-perfect is still possible.
 /// Without one it is in software mode, and the engine gain carries it.
+/// A volume limit below 0 dB is in the engine gain in every mode.
 pub struct OutputVolume {
     hardware: Option<Box<dyn HardwareVolume>>,
     /// Forced bit-perfect: a gain the engine would apply has no effect.
@@ -136,6 +137,10 @@ pub struct OutputVolume {
     percent: u8,
     /// The level last followed, none after any `set`.
     outside: Option<f32>,
+    /// The ceiling of the output, 0 dB for none. Applied in software on
+    /// top of the volume, whatever carries it, so that a level set on the
+    /// card's control does not lift it.
+    limit_db: f32,
 }
 
 impl OutputVolume {
@@ -146,6 +151,30 @@ impl OutputVolume {
             forced: bit_perfect == BitPerfect::Forced,
             percent: 100,
             outside: None,
+            limit_db: 0.0,
+        }
+    }
+
+    /// Sets the limit, from -60 to 0 dB. It never touches the card.
+    pub fn set_limit(&mut self, db: f32) {
+        self.limit_db = db.clamp(-60.0, 0.0);
+    }
+
+    pub fn limit_db(&self) -> f32 {
+        self.limit_db
+    }
+
+    /// Whether a limit below 0 dB is set.
+    pub fn limited(&self) -> bool {
+        self.limit_db < 0.0
+    }
+
+    /// What the limit multiplies every gain by.
+    fn limit_gain(&self) -> f32 {
+        if self.limited() {
+            db_to_gain(self.limit_db)
+        } else {
+            1.0
         }
     }
 
@@ -242,9 +271,11 @@ impl OutputVolume {
 
     /// The gain of a further output `offset_db` from this volume. It is
     /// always applied in software, whatever carries the master's, and also
-    /// in forced bit-perfect, which applies to the master only.
+    /// in forced bit-perfect, which applies to the master only. The limit
+    /// lowers it too.
     pub fn further_gain(&self, offset_db: f32) -> f32 {
-        self.level_db().map_or(0.0, |db| db_to_gain(db + offset_db))
+        self.level_db()
+            .map_or(0.0, |db| db_to_gain(db + offset_db) * self.limit_gain())
     }
 
     /// The gain the engine applies to the output: 1 in hardware mode and
@@ -253,8 +284,14 @@ impl OutputVolume {
     /// Below the lowest level of the card's control it is what the control
     /// lacks, so every percent is a step down on any card. A level followed
     /// from the control is its own, so it needs nothing more. A control that
-    /// does not carry the volume leaves all of it to the engine.
+    /// does not carry the volume leaves all of it to the engine. The limit
+    /// multiplies all of this, in forced bit-perfect too.
     pub fn gain(&self) -> f32 {
+        self.volume_gain() * self.limit_gain()
+    }
+
+    /// `gain` without the limit.
+    fn volume_gain(&self) -> f32 {
         match &self.hardware {
             Some(hardware) if hardware.carries_volume() => {
                 if self.percent == 0 && !hardware.can_mute() {
@@ -378,6 +415,82 @@ mod tests {
         assert_eq!(percent_to_db(100), Some(0.0));
         assert_eq!(percent_to_db(0), None);
         assert_eq!(percent_to_db(1), Some(-59.4));
+    }
+
+    /// Gains as close as f32 arithmetic leaves them.
+    fn near(a: f32, b: f32) -> bool {
+        (a - b).abs() < 1e-6
+    }
+
+    #[test]
+    fn a_limit_lowers_the_software_gain_below_the_volume() {
+        let mut volume = OutputVolume::new(None, BitPerfect::Auto);
+        volume.set(50);
+        volume.set_limit(-10.0);
+        assert!(near(volume.gain(), db_to_gain(-40.0)));
+        assert_eq!(volume.percent(), 50);
+        assert!(volume.limited());
+        assert_eq!(volume.limit_db(), -10.0);
+    }
+
+    #[test]
+    fn a_limit_is_applied_in_software_and_never_written_to_the_card() {
+        let (hw, set) = hardware((-103.5, 0.0));
+        let mut volume = OutputVolume::new(Some(hw), BitPerfect::Auto);
+        volume.set(100);
+        volume.set_limit(-10.0);
+        // The card stays at what the volume sets; the limit is the engine's.
+        assert_eq!(set.lock().unwrap().as_slice(), &[0.0]);
+        assert!(near(volume.gain(), db_to_gain(-10.0)));
+    }
+
+    #[test]
+    fn a_player_raising_the_card_does_not_lift_the_limit() {
+        let (hw, _, level) = fake((-103.5, 0.0), true, true);
+        let mut volume = OutputVolume::new(Some(hw), BitPerfect::Auto);
+        volume.set(50);
+        volume.set_limit(-10.0);
+        *level.lock().unwrap() = 0.0;
+        let db = volume.changed().unwrap();
+        volume.follow(db);
+        assert_eq!(volume.percent(), 100);
+        assert!(near(volume.gain(), db_to_gain(-10.0)));
+    }
+
+    #[test]
+    fn a_limit_applies_in_forced_bit_perfect() {
+        let mut volume = OutputVolume::new(None, BitPerfect::Forced);
+        volume.set(50);
+        assert_eq!(volume.gain(), 1.0);
+        volume.set_limit(-6.0);
+        assert!(near(volume.gain(), db_to_gain(-6.0)));
+    }
+
+    #[test]
+    fn a_limit_lowers_the_further_outputs_too() {
+        let mut volume = OutputVolume::new(None, BitPerfect::Auto);
+        volume.set(100);
+        volume.set_limit(-10.0);
+        assert!(near(volume.further_gain(-5.0), db_to_gain(-15.0)));
+    }
+
+    #[test]
+    fn a_limit_at_0_db_changes_nothing() {
+        let (hw, _) = hardware((-103.5, 0.0));
+        let mut volume = OutputVolume::new(Some(hw), BitPerfect::Auto);
+        volume.set(100);
+        volume.set_limit(0.0);
+        assert!(!volume.limited());
+        assert_eq!(volume.gain(), 1.0);
+    }
+
+    #[test]
+    fn a_limit_keeps_a_mute_silent() {
+        let (hw, _) = hardware_muting((-50.0, 0.0), false);
+        let mut volume = OutputVolume::new(Some(hw), BitPerfect::Auto);
+        volume.set(0);
+        volume.set_limit(-10.0);
+        assert_eq!(volume.gain(), 0.0);
     }
 
     #[test]

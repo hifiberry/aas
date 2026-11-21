@@ -127,12 +127,13 @@ is kept in `/var/lib/aas/state.toml`.
 | `channels` | 1 to 8 | 2 | The number of channels the card is opened with. A card that does not take the count is not opened: the output plays to nothing and the reason is logged once. |
 | `format` | `"f32"`, `"f64"`, `"i32"` | `"f32"` | The arithmetic used to mix and to apply volume. |
 | `resampling` | `"high"`, `"medium"` | `"high"` | Quality of the resampler for a client at another rate than the output. |
-| `bit_perfect` | `"auto"`, `"forced"`, `"off"` | `"auto"` | `auto` copies the samples untouched while one client plays at the output rate with no software volume. `forced` also ignores the software volume and bypasses plugins, except input detection. `off` always mixes. |
+| `bit_perfect` | `"auto"`, `"forced"`, `"off"` | `"auto"` | `auto` copies the samples untouched while one client plays at the output rate with no software volume. `forced` also ignores the software volume, except the volume limit, and bypasses plugins, except input detection. `off` always mixes. |
 | `idle` | `"off"`, `"zeros"` | `"off"` | What the output does when nothing plays: close the card after a delay, or keep it open and send zeros. |
 | `idle_delay_s` | whole seconds | 60 | The delay before `idle = "off"` closes the card. An error with `idle = "zeros"`. |
 | `volume_mode` | `"hardware"`, `"software"`, `"follow"` | the card's control if it has one | Who applies the volume: the card's mixer, or the daemon. `hardware` on a card without a control warns and uses software. `follow` follows and writes `volume_control`, such as a user-space `Softvol`, and applies the volume in software. |
 | `volume_control` | a mixer control name | the first of `Digital`, `Master`, `PCM` | The card's control that carries the volume. |
 | `volume_poll_ms` | 50 to 5000 | 100 | How often, in ms, the card's volume control is checked for a change made by another program. |
+| `volume_limit_db` | -60 to 0 | 0 | The ceiling of the output, in dB below what the volume plays at: 100 % plays at the limit. Applied in software whatever carries the volume, so a player that sets the card's control cannot lift it. 0 sets none. See [the volume limit](#the-volume-limit). |
 | `default_rate` | 8000 to 384000 | 48000 | The rate the output opens at before the first client plays. |
 | `api_port` | 0 to 65535 | 2718 | The port of the HTTP API, on 127.0.0.1. 0 turns the API off. |
 | `pulse_socket` | a path, or `""` | the client socket's directory plus `pulse` | The PulseAudio native-protocol socket. An empty value turns the endpoint off. |
@@ -365,6 +366,9 @@ Outputs are numbered as in the config's error messages: the master is 1, the
   another program, a player's mixer or `amixer -c`, becomes the volume; at
   start the card's control is read, not written.
 - `volume_db`, a further output only: its offset to the master, -60 to 0.
+- `limit_db`, the master only: the [volume limit](#the-volume-limit), -60 to
+  0, 0 for none. A value set through the API is kept in the state file, and
+  applies while `volume_limit_db` in the config stays as it was.
 - `idle`, `"off"` or `"zeros"`, and `idle_delay_s`, with the rules of the
   config keys: a delay with `zeros` is refused. A change takes effect at the
   next idle decision; an output that is off stays off until a client plays.
@@ -378,6 +382,23 @@ A name without a volume plays at 0 dB. At most 64 names are kept; one set back
 to 0 dB, unmuted, is no longer kept and frees its place. While a client plays
 alone at a volume other than 0 dB the master is not bit-perfect, with the reason
 `"volume"`. Every change of an input's volume fades over 10 ms.
+
+#### The volume limit
+
+The limit is a gain the daemon applies to the master's samples on top of the
+volume, and to every further output's. It never touches the card's control: a
+player that sets that control to 0 dB still plays at the limit. So that no mode
+gets around it, while a limit is set:
+
+- forced bit-perfect applies it too, although it still sets the volumes aside;
+- the master is never bit-perfect: with one client playing the reason is
+  `"limit"`;
+- a DoP stream is silent, and discarded in real time: it cannot be scaled, and
+  passed through it would play at the card's volume, past the limit.
+
+A change from one limit to another fades over 10 ms. Setting or lifting a
+limit while something plays fades out and back in, as a change of bit-perfect
+mode does. A limit of 0 dB changes nothing.
 
 `PUT /matrix` takes `{"outputs": [{"output": N, "routes": [...]}]}`, each
 route `{"from": ..., "to": ..., "gain_db": ...}` with the names and rules of a
