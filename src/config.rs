@@ -215,6 +215,8 @@ pub struct Config {
     pub pulse_socket: Option<PathBuf>,
     /// The default and cap for a PulseAudio stream's buffer, in ms.
     pub pulse_buffer_ms: Option<u16>,
+    /// The AirPlay receivers, from the `[[airplay]]` tables.
+    pub airplay: Vec<crate::airplay::config::AirplayConfig>,
 }
 
 /// The port of the API unless the config names another.
@@ -264,6 +266,7 @@ struct Raw {
     api_port: Option<toml::Value>,
     pulse_socket: Option<toml::Value>,
     pulse_buffer_ms: Option<toml::Value>,
+    airplay: Option<Vec<toml::Table>>,
 }
 
 #[derive(Deserialize)]
@@ -425,6 +428,7 @@ impl Default for Config {
             api_port: DEFAULT_API_PORT,
             pulse_socket: None,
             pulse_buffer_ms: None,
+            airplay: Vec::new(),
         }
     }
 }
@@ -646,6 +650,8 @@ impl Config {
                 path.display()
             ));
         }
+        let airplay = crate::airplay::config::receivers_from(raw.airplay.unwrap_or_default())
+            .map_err(|e| format!("{}: {e}", path.display()))?;
         let mut outputs: Vec<OutputConfig> = Vec::new();
         for (i, table) in raw_outputs.into_iter().enumerate() {
             let n = i + 2;
@@ -687,6 +693,7 @@ impl Config {
             api_port,
             pulse_socket,
             pulse_buffer_ms,
+            airplay,
         })
     }
 }
@@ -747,6 +754,16 @@ mod tests {
             let e = err(&format!("volume_limit_db = {bad}\n"));
             assert!(e.contains("volume_limit_db must be"), "{bad}: {e}");
         }
+    }
+
+    #[test]
+    fn airplay_tables_reach_the_config_and_their_errors_name_the_file() {
+        assert!(load_str("").unwrap().airplay.is_empty());
+        let c = load_str("[[airplay]]\nhost = \"soundbar.local\"\n").unwrap();
+        assert_eq!(c.airplay.len(), 1);
+        assert_eq!(c.airplay[0].host, "soundbar.local");
+        let e = load_str("[[airplay]]\nport = 1\n").unwrap_err();
+        assert!(e.ends_with("aas.toml: airplay 1: host is needed"), "{e}");
     }
 
     #[test]
