@@ -310,7 +310,7 @@ volume_db = -20           # the receiver's volume, sent once a session
 | `protocol` | `"airplay1"`, `"airplay2"` | `"airplay1"` | AirPlay 2 is not in this build yet: such a receiver fails with a message saying so. |
 | `connect` | `"signal"`, `"always"` | `"signal"` | When to connect: on the first 50 ms window above `threshold_dbfs`, or from the start and again after any failure. |
 | `threshold_dbfs` | -90 to 0 | -50 | The level that counts as a signal: the RMS of both channels, as `detect` measures it. |
-| `idle_s` | 1 to 86400 | 120 | Seconds without a signal after which the session ends with TEARDOWN, which frees the receiver's input. |
+| `idle_s` | 1 to 86400 | 120 | Seconds without a signal after which the session ends with TEARDOWN, which frees the receiver's input. Time in which the master sends nothing at all, closed when idle, counts as silence too. |
 | `latency_ms` | 250 to 5000 | 1500 | How far ahead of the receiver's clock the audio is sent. A receiver that asks for more gets more. |
 | `volume_db` | -30 to 0, or `"off"` | 0 | The receiver's own volume, sent once after each connect; `"off"` sends none. |
 
@@ -323,9 +323,13 @@ receiver that refuses that step is played to without it. The master's clock and
 the receiver's are kept together as a further output's are, by a resampler
 whose ratio follows the frames waiting.
 
-A failure, a receiver that closes the connection or one that does not answer is
-retried after 1, 2, 4, 8 and 16 s, then every 30 s, as long as there is a
-signal, or always with `connect = "always"`. The first second or so of a
+A failure, a receiver that closes the connection, one whose audio port refuses
+the stream (as after a reboot) or one that stops answering at all (found by TCP
+keepalive within about 15 s) is retried after 1, 2, 4, 8 and 16 s, then every
+30 s, as long as there is a signal, or always with `connect = "always"`. A new
+signal after a failed one starts again at 1 s. Each session logs, when it ends,
+how long it lasted, its packets, those the receiver asked for again and those
+that were short of frames. The first second or so of a
 signal is not heard: the session is still being set up. `GET /airplay` gives
 each receiver's `state`, `idle`, `connecting`, `playing` or `retrying`, and the
 last failure as `error` until a session plays again.

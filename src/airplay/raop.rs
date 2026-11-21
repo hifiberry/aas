@@ -145,6 +145,8 @@ impl Raop {
     /// Ends the session. An answer is not waited for beyond the read
     /// timeout, and a failure changes nothing.
     pub fn teardown(mut self) {
+        // A receiver that has gone does not hold up a stop for long.
+        self.conn.set_timeout(std::time::Duration::from_secs(1));
         let _ = self.send("TEARDOWN", None, None, &[], &[]);
     }
 

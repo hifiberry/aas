@@ -1255,9 +1255,10 @@ impl Control {
     /// Writes the state file if a change is still waiting for it, and
     /// returns only once the file is on disk.
     pub fn shutdown(&mut self) {
-        // Each receiver hears TEARDOWN while the audio still runs.
-        for receiver in &mut self.airplay {
-            receiver.stop();
+        // Every receiver ends its session at once; the state is saved
+        // while they do, and they are waited for last.
+        for receiver in &self.airplay {
+            receiver.ask_stop();
         }
         self.send(vec![Command::Shutdown]);
         if self.save_at.is_some() {
@@ -1265,6 +1266,9 @@ impl Control {
         }
         if let Some(saver) = &mut self.saver {
             saver.finish();
+        }
+        for receiver in &mut self.airplay {
+            receiver.stop();
         }
     }
 

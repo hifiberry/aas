@@ -35,7 +35,7 @@ Apache-2.0, and so compatible with `aas`'s MIT.
 
 Evidence:
 - `doc/pipewire-device.md`;
-- a HiFiBerry OS turntable box (an ADC-only CM5) under PipeWire, read 2026-11-21: one receiver, a sound bar advertising `et=0,4`, `cn=0,1`, `tp=UDP`, port 7000, reached with PipeWire's `module-raop-discover`, and a helper script that pauses the stream after two minutes without a record;
+- a device under PipeWire that plays to one AirPlay receiver, read 2026-11-21: the receiver advertises `et=0,4`, `cn=0,1`, `tp=UDP`, port 7000, and a helper script pauses the stream after a silence;
 - the reference implementation, PipeWire's `src/modules/module-raop-sink.c` (MIT, commit `ae12134`), which has both the legacy path and the AirPlay 2 path.
 
 No Rust crate fits: the senders are GPL-3.0 (`cidermill-airplay`,
@@ -237,7 +237,7 @@ it (`src/plugin/detect.rs`).
   - `Raop::audio_latency(&self) -> Option<u32>` (from the RECORD reply)
 
 The handshake, in this order:
-1. `OPTIONS *`, with `Apple-Challenge`: base64 of 16 random bytes, without
+1. `OPTIONS` to the session URL, as PipeWire sends it, with `Apple-Challenge`: base64 of 16 random bytes, without
    padding.
 2. `POST /auth-setup`.
 3. `ANNOUNCE rtsp://<local ip>/<session id>`, with the SDP of the Global
@@ -384,7 +384,7 @@ subnet, by its mDNS name, then to a Mac.
 
 - [ ] **Step 1:** Run the branch's `aas` as root with PipeWire stopped, as for the capture clock. Set `[[airplay]] host = "<the sound bar's name>"`, `idle_s = 30`.
 - [ ] **Step 2:** Play a record, or a 1 kHz tone with `aplay` to `aas`. The sound bar switches to AirPlay and plays it, and `GET /airplay` says `playing`.
-- [ ] **Step 3:** Stop the tone. After 30 s the state goes to `idle`, and the sound bar reports `extInput:airPlay` gone or `STOPPED` (its control API).
+- [ ] **Step 3:** Stop the tone. After 30 s the state goes to `idle`, and the receiver reports that its AirPlay input is no longer playing.
 - [ ] **Step 4:** Ten minutes of music, then check the stderr log: no padding and no retransmits beyond a handful.
 - [ ] **Step 5:** A Mac as the receiver (Review Focus 1).
 - [ ] **Step 6:** Record the results and commit: `docs: the AirPlay output on a sound bar and a Mac`.

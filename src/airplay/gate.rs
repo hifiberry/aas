@@ -57,6 +57,18 @@ impl Gate {
         self.open
     }
 
+    /// Time in which no frames came, as when the master has closed: it
+    /// counts as silence.
+    pub fn nothing(&mut self, elapsed: std::time::Duration) -> Option<GateEvent> {
+        let frames = (elapsed.as_secs_f64() * f64::from(self.rate)) as u64;
+        self.quiet = self.quiet.saturating_add(frames);
+        if self.open && self.quiet >= u64::from(self.idle_s) * u64::from(self.rate) {
+            self.open = false;
+            return Some(GateEvent::Silence);
+        }
+        None
+    }
+
     /// Measures interleaved stereo frames. Says when the gate opened or
     /// closed in them.
     pub fn feed(&mut self, interleaved: &[i32]) -> Option<GateEvent> {
@@ -91,6 +103,7 @@ impl Gate {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     const RATE: u32 = 48000;
 
@@ -163,6 +176,19 @@ mod tests {
             feed(&mut Gate::new(RATE, -70.0, 2), &quiet),
             [GateEvent::Signal]
         );
+    }
+
+    #[test]
+    fn time_without_frames_counts_as_silence() {
+        let mut gate = Gate::new(RATE, -50.0, 2);
+        feed(&mut gate, &sine(-20.0, 2400));
+        assert_eq!(gate.nothing(Duration::from_millis(1950)), None);
+        assert!(gate.signal());
+        assert_eq!(
+            gate.nothing(Duration::from_millis(50)),
+            Some(GateEvent::Silence)
+        );
+        assert_eq!(gate.nothing(Duration::from_secs(5)), None);
     }
 
     #[test]

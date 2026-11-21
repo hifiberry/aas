@@ -62,6 +62,13 @@ impl Receiver {
         }
     }
 
+    /// Asks the thread to end its session, without waiting for it.
+    pub fn ask_stop(&self) {
+        if let Some(handle) = &self.handle {
+            handle.ask_stop();
+        }
+    }
+
     /// Ends a session with TEARDOWN and joins the thread.
     pub fn stop(&mut self) {
         if let Some(handle) = self.handle.take() {

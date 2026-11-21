@@ -7,6 +7,11 @@ use std::io::{Read, Write};
 use std::net::{IpAddr, TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
+/// TCP keepalive on a session's connection, in seconds and probes: idle
+/// time, interval, count. Nothing is sent on it while audio streams, so a
+/// receiver that loses power is found by these probes, within about 15 s.
+pub const KEEPALIVE: [libc::c_int; 3] = [5, 2, 5];
+
 /// A response body larger than this is refused.
 pub const MAX_BODY: usize = 64 * 1024;
 
@@ -145,6 +150,7 @@ impl Conn {
                     stream.set_read_timeout(Some(timeout)).map_err(io)?;
                     stream.set_write_timeout(Some(timeout)).map_err(io)?;
                     let _ = stream.set_nodelay(true);
+                    keepalive(&stream);
                     return Ok(Conn {
                         stream,
                         cseq: 0,
@@ -199,6 +205,11 @@ impl Conn {
         closed || self.stream.set_nonblocking(false).is_err()
     }
 
+    /// A new limit for each read, such as a short one for the last request.
+    pub fn set_timeout(&mut self, timeout: Duration) {
+        let _ = self.stream.set_read_timeout(Some(timeout));
+    }
+
     pub fn local_ip(&self) -> IpAddr {
         self.stream
             .local_addr()
@@ -210,6 +221,29 @@ impl Conn {
             .peer_addr()
             .map_or(IpAddr::from([0, 0, 0, 0]), |a| a.ip())
     }
+}
+
+/// Turns on TCP keepalive with `KEEPALIVE`. A failure leaves the
+/// connection as it is: a receiver that closes it is still seen.
+fn keepalive(stream: &TcpStream) {
+    use std::os::fd::AsRawFd;
+    let fd = stream.as_raw_fd();
+    let set = |level, name, value: libc::c_int| {
+        // SAFETY: a plain integer option on a socket this function borrows.
+        unsafe {
+            libc::setsockopt(
+                fd,
+                level,
+                name,
+                (&raw const value).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        }
+    };
+    set(libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1);
+    set(libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, KEEPALIVE[0]);
+    set(libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, KEEPALIVE[1]);
+    set(libc::IPPROTO_TCP, libc::TCP_KEEPCNT, KEEPALIVE[2]);
 }
 
 #[cfg(test)]
@@ -337,6 +371,35 @@ mod tests {
         peer.join().unwrap();
         std::thread::sleep(Duration::from_millis(50));
         assert!(conn.closed());
+    }
+
+    #[test]
+    fn a_connection_probes_a_silent_peer() {
+        use std::os::fd::AsRawFd;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let _peer = std::thread::spawn(move || listener.accept().map(|(s, _)| s));
+        let conn = Conn::connect("127.0.0.1", port, Duration::from_secs(2)).unwrap();
+        let get = |level, name| {
+            let mut v: libc::c_int = 0;
+            let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+            // SAFETY: v and len are valid for the call.
+            let r = unsafe {
+                libc::getsockopt(
+                    conn.stream.as_raw_fd(),
+                    level,
+                    name,
+                    (&raw mut v).cast(),
+                    &raw mut len,
+                )
+            };
+            assert_eq!(r, 0);
+            v
+        };
+        assert_eq!(get(libc::SOL_SOCKET, libc::SO_KEEPALIVE), 1);
+        assert_eq!(get(libc::IPPROTO_TCP, libc::TCP_KEEPIDLE), KEEPALIVE[0]);
+        assert_eq!(get(libc::IPPROTO_TCP, libc::TCP_KEEPINTVL), KEEPALIVE[1]);
+        assert_eq!(get(libc::IPPROTO_TCP, libc::TCP_KEEPCNT), KEEPALIVE[2]);
     }
 
     #[test]

@@ -2465,3 +2465,30 @@ OS, 2026-11-21, with `clock = "auto"` and the analog input on, at 48 kHz and
 Run as a user, the start failed with `memory allocation of 262144 bytes
 failed`: that user may lock 8 MB, and `aas` locks its memory. The service has
 `LimitMEMLOCK=infinity`; the run was repeated as root.
+
+## AirPlay output
+
+2026-11-21, a CM5 with a HiFiBerry ADC under HiFiBerry OS, `aas` on the
+capture clock (`clock = "auto"`, the analog input on, 48 kHz, 64-frame periods)
+with PipeWire stopped for the run, playing to a sound bar on the same network
+that advertises `et=0,4`, `cn=0,1`, `tp=UDP`. `[[airplay]]` with the bar's
+mDNS name, `volume_db = -25`, `idle_s = 30`.
+
+- The first try never got past SETUP: the bar asks the sender's time before it
+  answers SETUP, and the output's thread, waiting for that answer, gave none.
+  Every try timed out after 5 s. With a thread that answers timing requests
+  from before SETUP on, the handshake goes through.
+- A 1 kHz tone at -30 dBFS for 10 s, played into `aas` through its PulseAudio
+  endpoint: the output connected about 4 s after the tone started, and the bar
+  went to its AirPlay input and reported `PLAYING`. 30 s after the tone ended
+  the session ended with TEARDOWN and the bar reported `PAUSED`.
+- 300 s with `connect = "always"` and no signal: 37662 packets, 125.5 a
+  second as 44100 / 352 gives, none asked for again, none short of frames; the
+  bar reported `PLAYING` throughout.
+- In that run the audio thread had one cycle of 7.3 ms and padded 64 frames of
+  the analog input once, against a worst cycle of 0.047 ms without AirPlay on
+  the same board. The board runs without `dist/90-aas.conf`, the compaction
+  that caused such stalls elsewhere; not yet pinned down.
+
+Whether the tone sounded right was not heard by whoever ran the test: that is
+for a listener in the room to say.

@@ -29,6 +29,9 @@ const IDLE_WAKE: Duration = Duration::from_millis(20);
 /// Seconds before each retry; after the last, every `RETRY_LAST`.
 const RETRIES: [u32; 5] = [1, 2, 4, 8, 16];
 const RETRY_LAST: u32 = 30;
+/// How long the tap may give nothing before that counts as silence: well
+/// beyond a period, so that it never cuts into a running master.
+const NOTHING: Duration = Duration::from_millis(200);
 /// Frames read from the tap at a time.
 const CHUNK: usize = 4096;
 
@@ -99,8 +102,14 @@ impl AirplayHandle {
         self.end();
     }
 
-    fn end(&mut self) {
+    /// Asks the thread to stop, without waiting: several receivers then
+    /// end their sessions at once.
+    pub fn ask_stop(&self) {
         let _ = self.tx.send(Msg::Stop);
+    }
+
+    fn end(&mut self) {
+        self.ask_stop();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -158,7 +167,7 @@ impl Timing {
     /// whether it should stop.
     const POLL: Duration = Duration::from_millis(100);
 
-    fn start(socket: UdpSocket) -> Timing {
+    fn start(socket: UdpSocket, line: Line) -> Timing {
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stopped = stop.clone();
         let thread = std::thread::Builder::new()
@@ -170,8 +179,9 @@ impl Timing {
                     let Ok((n, from)) = socket.recv_from(&mut buf) else {
                         continue;
                     };
-                    let received = ntp_now();
-                    if let Some(reply) = rtp::timing_reply(&buf[..n], received, ntp_now()) {
+                    let received = line.ntp(Instant::now());
+                    let reply = rtp::timing_reply(&buf[..n], received, line.ntp(Instant::now()));
+                    if let Some(reply) = reply {
                         let _ = socket.send_to(&reply, from);
                     }
                 }
@@ -199,18 +209,41 @@ struct Output {
     session: Option<Session>,
     retry_at: Option<Instant>,
     failures: usize,
+    /// When the tap last gave frames, or the time without them was last
+    /// counted.
+    heard: Instant,
     auth_setup_told: bool,
     frames: Vec<[i32; 2]>,
     interleaved: Vec<i32>,
     sent: Vec<Outgoing>,
 }
 
-fn ntp_now() -> u64 {
-    rtp::ntp_from(
-        SystemTime::now()
+/// A line from the monotonic clock to NTP time, taken from the wall clock
+/// once.
+#[derive(Clone, Copy)]
+struct Line {
+    at: Instant,
+    ntp: u64,
+}
+
+impl Line {
+    fn now() -> Line {
+        let wall = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap_or_default(),
-    )
+            .unwrap_or_default();
+        Line {
+            at: Instant::now(),
+            ntp: rtp::ntp_from(wall),
+        }
+    }
+
+    fn ntp(self, at: Instant) -> u64 {
+        let d = at.saturating_duration_since(self.at);
+        let fraction = (u64::from(d.subsec_nanos()) << 32) / 1_000_000_000;
+        self.ntp
+            .wrapping_add(d.as_secs() << 32)
+            .wrapping_add(fraction)
+    }
 }
 
 impl Output {
@@ -224,6 +257,7 @@ impl Output {
             session: None,
             retry_at: None,
             failures: 0,
+            heard: Instant::now(),
             auth_setup_told: false,
             frames: vec![[0; 2]; CHUNK],
             interleaved: Vec::with_capacity(CHUNK * 2),
@@ -256,7 +290,7 @@ impl Output {
                 && self.state() == AirplayState::Idle
                 && self.tap.is_some()
             {
-                self.connect(Instant::now());
+                self.connect();
             }
             self.pump(Instant::now());
             match rx.recv_timeout(self.wait(Instant::now())) {
@@ -299,8 +333,10 @@ impl Output {
     }
 
     /// Reads what the tap holds into the gate, and into the stream while
-    /// connected, and acts on what the gate says.
+    /// connected, and acts on what the gate says. Time in which the tap
+    /// gives nothing, as when the master has closed, counts as silence.
     fn read_tap(&mut self, now: Instant) {
+        let mut any = false;
         loop {
             let n = match &self.tap {
                 Some(tap) => tap.ring.read(&mut self.frames),
@@ -309,45 +345,59 @@ impl Output {
             if n == 0 {
                 break;
             }
+            any = true;
             self.interleaved.clear();
             self.interleaved.extend(self.frames[..n].iter().flatten());
             let event = self.gate.as_mut().and_then(|g| g.feed(&self.interleaved));
             if let Some(s) = &mut self.session {
                 s.stream.take(&self.interleaved);
             }
-            match (event, self.config.connect, self.state()) {
-                (Some(GateEvent::Signal), Connect::Signal, AirplayState::Idle) => {
-                    self.connect(now);
-                }
-                (Some(GateEvent::Silence), Connect::Signal, AirplayState::Playing) => {
-                    self.disconnect();
-                }
-                _ => {}
-            }
+            self.on_gate(event);
             if n < self.frames.len() {
                 break;
             }
         }
+        if any {
+            self.heard = now;
+        } else if now.duration_since(self.heard) >= NOTHING {
+            let elapsed = now.duration_since(self.heard);
+            self.heard = now;
+            let event = self.gate.as_mut().and_then(|g| g.nothing(elapsed));
+            self.on_gate(event);
+        }
     }
 
-    /// Once the time has come, tries again while the gate is open; else
-    /// the receiver is idle, which under `Connect::Always` connects again.
+    fn on_gate(&mut self, event: Option<GateEvent>) {
+        match (event, self.config.connect, self.state()) {
+            (Some(GateEvent::Signal), Connect::Signal, AirplayState::Idle) => self.connect(),
+            (Some(GateEvent::Silence), Connect::Signal, AirplayState::Playing) => {
+                self.disconnect();
+            }
+            _ => {}
+        }
+    }
+
+    /// Once the time has come, tries again: always, or while the gate is
+    /// open. Otherwise the episode is over and the receiver idle.
     fn retry(&mut self, now: Instant) {
         let Some(at) = self.retry_at else { return };
         if now < at {
             return;
         }
         self.retry_at = None;
-        if self.gate.as_ref().is_some_and(Gate::signal) {
-            self.connect(now);
+        let signal = self.gate.as_ref().is_some_and(Gate::signal);
+        if self.config.connect == Connect::Always || signal {
+            self.connect();
         } else {
+            // The episode is over: the next signal tries from 1 s again.
+            self.failures = 0;
             self.set(AirplayState::Idle, None);
         }
     }
 
-    fn connect(&mut self, now: Instant) {
+    fn connect(&mut self) {
         self.set(AirplayState::Connecting, None);
-        match self.open(now) {
+        match self.open() {
             Ok(session) => {
                 eprintln!("aas: airplay \"{}\": playing", self.config.name);
                 self.session = Some(session);
@@ -391,7 +441,7 @@ impl Output {
         }
     }
 
-    fn open(&mut self, now: Instant) -> Result<Session, String> {
+    fn open(&mut self) -> Result<Session, String> {
         let rate = self.tap.as_ref().map(|t| t.rate).ok_or("no audio yet")?;
         let c = &self.config;
         if c.protocol == super::config::Protocol::AirPlay2 {
@@ -410,7 +460,11 @@ impl Output {
         let first_timing = timing
             .try_clone()
             .map_err(|e| format!("a UDP socket: {e}"))?;
-        let responder = Timing::start(timing);
+        // One clock line for the session: the timing answers and the
+        // stream's sync packets both read it, and a step of the wall
+        // clock does not move it.
+        let line = Line::now();
+        let responder = Timing::start(timing, line);
         let setup = Setup {
             control_port: port(&control),
             timing_port: port(&first_timing),
@@ -435,9 +489,12 @@ impl Output {
             s.set_nonblocking(true).map_err(udp)?;
         }
         if let Some(t) = ports.timing {
-            let ntp = ntp_now();
+            let ntp = line.ntp(Instant::now());
             let _ = first_timing.send_to(&rtp::timing_packet(ntp, ntp, ntp), (peer, t));
         }
+        // The stream starts now, after the handshake, so that its time is
+        // not made up for with a burst.
+        let begun = Instant::now();
         let wanted = u64::from(c.latency_ms) * u64::from(rtp::RATE) / 1000;
         let latency = (wanted as u32).max(raop.audio_latency.unwrap_or(0));
         let stream = Stream::new(
@@ -445,15 +502,15 @@ impl Output {
             latency,
             setup.first_seq,
             setup.first_rtptime,
-            ntp_now(),
-            self.mono(now),
+            line.ntp(begun),
+            self.mono(begun),
         );
         Ok(Session {
             raop,
             data,
             control,
             stream,
-            started: now,
+            started: begun,
             resent: 0,
             _timing: responder,
         })
@@ -477,13 +534,32 @@ impl Output {
         }
         self.sent.clear();
         s.stream.due(mono, &mut self.sent);
+        let mut refused = None;
         for out in &self.sent {
-            // A lost datagram is the receiver's to ask for again.
-            let _ = match out {
+            // A lost datagram is the receiver's to ask for again; a refused
+            // one means its port is gone, as after a reboot.
+            let sent = match out {
                 Outgoing::Audio(p) => s.data.send(p),
                 Outgoing::Sync(p) => s.control.send(p),
             };
+            if let Err(e) = sent
+                && e.kind() == std::io::ErrorKind::ConnectionRefused
+            {
+                refused = Some(e);
+            }
         }
+        if let Some(e) = refused {
+            let summary = self
+                .session
+                .take()
+                .map(|s| self.summary(&s))
+                .unwrap_or_default();
+            self.fail(format!(
+                "the receiver refused the audio ({e}), after {summary}"
+            ));
+            return;
+        }
+        let Some(s) = &mut self.session else { return };
         let mut buf = [0u8; 64];
         let mut again = Vec::new();
         while let Ok(n) = s.control.recv(&mut buf) {
@@ -597,6 +673,97 @@ mod tests {
         let seen = receiver.finish();
         assert_eq!(seen.last().unwrap().method, "TEARDOWN");
         assert!(seen.iter().any(|s| s.body == b"volume: -25\r\n"));
+    }
+
+    #[test]
+    fn a_tap_that_stops_delivering_counts_as_silence() {
+        // The master closes when idle: the tap then gets nothing at all.
+        let receiver = streaming();
+        let handle = spawn(config(receiver.port, Connect::Signal));
+        let (ring, reader) = tap();
+        handle.tap(reader);
+        play(&ring, 0.3, true);
+        assert!(until(&handle, 3.0, playing), "{:?}", handle.status());
+        assert!(
+            until(&handle, 2.5, |s| s == AirplayState::Idle),
+            "{:?}",
+            handle.status()
+        );
+    }
+
+    #[test]
+    fn a_receiver_whose_audio_port_is_gone_is_retried() {
+        // Its port answers ICMP unreachable: a rebooted receiver.
+        let gone = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = gone.local_addr().unwrap().port();
+        drop(gone);
+        let receiver = FakeReceiver::serving(1, move |_| accepting_on(port));
+        let handle = spawn(config(receiver.port, Connect::Always));
+        let (_ring, reader) = tap();
+        handle.tap(reader);
+        assert!(
+            until(&handle, 3.0, |s| matches!(s, AirplayState::Retrying { .. })),
+            "{:?}",
+            handle.status()
+        );
+        let error = handle.status().error.unwrap();
+        assert!(error.contains("refused"), "{error}");
+    }
+
+    #[test]
+    fn a_slow_handshake_is_not_made_up_for_with_a_burst() {
+        let receiver = FakeReceiver::serving(1, |port| {
+            let accept = accepting_on(port);
+            move |s: &Seen| {
+                if s.method == "SETUP" {
+                    std::thread::sleep(Duration::from_millis(600));
+                }
+                accept(s)
+            }
+        });
+        let handle = spawn(config(receiver.port, Connect::Always));
+        let (_ring, reader) = tap();
+        handle.tap(reader);
+        let mut packet = [0u8; 2048];
+        receiver.data.recv(&mut packet).unwrap();
+        let first = Instant::now();
+        let mut count = 0;
+        receiver
+            .data
+            .set_read_timeout(Some(Duration::from_millis(20)))
+            .unwrap();
+        while first.elapsed() < Duration::from_millis(100) {
+            if receiver.data.recv(&mut packet).is_ok() {
+                count += 1;
+            }
+        }
+        // 100 ms is 12.5 packets; 0.6 s made up at once would be 75.
+        assert!(count < 30, "{count} packets in 100 ms");
+    }
+
+    #[test]
+    fn a_new_signal_after_a_failed_one_retries_from_1_s() {
+        // The discard port: every try is refused.
+        let handle = spawn(config(9, Connect::Signal));
+        let (ring, reader) = tap();
+        handle.tap(reader);
+        play(&ring, 0.1, true);
+        assert!(until(&handle, 2.0, |s| s == AirplayState::Retrying { in_s: 1 }));
+        play(&ring, 1.2, true);
+        assert!(until(&handle, 2.0, |s| s == AirplayState::Retrying { in_s: 2 }));
+        // The signal ends; at the next try the receiver goes idle.
+        assert!(
+            until(&handle, 4.0, |s| s == AirplayState::Idle),
+            "{:?}",
+            handle.status()
+        );
+        play(&ring, 0.1, true);
+        assert!(
+            until(&handle, 2.0, |s| matches!(s, AirplayState::Retrying { .. })),
+            "{:?}",
+            handle.status()
+        );
+        assert_eq!(handle.status().state, AirplayState::Retrying { in_s: 1 });
     }
 
     #[test]
