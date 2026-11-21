@@ -6,6 +6,7 @@ pub mod gate;
 pub mod raop;
 pub mod rtp;
 pub mod rtsp;
+pub mod stream;
 
 #[cfg(test)]
 mod fake;
