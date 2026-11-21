@@ -185,7 +185,7 @@ its sound page uses that chain for three things only:
   control cannot lift it *(call)*. For the same reason it applies in forced
   bit-perfect, and a DoP stream is silent while a limit is set *(call)*: DoP
   cannot be scaled, and would otherwise play at the card's volume. The web UI
-  hid the control under `aas` until this existed; it can now show it, set in dB.
+  shows the same control under both servers.
 
 ## What the user is told before switching
 
@@ -193,8 +193,8 @@ Before `set aas`, the web UI lists what will stop working on this device, and
 only what is in use there: the input processor enabled (`pipewire-api`'s RIAA
 state), AES67 or the USB gadget enabled (their units, through the config
 server). A paired Bluetooth device was on the list until Bluetooth worked under
-`aas`. A volume limit below 100 % still is, until the web UI sets `aas`'s own
-limit. The user confirms or stays on PipeWire. The settings stay, so
+`aas`. A volume limit below 100 % still is, as a value to set again under
+`aas`: PipeWire's is not copied over. The user confirms or stays on PipeWire. The settings stay, so
 switching back restores them *(call)*.
 
 Switching back to PipeWire needs no warning: nothing is lost.
