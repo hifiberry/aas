@@ -129,6 +129,7 @@ fn level_for(percent: u8, hardware: &dyn HardwareVolume) -> f32 {
 /// The output volume. With a hardware control it is in hardware mode and
 /// the engine gain stays at 0 dB, so bit-perfect is still possible.
 /// Without one it is in software mode, and the engine gain carries it.
+/// A volume limit below 0 dB is in the engine gain in every mode.
 pub struct OutputVolume {
     hardware: Option<Box<dyn HardwareVolume>>,
     /// Forced bit-perfect: a gain the engine would apply has no effect.

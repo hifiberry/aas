@@ -127,7 +127,7 @@ is kept in `/var/lib/aas/state.toml`.
 | `channels` | 1 to 8 | 2 | The number of channels the card is opened with. A card that does not take the count is not opened: the output plays to nothing and the reason is logged once. |
 | `format` | `"f32"`, `"f64"`, `"i32"` | `"f32"` | The arithmetic used to mix and to apply volume. |
 | `resampling` | `"high"`, `"medium"` | `"high"` | Quality of the resampler for a client at another rate than the output. |
-| `bit_perfect` | `"auto"`, `"forced"`, `"off"` | `"auto"` | `auto` copies the samples untouched while one client plays at the output rate with no software volume. `forced` also ignores the software volume and bypasses plugins, except input detection. `off` always mixes. |
+| `bit_perfect` | `"auto"`, `"forced"`, `"off"` | `"auto"` | `auto` copies the samples untouched while one client plays at the output rate with no software volume. `forced` also ignores the software volume, except the volume limit, and bypasses plugins, except input detection. `off` always mixes. |
 | `idle` | `"off"`, `"zeros"` | `"off"` | What the output does when nothing plays: close the card after a delay, or keep it open and send zeros. |
 | `idle_delay_s` | whole seconds | 60 | The delay before `idle = "off"` closes the card. An error with `idle = "zeros"`. |
 | `volume_mode` | `"hardware"`, `"software"`, `"follow"` | the card's control if it has one | Who applies the volume: the card's mixer, or the daemon. `hardware` on a card without a control warns and uses software. `follow` follows and writes `volume_control`, such as a user-space `Softvol`, and applies the volume in software. |
@@ -391,11 +391,14 @@ player that sets that control to 0 dB still plays at the limit. So that no mode
 gets around it, while a limit is set:
 
 - forced bit-perfect applies it too, although it still sets the volumes aside;
-- the master is never bit-perfect, with the reason `"limit"`;
+- the master is never bit-perfect: with one client playing the reason is
+  `"limit"`;
 - a DoP stream is silent, and discarded in real time: it cannot be scaled, and
   passed through it would play at the card's volume, past the limit.
 
-A change fades over 10 ms, and a limit of 0 dB changes nothing.
+A change from one limit to another fades over 10 ms. Setting or lifting a
+limit while something plays fades out and back in, as a change of bit-perfect
+mode does. A limit of 0 dB changes nothing.
 
 `PUT /matrix` takes `{"outputs": [{"output": N, "routes": [...]}]}`, each
 route `{"from": ..., "to": ..., "gain_db": ...}` with the names and rules of a

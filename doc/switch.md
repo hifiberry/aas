@@ -192,9 +192,10 @@ its sound page uses that chain for three things only:
 Before `set aas`, the web UI lists what will stop working on this device, and
 only what is in use there: the input processor enabled (`pipewire-api`'s RIAA
 state), AES67 or the USB gadget enabled (their units, through the config
-server). A volume limit below 100 % and a paired Bluetooth device were on the
-list until `aas` had a limit of its own and Bluetooth worked under it. The user confirms or stays on PipeWire. The
-settings stay, so switching back restores them *(call)*.
+server). A paired Bluetooth device was on the list until Bluetooth worked under
+`aas`. A volume limit below 100 % still is, until the web UI sets `aas`'s own
+limit. The user confirms or stays on PipeWire. The settings stay, so
+switching back restores them *(call)*.
 
 Switching back to PipeWire needs no warning: nothing is lost.
 
