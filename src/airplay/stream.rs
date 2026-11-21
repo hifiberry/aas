@@ -215,6 +215,11 @@ impl Stream {
     pub fn padded(&self) -> u64 {
         self.padded
     }
+
+    /// Audio packets made so far.
+    pub fn packets(&self) -> u64 {
+        self.made
+    }
 }
 
 /// A resampler from the master's rate to the stream's, and its drift

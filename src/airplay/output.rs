@@ -137,6 +137,9 @@ struct Session {
     data: UdpSocket,
     control: UdpSocket,
     stream: Stream,
+    /// When it started, and the packets the receiver asked for again.
+    started: Instant,
+    resent: u64,
     /// Answers the receiver's timing requests for as long as the session
     /// lasts.
     _timing: Timing,
@@ -346,6 +349,7 @@ impl Output {
         self.set(AirplayState::Connecting, None);
         match self.open(now) {
             Ok(session) => {
+                eprintln!("aas: airplay \"{}\": playing", self.config.name);
                 self.session = Some(session);
                 self.failures = 0;
                 self.set(AirplayState::Playing, None);
@@ -362,8 +366,24 @@ impl Output {
         self.set(AirplayState::Retrying { in_s: delay }, Some(why));
     }
 
+    /// What a session did, for the log when it ends.
+    fn summary(&self, s: &Session) -> String {
+        format!(
+            "{} s, {} packets, {} resent, {} short of frames",
+            s.started.elapsed().as_secs(),
+            s.stream.packets(),
+            s.resent,
+            s.stream.padded()
+        )
+    }
+
     fn disconnect(&mut self) {
         if let Some(s) = self.session.take() {
+            eprintln!(
+                "aas: airplay \"{}\": session ended: {}",
+                self.config.name,
+                self.summary(&s)
+            );
             s.raop.teardown();
         }
         if self.state() == AirplayState::Playing {
@@ -433,6 +453,8 @@ impl Output {
             data,
             control,
             stream,
+            started: now,
+            resent: 0,
             _timing: responder,
         })
     }
@@ -443,8 +465,14 @@ impl Output {
         let mono = self.mono(now);
         let Some(s) = &mut self.session else { return };
         if s.raop.closed() {
-            self.session = None;
-            self.fail("the receiver closed the connection".into());
+            let summary = self
+                .session
+                .take()
+                .map(|s| self.summary(&s))
+                .unwrap_or_default();
+            self.fail(format!(
+                "the receiver closed the connection, after {summary}"
+            ));
             return;
         }
         self.sent.clear();
@@ -463,6 +491,7 @@ impl Output {
                 s.stream.resend(first, count, &mut again);
             }
         }
+        s.resent += again.len() as u64;
         for p in &again {
             let _ = s.data.send(p);
         }
