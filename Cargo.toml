@@ -61,11 +61,19 @@ tokio = { version = "1", default-features = false, features = ["rt", "net", "syn
 toml = "1"
 # The WebSocket client of `aasctl events` and `levels`; HTTP is done by hand.
 tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }
+# AirPlay 2: transient pairing (SRP-6a over big integers, SHA-512), the
+# control channel's keys (HKDF) and the sealed channel and audio.
+chacha20poly1305 = "0.10.1"
+hkdf = "0.12.4"
+num-bigint = "0.4"
+sha2 = "0.10.9"
 
 [dev-dependencies]
 # Without its default `disable_release`, so the allocation checks also run
 # in release builds, which the audio thread is.
 assert_no_alloc = { version = "1", default-features = false }
+# Only for the SRP test vectors of RFC 5054, which use SHA-1.
+sha1 = "0.10"
 tempfile = "3"
 # Only its re-exported blocking client, to talk to `/events`.
 tokio-tungstenite = "0.29"
