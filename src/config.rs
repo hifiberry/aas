@@ -31,6 +31,19 @@ pub enum VolumeMode {
     Follow,
 }
 
+/// What clocks the master: its card's playback, or its capture, for a
+/// card that only captures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Clock {
+    /// The capture on a card with no playback, else the playback.
+    #[default]
+    Auto,
+    Playback,
+    /// The capture, also on a card that plays; its DAC stays closed.
+    Capture,
+}
+
 /// Resampler quality.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -176,6 +189,8 @@ pub struct Config {
     pub volume_control: Option<String>,
     /// Who applies the volume. None uses the card's control if it has one.
     pub volume_mode: Option<VolumeMode>,
+    /// What clocks the master.
+    pub clock: Clock,
     /// How often, in ms, the card's volume control is checked for a change
     /// made by another program, 50 to 5000.
     pub volume_poll_ms: u32,
@@ -239,6 +254,7 @@ struct Raw {
     idle_delay_s: Option<u32>,
     volume_control: Option<String>,
     volume_mode: Option<VolumeMode>,
+    clock: Option<Clock>,
     volume_poll_ms: Option<u32>,
     volume_limit_db: Option<toml::Value>,
     analog: Option<RawAnalog>,
@@ -399,6 +415,7 @@ impl Default for Config {
             },
             volume_control: None,
             volume_mode: None,
+            clock: Clock::Auto,
             volume_poll_ms: DEFAULT_VOLUME_POLL_MS,
             volume_limit_db: 0.0,
             analog: Analog::default(),
@@ -660,6 +677,7 @@ impl Config {
             idle,
             volume_control: raw.volume_control,
             volume_mode: raw.volume_mode,
+            clock: raw.clock.unwrap_or_default(),
             volume_poll_ms,
             volume_limit_db,
             analog,
@@ -729,6 +747,17 @@ mod tests {
             let e = err(&format!("volume_limit_db = {bad}\n"));
             assert!(e.contains("volume_limit_db must be"), "{bad}: {e}");
         }
+    }
+
+    #[test]
+    fn clock_is_auto_by_default_and_parsed() {
+        assert_eq!(load_str("").unwrap().clock, Clock::Auto);
+        let c = load_str("clock = \"capture\"\n").unwrap();
+        assert_eq!(c.clock, Clock::Capture);
+        let c = load_str("clock = \"playback\"\n").unwrap();
+        assert_eq!(c.clock, Clock::Playback);
+        let e = load_str("clock = \"adc\"\n").unwrap_err();
+        assert!(e.contains("clock"), "{e}");
     }
 
     #[test]

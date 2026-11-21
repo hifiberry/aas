@@ -125,6 +125,7 @@ is kept in `/var/lib/aas/state.toml`.
 | `latency_ms` | a number above 0 | 4 on a Pi 5 or CM5, 12 elsewhere | Target for the latency of the card's buffer. The period is the largest power of two that keeps two periods within it. |
 | `card` | an ALSA card id or index | the first card that is not `Loopback`, `Headphones` or HDMI | The card to play to. |
 | `channels` | 1 to 8 | 2 | The number of channels the card is opened with. A card that does not take the count is not opened: the output plays to nothing and the reason is logged once. |
+| `clock` | `"auto"`, `"playback"`, `"capture"` | `"auto"` | What clocks the output. `capture` runs it on the card's capture, which then also feeds the analog input, and plays nowhere: the mix reaches only the monitor and the further outputs. `auto` does that for a card that captures and does not play, such as the HiFiBerry ADC, and plays to any other. See [A card that only captures](#a-card-that-only-captures). |
 | `format` | `"f32"`, `"f64"`, `"i32"` | `"f32"` | The arithmetic used to mix and to apply volume. |
 | `resampling` | `"high"`, `"medium"` | `"high"` | Quality of the resampler for a client at another rate than the output. |
 | `bit_perfect` | `"auto"`, `"forced"`, `"off"` | `"auto"` | `auto` copies the samples untouched while one client plays at the output rate with no software volume. `forced` also ignores the software volume, except the volume limit, and bypasses plugins, except input detection. `off` always mixes. |
@@ -382,6 +383,17 @@ A name without a volume plays at 0 dB. At most 64 names are kept; one set back
 to 0 dB, unmuted, is no longer kept and frees its place. While a client plays
 alone at a volume other than 0 dB the master is not bit-perfect, with the reason
 `"volume"`. Every change of an input's volume fades over 10 ms.
+
+#### A card that only captures
+
+On a card with an ADC and no DAC, such as the HiFiBerry ADC, the output runs on
+the card's capture clock: each cycle starts when the card has captured a
+period. Nothing is played to the card. What the master mixes, the analog input
+and any player, reaches `aas.monitor` and every further output, which follow
+the capture's clock as they follow a DAC's. The volume is software, since
+there is no control to play through. `GET /outputs/1` then says `"clock":
+"capture"`. `clock = "capture"` does the same on a card that also plays,
+whose DAC then stays closed.
 
 #### The volume limit
 

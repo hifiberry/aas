@@ -107,6 +107,7 @@ impl Sink for ClockSink {
 
 /// The analog input reading the clock's device. Closing it leaves the
 /// device to the sink.
+#[derive(Clone)]
 pub struct ClockCapture(Arc<Mutex<Shared>>);
 
 impl Capture for ClockCapture {

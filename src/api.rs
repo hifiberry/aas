@@ -355,6 +355,10 @@ pub struct OutputView {
     /// The master only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit_db: Option<f32>,
+    /// The master only, and only as `"capture"`: it runs on its card's
+    /// capture clock and plays nowhere.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clock: Option<&'static str>,
     pub idle: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub idle_delay_s: Option<u32>,

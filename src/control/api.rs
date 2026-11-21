@@ -501,6 +501,7 @@ impl Control {
             volume,
             volume_db,
             limit_db,
+            clock: (index == 0 && self.capture_clock).then_some("capture"),
             idle: kind.to_string(),
             idle_delay_s: (idle != Idle::Zeros).then_some(delay),
             state: self.output_state(index).to_string(),
@@ -1549,6 +1550,20 @@ mod tests {
         assert!(close(engine.gains[0].1, db_to_gain(-6.0)));
         let view = control.call(Call::Output(1), now).unwrap();
         assert_eq!(view["limit_db"], json!(-6.0));
+    }
+
+    #[test]
+    fn the_master_says_its_clock_when_it_is_the_capture() {
+        let config = Config {
+            clock: crate::config::Clock::Capture,
+            ..Config::default()
+        };
+        let (mut control, _engine, _logs, now) = started_with(&config, Vec::new());
+        let view = control.call(Call::Output(1), now).unwrap();
+        assert_eq!(view["clock"], json!("capture"));
+        let (mut control, _engine, _logs, now) = started_with(&Config::default(), Vec::new());
+        let view = control.call(Call::Output(1), now).unwrap();
+        assert!(view.get("clock").is_none(), "{view}");
     }
 
     #[test]
