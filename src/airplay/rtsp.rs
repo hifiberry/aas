@@ -263,7 +263,18 @@ impl Conn {
                     if self.take(&chunk[..n]).is_err() {
                         break true;
                     }
-                    self.buf.clear();
+                    // Whole answers nobody waits for are dropped; a part
+                    // of one stays for the rest to join.
+                    loop {
+                        match parse(&self.buf) {
+                            Ok(Some((_, used))) => drop(self.buf.drain(..used)),
+                            Ok(None) => break,
+                            Err(_) => {
+                                self.buf.clear();
+                                break;
+                            }
+                        }
+                    }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break false,
                 Err(_) => break true,
@@ -515,6 +526,41 @@ mod tests {
         };
         conn.send(&req("POST")).unwrap();
         assert_eq!(conn.request(&req("GET_PARAMETER")).unwrap().status, 451);
+        peer.join().unwrap();
+    }
+
+    #[test]
+    fn closed_keeps_a_partly_received_answer() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let peer = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 256];
+            let _ = s.read(&mut buf).unwrap();
+            // The answer to the request sent without waiting, its body
+            // after a look by `closed`.
+            s.write_all(b"RTSP/1.0 200 OK\r\nCSeq: 1\r\nContent-Length: 2\r\n\r\n")
+                .unwrap();
+            rx.recv().unwrap();
+            s.write_all(b"ok").unwrap();
+            let _ = s.read(&mut buf).unwrap();
+            s.write_all(b"RTSP/1.0 204 x\r\nCSeq: 2\r\n\r\n").unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+        });
+        let mut conn = Conn::connect("127.0.0.1", port, Duration::from_secs(2)).unwrap();
+        let req = |method| Request {
+            method,
+            url: "*",
+            headers: &[],
+            content_type: None,
+            body: &[],
+        };
+        conn.send(&req("POST")).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!conn.closed());
+        tx.send(()).unwrap();
+        assert_eq!(conn.request(&req("GET_PARAMETER")).unwrap().status, 204);
         peer.join().unwrap();
     }
 

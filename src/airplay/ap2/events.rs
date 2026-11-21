@@ -52,7 +52,9 @@ impl Events {
                 Ok(0) => return false,
                 Ok(n) => {
                     self.raw.extend_from_slice(&chunk[..n]);
-                    if self.opener.open(&mut self.raw, &mut self.plain).is_err() {
+                    if self.opener.open(&mut self.raw, &mut self.plain).is_err()
+                        || self.raw.len() + self.plain.len() > MOST
+                    {
                         return false;
                     }
                 }
@@ -61,7 +63,10 @@ impl Events {
                 Err(_) => return false,
             }
         }
-        while let Some((cseq, used)) = request(&self.plain) {
+        while let Some(parsed) = request(&self.plain) {
+            let Some((cseq, used)) = parsed else {
+                return false;
+            };
             self.plain.drain(..used);
             let answer = format!("RTSP/1.0 200 OK\r\nServer: aas\r\nCSeq: {cseq}\r\n\r\n");
             let mut out = Vec::new();
@@ -76,8 +81,9 @@ impl Events {
     }
 }
 
-/// The CSeq of the first whole request in `buf` and the bytes it takes.
-fn request(buf: &[u8]) -> Option<(String, usize)> {
+/// The CSeq of the first whole request in `buf` and the bytes it takes;
+/// None while it is not whole, Some(None) for a length beyond `MOST`.
+fn request(buf: &[u8]) -> Option<Option<(String, usize)>> {
     let end = buf.windows(4).position(|w| w == b"\r\n\r\n")?;
     let head = String::from_utf8_lossy(&buf[..end]);
     let header = |name: &str| {
@@ -91,8 +97,11 @@ fn request(buf: &[u8]) -> Option<(String, usize)> {
     let length = header("Content-Length")
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(0);
+    if length > MOST {
+        return Some(None);
+    }
     let used = end + 4 + length;
-    (buf.len() >= used).then(|| (header("CSeq").unwrap_or_else(|| "0".into()), used))
+    (buf.len() >= used).then(|| Some((header("CSeq").unwrap_or_else(|| "0".into()), used)))
 }
 
 #[cfg(test)]
@@ -200,6 +209,20 @@ mod tests {
             receiver.answers(1),
             "RTSP/1.0 200 OK\r\nServer: aas\r\nCSeq: 9\r\n\r\n"
         );
+    }
+
+    #[test]
+    fn a_huge_or_endless_request_fails_the_channel() {
+        let (mut events, mut receiver) = pair();
+        receiver
+            .send(b"POST /x RTSP/1.0\r\nCSeq: 1\r\nContent-Length: 18446744073709551615\r\n\r\n");
+        poll_until(&mut events, |e| !e.poll());
+        assert!(!events.poll());
+        let (mut events, mut receiver) = pair();
+        receiver.send(b"POST /x RTSP/1.0\r\nCSeq: 1\r\nContent-Length: 100000\r\n\r\n");
+        receiver.send(&vec![b'x'; 70 * 1024]);
+        poll_until(&mut events, |e| !e.poll());
+        assert!(!events.poll());
     }
 
     #[test]

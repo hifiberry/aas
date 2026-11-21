@@ -195,6 +195,10 @@ struct Reader<'a> {
     bytes: &'a [u8],
     offsets: Vec<usize>,
     refs: usize,
+    /// Values that may still be read: shared objects are read once per
+    /// reference, so a few small arrays could otherwise stand for a tree
+    /// of billions.
+    budget: std::cell::Cell<usize>,
 }
 
 fn broken(why: impl Into<String>) -> PlistError {
@@ -232,10 +236,12 @@ pub fn decode(bytes: &[u8]) -> Result<Value, PlistError> {
     if offsets.iter().any(|&o| o < 8 || o >= table) {
         return Err(broken("an object outside the plist"));
     }
+    let budget = std::cell::Cell::new((offsets.len() * 4).max(4096));
     let reader = Reader {
         bytes: &bytes[..table],
         offsets,
         refs,
+        budget,
     };
     reader.object(top, 0)
 }
@@ -278,6 +284,11 @@ impl Reader<'_> {
         if depth > DEPTH {
             return Err(broken("containers nested too deep"));
         }
+        let left = self.budget.get();
+        if left == 0 {
+            return Err(broken("more values than the plist holds objects for"));
+        }
+        self.budget.set(left - 1);
         let at = *self
             .offsets
             .get(usize::try_from(index).unwrap_or(usize::MAX))
@@ -444,6 +455,38 @@ mod tests {
                  1007080d1c272b000000000000010100000000000000050000000000000000000000000000002d"
             )
         );
+    }
+
+    #[test]
+    fn shared_references_cannot_blow_up_into_a_huge_tree() {
+        // Three arrays of 1000 references each to the next, then one
+        // integer: a few kilobytes that would read as 10^9 values.
+        let mut b = b"bplist00".to_vec();
+        let mut offsets = Vec::new();
+        for next in 1u16..=3 {
+            offsets.push(b.len());
+            b.extend_from_slice(&[0xaf, 0x11, 0x03, 0xe8]);
+            for _ in 0..1000 {
+                b.extend_from_slice(&next.to_be_bytes());
+            }
+        }
+        offsets.push(b.len());
+        b.extend_from_slice(&[0x10, 0]);
+        let table = b.len();
+        for o in &offsets {
+            b.extend_from_slice(&(*o as u16).to_be_bytes());
+        }
+        b.extend_from_slice(&[0; 6]);
+        b.extend_from_slice(&[2, 2]);
+        b.extend_from_slice(&4u64.to_be_bytes());
+        b.extend_from_slice(&0u64.to_be_bytes());
+        b.extend_from_slice(&(table as u64).to_be_bytes());
+        let started = std::time::Instant::now();
+        assert!(decode(&b).is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        // One level of it, 1000 values from shared objects, still reads.
+        let v = Value::Array(vec![Value::Int(0); 1000]);
+        assert_eq!(decode(&encode(&v)).unwrap(), v);
     }
 
     #[test]
