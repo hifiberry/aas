@@ -8,7 +8,8 @@
 //! packet while it plays, every 20 ms otherwise. The audio thread never
 //! waits for it; the tap drops what does not fit.
 
-use super::config::{AirplayConfig, Connect};
+use super::ap2::session::Ap2;
+use super::config::{AirplayConfig, Connect, Protocol};
 use super::gate::{Gate, GateEvent};
 use super::raop::{self, Raop, Setup};
 use super::rtp;
@@ -34,6 +35,8 @@ const RETRY_LAST: u32 = 30;
 const NOTHING: Duration = Duration::from_millis(200);
 /// Frames read from the tap at a time.
 const CHUNK: usize = 4096;
+/// How often an AirPlay 2 session is told we are still there.
+const FEEDBACK: Duration = Duration::from_secs(2);
 
 /// The reading end of the monitor tap made for this receiver, at the
 /// master's rate.
@@ -141,8 +144,32 @@ pub fn spawn(config: AirplayConfig) -> AirplayHandle {
     }
 }
 
+/// The session's RTSP side, by protocol.
+enum Control {
+    One(Raop),
+    Two(Ap2),
+}
+
+impl Control {
+    fn closed(&mut self) -> bool {
+        match self {
+            Control::One(r) => r.closed(),
+            Control::Two(a) => a.closed(),
+        }
+    }
+
+    fn teardown(self) {
+        match self {
+            Control::One(r) => r.teardown(),
+            Control::Two(a) => a.teardown(),
+        }
+    }
+}
+
 struct Session {
-    raop: Raop,
+    rtsp: Control,
+    /// When AirPlay 2's next `/feedback` is due.
+    feedback_at: Option<Instant>,
     data: UdpSocket,
     control: UdpSocket,
     stream: Stream,
@@ -434,7 +461,7 @@ impl Output {
                 self.config.name,
                 self.summary(&s)
             );
-            s.raop.teardown();
+            s.rtsp.teardown();
         }
         if self.state() == AirplayState::Playing {
             self.set(AirplayState::Idle, None);
@@ -444,9 +471,6 @@ impl Output {
     fn open(&mut self) -> Result<Session, String> {
         let rate = self.tap.as_ref().map(|t| t.rate).ok_or("no audio yet")?;
         let c = &self.config;
-        if c.protocol == super::config::Protocol::AirPlay2 {
-            return Err("AirPlay 2 is not in this build yet; use protocol = \"airplay1\"".into());
-        }
         let conn = Conn::connect(&c.host, c.port, HANDSHAKE_TIMEOUT).map_err(|e| e.to_string())?;
         let (local, peer) = (conn.local_ip(), conn.peer_ip());
         let any = if local.is_ipv6() {
@@ -472,16 +496,27 @@ impl Output {
             first_rtptime: u32::from_be_bytes(raop::random()),
             volume_db: c.volume_db,
         };
-        let (raop, ports) = Raop::open(conn, &setup).map_err(|e| e.to_string())?;
-        if let Some(status) = raop.auth_setup_refused
-            && !self.auth_setup_told
-        {
-            eprintln!(
-                "aas: airplay \"{}\": /auth-setup answered {status}, playing without it",
-                c.name
-            );
-            self.auth_setup_told = true;
-        }
+        let (rtsp, ports, audio_latency, shk) = match c.protocol {
+            Protocol::AirPlay1 => {
+                let (raop, ports) = Raop::open(conn, &setup).map_err(|e| e.to_string())?;
+                if let Some(status) = raop.auth_setup_refused
+                    && !self.auth_setup_told
+                {
+                    eprintln!(
+                        "aas: airplay \"{}\": /auth-setup answered {status}, playing without it",
+                        c.name
+                    );
+                    self.auth_setup_told = true;
+                }
+                let latency = raop.audio_latency;
+                (Control::One(raop), ports, latency, None)
+            }
+            Protocol::AirPlay2 => {
+                let (ap2, ports) = Ap2::open(conn, &setup).map_err(|e| e.to_string())?;
+                let (latency, shk) = (ap2.audio_latency, ap2.shk);
+                (Control::Two(ap2), ports, latency, Some(shk))
+            }
+        };
         let udp = |e: std::io::Error| format!("UDP to {peer}: {e}");
         data.connect((peer, ports.server)).map_err(udp)?;
         control.connect((peer, ports.control)).map_err(udp)?;
@@ -496,8 +531,8 @@ impl Output {
         // not made up for with a burst.
         let begun = Instant::now();
         let wanted = u64::from(c.latency_ms) * u64::from(rtp::RATE) / 1000;
-        let latency = (wanted as u32).max(raop.audio_latency.unwrap_or(0));
-        let stream = Stream::new(
+        let latency = (wanted as u32).max(audio_latency.unwrap_or(0));
+        let mut stream = Stream::new(
             rate,
             latency,
             setup.first_seq,
@@ -505,8 +540,13 @@ impl Output {
             line.ntp(begun),
             self.mono(begun),
         );
+        if let Some(shk) = &shk {
+            stream = stream.sealed(shk);
+        }
+        let feedback_at = shk.map(|_| begun + FEEDBACK);
         Ok(Session {
-            raop,
+            rtsp,
+            feedback_at,
             data,
             control,
             stream,
@@ -521,7 +561,7 @@ impl Output {
     fn pump(&mut self, now: Instant) {
         let mono = self.mono(now);
         let Some(s) = &mut self.session else { return };
-        if s.raop.closed() {
+        if s.rtsp.closed() {
             let summary = self
                 .session
                 .take()
@@ -531,6 +571,13 @@ impl Output {
                 "the receiver closed the connection, after {summary}"
             ));
             return;
+        }
+        if let (Some(at), Control::Two(ap2)) = (s.feedback_at, &mut s.rtsp)
+            && now >= at
+        {
+            // A failure shows as a closed connection at the next look.
+            let _ = ap2.feedback();
+            s.feedback_at = Some(at + FEEDBACK);
         }
         self.sent.clear();
         s.stream.due(mono, &mut self.sent);
@@ -673,6 +720,35 @@ mod tests {
         let seen = receiver.finish();
         assert_eq!(seen.last().unwrap().method, "TEARDOWN");
         assert!(seen.iter().any(|s| s.body == b"volume: -25\r\n"));
+    }
+
+    #[test]
+    fn airplay2_pairs_seals_the_audio_and_keeps_the_session_alive() {
+        let receiver = FakeReceiver::serving(1, |port| {
+            super::super::ap2::session::tests::ap2_receiver(port, 0x4)
+        });
+        let mut c = config(receiver.port, Connect::Always);
+        c.protocol = Protocol::AirPlay2;
+        let handle = spawn(c);
+        let (_ring, reader) = tap();
+        handle.tap(reader);
+        assert!(until(&handle, 3.0, playing), "{:?}", handle.status());
+        // A packet of 352 frames, its payload sealed: the tag and the
+        // count after it.
+        let mut packet = [0u8; 2048];
+        let n = receiver.data.recv(&mut packet).unwrap();
+        assert_eq!(n, 12 + 1416 + 16 + 8);
+        std::thread::sleep(Duration::from_millis(2300));
+        handle.stop();
+        let seen = receiver.finish();
+        let feedback = seen.iter().filter(|s| s.url == "/feedback").count();
+        assert_eq!(
+            feedback,
+            1,
+            "{:?}",
+            seen.iter().map(|s| &s.url).collect::<Vec<_>>()
+        );
+        assert_eq!(seen.last().unwrap().method, "TEARDOWN");
     }
 
     #[test]
