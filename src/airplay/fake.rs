@@ -1,6 +1,7 @@
 //! A fake AirPlay receiver for tests: it accepts one RTSP connection,
 //! records every request and answers each as its script says.
 
+use super::ap2::channel::{Keys, Opener, Sealer};
 use std::io::{Read, Write};
 use std::net::{TcpListener, UdpSocket};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -29,6 +30,11 @@ impl Seen {
 /// What the receiver does with a request.
 pub enum Answer {
     Status(u16, Vec<(&'static str, String)>),
+    /// A status with a body, its type among the headers.
+    Body(u16, Vec<(&'static str, String)>, Vec<u8>),
+    /// The answer, in the clear, after which both sides seal the channel
+    /// with the keys of this secret.
+    SealAfter(Box<Answer>, Vec<u8>),
     /// Closes the connection without an answer.
     Close,
 }
@@ -145,6 +151,10 @@ fn take_request(buf: &mut Vec<u8>) -> Option<Seen> {
     })
 }
 
+/// The receiver's side of a sealed channel: it opens with the sender's
+/// write key and seals with its read key.
+type Sealed = (Opener, Sealer);
+
 /// Answers the requests on one connection as `script` says, until it
 /// closes or the script closes it.
 fn serve(
@@ -153,6 +163,8 @@ fn serve(
     log: &Mutex<Vec<Seen>>,
 ) {
     let mut buf = Vec::new();
+    let mut raw = Vec::new();
+    let mut sealed: Option<Sealed> = None;
     let mut chunk = [0u8; 4096];
     loop {
         let request = loop {
@@ -161,25 +173,61 @@ fn serve(
             }
             match stream.read(&mut chunk) {
                 Ok(0) | Err(_) => break None,
-                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                Ok(n) => match &mut sealed {
+                    None => buf.extend_from_slice(&chunk[..n]),
+                    Some((opener, _)) => {
+                        raw.extend_from_slice(&chunk[..n]);
+                        if opener.open(&mut raw, &mut buf).is_err() {
+                            break None;
+                        }
+                    }
+                },
             }
         };
         let Some(request) = request else { return };
         let cseq = request.header("CSeq").unwrap_or("0").to_string();
-        let answer = script(&request);
+        let mut answer = script(&request);
         log.lock().unwrap().push(request);
-        match answer {
+        let mut then_seal = None;
+        if let Answer::SealAfter(inner, secret) = answer {
+            answer = *inner;
+            then_seal = Some(secret);
+        }
+        let (status, headers, body) = match answer {
             Answer::Close => return,
-            Answer::Status(status, headers) => {
-                let mut text = format!("RTSP/1.0 {status} X\r\nCSeq: {cseq}\r\n");
-                for (n, v) in headers {
-                    text.push_str(&format!("{n}: {v}\r\n"));
-                }
-                text.push_str("\r\n");
-                if stream.write_all(text.as_bytes()).is_err() {
-                    return;
-                }
+            Answer::Status(status, headers) => (status, headers, Vec::new()),
+            Answer::Body(status, headers, body) => (status, headers, body),
+            Answer::SealAfter(..) => unreachable!("one seal at a time"),
+        };
+        let version = if sealed.is_some() {
+            "HTTP/1.1"
+        } else {
+            "RTSP/1.0"
+        };
+        let mut text = format!("{version} {status} X\r\nCSeq: {cseq}\r\n");
+        for (n, v) in headers {
+            text.push_str(&format!("{n}: {v}\r\n"));
+        }
+        if !body.is_empty() {
+            text.push_str(&format!("Content-Length: {}\r\n", body.len()));
+        }
+        text.push_str("\r\n");
+        let mut plain = text.into_bytes();
+        plain.extend_from_slice(&body);
+        let out = match &mut sealed {
+            None => plain,
+            Some((_, sealer)) => {
+                let mut out = Vec::new();
+                sealer.seal(&plain, &mut out);
+                out
             }
+        };
+        if stream.write_all(&out).is_err() {
+            return;
+        }
+        if let Some(secret) = then_seal {
+            let keys = Keys::control(&secret);
+            sealed = Some((Opener::new(&keys.write), Sealer::new(&keys.read)));
         }
     }
 }

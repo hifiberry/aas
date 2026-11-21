@@ -4,5 +4,6 @@
 
 pub mod bplist;
 pub mod channel;
+pub mod pair;
 pub mod srp;
 pub mod tlv;
