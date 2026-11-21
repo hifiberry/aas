@@ -853,6 +853,8 @@ pub struct Control {
     config_idle: Idle,
     /// The master's volume limit as the config sets it.
     config_limit_db: f32,
+    /// The master runs on its card's capture clock and plays nowhere.
+    capture_clock: bool,
     /// The master's card as the config names it, or empty, which keys its
     /// state.
     card: String,
@@ -993,6 +995,7 @@ impl Control {
             idle: config.idle,
             config_idle: config.idle,
             config_limit_db: config.volume_limit_db,
+            capture_clock: config.clock == crate::config::Clock::Capture,
             card: config.card.clone().unwrap_or_default(),
             policy: RatePolicy::new(config.default_rate, supported.clone()),
             supported,

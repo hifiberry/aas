@@ -20,6 +20,11 @@ const CARDS: &[Card] = &[
         adc: true,
     },
     Card {
+        // Captures only: the master runs on its clock.
+        driver: "snd_rpi_hifiberry_adc",
+        adc: true,
+    },
+    Card {
         driver: "snd_rpi_hifiberry_digi",
         adc: false,
     },
@@ -51,6 +56,12 @@ mod tests {
         assert!(has_adc("snd_rpi_hifiberry_dacplusadc"));
         assert!(has_adc("snd_rpi_hifiberry_dacplusadcpro"));
         assert!(lookup("snd_rpi_hifiberry_dacplusadc").unwrap().adc);
+    }
+
+    #[test]
+    fn the_hifiberry_adc_has_an_adc() {
+        // An ADC-only board: the master runs on its capture clock.
+        assert!(has_adc("snd_rpi_hifiberry_adc"));
     }
 
     #[test]

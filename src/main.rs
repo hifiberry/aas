@@ -87,6 +87,98 @@ fn output(config: &Config) -> Box<dyn Sink> {
     Box::new(aas::sink::NullSink::new(config.channels))
 }
 
+/// The master card's id when the master runs on its capture clock: as
+/// `clock` asks, or under `auto` for a card that captures and does not
+/// play. A card that is not there at the start is played to.
+#[cfg(feature = "alsa-output")]
+fn capture_clock(config: &Config) -> Option<String> {
+    use aas::sink_alsa::{
+        capture_clocked, card_directions, card_index, cards_text, find_card, parse_card_ids,
+        pcm_text,
+    };
+    let cards = cards_text();
+    let index = card_index(&cards, config.card.as_deref());
+    let directions = index.map(|i| card_directions(&pcm_text(), i));
+    if !capture_clocked(config.clock, directions) {
+        return None;
+    }
+    let Some(card) = config
+        .card
+        .clone()
+        .or_else(|| find_card(&parse_card_ids(&cards)))
+    else {
+        eprintln!("aas: warning: clock = \"capture\" with no card found, the output plays to none");
+        return None;
+    };
+    eprintln!("aas: the output is clocked by the capture of hw:{card}; it plays nowhere");
+    Some(card)
+}
+
+#[cfg(not(feature = "alsa-output"))]
+fn capture_clock(config: &Config) -> Option<String> {
+    if config.clock == config::Clock::Capture {
+        eprintln!("aas: warning: built without ALSA, clock = \"capture\" is ignored");
+    }
+    None
+}
+
+/// The master's sink under the capture clock, and the analog input's view
+/// of its device.
+#[cfg(feature = "alsa-output")]
+fn clocked_output(
+    config: &Config,
+    card: &str,
+) -> (Box<dyn Sink>, Option<aas::clock_sink::ClockCapture>) {
+    use aas::clock_sink::ClockSink;
+    use aas::sink_alsa::AlsaClock;
+    let sink = ClockSink::new(Box::new(AlsaClock::new(card.to_string())), config.channels);
+    let capture = sink.capture();
+    (Box::new(sink), Some(capture))
+}
+
+#[cfg(not(feature = "alsa-output"))]
+fn clocked_output(
+    config: &Config,
+    _card: &str,
+) -> (Box<dyn Sink>, Option<aas::clock_sink::ClockCapture>) {
+    (output(config), None)
+}
+
+/// The analog input under the capture clock: it reads the clock's device,
+/// which the master's sink opens and closes. A card that is there is
+/// decided on now, by its driver; one that is not is looked for at each
+/// try, as for a card played to.
+fn clocked_analog_input(
+    config: &Config,
+    card: &str,
+    capture: aas::clock_sink::ClockCapture,
+) -> Option<aas::control::OpenCapture> {
+    let lookup = {
+        let card = card.to_string();
+        move || clock_card_driver(&card)
+    };
+    let open = aas::clock_sink::analog_open(capture, lookup);
+    match clock_card_driver(card) {
+        Some(driver) => server::analog_capture(config, &driver, open),
+        None if config.analog.enabled => {
+            eprintln!("aas: analog input on, its card is not there yet");
+            Some(open)
+        }
+        None => None,
+    }
+}
+
+#[cfg(feature = "alsa-output")]
+fn clock_card_driver(card: &str) -> Option<String> {
+    use aas::sink_alsa::{card_driver, cards_text};
+    card_driver(&cards_text(), Some(card)).map(|(_, driver)| driver)
+}
+
+#[cfg(not(feature = "alsa-output"))]
+fn clock_card_driver(_card: &str) -> Option<String> {
+    None
+}
+
 /// A card for each `[[output]]` table, buffering `further::BUFFERED`
 /// periods, each looked for while it is gone. Two outputs on one card are
 /// refused, by the card's index, whatever they name it by.
@@ -241,7 +333,7 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let config = match Config::load(&args.config) {
+    let mut config = match Config::load(&args.config) {
         Ok(config) => config,
         Err(e) => {
             eprintln!("aas: {e}");
@@ -260,7 +352,16 @@ fn main() -> ExitCode {
     }
     let shutdown = Arc::new(AtomicBool::new(false));
     handle_signals(shutdown.clone());
-    let sink = output(&config);
+    // Decided once: from here on the config says which clock it is.
+    let clocked = capture_clock(&config);
+    config.clock = match clocked {
+        Some(_) => config::Clock::Capture,
+        None => config::Clock::Playback,
+    };
+    let (sink, clock_capture) = match &clocked {
+        Some(card) => clocked_output(&config, card),
+        None => (output(&config), None),
+    };
     let further = match further_outputs(&config) {
         Ok(further) => further,
         Err(e) => {
@@ -274,8 +375,18 @@ fn main() -> ExitCode {
         further,
         api: api_listener(config.api_port),
     };
-    let hardware = hardware_volume(&config);
-    let capture = analog_input(&config);
+    let (hardware, capture) = match (clocked, clock_capture) {
+        (Some(card), Some(clock_capture)) => {
+            if matches!(
+                config.volume_mode,
+                Some(config::VolumeMode::Hardware | config::VolumeMode::Follow)
+            ) {
+                eprintln!("aas: warning: the output plays nowhere, its volume is software");
+            }
+            (None, clocked_analog_input(&config, &card, clock_capture))
+        }
+        _ => (hardware_volume(&config), analog_input(&config)),
+    };
     let (socket, state) = (&args.socket, &args.state);
     match server::run_outputs(config, devices, socket, state, hardware, capture, shutdown) {
         Ok(()) => ExitCode::SUCCESS,

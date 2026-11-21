@@ -6,6 +6,7 @@ pub mod bitperfect;
 pub mod board;
 pub mod capture;
 pub mod cards;
+pub mod clock_sink;
 pub mod config;
 pub mod control;
 pub mod counters;

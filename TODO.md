@@ -228,11 +228,13 @@ Missing:
   connected source keeps it open and running), and `audiocontrol`'s
   Bluetooth player under `aas`. First step: pause the iPhone and read
   `/api/aas/v1/state` on the Pi 4.
-- The volume limit is in `aas` (`limit_db`, README "The volume limit").
-  Missing: the web UI (`hbos-ui`, `general-sound.vue`) showing the control
-  under `aas` through `PATCH /outputs/1` and dropping it from the list of what
-  stops working; `aas-config` carrying PipeWire's master gain
-  (`/module/speakereq/gain/master`) over into `volume_limit_db` on a switch.
+- The volume limit: merged 2026-11-21 in `aas` (#2) and the web UI
+  (hifiberry/hbos-ui#53), both unreleased; on the Pi 4 as packages built
+  from both mains (`aas` 0.2.0+git20261121.8c3e9b2, `hifiberry-webui`
+  0.30.0+git20261121.49efa28). The switch warning now names PipeWire's limit and says to set
+  it again. Missing: `aas-config` carrying PipeWire's master gain
+  (`/module/speakereq/gain/master`) over into `volume_limit_db` on a switch,
+  after which the warning can go.
 - Speaker EQ and the input processor as plugins: the next phase, see
   `doc/switch.md`.
 

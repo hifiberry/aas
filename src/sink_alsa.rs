@@ -5,11 +5,12 @@
 //! the `alsa-output` feature.
 
 use crate::capture::OpenError;
-use crate::config::Config;
+use crate::config::{Clock, Config};
 use std::fs;
 
 /// Where the kernel lists the sound cards.
 const CARDS: &str = "/proc/asound/cards";
+const PCMS: &str = "/proc/asound/pcm";
 
 /// The card to play to: the first one that is not a loopback, the Pi's
 /// headphone jack or its HDMI output. A card named in the config is used
@@ -105,6 +106,46 @@ pub fn distinct_cards(text: &str, cards: &[Option<String>]) -> Result<(), String
 }
 
 /// The kernel's list of cards now, empty if it cannot be read.
+pub fn pcm_text() -> String {
+    fs::read_to_string(PCMS).unwrap_or_default()
+}
+
+/// Whether card `card` has a device that plays and one that captures, from
+/// the kernel's list of PCM devices in `text`, lines such as
+/// `02-00: HiFiBerry ADC HiFi … : capture 1`.
+pub fn card_directions(text: &str, card: u32) -> (bool, bool) {
+    let mut found = (false, false);
+    for line in text.lines() {
+        let Some((id, rest)) = line.split_once(':') else {
+            continue;
+        };
+        let index = id
+            .split('-')
+            .next()
+            .and_then(|c| c.trim().parse::<u32>().ok());
+        if index != Some(card) {
+            continue;
+        }
+        for part in rest.split(" : ") {
+            let part = part.trim();
+            found.0 |= part.starts_with("playback ");
+            found.1 |= part.starts_with("capture ");
+        }
+    }
+    found
+}
+
+/// Whether the master runs on its card's capture clock: as configured, or
+/// under `auto` for a card that captures and does not play. `directions` is
+/// `None` for a card that is not there, which is played to as before.
+pub fn capture_clocked(clock: Clock, directions: Option<(bool, bool)>) -> bool {
+    match clock {
+        Clock::Capture => true,
+        Clock::Playback => false,
+        Clock::Auto => directions == Some((false, true)),
+    }
+}
+
 pub fn cards_text() -> String {
     fs::read_to_string(CARDS).unwrap_or_default()
 }
@@ -297,7 +338,7 @@ fn card_device(card: Option<&str>) -> Result<String, String> {
 }
 
 #[cfg(feature = "alsa-output")]
-pub use capture::AlsaCapture;
+pub use capture::{AlsaCapture, AlsaClock};
 #[cfg(feature = "alsa-output")]
 pub use card::AlsaSink;
 #[cfg(feature = "alsa-output")]
@@ -517,7 +558,7 @@ mod card {
     const WAIT_MS: u32 = 500;
 
     /// Rates offered to the rate rules, if the card takes them.
-    const RATES: [u32; 14] = [
+    pub(super) const RATES: [u32; 14] = [
         8000, 11025, 16000, 22050, 32000, 44100, 48000, 64000, 88200, 96000, 176400, 192000,
         352800, 384000,
     ];
@@ -997,9 +1038,10 @@ mod card {
 
 #[cfg(feature = "alsa-output")]
 mod capture {
-    use super::card::alsa_format;
+    use super::card::{RATES, alsa_format};
     use super::{CardFormat, SETTLE_MS, decode, mute_settling};
     use crate::capture::Capture;
+    use crate::clock_sink::ClockDevice;
     use crate::sink::SinkError;
     use alsa::pcm::{Access, Frames, HwParams, PCM, State};
     use alsa::{Direction, ValueOr};
@@ -1206,6 +1248,160 @@ mod capture {
             }
         }
     }
+
+    /// How long a wait for the capture lasts before the card counts as
+    /// stuck, as for a playback card.
+    const WAIT_MS: u32 = 500;
+
+    /// The master's device under the capture clock: an `AlsaCapture` the
+    /// audio thread waits on. Its rates are read once, when it is made.
+    pub struct AlsaClock {
+        card: String,
+        rates: Vec<u32>,
+        capture: Option<AlsaCapture>,
+        /// The last open failure, logged once until it changes.
+        failed: Option<String>,
+    }
+
+    impl AlsaClock {
+        pub fn new(card: String) -> AlsaClock {
+            let rates = capture_rates(&card).unwrap_or_else(|e| {
+                eprintln!("aas: {e}; its rates are read when it opens");
+                Vec::new()
+            });
+            if !rates.is_empty() {
+                eprintln!("aas: capture hw:{card} takes {rates:?}");
+            }
+            AlsaClock {
+                card,
+                rates,
+                capture: None,
+                failed: None,
+            }
+        }
+
+        fn pcm(&self) -> Result<&PCM, SinkError> {
+            let capture = self.capture.as_ref().ok_or(SinkError::Gone)?;
+            capture.pcm.as_ref().ok_or(SinkError::Gone)
+        }
+    }
+
+    /// The rates the card captures at, in the format the analog input
+    /// reads, stereo.
+    fn capture_rates(card: &str) -> Result<Vec<u32>, String> {
+        let device = format!("hw:{card}");
+        let e = |what: &str, err: alsa::Error| format!("{device} capture: {what}: {err}");
+        let pcm = PCM::new(&device, Direction::Capture, true).map_err(|x| e("open", x))?;
+        let hw = HwParams::any(&pcm).map_err(|x| e("hw params", x))?;
+        hw.set_channels(CHANNELS as u32)
+            .map_err(|x| e("channels", x))?;
+        hw.set_access(Access::RWInterleaved)
+            .map_err(|x| e("access", x))?;
+        let format = CardFormat::PREFERRED
+            .into_iter()
+            .find(|&f| hw.test_format(alsa_format(f)).is_ok())
+            .ok_or_else(|| format!("{device} capture: no format aas reads"))?;
+        hw.set_format(alsa_format(format))
+            .map_err(|x| e("format", x))?;
+        Ok(RATES
+            .into_iter()
+            .filter(|&r| hw.test_rate(r).is_ok())
+            .collect())
+    }
+
+    impl Capture for AlsaClock {
+        fn available(&mut self) -> Result<usize, SinkError> {
+            self.capture.as_mut().ok_or(SinkError::Gone)?.available()
+        }
+
+        fn read(&mut self, out: &mut [[i32; 2]]) -> Result<usize, SinkError> {
+            self.capture.as_mut().ok_or(SinkError::Gone)?.read(out)
+        }
+
+        fn skip(&mut self, frames: usize) -> Result<(), SinkError> {
+            self.capture.as_mut().ok_or(SinkError::Gone)?.skip(frames)
+        }
+
+        fn close(&mut self) {
+            if let Some(mut capture) = self.capture.take() {
+                capture.close();
+            }
+        }
+    }
+
+    impl ClockDevice for AlsaClock {
+        fn open(&mut self, rate: u32, period: u32) -> Result<(), SinkError> {
+            self.close();
+            // Rates not read at the start, the card absent or busy then,
+            // are read before the open holds the device; the fallback
+            // passes them on to the rate rules.
+            if self.rates.is_empty()
+                && let Ok(rates) = capture_rates(&self.card)
+            {
+                eprintln!("aas: capture hw:{} takes {rates:?}", self.card);
+                self.rates = rates;
+            }
+            match AlsaCapture::open(&self.card, rate, period) {
+                Ok(capture) => {
+                    // The wait wakes when an engine period is there, also
+                    // on a card that granted a smaller one, rather than
+                    // spinning on each of the card's.
+                    if let Some(pcm) = capture.pcm.as_ref()
+                        && let Ok(sw) = pcm.sw_params_current()
+                    {
+                        let _ = sw.set_avail_min(Frames::from(period));
+                        let _ = pcm.sw_params(&sw);
+                    }
+                    self.capture = Some(capture);
+                    self.failed = None;
+                    Ok(())
+                }
+                Err(why) => {
+                    if self.failed.as_ref() != Some(&why) {
+                        eprintln!("aas: {why}");
+                        self.failed = Some(why);
+                    }
+                    Err(SinkError::Gone)
+                }
+            }
+        }
+
+        /// Waits until `frames` are queued. An overrun found here is
+        /// recovered from and told as `Xrun`, so the engine counts it; the
+        /// read in `queued` would have recovered from it without a word.
+        fn wait(&mut self, frames: usize) -> Result<(), SinkError> {
+            let pcm = self.pcm()?;
+            loop {
+                if pcm.state() == State::XRun {
+                    AlsaCapture::recover(pcm, alsa::Error::new("state", libc::EPIPE))?;
+                    return Err(SinkError::Xrun);
+                }
+                if AlsaCapture::queued(pcm)? >= frames {
+                    return Ok(());
+                }
+                match pcm.wait(Some(WAIT_MS)) {
+                    Ok(true) => {}
+                    Ok(false) => return Err(SinkError::Gone),
+                    Err(e) if e.errno() == libc::EINTR => {}
+                    Err(e) => {
+                        let overrun = e.errno() == libc::EPIPE;
+                        AlsaCapture::recover(pcm, e)?;
+                        if overrun {
+                            return Err(SinkError::Xrun);
+                        }
+                    }
+                }
+            }
+        }
+
+        fn rates(&self) -> Vec<u32> {
+            self.rates.clone()
+        }
+
+        fn is_open(&self) -> bool {
+            self.capture.as_ref().is_some_and(|c| c.pcm.is_some())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1214,6 +1410,55 @@ mod tests {
 
     fn ids(names: &[&str]) -> Vec<String> {
         names.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// `/proc/asound/pcm` of a CM5 with a HiFiBerry ADC: it captures only.
+    const ADC_ONLY_PCM: &str = "00-00: MAI PCM i2s-hifi-0 : MAI PCM i2s-hifi-0 : playback 1\n\
+        01-00: MAI PCM i2s-hifi-0 : MAI PCM i2s-hifi-0 : playback 1\n\
+        02-00: HiFiBerry ADC HiFi pcm1863-aif-0 : HiFiBerry ADC HiFi pcm1863-aif-0 : capture 1\n";
+
+    /// A DAC+ ADC: one device that plays and captures.
+    const DACADC_PCM: &str = "00-00: HiFiBerry DAC+ADC HiFi multicodec-0 : \
+        HiFiBerry DAC+ADC HiFi multicodec-0 : playback 1 : capture 1\n";
+
+    #[test]
+    fn card_directions_reads_an_adc_only_board() {
+        assert_eq!(card_directions(ADC_ONLY_PCM, 2), (false, true));
+        assert_eq!(card_directions(ADC_ONLY_PCM, 0), (true, false));
+        assert_eq!(card_directions(ADC_ONLY_PCM, 5), (false, false));
+    }
+
+    #[test]
+    fn card_directions_reads_a_card_that_does_both() {
+        assert_eq!(card_directions(DACADC_PCM, 0), (true, true));
+        // The Pi 4's DAC+.
+        let dacplus = "00-00: HiFiBerry DAC+ HiFi pcm512x-hifi-0 : \
+            HiFiBerry DAC+ HiFi pcm512x-hifi-0 : playback 1\n";
+        assert_eq!(card_directions(dacplus, 0), (true, false));
+    }
+
+    #[test]
+    fn a_second_device_of_a_card_counts() {
+        let text = "03-00: a : a : playback 1\n03-01: b : b : capture 1\n";
+        assert_eq!(card_directions(text, 3), (true, true));
+        // Card 13 is not card 3.
+        assert_eq!(
+            card_directions("13-00: a : a : capture 1\n", 3),
+            (false, false)
+        );
+    }
+
+    #[test]
+    fn auto_is_the_capture_only_on_a_card_that_only_captures() {
+        use crate::config::Clock;
+        assert!(capture_clocked(Clock::Auto, Some((false, true))));
+        assert!(!capture_clocked(Clock::Auto, Some((true, true))));
+        assert!(!capture_clocked(Clock::Auto, Some((true, false))));
+        // A card that is not there yet is played to, as before.
+        assert!(!capture_clocked(Clock::Auto, None));
+        assert!(capture_clocked(Clock::Capture, Some((true, true))));
+        assert!(capture_clocked(Clock::Capture, None));
+        assert!(!capture_clocked(Clock::Playback, Some((false, true))));
     }
 
     #[test]

@@ -2427,3 +2427,41 @@ same 8 ms hole.
   `/levels`, with its pings, reached a daemon built without ALSA, with the
   prefix stripped. `hifiberry-auth` was not run; the manifest is checked by
   a test against the security model's matching rules.
+
+## A master clocked by a capture card
+
+2026-11-21, on the CM5 test board (DAC+ ADC Pro, `,slave` overlay, the DAC's
+output cabled to the ADC), with `clock = "capture"`, the analog input on, its
+`detect` threshold at -70 dBFS, at 48 kHz with 64-frame periods. PipeWire kept
+the DAC and played a 1 kHz tone at -20 dBFS to it; `aas` held only the
+capture.
+
+- The cycles followed the capture: 21780 in about 29 s, 750 a second, as
+  48000 / 64 gives. No xrun, no frame padded or dropped, worst cycle 0.029 ms.
+- The tone reached the analog meter at -53 dBFS RMS (the cable and the ADC's
+  gain take about 33 dB), the master's meter at the same level, and
+  `aas.monitor` through `parecord` with a peak of 106 in 16 bits (-50 dBFS).
+- `GET /outputs/1` said `"clock": "capture"`; the log said
+  `the output is clocked by the capture of hw:sndrpihifiberry; it plays nowhere`
+  and listed the capture's rates, 8 to 192 kHz.
+- With `clock = "auto"` on this card, which also plays, the output played to
+  the card as before.
+
+At the default `detect` threshold the tone, at -53 dBFS, counted as no signal
+and the mix stayed silent, as it should.
+
+On a board whose card only captures, a CM5 with a HiFiBerry ADC under HiFiBerry
+OS, 2026-11-21, with `clock = "auto"` and the analog input on, at 48 kHz and
+64-frame periods, PipeWire stopped for the run:
+
+- `auto` chose the capture: `the output is clocked by the capture of
+  hw:sndrpihifiberry; it plays nowhere`, rates 44.1 to 192 kHz.
+- 42760 cycles in about 57 s, 750 a second. No xrun, no frame padded or
+  dropped, worst cycle 0.047 ms; 2 wake gaps, the worst 3.1 ms, on a board
+  without `dist/90-aas.conf`.
+- No record played: the input's peaks stayed near -58 dBFS and `detect` held
+  it quiet.
+
+Run as a user, the start failed with `memory allocation of 262144 bytes
+failed`: that user may lock 8 MB, and `aas` locks its memory. The service has
+`LimitMEMLOCK=infinity`; the run was repeated as root.
