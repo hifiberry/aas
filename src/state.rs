@@ -53,6 +53,9 @@ pub struct StoredOutput {
     /// Further outputs only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub volume_db: Option<Stored<f32>>,
+    /// The master only: its volume limit, -60 to 0 dB.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit_db: Option<Stored<f32>>,
     /// "zeros" or "off".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle: Option<Stored<String>>,
@@ -187,6 +190,12 @@ impl State {
                 if !db_ok(v.value, -60.0) {
                     say(&format!("the volume of output {card:?}"));
                     o.volume_db = None;
+                }
+            }
+            if let Some(v) = &o.limit_db {
+                if !db_ok(v.value, -60.0) {
+                    say(&format!("the volume limit of output {card:?}"));
+                    o.limit_db = None;
                 }
             }
             if let Some(v) = &o.idle {
@@ -495,6 +504,7 @@ mod tests {
             "Loopback".into(),
             StoredOutput {
                 volume_db: Some(stored(-3.0)),
+                limit_db: Some(stored(-6.0)),
                 idle: Some(Stored {
                     value: "off".into(),
                     config: "zeros".into(),
@@ -615,6 +625,21 @@ mod tests {
         assert_eq!(state.clients.keys().collect::<Vec<_>>(), ["fine"]);
         assert!(state.outputs["x"].volume_db.is_none());
         assert!(state.outputs["x"].idle.is_some());
+    }
+
+    #[test]
+    fn a_limit_is_kept_and_one_out_of_range_dropped_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        let text = "[outputs.x.limit_db]\nvalue = -12.0\nconfig = 0.0\n\
+            [outputs.y.limit_db]\nvalue = -61.0\nconfig = 0.0\n\
+            [outputs.y.idle]\nvalue = \"zeros\"\nconfig = \"off\"\n";
+        std::fs::write(&path, text).unwrap();
+        let state = State::load(&path);
+        let kept = state.outputs["x"].limit_db.as_ref().unwrap();
+        assert_eq!((kept.value, kept.config), (-12.0, 0.0));
+        assert!(state.outputs["y"].limit_db.is_none());
+        assert!(state.outputs["y"].idle.is_some());
     }
 
     #[test]

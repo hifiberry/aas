@@ -228,8 +228,13 @@ Missing:
   connected source keeps it open and running), and `audiocontrol`'s
   Bluetooth player under `aas`. First step: pause the iPhone and read
   `/api/aas/v1/state` on the Pi 4.
-- The volume limit as an output ceiling, and speaker EQ and the input
-  processor as plugins: the next phase, see `doc/switch.md`.
+- The volume limit is in `aas` (`limit_db`, README "The volume limit").
+  Missing: the web UI (`hbos-ui`, `general-sound.vue`) showing the control
+  under `aas` through `PATCH /outputs/1` and dropping it from the list of what
+  stops working; `aas-config` carrying PipeWire's master gain
+  (`/module/speakereq/gain/master`) over into `volume_limit_db` on a switch.
+- Speaker EQ and the input processor as plugins: the next phase, see
+  `doc/switch.md`.
 
 ## A reopen cuts the sound instead of fading it
 

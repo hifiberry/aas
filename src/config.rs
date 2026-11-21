@@ -179,6 +179,9 @@ pub struct Config {
     /// How often, in ms, the card's volume control is checked for a change
     /// made by another program, 50 to 5000.
     pub volume_poll_ms: u32,
+    /// The ceiling of the output in dB, from -60 to 0. Applied in software
+    /// on top of the volume, whatever carries it. 0 sets none.
+    pub volume_limit_db: f32,
     /// The card's analog input.
     pub analog: Analog,
     /// The plugins, in the order of the file.
@@ -237,6 +240,7 @@ struct Raw {
     volume_control: Option<String>,
     volume_mode: Option<VolumeMode>,
     volume_poll_ms: Option<u32>,
+    volume_limit_db: Option<toml::Value>,
     analog: Option<RawAnalog>,
     plugin: Option<Vec<toml::Table>>,
     matrix: Option<Vec<RawRoute>>,
@@ -396,6 +400,7 @@ impl Default for Config {
             volume_control: None,
             volume_mode: None,
             volume_poll_ms: DEFAULT_VOLUME_POLL_MS,
+            volume_limit_db: 0.0,
             analog: Analog::default(),
             plugins: Vec::new(),
             matrix: None,
@@ -542,6 +547,15 @@ impl Config {
                 path.display()
             ));
         }
+        let volume_limit_db = match raw.volume_limit_db {
+            None => Some(0.0),
+            Some(toml::Value::Integer(v)) => Some(v as f64),
+            Some(toml::Value::Float(v)) => Some(v),
+            Some(_) => None,
+        }
+        .filter(|db| (-60.0..=0.0).contains(db))
+        .ok_or_else(|| format!("{}: volume_limit_db must be from -60 to 0", path.display()))?
+            as f32;
         if raw.volume_mode == Some(VolumeMode::Follow) && raw.volume_control.is_none() {
             return Err(format!(
                 "{}: volume_mode = \"follow\" needs volume_control",
@@ -647,6 +661,7 @@ impl Config {
             volume_control: raw.volume_control,
             volume_mode: raw.volume_mode,
             volume_poll_ms,
+            volume_limit_db,
             analog,
             plugins,
             matrix,
@@ -694,6 +709,25 @@ mod tests {
         for bad in [49, 5001] {
             let e = load_str(&format!("volume_poll_ms = {bad}\n")).unwrap_err();
             assert!(e.contains("volume_poll_ms"), "{e}");
+        }
+    }
+
+    #[test]
+    fn volume_limit_db_is_loaded_and_checked() {
+        assert_eq!(load_str("").unwrap().volume_limit_db, 0.0);
+        assert_eq!(
+            load_str("volume_limit_db = -12\n").unwrap().volume_limit_db,
+            -12.0
+        );
+        assert_eq!(
+            load_str("volume_limit_db = -3.5\n")
+                .unwrap()
+                .volume_limit_db,
+            -3.5
+        );
+        for bad in ["-60.5", "1", "\"loud\"", "nan"] {
+            let e = err(&format!("volume_limit_db = {bad}\n"));
+            assert!(e.contains("volume_limit_db must be"), "{bad}: {e}");
         }
     }
 

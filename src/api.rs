@@ -250,6 +250,8 @@ pub struct OutputPatch {
     pub volume: Option<i64>,
     /// A further output only: its offset, -60 to 0 dB.
     pub volume_db: Option<f32>,
+    /// The master only: its volume limit, -60 to 0 dB, 0 for none.
+    pub limit_db: Option<f32>,
     /// `"zeros"` or `"off"`.
     pub idle: Option<String>,
     /// Only with `idle` off.
@@ -302,6 +304,8 @@ pub enum ApiEvent {
         volume: Option<u8>,
         #[serde(skip_serializing_if = "Option::is_none")]
         volume_db: Option<f32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        limit_db: Option<f32>,
         idle: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         idle_delay_s: Option<u32>,
@@ -348,6 +352,9 @@ pub struct OutputView {
     pub volume: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub volume_db: Option<f32>,
+    /// The master only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit_db: Option<f32>,
     pub idle: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub idle_delay_s: Option<u32>,
@@ -362,6 +369,7 @@ impl OutputView {
             id: self.id,
             volume: self.volume,
             volume_db: self.volume_db,
+            limit_db: self.limit_db,
             idle: self.idle.clone(),
             idle_delay_s: self.idle_delay_s,
             state: self.state.clone(),

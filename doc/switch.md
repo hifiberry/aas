@@ -179,16 +179,21 @@ its sound page uses that chain for three things only:
 
 - **Balance:** under `aas`, the output's `balance` plugin, through `aas`'s API.
 - **Mono:** under `aas`, the matrix, through `aas`'s API.
-- **Volume limit:** `aas` has no output ceiling yet. Under `aas` the control is
-  hidden until one exists *(call)*.
+- **Volume limit:** under `aas`, the master's `limit_db`, through `aas`'s API
+  (README, "The volume limit"). It is a gain `aas` applies in software on top of
+  the volume, independent of the card's control, so that a player writing that
+  control cannot lift it *(call)*. For the same reason it applies in forced
+  bit-perfect, and a DoP stream is silent while a limit is set *(call)*: DoP
+  cannot be scaled, and would otherwise play at the card's volume. The web UI
+  hid the control under `aas` until this existed; it can now show it, set in dB.
 
 ## What the user is told before switching
 
 Before `set aas`, the web UI lists what will stop working on this device, and
 only what is in use there: the input processor enabled (`pipewire-api`'s RIAA
 state), AES67 or the USB gadget enabled (their units, through the config
-server), a volume limit below 100 %. A paired Bluetooth device was on the
-list until Bluetooth worked under `aas` ("Bluetooth"). The user confirms or stays on PipeWire. The
+server). A volume limit below 100 % and a paired Bluetooth device were on the
+list until `aas` had a limit of its own and Bluetooth worked under it. The user confirms or stays on PipeWire. The
 settings stay, so switching back restores them *(call)*.
 
 Switching back to PipeWire needs no warning: nothing is lost.
@@ -309,6 +314,5 @@ headphones, and a per-client volume for the phone instead of `Master`.
 
 ## Next phase
 
-- The volume limit as an `aas` output ceiling.
 - Speaker EQ and the input processor as native plugins, and AES67, as their
   stages in `doc/design.md`.

@@ -851,6 +851,8 @@ pub struct Control {
     /// The master's idle rule, and what the config says.
     idle: Idle,
     config_idle: Idle,
+    /// The master's volume limit as the config sets it.
+    config_limit_db: f32,
     /// The master's card as the config names it, or empty, which keys its
     /// state.
     card: String,
@@ -990,6 +992,7 @@ impl Control {
             format: config.format,
             idle: config.idle,
             config_idle: config.idle,
+            config_limit_db: config.volume_limit_db,
             card: config.card.clone().unwrap_or_default(),
             policy: RatePolicy::new(config.default_rate, supported.clone()),
             supported,
@@ -1012,7 +1015,11 @@ impl Control {
             dop_claims: Vec::new(),
             dop_owner: None,
             outbox: Vec::new(),
-            volume: OutputVolume::new(None, config.bit_perfect),
+            volume: {
+                let mut volume = OutputVolume::new(None, config.bit_perfect);
+                volume.set_limit(config.volume_limit_db);
+                volume
+            },
             saver: None,
             save_at: None,
             follow_at: None,
@@ -1144,6 +1151,10 @@ impl Control {
         if let Some(card) = cards.first() {
             self.card = card.clone();
         }
+        let entry = stored.outputs.get(&self.card);
+        let limit = entry.and_then(|o| o.limit_db.as_ref());
+        let limit = Stored::resolve(limit, &self.config_limit_db);
+        self.volume.set_limit(limit);
         self.idle = api::resolve_idle(stored.outputs.get(&self.card), self.config_idle);
         for (output, card) in self.further.iter_mut().zip(cards.iter().skip(1)) {
             output.card = card.clone();
@@ -1205,7 +1216,13 @@ impl Control {
     /// zeros, and the idle rule applies from now, unless the analog input
     /// is on.
     pub fn start(&mut self, now: Instant) {
-        let mut batch = vec![Command::SetGain(0, self.volume.gain())];
+        let mut batch = Vec::new();
+        // The engine starts without a limit, and takes one ahead of the
+        // gain that carries it.
+        if self.volume.limited() {
+            batch.push(Command::SetLimited(true));
+        }
+        batch.push(Command::SetGain(0, self.volume.gain()));
         for i in 0..self.further.len() {
             let gain = self.further_gain(&self.further[i]);
             let output = &mut self.further[i];
@@ -3839,6 +3856,7 @@ mod tests {
                     Command::RemoveOutput(index) => (format!("RemoveOutput {index}"), None),
                     Command::SetDelay(frames) => (format!("SetDelay {frames}"), None),
                     Command::SetMode(mode) => (format!("SetMode {mode:?}"), None),
+                    Command::SetLimited(on) => (format!("SetLimited {on}"), None),
                     Command::Shutdown => ("Shutdown".into(), None),
                 };
                 seen.push(name);
