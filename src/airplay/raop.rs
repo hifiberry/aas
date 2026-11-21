@@ -121,6 +121,11 @@ impl Raop {
         Ok((raop, ports))
     }
 
+    /// Whether the receiver has closed the session's connection.
+    pub fn closed(&mut self) -> bool {
+        self.conn.closed()
+    }
+
     /// Sets the receiver's volume, -30 to 0 dB.
     pub fn volume(&mut self, db: f32) -> Result<(), RtspError> {
         self.parameter(&format!("volume: {db}\r\n"))

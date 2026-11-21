@@ -93,12 +93,19 @@ pub fn timing_reply(request: &[u8], received: u64, transmitted: u64) -> Option<[
     if request.len() != 32 || request[..4] != [0x80, 0xd2, 0x00, 0x07] {
         return None;
     }
+    let reference = u64::from_be_bytes(request[24..32].try_into().ok()?);
+    Some(timing_packet(reference, received, transmitted))
+}
+
+/// A timing packet: a reference time, when its request came, when it goes.
+/// The first one a sender sends, after SETUP, has all three the same.
+pub fn timing_packet(reference: u64, received: u64, transmitted: u64) -> [u8; 32] {
     let mut p = [0u8; 32];
     p[..2].copy_from_slice(&[0x80, 0xd3]);
-    p[8..16].copy_from_slice(&request[24..32]);
+    p[8..16].copy_from_slice(&reference.to_be_bytes());
     p[16..24].copy_from_slice(&received.to_be_bytes());
     p[24..].copy_from_slice(&transmitted.to_be_bytes());
-    Some(p)
+    p
 }
 
 /// A retransmit request's first sequence number and count. None for

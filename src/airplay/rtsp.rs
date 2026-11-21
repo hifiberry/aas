@@ -181,6 +181,24 @@ impl Conn {
         }
     }
 
+    /// Whether the receiver has closed the connection or it failed. Reads
+    /// and drops anything it sent unasked. Does not wait.
+    pub fn closed(&mut self) -> bool {
+        if self.stream.set_nonblocking(true).is_err() {
+            return true;
+        }
+        let mut chunk = [0u8; 512];
+        let closed = loop {
+            match self.stream.read(&mut chunk) {
+                Ok(0) => break true,
+                Ok(_) => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break false,
+                Err(_) => break true,
+            }
+        };
+        closed || self.stream.set_nonblocking(false).is_err()
+    }
+
     pub fn local_ip(&self) -> IpAddr {
         self.stream
             .local_addr()
@@ -299,6 +317,26 @@ mod tests {
         assert!(seen[1].starts_with("GET_PARAMETER * RTSP/1.0\r\nCSeq: 2\r\n"));
         assert_eq!(conn.local_ip().to_string(), "127.0.0.1");
         assert_eq!(conn.peer_ip().to_string(), "127.0.0.1");
+    }
+
+    #[test]
+    fn closed_tells_a_closed_connection_from_a_quiet_one() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let peer = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            s.write_all(b"unasked").unwrap();
+            rx.recv().unwrap();
+            drop(s);
+        });
+        let mut conn = Conn::connect("127.0.0.1", port, Duration::from_secs(2)).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!conn.closed());
+        tx.send(()).unwrap();
+        peer.join().unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(conn.closed());
     }
 
     #[test]

@@ -2,9 +2,11 @@
 //! records every request and answers each as its script says.
 
 use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, UdpSocket};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 /// A request as the receiver saw it.
 #[derive(Debug, Clone)]
@@ -54,53 +56,47 @@ pub fn accepting(seen: &Seen) -> Answer {
 
 pub struct FakeReceiver {
     pub port: u16,
+    /// The receiver's audio socket, at the port `udp_accepting` gives.
+    pub data: UdpSocket,
+    /// Connections accepted so far.
+    pub accepted: Arc<AtomicUsize>,
     seen: Arc<Mutex<Vec<Seen>>>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl FakeReceiver {
     pub fn start(script: impl Fn(&Seen) -> Answer + Send + 'static) -> FakeReceiver {
+        FakeReceiver::serving(1, |_| script)
+    }
+
+    /// A receiver that takes `connections` connections one after another.
+    /// `make` builds the script from the port of the receiver's audio
+    /// socket.
+    pub fn serving<S: Fn(&Seen) -> Answer + Send + 'static>(
+        connections: usize,
+        make: impl FnOnce(u16) -> S,
+    ) -> FakeReceiver {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
+        let data = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let script = make(data.local_addr().unwrap().port());
+        data.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let seen = Arc::new(Mutex::new(Vec::new()));
-        let log = seen.clone();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let (log, count) = (seen.clone(), accepted.clone());
         let thread = std::thread::spawn(move || {
-            let Ok((mut stream, _)) = listener.accept() else {
-                return;
-            };
-            let mut buf = Vec::new();
-            let mut chunk = [0u8; 4096];
-            loop {
-                let request = loop {
-                    if let Some(r) = take_request(&mut buf) {
-                        break Some(r);
-                    }
-                    match stream.read(&mut chunk) {
-                        Ok(0) | Err(_) => break None,
-                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
-                    }
+            for _ in 0..connections {
+                let Ok((stream, _)) = listener.accept() else {
+                    return;
                 };
-                let Some(request) = request else { return };
-                let cseq = request.header("CSeq").unwrap_or("0").to_string();
-                let answer = script(&request);
-                log.lock().unwrap().push(request);
-                match answer {
-                    Answer::Close => return,
-                    Answer::Status(status, headers) => {
-                        let mut text = format!("RTSP/1.0 {status} X\r\nCSeq: {cseq}\r\n");
-                        for (n, v) in headers {
-                            text.push_str(&format!("{n}: {v}\r\n"));
-                        }
-                        text.push_str("\r\n");
-                        if stream.write_all(text.as_bytes()).is_err() {
-                            return;
-                        }
-                    }
-                }
+                count.fetch_add(1, Ordering::SeqCst);
+                serve(stream, &script, &log);
             }
         });
         FakeReceiver {
             port,
+            data,
+            accepted,
             seen,
             thread: Some(thread),
         }
@@ -147,4 +143,60 @@ fn take_request(buf: &mut Vec<u8>) -> Option<Seen> {
         headers,
         body,
     })
+}
+
+/// Answers the requests on one connection as `script` says, until it
+/// closes or the script closes it.
+fn serve(
+    mut stream: std::net::TcpStream,
+    script: &dyn Fn(&Seen) -> Answer,
+    log: &Mutex<Vec<Seen>>,
+) {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let request = loop {
+            if let Some(r) = take_request(&mut buf) {
+                break Some(r);
+            }
+            match stream.read(&mut chunk) {
+                Ok(0) | Err(_) => break None,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            }
+        };
+        let Some(request) = request else { return };
+        let cseq = request.header("CSeq").unwrap_or("0").to_string();
+        let answer = script(&request);
+        log.lock().unwrap().push(request);
+        match answer {
+            Answer::Close => return,
+            Answer::Status(status, headers) => {
+                let mut text = format!("RTSP/1.0 {status} X\r\nCSeq: {cseq}\r\n");
+                for (n, v) in headers {
+                    text.push_str(&format!("{n}: {v}\r\n"));
+                }
+                text.push_str("\r\n");
+                if stream.write_all(text.as_bytes()).is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// As `accepting`, with the audio going to `data_port`.
+pub fn accepting_on(data_port: u16) -> impl Fn(&Seen) -> Answer + Send + 'static {
+    move |seen: &Seen| match seen.method.as_str() {
+        "SETUP" => Answer::Status(
+            200,
+            vec![
+                ("Session", "DEADBEEF".into()),
+                (
+                    "Transport",
+                    format!("RTP/AVP/UDP;unicast;server_port={data_port};control_port=9"),
+                ),
+            ],
+        ),
+        _ => accepting(seen),
+    }
 }
