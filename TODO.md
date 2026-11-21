@@ -238,6 +238,17 @@ Missing:
 - Speaker EQ and the input processor as plugins: the next phase, see
   `doc/switch.md`.
 
+## AirPlay 2, the second part of the AirPlay output
+
+AirPlay 1 is built (`doc/plans/2026-11-21-airplay-output.md`, part 1); a
+receiver with `protocol = "airplay2"` fails with a message saying it is not
+built yet. Part 2 of the plan is still to do: transient pairing (SRP-6a,
+PIN 3939), the encrypted control channel and the encrypted audio, with
+PipeWire's `module-raop-sink.c` (MIT) as the reference. First step: write the
+exact AirPlay 2 messages from PipeWire's source into fixtures, as the plan
+says before its task 8. Also missing: `aas-config` carrying a PipeWire
+`raop-discover` setup over to an `[[airplay]]` table.
+
 ## A reopen cuts the sound instead of fading it
 
 A change of `latency_ms` through `/settings` leaves a hole of 7 to 8 ms in

@@ -327,6 +327,9 @@ impl Output {
     fn open(&mut self, now: Instant) -> Result<Session, String> {
         let rate = self.tap.as_ref().map(|t| t.rate).ok_or("no audio yet")?;
         let c = &self.config;
+        if c.protocol == super::config::Protocol::AirPlay2 {
+            return Err("AirPlay 2 is not in this build yet; use protocol = \"airplay1\"".into());
+        }
         let conn = Conn::connect(&c.host, c.port, HANDSHAKE_TIMEOUT).map_err(|e| e.to_string())?;
         let (local, peer) = (conn.local_ip(), conn.peer_ip());
         let any = if local.is_ipv6() {

@@ -286,6 +286,50 @@ to = 1
 gain_db = -6
 ```
 
+### AirPlay
+
+`aas` can send what the master plays to AirPlay receivers. Each
+`[[airplay]]` table, up to four, names one receiver by `host` (a name or an
+address), and `aas` connects to it when the mix has a signal and disconnects
+after a silence, or stays connected:
+
+```toml
+[[airplay]]
+host = "soundbar.local"
+connect = "signal"        # or "always"
+threshold_dbfs = -50      # a 50 ms window above this is a signal
+idle_s = 120              # silence before the session ends
+volume_db = -20           # the receiver's volume, sent once a session
+```
+
+| Key | Values | Default | |
+|---|---|---|---|
+| `host` | a name or an address | none, it is needed | The receiver. A name that does not resolve is retried like any failure. |
+| `port` | 1 to 65535 | 7000 | Its RTSP port. Older receivers, such as an AirPort Express, take 5000. |
+| `name` | text | the host | How the API and the log name it. |
+| `protocol` | `"airplay1"`, `"airplay2"` | `"airplay1"` | AirPlay 2 is not in this build yet: such a receiver fails with a message saying so. |
+| `connect` | `"signal"`, `"always"` | `"signal"` | When to connect: on the first 50 ms window above `threshold_dbfs`, or from the start and again after any failure. |
+| `threshold_dbfs` | -90 to 0 | -50 | The level that counts as a signal: the RMS of both channels, as `detect` measures it. |
+| `idle_s` | 1 to 86400 | 120 | Seconds without a signal after which the session ends with TEARDOWN, which frees the receiver's input. |
+| `latency_ms` | 250 to 5000 | 1500 | How far ahead of the receiver's clock the audio is sent. A receiver that asks for more gets more. |
+| `volume_db` | -30 to 0, or `"off"` | 0 | The receiver's own volume, sent once after each connect; `"off"` sends none. |
+
+What is sent is what the master card gets, as `aas.monitor` records it: after
+the mix, the plugins, the master gain and the volume limit. A master that plays
+nowhere, on a [capture clock](#a-card-that-only-captures), sends its mix all the
+same. The audio goes as AirPlay 1 (RAOP): 44.1 kHz, 16 bits, stereo,
+uncompressed, in the clear, after the `auth-setup` that sound bars ask for; a
+receiver that refuses that step is played to without it. The master's clock and
+the receiver's are kept together as a further output's are, by a resampler
+whose ratio follows the frames waiting.
+
+A failure, a receiver that closes the connection or one that does not answer is
+retried after 1, 2, 4, 8 and 16 s, then every 30 s, as long as there is a
+signal, or always with `connect = "always"`. The first second or so of a
+signal is not heard: the session is still being set up. `GET /airplay` gives
+each receiver's `state`, `idle`, `connecting`, `playing` or `retrying`, and the
+last failure as `error` until a session plays again.
+
 ### Recording
 
 The `default` device records the analog input, for example:
@@ -348,6 +392,7 @@ without that prefix.
 |---|---|
 | `GET /state` | The rate, the processing format, every output with its card and whether it is `open`, `parked` or `off`, every connected client with its name, rate and whether it runs, and whether the master is bit-perfect, with the reason if not |
 | `GET /outputs`, `GET /outputs/{id}` | Every output, or one |
+| `GET /airplay` | Every AirPlay receiver, with its state and last failure |
 | `PATCH /outputs/{id}` | Change an output's volume and idle rule |
 | `GET /inputs` | The analog input, if enabled, every client that plays and every name given a volume |
 | `GET`, `PATCH /inputs/analog` | The analog input's volume and mute |
@@ -489,8 +534,9 @@ WebSocket `/events` sends a JSON object with a `type` for each change:
 `output` (its volume or offset, idle and state), `input` (`id` is `analog` or
 `clients/<name>`, with `volume_db` and `muted`), `client` (a name `connected`,
 `running`, `stopped` or `gone`), `matrix` (an output's routes), `rate`,
-`plugin` (its `id`, whether it is `enabled`, and its `params` by name) and
-`settings` (`bit_perfect`, `latency_ms` and `default_rate`). A
+`plugin` (its `id`, whether it is `enabled`, and its `params` by name),
+`settings` (`bit_perfect`, `latency_ms` and `default_rate`) and `airplay` (a
+receiver's `name`, its `state` and any `error`). A
 subscriber that falls more than 256 events behind gets `{"type": "resync"}`
 and should read `/state` again; nothing waits for it. Clients are told apart by
 name alone, so with two processes of one name, `gone` for the name means that

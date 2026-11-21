@@ -313,6 +313,18 @@ something that stops working under `aas`.
 Not in this part: HFP and HSP (calls), the device as a Bluetooth source to
 headphones, and a per-client volume for the phone instead of `Master`.
 
+## AirPlay as an output
+
+A device whose card only captures, such as a turntable box with a HiFiBerry
+ADC, plays to an AirPlay receiver under PipeWire: `module-raop-discover` makes
+a sink for each receiver, a `stream.rules` entry links the speaker EQ's output
+to the one wanted, and a helper script unlinks the stream after a silence so
+the receiver's input is free again. Under `aas` that is one `[[airplay]]`
+table with `connect = "signal"` (README, "AirPlay"), on the capture clock that
+`clock = "auto"` picks for such a card. Nothing carries the PipeWire setup
+over yet: `aas-config` would have to name the receiver from the `stream.rules`
+entry.
+
 ## Next phase
 
 - Speaker EQ and the input processor as native plugins, and AES67, as their

@@ -873,6 +873,8 @@ pub struct Control {
     /// The same for the audio thread's table of capture streams.
     taps_capacity: usize,
     taps_len: usize,
+    /// The AirPlay receivers: each a thread, and the monitor tap it reads.
+    airplay: Vec<crate::airplay::Receiver>,
     /// The rate and period the output was last told to open at. None while
     /// it is closed.
     output: Option<(u32, u32)>,
@@ -1010,6 +1012,7 @@ impl Control {
             table_len: 0,
             taps_capacity: INITIAL_TAPS,
             taps_len: 0,
+            airplay: config.airplay.iter().cloned().map(crate::airplay::Receiver::new).collect(),
             output: None,
             parked: None,
             reopening: 0,
@@ -1219,6 +1222,9 @@ impl Control {
     /// zeros, and the idle rule applies from now, unless the analog input
     /// is on.
     pub fn start(&mut self, now: Instant) {
+        for receiver in &mut self.airplay {
+            receiver.spawn();
+        }
         let mut batch = Vec::new();
         // The engine starts without a limit, and takes one ahead of the
         // gain that carries it.
@@ -1249,6 +1255,10 @@ impl Control {
     /// Writes the state file if a change is still waiting for it, and
     /// returns only once the file is on disk.
     pub fn shutdown(&mut self) {
+        // Each receiver hears TEARDOWN while the audio still runs.
+        for receiver in &mut self.airplay {
+            receiver.stop();
+        }
         self.send(vec![Command::Shutdown]);
         if self.save_at.is_some() {
             self.save();
@@ -2001,6 +2011,56 @@ impl Control {
         }
     }
 
+    /// Gives each AirPlay receiver a monitor tap at `rate`, in place of
+    /// one at another rate. The thread reads it on its own timer.
+    fn airplay_taps(&mut self, rate: u32, batch: &mut Vec<Command>) {
+        for i in 0..self.airplay.len() {
+            if !self.airplay[i].wants_tap(rate) {
+                continue;
+            }
+            if let Some(old) = self.airplay[i].take_tap() {
+                batch.push(Command::RemoveTap(old));
+                self.taps_len -= 1;
+            }
+            // Half a second: the thread reads every 20 ms at the least.
+            let made = Ring::create((rate / 2).max(4096)).and_then(|(ring, memfd)| {
+                let reader = Ring::map(memfd.as_fd())?;
+                Ok((ring, reader, eventfd()?))
+            });
+            let (ring, reader, wake) = match made {
+                Ok(made) => made,
+                Err(e) => {
+                    eprintln!("aas: no ring for an AirPlay receiver: {e}");
+                    continue;
+                }
+            };
+            let id = self.next_id;
+            self.next_id += 1;
+            if self.taps_len == self.taps_capacity {
+                self.taps_capacity *= 2;
+                batch.push(Command::GrowTaps(Vec::with_capacity(self.taps_capacity)));
+            }
+            let mut tap = Tap::new(id, ring, wake);
+            tap.monitor = true;
+            tap.running = true;
+            batch.push(Command::AddTap(Box::new(tap)));
+            self.taps_len += 1;
+            self.airplay[i].give_tap(id, rate, reader);
+        }
+    }
+
+    /// Publishes each AirPlay receiver whose state changed.
+    fn publish_airplay(&mut self) {
+        let changed: Vec<ApiEvent> = self
+            .airplay
+            .iter_mut()
+            .filter_map(crate::airplay::Receiver::changed)
+            .collect();
+        for event in changed {
+            self.publish(event);
+        }
+    }
+
     /// Ends every capture stream that records at another rate than `rate`.
     /// The capture runs at the output's rate only, so the client has to
     /// configure again. It is told through the ring once the tap is back.
@@ -2447,6 +2507,7 @@ impl Control {
             analog.retry_at = None;
         }
         self.end_recorders(rate, batch);
+        self.airplay_taps(rate, batch);
         if resumed {
             for output in self.further.iter_mut().filter(|o| o.open) {
                 output.resumed_until = Some(now + RESUME_STARVE);
@@ -2896,6 +2957,7 @@ impl Control {
     /// matrix that waited for its turn. Such a drain is not ended while the
     /// output is being opened.
     pub fn tick(&mut self, now: Instant) {
+        self.publish_airplay();
         self.follow_card(now);
         let mut batch = Vec::new();
         let before = self.policy.current();
