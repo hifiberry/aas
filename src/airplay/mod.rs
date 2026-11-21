@@ -3,5 +3,9 @@
 
 pub mod config;
 pub mod gate;
+pub mod raop;
 pub mod rtp;
 pub mod rtsp;
+
+#[cfg(test)]
+mod fake;
