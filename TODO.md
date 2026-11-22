@@ -622,3 +622,12 @@ Record streams are built: `src/pulse/record.rs` records `aas.monitor` and
 - `objects::source_output_info` reports a standard channel map (mono or
   front-left, front-right) instead of the one the client created the stream
   with. Keep the client's map in `SourceOutput` and report it.
+
+## AirPlay 2: latencyMax below a long latency_ms
+
+The stream SETUP always sends `latencyMax` 88200 frames (2 s), but
+`latency_ms` takes up to 5000, so above 2000 ms the sync packets ask for more
+than the maximum the receiver was given. Either send
+`max(88200, latency)` as `latencyMax` (a field next to `Setup.min_latency`) or
+cap `latency_ms` at 2000 for `protocol = "airplay2"`. Not yet tried on a
+receiver; start in `src/airplay/ap2/session.rs` where `latencyMax` is set.

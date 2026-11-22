@@ -710,6 +710,29 @@ mod tests {
     }
 
     #[test]
+    fn the_receiver_is_offered_the_latency_up_to_250_ms() {
+        for (latency_ms, offered) in [(100, 4410), (1500, 11025)] {
+            let receiver = streaming();
+            let handle = spawn(AirplayConfig {
+                latency_ms,
+                ..config(receiver.port, Connect::Always)
+            });
+            let (ring, reader) = tap();
+            handle.tap(reader);
+            play(&ring, 0.2, false);
+            assert!(until(&handle, 3.0, playing), "{:?}", handle.status());
+            handle.stop();
+            let seen = receiver.finish();
+            let announce = seen.iter().find(|s| s.method == "ANNOUNCE").unwrap();
+            let sdp = String::from_utf8_lossy(&announce.body).to_string();
+            assert!(
+                sdp.ends_with(&format!("a=min-latency:{offered}\r\n")),
+                "{latency_ms} ms: {sdp}"
+            );
+        }
+    }
+
+    #[test]
     fn a_signal_connects_and_silence_tears_down() {
         let receiver = streaming();
         let handle = spawn(config(receiver.port, Connect::Signal));

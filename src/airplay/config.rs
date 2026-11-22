@@ -200,8 +200,8 @@ mod tests {
         assert_eq!(r.idle_s, 30);
         assert_eq!(r.latency_ms, 2000);
         assert_eq!(
-            one("host = \"h\"\nlatency_ms = 100\n").unwrap().latency_ms,
-            100
+            one("host = \"h\"\nlatency_ms = 50\n").unwrap().latency_ms,
+            50
         );
         assert_eq!(r.volume_db, Some(-6.0));
         assert_eq!(
