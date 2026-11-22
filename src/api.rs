@@ -36,6 +36,8 @@ pub enum Call {
     PatchPlugin(PluginId, PluginPatch),
     /// `GET /settings`.
     Settings,
+    /// The AirPlay receivers and their state.
+    Airplay,
     PatchSettings(SettingsPatch),
 }
 
@@ -297,6 +299,14 @@ pub struct RouteJson {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ApiEvent {
+    /// An AirPlay receiver's state changed: `"idle"`, `"connecting"`,
+    /// `"playing"` or `"retrying"`, with the last failure.
+    Airplay {
+        name: String,
+        state: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
     /// An output's settings or its state: `"open"`, `"parked"` or `"off"`.
     Output {
         id: usize,
@@ -379,6 +389,23 @@ impl OutputView {
             state: self.state.clone(),
         }
     }
+}
+
+/// An AirPlay receiver as `GET /airplay` gives it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct AirplayView {
+    pub name: String,
+    pub host: String,
+    pub port: u16,
+    /// `"airplay1"` or `"airplay2"`.
+    pub protocol: &'static str,
+    /// `"signal"` or `"always"`.
+    pub connect: &'static str,
+    /// `"idle"`, `"connecting"`, `"playing"` or `"retrying"`.
+    pub state: &'static str,
+    /// The last failure, until a session plays again.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// An input as `GET /inputs` gives it.

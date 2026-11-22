@@ -339,6 +339,7 @@ impl Control {
             Call::Plugin(id) => self.plugin_answer(&id),
             Call::PatchPlugin(id, patch) => self.patch_plugin(id, patch, now),
             Call::Settings => api::answer(&self.settings_view()),
+            Call::Airplay => api::answer(&self.airplay_views()),
             Call::PatchSettings(patch) => self.patch_settings(patch, now),
         };
         self.publish_changes();
@@ -369,6 +370,10 @@ impl Control {
     /// config's channels are taken until then. Call before `restore`.
     pub fn set_matrix_width(&mut self, width: usize) {
         self.matrices[0].width = width;
+    }
+
+    pub(super) fn airplay_views(&self) -> Vec<api::AirplayView> {
+        self.airplay.iter().map(crate::airplay::Receiver::view).collect()
     }
 
     /// Sends an event to the API's subscribers, if any.
@@ -1550,6 +1555,81 @@ mod tests {
         assert!(close(engine.gains[0].1, db_to_gain(-6.0)));
         let view = control.call(Call::Output(1), now).unwrap();
         assert_eq!(view["limit_db"], json!(-6.0));
+    }
+
+    fn with_a_receiver() -> Config {
+        use crate::airplay::config::{AirplayConfig, Connect, Protocol};
+        Config {
+            airplay: vec![AirplayConfig {
+                name: "Study".into(),
+                host: "127.0.0.1".into(),
+                // The discard port: nothing answers there.
+                port: 9,
+                protocol: Protocol::AirPlay1,
+                connect: Connect::Signal,
+                threshold_dbfs: -50.0,
+                idle_s: 120,
+                latency_ms: 1500,
+                volume_db: Some(-25.0),
+            }],
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn get_airplay_lists_each_receiver_with_its_state() {
+        let (mut control, _engine, _logs, now) = started_with(&with_a_receiver(), Vec::new());
+        let view = control.call(Call::Airplay, now).unwrap();
+        assert_eq!(
+            view,
+            json!([{
+                "name": "Study",
+                "host": "127.0.0.1",
+                "port": 9,
+                "protocol": "airplay1",
+                "connect": "signal",
+                "state": "idle"
+            }])
+        );
+        let (mut control, _engine, _logs, now) = started_with(&Config::default(), Vec::new());
+        assert_eq!(control.call(Call::Airplay, now).unwrap(), json!([]));
+    }
+
+    #[test]
+    fn a_receivers_state_is_published_once_per_change() {
+        let mut config = with_a_receiver();
+        // Connects at once to a port nothing answers: it fails and retries.
+        config.airplay[0].connect = crate::airplay::config::Connect::Always;
+        let (mut control, _engine, _logs, now) = started_with(&config, Vec::new());
+        let mut published = subscribe(&mut control);
+        let mut states = Vec::new();
+        let end = Instant::now() + std::time::Duration::from_secs(3);
+        while Instant::now() < end && !states.iter().any(|s: &String| s == "retrying") {
+            control.tick(now);
+            for e in events(&mut published) {
+                if let ApiEvent::Airplay { name, state, error } = e {
+                    assert_eq!(name, "Study");
+                    if state == "retrying" {
+                        assert!(error.is_some());
+                    }
+                    states.push(state);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(states.last().map(String::as_str), Some("retrying"), "{states:?}");
+        // Nothing new, nothing told.
+        control.tick(now);
+        assert!(events(&mut published).is_empty());
+    }
+
+    #[test]
+    fn opening_the_output_gives_each_receiver_a_monitor_tap() {
+        let (_control, mut engine, _logs, _now) = started_with(&with_a_receiver(), Vec::new());
+        let seen = engine.take(true);
+        assert_eq!(seen.iter().filter(|c| c.starts_with("AddTap")).count(), 1, "{seen:?}");
+        let (_control, mut engine, _logs, _now) = started_with(&Config::default(), Vec::new());
+        assert!(!engine.take(true).iter().any(|c| c.starts_with("AddTap")));
     }
 
     #[test]
