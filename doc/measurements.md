@@ -2514,3 +2514,8 @@ applies.
 - 300 s with `connect = "always"`: 37583 packets, none asked for again, none
   short; `POST /feedback` every 2 s answered throughout, the bar `PLAYING`.
   The audio thread had no xruns and no wake-up gap, its worst cycle 0.063 ms.
+- `latency_ms` = 250 and 100, 60 s each with `connect = "always"`: the bar
+  took the shorter `latencyMin`, asked for no latency of its own in the RECORD
+  answer and played throughout (7439 and 7466 packets, none asked for again,
+  none short). Neither was timed at the speaker: the board has no microphone,
+  and the bar may add a processing delay of its own.

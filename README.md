@@ -311,7 +311,7 @@ volume_db = -20           # the receiver's volume, sent once a session
 | `connect` | `"signal"`, `"always"` | `"signal"` | When to connect: on the first 50 ms window above `threshold_dbfs`, or from the start and again after any failure. |
 | `threshold_dbfs` | -90 to 0 | -50 | The level that counts as a signal: the RMS of both channels, as `detect` measures it. |
 | `idle_s` | 1 to 86400 | 120 | Seconds without a signal after which the session ends with TEARDOWN, which frees the receiver's input. Time in which the master sends nothing at all, closed when idle, counts as silence too. |
-| `latency_ms` | 250 to 5000 | 1500 | How far ahead of the receiver's clock the audio is sent. A receiver that asks for more gets more. |
+| `latency_ms` | 50 to 5000 | 1500 | How far ahead of the receiver's clock the audio is sent. Below 250 ms it is also offered to the receiver as its minimum; a receiver that asks for more gets more. A short latency leaves less time to resend a lost packet. |
 | `volume_db` | -30 to 0, or `"off"` | 0 | The receiver's own volume, sent once after each connect; `"off"` sends none. |
 
 What is sent is what the master card gets, as `aas.monitor` records it: after
