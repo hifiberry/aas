@@ -2,6 +2,8 @@
 //! remote outputs that can show it. See
 //! `doc/plans/2026-11-22-song-metadata-design.md`.
 
+pub mod config;
+
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
