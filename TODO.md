@@ -238,16 +238,17 @@ Missing:
 - Speaker EQ and the input processor as plugins: the next phase, see
   `doc/switch.md`.
 
-## AirPlay 2, the second part of the AirPlay output
+## AirPlay: what is not yet tried on a receiver
 
-AirPlay 1 is built (`doc/plans/2026-11-21-airplay-output.md`, part 1); a
-receiver with `protocol = "airplay2"` fails with a message saying it is not
-built yet. Part 2 of the plan is still to do: transient pairing (SRP-6a,
-PIN 3939), the encrypted control channel and the encrypted audio, with
-PipeWire's `module-raop-sink.c` (MIT) as the reference. First step: write the
-exact AirPlay 2 messages from PipeWire's source into fixtures, as the plan
-says before its task 8. Also missing: `aas-config` carrying a PipeWire
-`raop-discover` setup over to an `[[airplay]]` table.
+Both protocols play to a sound bar (`doc/measurements.md`, "AirPlay output").
+Not tried: an AirPlay 2 session after the receiver has been switched to
+another input and back (the case PipeWire's pause helper handles), a Mac or
+another make of receiver, and a 10-minute run with music. Also missing:
+`aas-config` carrying a PipeWire `raop-discover` setup over to an
+`[[airplay]]` table, which needs the receiver named in its `stream.rules`
+entry. First step for the input switch: play with `connect = "always"`,
+switch the receiver to another input and back, and see whether the session
+ends and is retried.
 
 ## A reopen cuts the sound instead of fading it
 
@@ -621,3 +622,12 @@ Record streams are built: `src/pulse/record.rs` records `aas.monitor` and
 - `objects::source_output_info` reports a standard channel map (mono or
   front-left, front-right) instead of the one the client created the stream
   with. Keep the client's map in `SourceOutput` and report it.
+
+## AirPlay 2: latencyMax below a long latency_ms
+
+The stream SETUP always sends `latencyMax` 88200 frames (2 s), but
+`latency_ms` takes up to 5000, so above 2000 ms the sync packets ask for more
+than the maximum the receiver was given. Either send
+`max(88200, latency)` as `latencyMax` (a field next to `Setup.min_latency`) or
+cap `latency_ms` at 2000 for `protocol = "airplay2"`. Not yet tried on a
+receiver; start in `src/airplay/ap2/session.rs` where `latencyMax` is set.

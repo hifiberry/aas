@@ -2,6 +2,7 @@
 //! parsed as they arrive, over a blocking TCP connection with a timeout on
 //! every read, on the output's own thread.
 
+use super::ap2::channel::{Keys, Opener, Sealer};
 use std::fmt;
 use std::io::{Read, Write};
 use std::net::{IpAddr, TcpStream, ToSocketAddrs};
@@ -23,6 +24,9 @@ pub enum RtspError {
     Status { method: String, status: u16 },
     /// The answer could not be read.
     Malformed(String),
+    /// AirPlay 2 pairing failed: the receiver refused it, or its proof
+    /// was wrong.
+    Pairing(String),
 }
 
 impl fmt::Display for RtspError {
@@ -31,6 +35,7 @@ impl fmt::Display for RtspError {
             RtspError::Io(why) => write!(f, "{why}"),
             RtspError::Status { method, status } => write!(f, "{method} answered {status}"),
             RtspError::Malformed(why) => write!(f, "a malformed answer: {why}"),
+            RtspError::Pairing(why) => write!(f, "pairing failed: {why}"),
         }
     }
 }
@@ -46,7 +51,13 @@ pub struct Request<'a> {
 impl Request<'_> {
     /// The request as it goes on the wire, with `cseq`.
     pub fn write(&self, cseq: u32, out: &mut Vec<u8>) {
-        let mut head = format!("{} {} RTSP/1.0\r\nCSeq: {cseq}\r\n", self.method, self.url);
+        self.write_as("RTSP/1.0", cseq, out);
+    }
+
+    /// As `write`, naming the protocol `version`: on the sealed channel of
+    /// AirPlay 2 requests go as HTTP/1.1, as PipeWire sends them.
+    pub fn write_as(&self, version: &str, cseq: u32, out: &mut Vec<u8>) {
+        let mut head = format!("{} {} {version}\r\nCSeq: {cseq}\r\n", self.method, self.url);
         for (name, value) in self.headers {
             head.push_str(&format!("{name}: {value}\r\n"));
         }
@@ -92,7 +103,7 @@ pub fn parse(buf: &[u8]) -> Result<Option<(Response, usize)>, RtspError> {
     let mut lines = head.split("\r\n");
     let status_line = lines.next().unwrap_or_default();
     let mut parts = status_line.split_whitespace();
-    if parts.next() != Some("RTSP/1.0") {
+    if !matches!(parts.next(), Some("RTSP/1.0" | "HTTP/1.1" | "HTTP/1.0")) {
         return Err(RtspError::Malformed(format!("status line {status_line:?}")));
     }
     let status = parts
@@ -134,7 +145,12 @@ pub fn parse(buf: &[u8]) -> Result<Option<(Response, usize)>, RtspError> {
 pub struct Conn {
     stream: TcpStream,
     cseq: u32,
+    /// What has been read and not yet parsed, in the clear.
     buf: Vec<u8>,
+    /// Once sealed, AirPlay 2's channel, and the sealed bytes read that do
+    /// not yet make a whole frame.
+    sealed: Option<(Sealer, Opener)>,
+    raw: Vec<u8>,
 }
 
 impl Conn {
@@ -155,6 +171,8 @@ impl Conn {
                         stream,
                         cseq: 0,
                         buf: Vec::new(),
+                        sealed: None,
+                        raw: Vec::new(),
                     });
                 }
                 Err(e) => last = io(e),
@@ -163,28 +181,69 @@ impl Conn {
         Err(last)
     }
 
+    /// From now on every byte either way goes sealed with `keys`.
+    pub fn seal(&mut self, keys: &Keys) {
+        self.sealed = Some((Sealer::new(&keys.write), Opener::new(&keys.read)));
+    }
+
     /// Sends `req` and waits for its answer.
     pub fn request(&mut self, req: &Request) -> Result<Response, RtspError> {
-        let io = |e: std::io::Error| RtspError::Io(format!("{}: {e}", req.method));
-        self.cseq += 1;
-        let mut out = Vec::new();
-        req.write(self.cseq, &mut out);
-        self.stream.write_all(&out).map_err(io)?;
+        self.send(req)?;
         let mut chunk = [0u8; 4096];
         loop {
             if let Some((response, used)) = parse(&self.buf)? {
                 self.buf.drain(..used);
-                return Ok(response);
+                // The answer to a request sent without waiting is passed
+                // over.
+                let cseq = response.header("CSeq").and_then(|c| c.parse::<u32>().ok());
+                if cseq.is_none_or(|c| c == self.cseq) {
+                    return Ok(response);
+                }
+                continue;
             }
-            let n = self.stream.read(&mut chunk).map_err(io)?;
+            let n = self
+                .stream
+                .read(&mut chunk)
+                .map_err(|e| RtspError::Io(format!("{}: {e}", req.method)))?;
             if n == 0 {
                 return Err(RtspError::Io(format!(
                     "{}: the receiver closed",
                     req.method
                 )));
             }
-            self.buf.extend_from_slice(&chunk[..n]);
+            self.take(&chunk[..n])?;
         }
+    }
+
+    /// Sends `req` without waiting for its answer, which `closed` drops.
+    pub fn send(&mut self, req: &Request) -> Result<(), RtspError> {
+        self.cseq += 1;
+        let mut out = Vec::new();
+        match &mut self.sealed {
+            None => req.write(self.cseq, &mut out),
+            Some((sealer, _)) => {
+                let mut plain = Vec::new();
+                req.write_as("HTTP/1.1", self.cseq, &mut plain);
+                sealer.seal(&plain, &mut out);
+            }
+        }
+        self.stream
+            .write_all(&out)
+            .map_err(|e| RtspError::Io(format!("{}: {e}", req.method)))
+    }
+
+    /// Takes bytes read from the connection, opening them when sealed.
+    fn take(&mut self, bytes: &[u8]) -> Result<(), RtspError> {
+        match &mut self.sealed {
+            None => self.buf.extend_from_slice(bytes),
+            Some((_, opener)) => {
+                self.raw.extend_from_slice(bytes);
+                opener
+                    .open(&mut self.raw, &mut self.buf)
+                    .map_err(|e| RtspError::Malformed(e.to_string()))?;
+            }
+        }
+        Ok(())
     }
 
     /// Whether the receiver has closed the connection or it failed. Reads
@@ -197,7 +256,26 @@ impl Conn {
         let closed = loop {
             match self.stream.read(&mut chunk) {
                 Ok(0) => break true,
-                Ok(_) => continue,
+                // Sealed bytes are opened all the same, so that the count
+                // of frames stays in step; a frame that does not open ends
+                // the session as a close would.
+                Ok(n) => {
+                    if self.take(&chunk[..n]).is_err() {
+                        break true;
+                    }
+                    // Whole answers nobody waits for are dropped; a part
+                    // of one stays for the rest to join.
+                    loop {
+                        match parse(&self.buf) {
+                            Ok(Some((_, used))) => drop(self.buf.drain(..used)),
+                            Ok(None) => break,
+                            Err(_) => {
+                                self.buf.clear();
+                                break;
+                            }
+                        }
+                    }
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break false,
                 Err(_) => break true,
             }
@@ -311,11 +389,78 @@ mod tests {
     }
 
     #[test]
-    fn a_status_line_that_is_not_rtsp_is_an_error() {
+    fn a_status_line_that_is_neither_rtsp_nor_http_is_an_error() {
         assert!(matches!(
-            parse(b"HTTP/1.1 200 OK\r\n\r\n"),
+            parse(b"SIP/2.0 200 OK\r\n\r\n"),
             Err(RtspError::Malformed(_))
         ));
+        // The sealed channel of AirPlay 2 answers as HTTP.
+        let (r, _) = parse(b"HTTP/1.1 200 OK\r\n\r\n").unwrap().unwrap();
+        assert_eq!(r.status, 200);
+    }
+
+    #[test]
+    fn a_sealed_conn_seals_requests_as_http_and_opens_answers() {
+        let keys = Keys {
+            write: [1; 32],
+            read: [2; 32],
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let peer = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            // The receiver's side: it opens with our write key and seals
+            // with our read key.
+            let (mut opener, mut sealer) = (Opener::new(&[1; 32]), Sealer::new(&[2; 32]));
+            let mut raw = Vec::new();
+            let mut plain = Vec::new();
+            let mut buf = [0u8; 4096];
+            while !plain.ends_with(b"\r\n\r\n") {
+                let n = s.read(&mut buf).unwrap();
+                raw.extend_from_slice(&buf[..n]);
+                opener.open(&mut raw, &mut plain).unwrap();
+            }
+            let mut out = Vec::new();
+            sealer.seal(
+                b"HTTP/1.1 200 OK\r\nCSeq: 1\r\nContent-Length: 2\r\n\r\nok",
+                &mut out,
+            );
+            // In two writes, the second a part of a frame.
+            s.write_all(&out[..5]).unwrap();
+            std::thread::sleep(Duration::from_millis(20));
+            s.write_all(&out[5..]).unwrap();
+            // Then an answer nobody waits for, which `closed` must open to
+            // stay in step, and one that is waited for.
+            out.clear();
+            sealer.seal(b"HTTP/1.1 200 OK\r\nCSeq: 2\r\n\r\n", &mut out);
+            s.write_all(&out).unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+            out.clear();
+            sealer.seal(b"HTTP/1.1 204 OK\r\nCSeq: 3\r\n\r\n", &mut out);
+            s.write_all(&out).unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+            String::from_utf8(plain).unwrap()
+        });
+        let mut conn = Conn::connect("127.0.0.1", port, Duration::from_secs(2)).unwrap();
+        conn.seal(&keys);
+        let req = |method| Request {
+            method,
+            url: "/info",
+            headers: &[],
+            content_type: None,
+            body: &[],
+        };
+        let r = conn.request(&req("GET")).unwrap();
+        assert_eq!((r.status, r.body.as_slice()), (200, &b"ok"[..]));
+        conn.send(&req("POST")).unwrap();
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(!conn.closed());
+        assert_eq!(conn.request(&req("GET")).unwrap().status, 204);
+        assert!(
+            peer.join()
+                .unwrap()
+                .starts_with("GET /info HTTP/1.1\r\nCSeq: 1\r\n")
+        );
     }
 
     #[test]
@@ -351,6 +496,72 @@ mod tests {
         assert!(seen[1].starts_with("GET_PARAMETER * RTSP/1.0\r\nCSeq: 2\r\n"));
         assert_eq!(conn.local_ip().to_string(), "127.0.0.1");
         assert_eq!(conn.peer_ip().to_string(), "127.0.0.1");
+    }
+
+    #[test]
+    fn an_answer_to_an_earlier_request_is_passed_over() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let peer = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 256];
+            let mut seen = 0;
+            while seen < 2 {
+                let n = s.read(&mut buf).unwrap();
+                seen += buf[..n].windows(4).filter(|w| w == b"\r\n\r\n").count();
+            }
+            // Both answers in one write: the first is to the request sent
+            // without waiting.
+            s.write_all(b"RTSP/1.0 200 OK\r\nCSeq: 1\r\n\r\nRTSP/1.0 451 x\r\nCSeq: 2\r\n\r\n")
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+        });
+        let mut conn = Conn::connect("127.0.0.1", port, Duration::from_secs(2)).unwrap();
+        let req = |method| Request {
+            method,
+            url: "*",
+            headers: &[],
+            content_type: None,
+            body: &[],
+        };
+        conn.send(&req("POST")).unwrap();
+        assert_eq!(conn.request(&req("GET_PARAMETER")).unwrap().status, 451);
+        peer.join().unwrap();
+    }
+
+    #[test]
+    fn closed_keeps_a_partly_received_answer() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let peer = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 256];
+            let _ = s.read(&mut buf).unwrap();
+            // The answer to the request sent without waiting, its body
+            // after a look by `closed`.
+            s.write_all(b"RTSP/1.0 200 OK\r\nCSeq: 1\r\nContent-Length: 2\r\n\r\n")
+                .unwrap();
+            rx.recv().unwrap();
+            s.write_all(b"ok").unwrap();
+            let _ = s.read(&mut buf).unwrap();
+            s.write_all(b"RTSP/1.0 204 x\r\nCSeq: 2\r\n\r\n").unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+        });
+        let mut conn = Conn::connect("127.0.0.1", port, Duration::from_secs(2)).unwrap();
+        let req = |method| Request {
+            method,
+            url: "*",
+            headers: &[],
+            content_type: None,
+            body: &[],
+        };
+        conn.send(&req("POST")).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!conn.closed());
+        tx.send(()).unwrap();
+        assert_eq!(conn.request(&req("GET_PARAMETER")).unwrap().status, 204);
+        peer.join().unwrap();
     }
 
     #[test]

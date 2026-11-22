@@ -13,8 +13,15 @@ pub const AUTH_SETUP: [u8; 33] = [
     0x4e,
 ];
 
-/// The frames a receiver is asked to buffer at least, 250 ms.
+/// The frames a receiver is asked to buffer at least, 250 ms, unless the
+/// latency asked for is shorter.
 pub const MIN_LATENCY: u32 = 11025;
+
+/// The minimum latency offered for a stream played `latency` frames late:
+/// the latency itself, up to `MIN_LATENCY`.
+pub fn offered_minimum(latency: u32) -> u32 {
+    latency.min(MIN_LATENCY)
+}
 
 /// What a session starts with.
 pub struct Setup {
@@ -26,6 +33,8 @@ pub struct Setup {
     pub first_rtptime: u32,
     /// Sent after RECORD; None sends none.
     pub volume_db: Option<f32>,
+    /// The minimum latency offered to the receiver, in frames.
+    pub min_latency: u32,
 }
 
 /// The receiver's UDP ports.
@@ -87,7 +96,12 @@ impl Raop {
             }
             other => raop.auth_setup_refused = Some(other),
         }
-        let sdp = sdp(session, raop.conn.local_ip(), raop.conn.peer_ip());
+        let sdp = sdp(
+            session,
+            raop.conn.local_ip(),
+            raop.conn.peer_ip(),
+            setup.min_latency,
+        );
         raop.expect(
             "ANNOUNCE",
             None,
@@ -223,12 +237,12 @@ pub fn random<const N: usize>() -> [u8; N] {
 }
 
 /// The SDP of ANNOUNCE.
-pub fn sdp(session: u32, local: IpAddr, peer: IpAddr) -> String {
+pub fn sdp(session: u32, local: IpAddr, peer: IpAddr, min_latency: u32) -> String {
     let v = |ip: IpAddr| if ip.is_ipv6() { 6 } else { 4 };
     format!(
         "v=0\r\no=iTunes {session} 0 IN IP{} {local}\r\ns=iTunes\r\nc=IN IP{} {peer}\r\n\
          t=0 0\r\nm=audio 0 RTP/AVP 96\r\na=rtpmap:96 AppleLossless\r\n\
-         a=fmtp:96 {} 0 16 40 10 14 2 255 0 0 {}\r\na=min-latency:{MIN_LATENCY}\r\n",
+         a=fmtp:96 {} 0 16 40 10 14 2 255 0 0 {}\r\na=min-latency:{min_latency}\r\n",
         v(local),
         v(peer),
         super::rtp::FRAMES,
@@ -268,6 +282,7 @@ mod tests {
             first_seq: 5,
             first_rtptime: 77,
             volume_db: Some(-12.5),
+            min_latency: MIN_LATENCY,
         }
     }
 
@@ -552,8 +567,22 @@ mod tests {
     fn the_sdp_names_ipv6_as_such() {
         let local: IpAddr = "fe80::1".parse().unwrap();
         let peer: IpAddr = "fe80::2".parse().unwrap();
-        let text = sdp(9, local, peer);
+        let text = sdp(9, local, peer, MIN_LATENCY);
         assert!(text.contains("o=iTunes 9 0 IN IP6 fe80::1\r\n"), "{text}");
         assert!(text.contains("c=IN IP6 fe80::2\r\n"), "{text}");
+    }
+
+    #[test]
+    fn the_sdp_offers_the_minimum_latency_it_is_given() {
+        let ip: IpAddr = "192.0.2.1".parse().unwrap();
+        let text = sdp(9, ip, ip, 4410);
+        assert!(text.ends_with("a=min-latency:4410\r\n"), "{text}");
+    }
+
+    #[test]
+    fn the_offered_minimum_is_the_latency_up_to_250_ms() {
+        assert_eq!(offered_minimum(4410), 4410);
+        assert_eq!(offered_minimum(11025), 11025);
+        assert_eq!(offered_minimum(66150), 11025);
     }
 }

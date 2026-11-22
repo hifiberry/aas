@@ -2492,3 +2492,30 @@ mDNS name, `volume_db = -25`, `idle_s = 30`.
 
 Whether the tone sounded right was not heard by whoever ran the test: that is
 for a listener in the room to say.
+
+### AirPlay 2
+
+The same board and sound bar, with `protocol = "airplay2"`. The bar's `/info`
+gives `statusFlags` 0x4: no PIN and no one-time pairing, so transient pairing
+applies.
+
+- Pairing, the sealed control connection, both SETUPs and SETPEERS went
+  through at the first try, but the bar never answered RECORD: every try timed
+  out after 5 s. Its answer to the session SETUP names an `eventPort`, and the
+  bar waits for the sender to connect to it. PipeWire's sender does not; OwnTone
+  and pyatv do. With the event connection open, RECORD is answered at once.
+- The bar's session answer gives `timingPort` 0 and a `timingPeerInfo` of its
+  own, and it never asked our NTP port for the time, in either run. It plays
+  by the sync packets.
+- The tone as for AirPlay 1: connected about 4 s after the tone started, the bar
+  went to its AirPlay input and reported `PLAYING`; 30 s after the tone ended
+  the session ended with TEARDOWN and the bar reported `PAUSED`. 39 s, 4944
+  packets, none asked for again, none short.
+- 300 s with `connect = "always"`: 37583 packets, none asked for again, none
+  short; `POST /feedback` every 2 s answered throughout, the bar `PLAYING`.
+  The audio thread had no xruns and no wake-up gap, its worst cycle 0.063 ms.
+- `latency_ms` = 250 and 100, 60 s each with `connect = "always"`: the bar
+  took the shorter `latencyMin`, asked for no latency of its own in the RECORD
+  answer and played throughout (7439 and 7466 packets, none asked for again,
+  none short). Neither was timed at the speaker: the board has no microphone,
+  and the bar may add a processing delay of its own.

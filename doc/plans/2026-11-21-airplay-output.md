@@ -393,6 +393,18 @@ subnet, by its mDNS name, then to a Mac.
 
 ## Part 2: AirPlay 2
 
+> **As built (2026-11-21).** Done, with these differences from the tasks
+> below, found on a sound bar: the receiver answers RECORD only once the
+> sender has connected to the `eventPort` of its session SETUP answer
+> (`src/airplay/ap2/events.rs`, keys `Events-Salt`, read and write swapped,
+> as OwnTone and pyatv have them; PipeWire's sender does not open it). The
+> RTSP connection seals itself after pairing (`Conn::seal`) instead of a
+> separate `Sealed` type, and skips answers to requests sent without waiting,
+> such as `/feedback`. `shk` is a random key per session. Binary plists are
+> written and read by `ap2/bplist.rs`, checked against Python's `plistlib`.
+> Task 11's reconnect after the bar is switched to another input and back is
+> not tested yet.
+
 The same thread, gate, stream timing and packets as Part 1. What differs is
 how the session is opened and that the RTP payload is encrypted. The
 reference is PipeWire's AirPlay 2 path in `module-raop-sink.c`

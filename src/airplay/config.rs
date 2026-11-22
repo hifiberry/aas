@@ -124,7 +124,7 @@ fn receiver_from(table: toml::Table) -> Result<AirplayConfig, String> {
         Some(v) => number(v, -90.0, 0.0).ok_or("threshold_dbfs must be from -90 to 0")?,
     };
     let idle_s = whole(&table, "idle_s", 1, 86400)?.unwrap_or(120) as u32;
-    let latency_ms = whole(&table, "latency_ms", 250, 5000)?.unwrap_or(1500) as u32;
+    let latency_ms = whole(&table, "latency_ms", 50, 5000)?.unwrap_or(1500) as u32;
     let volume_db = match table.get("volume_db") {
         None => Some(0.0),
         Some(toml::Value::String(s)) if s == "off" => None,
@@ -199,6 +199,10 @@ mod tests {
         assert_eq!(r.threshold_dbfs, -62.5);
         assert_eq!(r.idle_s, 30);
         assert_eq!(r.latency_ms, 2000);
+        assert_eq!(
+            one("host = \"h\"\nlatency_ms = 50\n").unwrap().latency_ms,
+            50
+        );
         assert_eq!(r.volume_db, Some(-6.0));
         assert_eq!(
             one("host = \"h\"\nvolume_db = \"off\"\n")
@@ -250,12 +254,12 @@ mod tests {
                 "airplay 1: idle_s must be from 1 to 86400",
             ),
             (
-                "host = \"h\"\nlatency_ms = 249\n",
-                "airplay 1: latency_ms must be from 250 to 5000",
+                "host = \"h\"\nlatency_ms = 49\n",
+                "airplay 1: latency_ms must be from 50 to 5000",
             ),
             (
                 "host = \"h\"\nlatency_ms = 5001\n",
-                "airplay 1: latency_ms must be from 250 to 5000",
+                "airplay 1: latency_ms must be from 50 to 5000",
             ),
             (
                 "host = \"h\"\nvolume_db = -31\n",
