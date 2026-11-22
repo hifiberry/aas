@@ -6,11 +6,14 @@ use std::fmt;
 
 /// The item types of the pairing messages.
 pub const METHOD: u8 = 0;
+pub const IDENTIFIER: u8 = 1;
 pub const SALT: u8 = 2;
 pub const PUBLIC_KEY: u8 = 3;
 pub const PROOF: u8 = 4;
+pub const ENCRYPTED_DATA: u8 = 5;
 pub const STATE: u8 = 6;
 pub const ERROR: u8 = 7;
+pub const SIGNATURE: u8 = 10;
 pub const FLAGS: u8 = 19;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

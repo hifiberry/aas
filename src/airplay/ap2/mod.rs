@@ -6,6 +6,9 @@ pub mod audio;
 pub mod bplist;
 pub mod channel;
 pub mod events;
+#[cfg(test)]
+mod fake_hap;
+pub mod hap;
 pub mod keys;
 pub mod pair;
 pub mod session;

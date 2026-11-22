@@ -62,23 +62,7 @@ fn post(
     headers: &[(&'static str, String)],
     items: &[(u8, &[u8])],
 ) -> Result<Vec<(u8, Vec<u8>)>, RtspError> {
-    let mut all = headers.to_vec();
-    all.push(("X-Apple-HKP", "4".into()));
-    let body = tlv::encode(items);
-    let answer = conn.request(&Request {
-        method: "POST",
-        url: "/pair-setup",
-        headers: &all,
-        content_type: Some("application/octet-stream"),
-        body: &body,
-    })?;
-    if answer.status != 200 {
-        return Err(RtspError::Status {
-            method: "POST /pair-setup".into(),
-            status: answer.status,
-        });
-    }
-    let items = tlv::decode(&answer.body).map_err(|e| RtspError::Malformed(e.to_string()))?;
+    let items = exchange(conn, headers, "/pair-setup", "4", items)?;
     if let Some(code) = tlv::find(&items, tlv::ERROR) {
         let code = code.first().copied().unwrap_or(0);
         let why = match code {
@@ -95,6 +79,34 @@ fn post(
         )));
     }
     Ok(items)
+}
+
+/// Posts TLV8 `items` to `url` with `X-Apple-HKP: hkp` and gives the
+/// items of the answer, an error item included.
+pub fn exchange(
+    conn: &mut Conn,
+    headers: &[(&'static str, String)],
+    url: &str,
+    hkp: &str,
+    items: &[(u8, &[u8])],
+) -> Result<Vec<(u8, Vec<u8>)>, RtspError> {
+    let mut all = headers.to_vec();
+    all.push(("X-Apple-HKP", hkp.to_string()));
+    let body = tlv::encode(items);
+    let answer = conn.request(&Request {
+        method: "POST",
+        url,
+        headers: &all,
+        content_type: Some("application/octet-stream"),
+        body: &body,
+    })?;
+    if answer.status != 200 {
+        return Err(RtspError::Status {
+            method: format!("POST {url}"),
+            status: answer.status,
+        });
+    }
+    tlv::decode(&answer.body).map_err(|e| RtspError::Malformed(e.to_string()))
 }
 
 #[cfg(test)]
