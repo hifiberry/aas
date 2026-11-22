@@ -14,6 +14,19 @@ use std::time::{Duration, Instant};
 /// How long a receiver showing its PIN is waited for.
 pub const PIN_WAIT: Duration = Duration::from_secs(120);
 
+/// Drops a held start older than `PIN_WAIT`, closing its connection.
+/// Whether it dropped one.
+pub fn expire(held: &Mutex<Option<Held>>, now: Instant) -> bool {
+    let mut held = held.lock().unwrap();
+    let old = held
+        .as_ref()
+        .is_some_and(|h| now.saturating_duration_since(h.since) > PIN_WAIT);
+    if old {
+        held.take();
+    }
+    old
+}
+
 /// A pairing started and waiting for its PIN.
 pub struct Held {
     conn: Conn,
@@ -39,7 +52,8 @@ pub fn step(
         let started = hap::pin_start(&mut conn, &headers)
             .and_then(|()| hap::setup_start(&mut conn, &headers))
             .map_err(|e| match e {
-                RtspError::Status { .. } | RtspError::Pairing(_) => refused(),
+                RtspError::Status { .. } => refused(),
+                RtspError::Pairing(why) => ApiError::unprocessable(why),
                 e => unreachable(e),
             })?;
         *held.lock().unwrap() = Some(Held {
@@ -67,7 +81,7 @@ pub fn step(
     let me = pairings.identity();
     let peer = hap::setup_finish(&mut conn, &headers, started, pin, &me).map_err(|e| match e {
         RtspError::WrongPin => ApiError::unprocessable("the receiver did not take the PIN"),
-        RtspError::Pairing(_) => refused(),
+        RtspError::Pairing(why) => ApiError::unprocessable(why),
         e => unreachable(e),
     })?;
     pairings
@@ -84,9 +98,7 @@ const USER_AGENT: &str = "AirPlay/999.0.0";
 const TIMEOUT: Duration = Duration::from_secs(5);
 
 fn refused() -> ApiError {
-    ApiError::unprocessable(
-        "the receiver refused pairing: allow AirPlay access for everyone on the network",
-    )
+    ApiError::unprocessable(hap::ACCESS_REFUSED)
 }
 
 fn unreachable(e: RtspError) -> ApiError {
@@ -214,6 +226,38 @@ mod tests {
                     .into()
             )
         );
+    }
+
+    #[test]
+    fn a_busy_receiver_says_to_try_again() {
+        let acc = FakeAccessory::new("1234");
+        acc.busy_once();
+        let r = receiver(&acc, 1);
+        let (pairings, held) = (Pairings::new(), Mutex::new(None));
+        assert_eq!(
+            status(step(
+                &config(r.port),
+                &pairings,
+                &held,
+                None,
+                Instant::now()
+            )),
+            (422, "the receiver is busy: try again in a moment".into())
+        );
+    }
+
+    #[test]
+    fn a_held_start_is_dropped_after_two_minutes() {
+        let acc = FakeAccessory::new("1234");
+        let r = receiver(&acc, 1);
+        let (pairings, held, now) = (Pairings::new(), Mutex::new(None), Instant::now());
+        step(&config(r.port), &pairings, &held, None, now).unwrap();
+        assert!(!expire(&held, now + PIN_WAIT));
+        assert!(held.lock().unwrap().is_some());
+        assert!(expire(&held, now + PIN_WAIT + Duration::from_secs(1)));
+        assert!(held.lock().unwrap().is_none());
+        // The connection is closed with it: the receiver's side ends.
+        r.finish();
     }
 
     #[test]

@@ -27,6 +27,8 @@ struct State {
     /// Pair-verify under way: our X25519 key and the controller's.
     verify: Option<([u8; 32], [u8; 32])>,
     shared: Option<[u8; 32]>,
+    /// Answers the next M1 of pair-setup with "busy".
+    busy: bool,
 }
 
 pub struct FakeAccessory {
@@ -69,6 +71,11 @@ impl FakeAccessory {
         self.state.lock().unwrap().shared
     }
 
+    /// Answers the next start of pair-setup with "busy" (error 7).
+    pub fn busy_once(&self) {
+        self.state.lock().unwrap().busy = true;
+    }
+
     /// Forgets every paired controller, as a reset does.
     pub fn forget(&self) {
         self.state.lock().unwrap().paired.clear();
@@ -90,6 +97,9 @@ impl FakeAccessory {
         let items = tlv::decode(&seen.body).unwrap();
         let mut st = self.state.lock().unwrap();
         match tlv::find(&items, tlv::STATE) {
+            Some([1]) if std::mem::take(&mut st.busy) => {
+                body(&[(tlv::STATE, &[2]), (tlv::ERROR, &[7])])
+            }
             Some([1]) => {
                 let b = server.public::<Sha512>().to_bytes_be();
                 body(&[

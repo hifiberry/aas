@@ -90,7 +90,11 @@ pub fn setup_finish(
             (tlv::PUBLIC_KEY, client.public()),
             (tlv::PROOF, &proofs.client),
         ],
-    )?;
+    )
+    .map_err(|e| match e {
+        RtspError::Status { .. } => RtspError::WrongPin,
+        e => e,
+    })?;
     if tlv::find(&m4, tlv::ERROR).is_some()
         || tlv::find(&m4, tlv::PROOF) != Some(proofs.server.as_slice())
     {
@@ -164,7 +168,8 @@ pub fn verify(
         "/pair-verify",
         HKP,
         &[(tlv::STATE, &[1]), (tlv::PUBLIC_KEY, &ours)],
-    )?;
+    )
+    .map_err(refused_by_status)?;
     if tlv::find(&m2, tlv::ERROR).is_some() {
         return Err(RtspError::PairingRefused);
     }
@@ -199,11 +204,21 @@ pub fn verify(
         "/pair-verify",
         HKP,
         &[(tlv::STATE, &[3]), (tlv::ENCRYPTED_DATA, &sealed)],
-    )?;
+    )
+    .map_err(refused_by_status)?;
     if tlv::find(&m4, tlv::ERROR).is_some() {
         return Err(RtspError::PairingRefused);
     }
     Ok(shared)
+}
+
+/// A status other than 200 to pair-verify refuses the pairing, as an error
+/// item does.
+fn refused_by_status(e: RtspError) -> RtspError {
+    match e {
+        RtspError::Status { .. } => RtspError::PairingRefused,
+        e => e,
+    }
 }
 
 /// Whether `signature` over `message` is by the Ed25519 key `public`.
@@ -217,15 +232,23 @@ fn signed_by(public: &[u8; 32], message: &[u8], signature: &[u8]) -> bool {
     key.verify(message, &signature).is_ok()
 }
 
-/// The receiver's error item, if it sent one.
+/// What a refusal without a reason of its own says: the receiver's access
+/// setting keeps aas out.
+pub const ACCESS_REFUSED: &str =
+    "the receiver refused pairing: allow AirPlay access for everyone on the network";
+
+/// The receiver's error item, if it sent one, as what it means.
 fn refused(items: &[(u8, Vec<u8>)]) -> Result<(), RtspError> {
-    match tlv::find(items, tlv::ERROR) {
-        None => Ok(()),
-        Some(code) => Err(RtspError::Pairing(format!(
-            "the receiver refused pairing (error {})",
-            code.first().copied().unwrap_or(0)
-        ))),
-    }
+    let Some(code) = tlv::find(items, tlv::ERROR) else {
+        return Ok(());
+    };
+    let why = match code.first().copied().unwrap_or(0) {
+        3 | 7 => "the receiver is busy: try again in a moment",
+        5 => "the receiver refuses after too many tries: restart it, then pair again",
+        6 => "the receiver cannot pair now: try again in a moment",
+        _ => ACCESS_REFUSED,
+    };
+    Err(RtspError::Pairing(why.into()))
 }
 
 fn missing(what: &str) -> RtspError {
@@ -324,6 +347,39 @@ mod tests {
         let mut c = conn(&r);
         let e = verify(&mut c, &headers(), &me, &peer).unwrap_err();
         assert!(matches!(e, RtspError::PairingRefused), "{e}");
+    }
+
+    /// A receiver that answers `url` in state `state` with HTTP 470.
+    fn refusing(acc: &Arc<FakeAccessory>, url: &'static str, state: u8) -> FakeReceiver {
+        let acc = acc.clone();
+        FakeReceiver::start(move |seen| {
+            let items = tlv::decode(&seen.body).unwrap_or_default();
+            if seen.url == url && tlv::find(&items, tlv::STATE) == Some(&[state][..]) {
+                return Answer::Status(470, Vec::new());
+            }
+            acc.answer(seen).unwrap_or(Answer::Status(200, Vec::new()))
+        })
+    }
+
+    #[test]
+    fn a_verify_refused_by_status_is_a_refused_pairing() {
+        let acc = FakeAccessory::new("1234");
+        let (me, peer) = paired(&acc);
+        let r = refusing(&acc, "/pair-verify", 1);
+        let mut c = conn(&r);
+        let e = verify(&mut c, &headers(), &me, &peer).unwrap_err();
+        assert!(matches!(e, RtspError::PairingRefused), "{e}");
+    }
+
+    #[test]
+    fn a_pin_refused_by_status_is_a_wrong_pin() {
+        let acc = FakeAccessory::new("1234");
+        let r = refusing(&acc, "/pair-setup", 3);
+        let mut c = conn(&r);
+        let me = Pairings::new().identity();
+        let started = setup_start(&mut c, &headers()).unwrap();
+        let e = setup_finish(&mut c, &headers(), started, "1234", &me).unwrap_err();
+        assert!(matches!(e, RtspError::WrongPin), "{e}");
     }
 
     #[test]

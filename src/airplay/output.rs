@@ -403,6 +403,8 @@ impl Output {
                 self.connect();
             }
             self.pump(Instant::now());
+            // A pairing start nobody finished lets the receiver go.
+            pairing::expire(&self.held, Instant::now());
             match rx.recv_timeout(self.wait(Instant::now())) {
                 Ok(Msg::Tap(tap)) => self.new_tap(tap),
                 Ok(Msg::Pair { pin, answer }) => self.pair(pin, answer),
