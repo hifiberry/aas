@@ -433,7 +433,11 @@ pub mod tests {
         }
         let shared = events.clone();
         let script = move |seen: &Seen| {
-            let hap = accessory.as_ref().and_then(|a| a.answer(seen));
+            // HomeKit pairing says HKP 3; transient pairing, 4.
+            let hap = accessory
+                .as_ref()
+                .filter(|_| seen.header("X-Apple-HKP") == Some("3"))
+                .and_then(|a| a.answer(seen));
             if let Some(answer) = hap.or_else(|| pairing(seen, PIN)) {
                 if let Answer::SealAfter(_, secret) = &answer {
                     *key.lock().unwrap() = Some(secret.clone());

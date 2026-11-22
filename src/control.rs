@@ -1165,6 +1165,8 @@ impl Control {
     /// clients' have none and always apply. Values of cards no longer in
     /// the config are kept, unused.
     pub fn restore(&mut self, mut volume: OutputVolume, state: PathBuf, cards: &[String]) {
+        self.pairings
+            .load(state.with_file_name("airplay-pairing.toml"));
         let stored = State::load(&state);
         volume.adopt(stored.output_percent);
         let followed = volume.percent() != stored.output_percent;

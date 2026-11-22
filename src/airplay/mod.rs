@@ -6,6 +6,7 @@ pub mod config;
 pub mod gate;
 pub mod meta;
 pub mod output;
+pub mod pairing;
 pub mod raop;
 pub mod rtp;
 pub mod rtsp;
@@ -50,6 +51,27 @@ impl Receiver {
     /// Whether it reads `now_playing`.
     pub fn shares(&self, now_playing: &std::sync::Arc<crate::metadata::NowPlaying>) -> bool {
         std::sync::Arc::ptr_eq(&self.now_playing, now_playing)
+    }
+
+    pub fn name(&self) -> &str {
+        &self.config.name
+    }
+
+    pub fn protocol(&self) -> Protocol {
+        self.config.protocol
+    }
+
+    /// Runs a pairing step on the receiver's thread, which is started if
+    /// it is not yet; `answer` gets the result.
+    pub fn pair(
+        &mut self,
+        pin: Option<String>,
+        answer: tokio::sync::oneshot::Sender<crate::api::Answer>,
+    ) {
+        self.spawn();
+        if let Some(handle) = &self.handle {
+            handle.pair(pin, answer);
+        }
     }
 
     /// Starts the thread, once.
@@ -135,6 +157,10 @@ impl Receiver {
                 Connect::Always => "always",
             },
             state: status.state.name(),
+            paired: match c.protocol {
+                Protocol::AirPlay1 => None,
+                Protocol::AirPlay2 => Some(self.pairings.peer(&c.name).is_some()),
+            },
             error: status.error,
         }
     }

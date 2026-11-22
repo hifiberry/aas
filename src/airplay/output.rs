@@ -12,6 +12,7 @@ use super::ap2::session::Ap2;
 use super::config::{AirplayConfig, Connect, Protocol};
 use super::gate::{Gate, GateEvent};
 use super::meta;
+use super::pairing;
 use super::raop::{self, Raop, Setup};
 use super::rtp;
 use super::rtsp::{Conn, RtspError};
@@ -79,6 +80,10 @@ pub struct Status {
 
 enum Msg {
     Tap(TapReader),
+    Pair {
+        pin: Option<String>,
+        answer: tokio::sync::oneshot::Sender<crate::api::Answer>,
+    },
     Stop,
 }
 
@@ -106,6 +111,15 @@ impl AirplayHandle {
     /// way finishes first, within `HANDSHAKE_TIMEOUT` per step.
     pub fn stop(mut self) {
         self.end();
+    }
+
+    /// Runs a pairing step for this receiver; `answer` gets its result.
+    pub fn pair(
+        &self,
+        pin: Option<String>,
+        answer: tokio::sync::oneshot::Sender<crate::api::Answer>,
+    ) {
+        let _ = self.tx.send(Msg::Pair { pin, answer });
     }
 
     /// Asks the thread to stop, without waiting: several receivers then
@@ -275,6 +289,8 @@ struct Output {
     sent: Vec<Outgoing>,
     now_playing: Arc<NowPlaying>,
     pairings: Arc<Pairings>,
+    /// A pairing started and waiting for its PIN.
+    held: Arc<Mutex<Option<pairing::Held>>>,
 }
 
 /// A line from the monotonic clock to NTP time, taken from the wall clock
@@ -315,6 +331,7 @@ impl Output {
         Output {
             now_playing,
             pairings,
+            held: Arc::default(),
             config,
             status,
             base: Instant::now(),
@@ -328,6 +345,33 @@ impl Output {
             frames: vec![[0; 2]; CHUNK],
             interleaved: Vec::with_capacity(CHUNK * 2),
             sent: Vec::new(),
+        }
+    }
+
+    /// Runs a pairing step in a helper thread, so that the packets of a
+    /// playing session go on meanwhile.
+    fn pair(
+        &mut self,
+        pin: Option<String>,
+        answer: tokio::sync::oneshot::Sender<crate::api::Answer>,
+    ) {
+        let (config, pairings, held) = (
+            self.config.clone(),
+            self.pairings.clone(),
+            self.held.clone(),
+        );
+        let spawned = std::thread::Builder::new()
+            .name("aas-pairing".into())
+            .spawn(move || {
+                let result =
+                    pairing::step(&config, &pairings, &held, pin.as_deref(), Instant::now());
+                let _ = answer.send(result);
+            });
+        if let Err(e) = spawned {
+            eprintln!(
+                "aas: airplay \"{}\": no pairing thread: {e}",
+                self.config.name
+            );
         }
     }
 
@@ -361,6 +405,7 @@ impl Output {
             self.pump(Instant::now());
             match rx.recv_timeout(self.wait(Instant::now())) {
                 Ok(Msg::Tap(tap)) => self.new_tap(tap),
+                Ok(Msg::Pair { pin, answer }) => self.pair(pin, answer),
                 Ok(Msg::Stop) | Err(RecvTimeoutError::Disconnected) => {
                     self.disconnect();
                     return;
@@ -783,6 +828,94 @@ mod tests {
 
     fn spawn_quiet(c: AirplayConfig) -> AirplayHandle {
         spawn(c, NowPlaying::new(), Pairings::new())
+    }
+
+    /// Asks `handle` for a pairing step and waits for the answer.
+    fn pair(handle: &AirplayHandle, pin: Option<&str>) -> crate::api::Answer {
+        let (answer, answered) = tokio::sync::oneshot::channel();
+        handle.pair(pin.map(String::from), answer);
+        answered.blocking_recv().unwrap()
+    }
+
+    fn ap2_config(port: u16, connect: Connect) -> AirplayConfig {
+        let mut c = config(port, connect);
+        c.protocol = Protocol::AirPlay2;
+        c
+    }
+
+    #[test]
+    fn pairing_through_the_handle_then_a_session_plays() {
+        use crate::airplay::ap2::fake_hap::FakeAccessory;
+        use crate::airplay::ap2::session::tests::{EventPort, ap2_receiver_paired};
+        let acc = FakeAccessory::new("1234");
+        let a = acc.clone();
+        let pairing = FakeReceiver::serving(1, move |port| {
+            ap2_receiver_paired(port, 0x644, EventPort::None, Some(a)).0
+        });
+        let pairings = Pairings::new();
+        let quiet = spawn(
+            ap2_config(pairing.port, Connect::Signal),
+            NowPlaying::new(),
+            pairings.clone(),
+        );
+        assert_eq!(
+            pair(&quiet, None).unwrap(),
+            serde_json::json!({"pin": "shown"})
+        );
+        assert_eq!(
+            pair(&quiet, Some("1234")).unwrap(),
+            serde_json::json!({"paired": true})
+        );
+        quiet.stop();
+        let a = acc.clone();
+        let session = FakeReceiver::serving(1, move |port| {
+            ap2_receiver_paired(port, 0x644, EventPort::None, Some(a)).0
+        });
+        let mut c = ap2_config(session.port, Connect::Always);
+        c.name = "test".into();
+        let handle = spawn(c, NowPlaying::new(), pairings);
+        let (_ring, reader) = tap();
+        handle.tap(reader);
+        assert!(until(&handle, 3.0, playing), "{:?}", handle.status());
+        handle.stop();
+    }
+
+    #[test]
+    fn pairing_beside_a_playing_session_keeps_it_playing() {
+        use crate::airplay::ap2::fake_hap::FakeAccessory;
+        use crate::airplay::ap2::session::tests::{EventPort, ap2_receiver_paired};
+        let acc = FakeAccessory::new("1234");
+        let receiver = FakeReceiver::together(2, move |port| {
+            ap2_receiver_paired(port, 0x4, EventPort::None, Some(acc)).0
+        });
+        let handle = spawn(
+            ap2_config(receiver.port, Connect::Always),
+            NowPlaying::new(),
+            Pairings::new(),
+        );
+        let (_ring, reader) = tap();
+        handle.tap(reader);
+        assert!(until(&handle, 3.0, playing), "{:?}", handle.status());
+        let mut packet = [0u8; 2048];
+        receiver
+            .data
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        let drained = Instant::now();
+        while drained.elapsed() < Duration::from_millis(100) {
+            let _ = receiver.data.recv(&mut packet);
+        }
+        assert!(pair(&handle, None).is_ok());
+        assert_eq!(handle.status().state, AirplayState::Playing);
+        let started = Instant::now();
+        let mut count = 0;
+        while started.elapsed() < Duration::from_millis(200) {
+            if receiver.data.recv(&mut packet).is_ok() {
+                count += 1;
+            }
+        }
+        assert!(count > 10, "{count} packets in 200 ms while pairing");
+        handle.stop();
     }
 
     #[test]

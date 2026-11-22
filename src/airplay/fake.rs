@@ -108,6 +108,43 @@ impl FakeReceiver {
         }
     }
 
+    /// As `serving`, with each connection served at the same time as the
+    /// others, in a thread of its own.
+    pub fn together<S: Fn(&Seen) -> Answer + Send + Sync + 'static>(
+        connections: usize,
+        make: impl FnOnce(u16) -> S,
+    ) -> FakeReceiver {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let data = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let script = Arc::new(make(data.local_addr().unwrap().port()));
+        data.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let (log, count) = (seen.clone(), accepted.clone());
+        let thread = std::thread::spawn(move || {
+            let mut served = Vec::new();
+            for _ in 0..connections {
+                let Ok((stream, _)) = listener.accept() else {
+                    break;
+                };
+                count.fetch_add(1, Ordering::SeqCst);
+                let (script, log) = (script.clone(), log.clone());
+                served.push(std::thread::spawn(move || serve(stream, &*script, &log)));
+            }
+            for t in served {
+                let _ = t.join();
+            }
+        });
+        FakeReceiver {
+            port,
+            data,
+            accepted,
+            seen,
+            thread: Some(thread),
+        }
+    }
+
     /// The requests so far.
     pub fn seen(&self) -> Vec<Seen> {
         self.seen.lock().unwrap().clone()
