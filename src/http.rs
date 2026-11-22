@@ -19,7 +19,7 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
 use axum::http::{StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, patch, post};
 use serde::de::DeserializeOwned;
 use std::future::{Future, poll_fn};
 use std::io;
@@ -128,6 +128,8 @@ fn router(shared: Arc<Shared>) -> Router {
         .route("/state", get(|s| ask(s, Call::State)))
         .route("/airplay", get(|s| ask(s, Call::Airplay)))
         .route("/metadata", get(|s| ask(s, Call::Metadata)))
+        .route("/airplay/{name}", patch(patch_airplay))
+        .route("/airplay/{name}/pair", post(pair_airplay))
         .route("/outputs", get(|s| ask(s, Call::Outputs)))
         .route("/outputs/{id}", get(get_output).patch(patch_output))
         .route("/inputs", get(|s| ask(s, Call::Inputs)))
@@ -185,9 +187,15 @@ async fn ask(s: State<Arc<Shared>>, call: Call) -> Response {
 
 /// Sends `call` to the control thread and gives its answer, or why there
 /// is none.
-async fn fetch(
+async fn fetch(s: State<Arc<Shared>>, call: Call) -> Result<serde_json::Value, ApiError> {
+    fetch_within(s, call, ANSWER_WITHIN).await
+}
+
+/// As `fetch`, waiting up to `within` for the answer.
+async fn fetch_within(
     State(shared): State<Arc<Shared>>,
     call: Call,
+    within: Duration,
 ) -> Result<serde_json::Value, ApiError> {
     let stopped = || ApiError::unavailable("the control thread has stopped");
     let (answer, answered) = oneshot::channel();
@@ -204,9 +212,9 @@ async fn fetch(
             size_of::<u64>(),
         )
     };
-    match tokio::time::timeout(ANSWER_WITHIN, answered).await {
+    match tokio::time::timeout(within, answered).await {
         Err(_) => {
-            let s = ANSWER_WITHIN.as_secs();
+            let s = within.as_secs();
             Err(ApiError::unavailable(format!(
                 "no answer from the control thread in {s} s"
             )))
@@ -302,6 +310,40 @@ async fn patch_output(s: State<Arc<Shared>>, id: PathOf<String>, body: BodyOf) -
         let id = output_id(&id)?;
         Ok(Call::PatchOutput(id, parse(&body)?))
     });
+    ask_for(s, call).await
+}
+
+/// How long a pairing step may take: a connect and a few answers, each
+/// within 5 s.
+const PAIR_WITHIN: Duration = Duration::from_secs(40);
+
+/// The body of `POST /airplay/{name}/pair`.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PairBody {
+    pin: Option<String>,
+}
+
+async fn pair_airplay(s: State<Arc<Shared>>, name: PathOf<String>, body: BodyOf) -> Response {
+    let call = path(name).and_then(|name| {
+        let pin = match &body {
+            Ok(b) if b.is_empty() => None,
+            _ => parse::<PairBody>(&body)?.pin,
+        };
+        Ok(Call::PairAirplay { name, pin })
+    });
+    let answer = match call {
+        Ok(call) => fetch_within(s, call, PAIR_WITHIN).await,
+        Err(e) => Err(e),
+    };
+    match answer {
+        Ok(body) => axum::Json(body).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn patch_airplay(s: State<Arc<Shared>>, name: PathOf<String>, body: BodyOf) -> Response {
+    let call = path(name).and_then(|name| Ok(Call::PatchAirplay(name, parse(&body)?)));
     ask_for(s, call).await
 }
 

@@ -6,13 +6,14 @@ pub mod config;
 pub mod gate;
 pub mod meta;
 pub mod output;
+pub mod pairing;
 pub mod raop;
 pub mod rtp;
 pub mod rtsp;
 pub mod stream;
 
 #[cfg(test)]
-mod fake;
+pub mod fake;
 
 use crate::api::{AirplayView, ApiEvent};
 use crate::rate::ClientId;
@@ -24,7 +25,13 @@ use output::{AirplayHandle, AirplayState, Status, TapReader};
 /// and the id and rate of the monitor tap it reads.
 pub struct Receiver {
     config: AirplayConfig,
+    /// What the config file says of `enabled`, whatever the API set since.
+    config_enabled: bool,
     now_playing: std::sync::Arc<crate::metadata::NowPlaying>,
+    pairings: std::sync::Arc<ap2::keys::Pairings>,
+    /// A pairing started and waiting for its PIN, kept here so that a
+    /// receiver that is off can be paired too.
+    held: std::sync::Arc<std::sync::Mutex<Option<pairing::Held>>>,
     handle: Option<AirplayHandle>,
     tap: Option<(ClientId, u32)>,
     told: Option<Status>,
@@ -34,10 +41,14 @@ impl Receiver {
     pub fn new(
         config: AirplayConfig,
         now_playing: std::sync::Arc<crate::metadata::NowPlaying>,
+        pairings: std::sync::Arc<ap2::keys::Pairings>,
     ) -> Receiver {
         Receiver {
+            config_enabled: config.enabled,
             config,
             now_playing,
+            pairings,
+            held: Default::default(),
             handle: None,
             tap: None,
             told: None,
@@ -49,10 +60,94 @@ impl Receiver {
         std::sync::Arc::ptr_eq(&self.now_playing, now_playing)
     }
 
-    /// Starts the thread, once.
+    /// Whether its thread runs.
+    pub fn running(&self) -> bool {
+        self.handle.is_some()
+    }
+
+    /// Whether it is played to.
+    pub fn enabled(&self) -> bool {
+        self.config.enabled
+    }
+
+    pub fn name(&self) -> &str {
+        &self.config.name
+    }
+
+    pub fn protocol(&self) -> Protocol {
+        self.config.protocol
+    }
+
+    /// Runs a pairing step in a helper thread, on or off, so that neither
+    /// the control thread nor a session waits for it; `answer` gets the
+    /// result. A start nobody finishes is dropped after `PIN_WAIT`.
+    pub fn pair(
+        &mut self,
+        pin: Option<String>,
+        answer: tokio::sync::oneshot::Sender<crate::api::Answer>,
+    ) {
+        let (config, pairings, held) = (
+            self.config.clone(),
+            self.pairings.clone(),
+            self.held.clone(),
+        );
+        let spawned = std::thread::Builder::new()
+            .name("aas-pairing".into())
+            .spawn(move || {
+                let starting = pin.is_none();
+                let now = std::time::Instant::now();
+                let result = pairing::step(&config, &pairings, &held, pin.as_deref(), now);
+                let started = starting && result.is_ok();
+                let _ = answer.send(result);
+                if started {
+                    std::thread::sleep(pairing::PIN_WAIT + std::time::Duration::from_secs(1));
+                    pairing::expire(&held, std::time::Instant::now());
+                }
+            });
+        if let Err(e) = spawned {
+            eprintln!(
+                "aas: airplay \"{}\": no pairing thread: {e}",
+                self.config.name
+            );
+        }
+    }
+
+    /// What the config file says of `enabled`.
+    pub fn config_enabled(&self) -> bool {
+        self.config_enabled
+    }
+
+    /// Turns it on or off. Off ends a session with TEARDOWN, in a thread of
+    /// its own so that nobody waits for it, and gives the tap the engine is
+    /// to drop; on starts the thread.
+    pub fn set_enabled(&mut self, on: bool) -> Option<ClientId> {
+        self.config.enabled = on;
+        self.told = None;
+        if on {
+            self.spawn();
+            return None;
+        }
+        if let Some(handle) = self.handle.take() {
+            handle.ask_stop();
+            // Dropping the handle joins the thread.
+            std::thread::spawn(move || drop(handle));
+        }
+        self.take_tap()
+    }
+
+    /// Takes the state file's `enabled` before the thread starts.
+    pub fn restore_enabled(&mut self, on: bool) {
+        self.config.enabled = on;
+    }
+
+    /// Starts the thread, once, if it is on.
     pub fn spawn(&mut self) {
-        if self.handle.is_none() {
-            self.handle = Some(output::spawn(self.config.clone(), self.now_playing.clone()));
+        if self.config.enabled && self.handle.is_none() {
+            self.handle = Some(output::spawn(
+                self.config.clone(),
+                self.now_playing.clone(),
+                self.pairings.clone(),
+            ));
         }
     }
 
@@ -128,6 +223,11 @@ impl Receiver {
                 Connect::Always => "always",
             },
             state: status.state.name(),
+            enabled: c.enabled,
+            paired: match c.protocol {
+                Protocol::AirPlay1 => None,
+                Protocol::AirPlay2 => Some(self.pairings.peer(&c.name).is_some()),
+            },
             error: status.error,
         }
     }

@@ -40,6 +40,14 @@ pub enum Call {
     Airplay,
     /// `GET /metadata`: the current track.
     Metadata,
+    /// `POST /airplay/{name}/pair`: the start of pairing, or with the PIN
+    /// its finish.
+    PairAirplay {
+        name: String,
+        pin: Option<String>,
+    },
+    /// `PATCH /airplay/{name}`.
+    PatchAirplay(String, AirplayPatch),
     PatchSettings(SettingsPatch),
 }
 
@@ -405,6 +413,11 @@ pub struct AirplayView {
     pub connect: &'static str,
     /// `"idle"`, `"connecting"`, `"playing"` or `"retrying"`.
     pub state: &'static str,
+    /// Whether it is played to.
+    pub enabled: bool,
+    /// Whether an AirPlay 2 receiver is paired; absent for AirPlay 1.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paired: Option<bool>,
     /// The last failure, until a session plays again.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -545,6 +558,13 @@ pub struct PluginMetrics {
 }
 
 /// The answer to a call whose view serialises, which every view does.
+/// The body of `PATCH /airplay/{name}`.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AirplayPatch {
+    pub enabled: Option<bool>,
+}
+
 /// `GET /metadata`: the current track, the cover as its type and size.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct MetadataView {

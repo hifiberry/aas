@@ -119,6 +119,16 @@ pub struct State {
     pub clients: BTreeMap<String, StoredInput>,
     /// Keyed by card.
     pub outputs: BTreeMap<String, StoredOutput>,
+    /// AirPlay receivers, keyed by name.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub airplay: BTreeMap<String, StoredReceiver>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct StoredReceiver {
+    /// Whether it is played to, as the API set it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<Stored<bool>>,
 }
 
 impl Default for State {
@@ -130,6 +140,7 @@ impl Default for State {
             analog: None,
             clients: BTreeMap::new(),
             outputs: BTreeMap::new(),
+            airplay: BTreeMap::new(),
         }
     }
 }
@@ -374,6 +385,24 @@ fn write(state: &State, path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_receivers_enabled_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        let mut state = State::default();
+        state.airplay.insert(
+            "Apple TV".into(),
+            StoredReceiver {
+                enabled: Some(Stored {
+                    value: true,
+                    config: false,
+                }),
+            },
+        );
+        state.save(&path).unwrap();
+        assert_eq!(State::load(&path).airplay, state.airplay);
+    }
 
     #[test]
     fn a_missing_or_corrupt_state_file_starts_at_0_db() {

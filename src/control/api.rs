@@ -303,7 +303,7 @@ impl Control {
     }
 
     /// Handles one call of the API and gives its answer.
-    pub fn call(&mut self, call: Call, now: Instant) -> api::Answer {
+    pub fn call(&mut self, call: Call, now: Instant) -> crate::api::Answer {
         let answer = match call {
             Call::State => api::answer(&self.state_view()),
             Call::Outputs => {
@@ -341,6 +341,8 @@ impl Control {
             Call::Settings => api::answer(&self.settings_view()),
             Call::Airplay => api::answer(&self.airplay_views()),
             Call::Metadata => api::answer(&self.metadata_view(now)),
+            Call::PairAirplay { .. } => Err(ApiError::internal("not yet")),
+            Call::PatchAirplay(name, patch) => self.patch_airplay(&name, patch, now),
             Call::PatchSettings(patch) => self.patch_settings(patch, now),
         };
         self.publish_changes();
@@ -356,8 +358,41 @@ impl Control {
         if call.answer.is_closed() {
             return;
         }
+        // Pairing is answered by the receiver's thread, when it is done.
+        if let Call::PairAirplay { name, pin } = call.call {
+            return self.pair_airplay(name, pin, call.answer);
+        }
         // A caller that has given up meanwhile has dropped its one-shot.
         let _ = call.answer.send(self.call(call.call, now));
+    }
+
+    /// Hands a pairing step to the receiver named `name`, or answers why
+    /// not.
+    fn pair_airplay(
+        &mut self,
+        name: String,
+        pin: Option<String>,
+        answer: tokio::sync::oneshot::Sender<api::Answer>,
+    ) {
+        let Some(receiver) = self.airplay.iter_mut().find(|r| r.name() == name) else {
+            let _ = answer.send(Err(ApiError::not_found(format!(
+                "no AirPlay receiver \"{name}\""
+            ))));
+            return;
+        };
+        if receiver.protocol() == crate::airplay::config::Protocol::AirPlay1 {
+            let _ = answer.send(Err(ApiError::unprocessable(format!(
+                "\"{name}\" is an AirPlay 1 receiver, which needs no pairing"
+            ))));
+            return;
+        }
+        if let Some(pin) = &pin
+            && (pin.len() != 4 || !pin.bytes().all(|b| b.is_ascii_digit()))
+        {
+            let _ = answer.send(Err(ApiError::bad_request("pin is 4 digits")));
+            return;
+        }
+        receiver.pair(pin, answer);
     }
 
     /// When the earliest matrix that waits for its turn is due, so that
@@ -387,6 +422,34 @@ impl Control {
                 bytes: c.bytes.len(),
             }),
         }
+    }
+
+    /// `PATCH /airplay/{name}`: turns a receiver on or off, and keeps it.
+    fn patch_airplay(&mut self, name: &str, patch: api::AirplayPatch, now: Instant) -> api::Answer {
+        let Some(i) = self.airplay.iter().position(|r| r.name() == name) else {
+            return Err(ApiError::not_found(format!("no AirPlay receiver \"{name}\"")));
+        };
+        if let Some(on) = patch.enabled
+            && on != self.airplay[i].enabled()
+        {
+            let mut batch = Vec::new();
+            if let Some(tap) = self.airplay[i].set_enabled(on) {
+                batch.push(Command::RemoveTap(tap));
+                self.taps_len -= 1;
+            }
+            if on && let Some((rate, _)) = self.output {
+                self.airplay_taps(rate, &mut batch);
+            }
+            if !batch.is_empty() {
+                self.send(batch);
+            }
+            let config = self.airplay[i].config_enabled();
+            self.state.airplay.entry(name.to_string()).or_default().enabled =
+                Some(Stored { value: on, config });
+            self.save_later(now);
+            self.publish_airplay();
+        }
+        api::answer(&self.airplay[i].view())
     }
 
     pub(super) fn airplay_views(&self) -> Vec<api::AirplayView> {
@@ -1588,9 +1651,155 @@ mod tests {
                 idle_s: 120,
                 latency_ms: 1500,
                 volume_db: Some(-25.0),
+                enabled: true,
             }],
             ..Config::default()
         }
+    }
+
+    /// The answer of a pairing call that is answered at once.
+    fn pair_now(control: &mut Control, name: &str, pin: Option<&str>, now: Instant) -> ApiError {
+        let (answer, mut answered) = tokio::sync::oneshot::channel();
+        let call = Call::PairAirplay {
+            name: name.into(),
+            pin: pin.map(String::from),
+        };
+        control.answer(ApiCall { call, answer }, now);
+        answered.try_recv().unwrap().unwrap_err()
+    }
+
+    fn with_an_airplay2_receiver() -> Config {
+        let mut c = with_a_receiver();
+        c.airplay[0].protocol = crate::airplay::config::Protocol::AirPlay2;
+        c
+    }
+
+    fn off(mut c: Config) -> Config {
+        c.airplay[0].enabled = false;
+        c
+    }
+
+    fn patch_enabled(control: &mut Control, name: &str, on: bool, now: Instant) -> crate::api::Answer {
+        let patch = crate::api::AirplayPatch { enabled: Some(on) };
+        control.call(Call::PatchAirplay(name.into(), patch), now)
+    }
+
+    #[test]
+    fn a_receiver_that_is_off_has_no_thread_and_says_so() {
+        let (mut control, _engine, _logs, now) = started_with(&off(with_a_receiver()), Vec::new());
+        assert!(!control.airplay[0].running());
+        let view = control.call(Call::Airplay, now).unwrap();
+        assert_eq!(view[0]["enabled"], json!(false));
+    }
+
+    #[test]
+    fn patch_airplay_turns_a_receiver_off_and_on() {
+        let (mut control, _engine, _logs, now) = started_with(&with_a_receiver(), Vec::new());
+        assert!(control.airplay[0].running());
+        let view = patch_enabled(&mut control, "Study", false, now).unwrap();
+        assert_eq!(view["enabled"], json!(false));
+        assert!(!control.airplay[0].running());
+        let view = patch_enabled(&mut control, "Study", true, now).unwrap();
+        assert_eq!(view["enabled"], json!(true));
+        assert!(control.airplay[0].running());
+    }
+
+    #[test]
+    fn patch_airplay_is_kept_in_the_state() {
+        let (mut control, _engine, _logs, now) = started_with(&with_a_receiver(), Vec::new());
+        patch_enabled(&mut control, "Study", false, now).unwrap();
+        assert_eq!(
+            control.state.airplay["Study"].enabled,
+            Some(Stored {
+                value: false,
+                config: true
+            })
+        );
+    }
+
+    #[test]
+    fn the_state_does_not_outlast_a_changed_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        let mut state = State::default();
+        state.airplay.entry("Study".into()).or_default().enabled = Some(Stored {
+            value: false,
+            config: true,
+        });
+        state.save(&path).unwrap();
+        let restore = |config: Config| {
+            let (mut control, _engine, _logs) = unstarted_with(&config, Vec::new());
+            let volume = OutputVolume::new(None, config::BitPerfect::Auto);
+            control.restore(volume, path.clone(), &[]);
+            control.airplay[0].enabled()
+        };
+        // The config still says on: the stored off applies.
+        assert!(!restore(with_a_receiver()));
+        // The config says off now: it wins, and so would on.
+        assert!(!restore(off(with_a_receiver())));
+    }
+
+    #[test]
+    fn a_receiver_that_is_off_can_be_paired() {
+        use crate::airplay::ap2::fake_hap::FakeAccessory;
+        use crate::airplay::fake::{Answer as Reply, FakeReceiver};
+        let acc = FakeAccessory::new("1234");
+        let receiver = FakeReceiver::serving(1, move |_| {
+            move |seen: &crate::airplay::fake::Seen| {
+                acc.answer(seen).unwrap_or(Reply::Status(200, Vec::new()))
+            }
+        });
+        let mut config = off(with_an_airplay2_receiver());
+        config.airplay[0].port = receiver.port;
+        let (mut control, _engine, _logs, now) = started_with(&config, Vec::new());
+        let (answer, answered) = tokio::sync::oneshot::channel();
+        let call = Call::PairAirplay {
+            name: "Study".into(),
+            pin: None,
+        };
+        control.answer(ApiCall { call, answer }, now);
+        assert_eq!(answered.blocking_recv().unwrap().unwrap(), json!({"pin": "shown"}));
+        assert!(!control.airplay[0].running());
+    }
+
+    #[test]
+    fn patch_airplay_for_an_unknown_receiver_is_404() {
+        let (mut control, _engine, _logs, now) = started_with(&with_a_receiver(), Vec::new());
+        let e = patch_enabled(&mut control, "Kitchen", false, now).unwrap_err();
+        assert_eq!(e.status, 404);
+    }
+
+    #[test]
+    fn pairing_an_unknown_receiver_is_404() {
+        let (mut control, _engine, _logs, now) = started_with(&with_an_airplay2_receiver(), Vec::new());
+        assert_eq!(pair_now(&mut control, "Kitchen", None, now).status, 404);
+    }
+
+    #[test]
+    fn pairing_an_airplay1_receiver_is_422() {
+        let (mut control, _engine, _logs, now) = started_with(&with_a_receiver(), Vec::new());
+        let e = pair_now(&mut control, "Study", None, now);
+        assert_eq!(e.status, 422);
+        assert_eq!(e.message, "\"Study\" is an AirPlay 1 receiver, which needs no pairing");
+    }
+
+    #[test]
+    fn a_pin_that_is_not_four_digits_is_400() {
+        let (mut control, _engine, _logs, now) = started_with(&with_an_airplay2_receiver(), Vec::new());
+        for pin in ["123", "12345", "12a4", ""] {
+            let e = pair_now(&mut control, "Study", Some(pin), now);
+            assert_eq!((e.status, e.message.as_str()), (400, "pin is 4 digits"), "{pin}");
+        }
+    }
+
+    #[test]
+    fn get_airplay_says_whether_an_airplay2_receiver_is_paired() {
+        let (mut control, _engine, _logs, now) = started_with(&with_an_airplay2_receiver(), Vec::new());
+        let view = control.call(Call::Airplay, now).unwrap();
+        assert_eq!(view[0]["paired"], json!(false));
+        let (mut control, _engine, _logs, now) = started_with(&with_a_receiver(), Vec::new());
+        let view = control.call(Call::Airplay, now).unwrap();
+        assert!(view[0].get("paired").is_none());
     }
 
     #[test]
@@ -1635,7 +1844,8 @@ mod tests {
                 "port": 9,
                 "protocol": "airplay1",
                 "connect": "signal",
-                "state": "idle"
+                "state": "idle",
+                "enabled": true
             }])
         );
         let (mut control, _engine, _logs, now) = started_with(&Config::default(), Vec::new());

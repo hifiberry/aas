@@ -29,6 +29,12 @@ pub enum RtspError {
     /// AirPlay 2 pairing failed: the receiver refused it, or its proof
     /// was wrong.
     Pairing(String),
+    /// The receiver wants pairing and none is stored.
+    NeedsPairing,
+    /// The receiver refused the stored pairing.
+    PairingRefused,
+    /// The receiver did not take the PIN.
+    WrongPin,
 }
 
 impl fmt::Display for RtspError {
@@ -38,6 +44,9 @@ impl fmt::Display for RtspError {
             RtspError::Status { method, status } => write!(f, "{method} answered {status}"),
             RtspError::Malformed(why) => write!(f, "a malformed answer: {why}"),
             RtspError::Pairing(why) => write!(f, "pairing failed: {why}"),
+            RtspError::NeedsPairing => write!(f, "the receiver needs pairing"),
+            RtspError::PairingRefused => write!(f, "the receiver refused the pairing"),
+            RtspError::WrongPin => write!(f, "the receiver did not take the PIN"),
         }
     }
 }

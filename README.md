@@ -313,6 +313,7 @@ volume_db = -20           # the receiver's volume, sent once a session
 | `idle_s` | 1 to 86400 | 120 | Seconds without a signal after which the session ends with TEARDOWN, which frees the receiver's input. Time in which the master sends nothing at all, closed when idle, counts as silence too. |
 | `latency_ms` | 50 to 5000 | 1500 | How far ahead of the receiver's clock the audio is sent. Below 250 ms it is also offered to the receiver as its minimum; a receiver that asks for more gets more. A short latency leaves less time to resend a lost packet. |
 | `volume_db` | -30 to 0, or `"off"` | 0 | The receiver's own volume, sent once after each connect; `"off"` sends none. |
+| `enabled` | `true`, `false` | `true` | Whether it is played to. `PATCH /airplay/{name}` turns it on or off at run time; that is kept in the state file while `enabled` in the config stays as it was. A receiver that is off can still be paired. |
 
 What is sent is what the master card gets, as `aas.monitor` records it: after
 the mix, the plugins, the master gain and the volume limit. A master that plays
@@ -336,6 +337,27 @@ that were short of frames. The first second or so of a
 signal is not heard: the session is still being set up. `GET /airplay` gives
 each receiver's `state`, `idle`, `connecting`, `playing` or `retrying`, and the
 last failure as `error` until a session plays again.
+
+### Pairing an AirPlay 2 receiver
+
+A receiver that asks for one-time pairing, an Apple TV for example, is paired
+once with the PIN it shows:
+
+```sh
+aasctl airplay pair "Apple TV"         # the receiver shows a PIN
+aasctl airplay pair "Apple TV" 1234    # within 2 minutes
+```
+
+`aas` keeps its own key and the receiver's in `airplay-pairing.toml` beside
+the state file, readable only by `aas`, and verifies them at every session
+from then on instead of pairing for the session. Until it is paired, such a
+receiver fails with "the receiver needs pairing: aasctl airplay pair NAME";
+a receiver that has forgotten the pairing, after a reset, fails with "the
+receiver refused the pairing", and is paired again the same way. The Apple
+TV's AirPlay access must allow devices on the network ("Anyone on the same
+network" or "Everyone"), with no password; a receiver that wants a PIN for
+every connection is not supported. `GET /airplay` gives `paired` for each
+AirPlay 2 receiver.
 
 ### Song metadata
 
@@ -428,6 +450,8 @@ without that prefix.
 | `GET /state` | The rate, the processing format, every output with its card and whether it is `open`, `parked` or `off`, every connected client with its name, rate and whether it runs, and whether the master is bit-perfect, with the reason if not |
 | `GET /outputs`, `GET /outputs/{id}` | Every output, or one |
 | `GET /airplay` | Every AirPlay receiver, with its state and last failure |
+| `PATCH /airplay/{name}` | `{"enabled": true\|false}`: turns a receiver on, or off with TEARDOWN; the answer is the receiver as `GET /airplay` gives it |
+| `POST /airplay/{name}/pair` | `{}` makes the receiver show its PIN, `{"pin": "1234"}` pairs; answered when the receiver has, within 40 s |
 | `GET /metadata` | The current track from the metadata source: `title`, `artist`, `album`, `duration_s`, `position_s`, `playing`, and `cover` as its `mime` and size in `bytes`, or `null` |
 | `PATCH /outputs/{id}` | Change an output's volume and idle rule |
 | `GET /inputs` | The analog input, if enabled, every client that plays and every name given a volume |
@@ -665,6 +689,8 @@ aasctl client mpd mute               # or: client mpd volume-db -6
 aasctl plugin 1/mix/0 set gain_db=-3 # or: plugin 1/mix/0 disable
 aasctl settings latency_ms=5 bit_perfect=off
 aasctl matrix put matrix.json        # the body of PUT /matrix
+aasctl airplay pair "Apple TV" 1234  # see "Pairing an AirPlay 2 receiver"
+aasctl airplay "Apple TV" enable     # or: disable
 aasctl events                        # one JSON line per event, until stopped
 aasctl levels                        # one line per frame
 ```

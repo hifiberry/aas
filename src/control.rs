@@ -878,6 +878,8 @@ pub struct Control {
     /// The current track, which the metadata source fills and the AirPlay
     /// receivers read.
     now_playing: std::sync::Arc<crate::metadata::NowPlaying>,
+    /// The AirPlay 2 pairing keys, beside the state file once it is known.
+    pairings: std::sync::Arc<crate::airplay::ap2::keys::Pairings>,
     /// The rate and period the output was last told to open at. None while
     /// it is closed.
     output: Option<(u32, u32)>,
@@ -990,6 +992,7 @@ impl Control {
         let mut libraries = Libraries::default();
         let plugins = plugins::entries(1, &config.plugins, &mut libraries);
         let now_playing = crate::metadata::NowPlaying::new();
+        let pairings = crate::airplay::ap2::keys::Pairings::new();
         // The source runs until the daemon ends; its thread is not joined.
         drop(crate::metadata::start(&config.metadata, now_playing.clone()));
         Control {
@@ -1022,9 +1025,10 @@ impl Control {
                 .airplay
                 .iter()
                 .cloned()
-                .map(|c| crate::airplay::Receiver::new(c, now_playing.clone()))
+                .map(|c| crate::airplay::Receiver::new(c, now_playing.clone(), pairings.clone()))
                 .collect(),
             now_playing,
+            pairings,
             output: None,
             parked: None,
             reopening: 0,
@@ -1161,6 +1165,8 @@ impl Control {
     /// clients' have none and always apply. Values of cards no longer in
     /// the config are kept, unused.
     pub fn restore(&mut self, mut volume: OutputVolume, state: PathBuf, cards: &[String]) {
+        self.pairings
+            .load(state.with_file_name("airplay-pairing.toml"));
         let stored = State::load(&state);
         volume.adopt(stored.output_percent);
         let followed = volume.percent() != stored.output_percent;
@@ -1182,6 +1188,14 @@ impl Control {
             let volume_db = entry.and_then(|e| e.volume_db.as_ref());
             output.volume_db = Stored::resolve(volume_db, &output.config_volume_db);
             output.idle = api::resolve_idle(entry, output.config_idle);
+        }
+        for receiver in &mut self.airplay {
+            let entry = stored.airplay.get(receiver.name());
+            let on = Stored::resolve(
+                entry.and_then(|e| e.enabled.as_ref()),
+                &receiver.config_enabled(),
+            );
+            receiver.restore_enabled(on);
         }
         self.restore_matrices(&stored);
         self.restore_plugins(&stored);
