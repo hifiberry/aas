@@ -14,6 +14,7 @@ pub const USAGE: &str = "usage: aasctl [--port N | --config PATH] COMMAND
   plugin ID set NAME=VALUE... | enable | disable
   settings KEY=VALUE...
   matrix put FILE
+  airplay pair NAME [PIN]
   events | levels";
 
 #[derive(Debug, PartialEq)]
@@ -24,6 +25,11 @@ pub enum Command {
         dot: bool,
     },
     Patch {
+        path: String,
+        body: Value,
+    },
+    /// `airplay pair NAME [PIN]`: a call that may take a while.
+    Post {
         path: String,
         body: Value,
     },
@@ -124,6 +130,14 @@ fn command(words: &[&str]) -> Result<Command, String> {
         ["settings", pairs @ ..] if !pairs.is_empty() => Ok(Command::Patch {
             path: "/settings".into(),
             body: Value::Object(pairs_of(pairs, setting)?),
+        }),
+        ["airplay", "pair", name] => Ok(Command::Post {
+            path: format!("/airplay/{}/pair", encode(name)),
+            body: json!({}),
+        }),
+        ["airplay", "pair", name, pin] => Ok(Command::Post {
+            path: format!("/airplay/{}/pair", encode(name)),
+            body: json!({"pin": pin}),
         }),
         ["matrix", "put", file] => Ok(Command::Put {
             path: "/matrix".into(),
@@ -247,6 +261,34 @@ mod tests {
             path: path.into(),
             body,
         }
+    }
+
+    fn words(words: &[&str]) -> Command {
+        parse(words.iter().map(OsString::from), |_| Ok(9999))
+            .unwrap()
+            .command
+    }
+
+    #[test]
+    fn airplay_pair_starts() {
+        assert_eq!(
+            words(&["airplay", "pair", "Apple TV"]),
+            Command::Post {
+                path: "/airplay/Apple%20TV/pair".into(),
+                body: json!({}),
+            }
+        );
+    }
+
+    #[test]
+    fn airplay_pair_finishes() {
+        assert_eq!(
+            words(&["airplay", "pair", "Apple TV", "1234"]),
+            Command::Post {
+                path: "/airplay/Apple%20TV/pair".into(),
+                body: json!({"pin": "1234"}),
+            }
+        );
     }
 
     #[test]

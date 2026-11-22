@@ -69,6 +69,13 @@ fn run(port: u16, command: Command) -> Result<(), Stop> {
             call(port, "GET", path, None)
         }
         Command::Patch { path, body } => call(port, "PATCH", &path, Some(&body.to_string())),
+        Command::Post { path, body } => call_within(
+            port,
+            "POST",
+            &path,
+            Some(&body.to_string()),
+            client::PAIR_PATIENCE,
+        ),
         Command::Put { path, file } => {
             let text = std::fs::read_to_string(&file).map_err(|e| format!("{file}: {e}"))?;
             let body: Value = serde_json::from_str(&text).map_err(|e| format!("{file}: {e}"))?;
@@ -87,7 +94,18 @@ fn run(port: u16, command: Command) -> Result<(), Stop> {
 
 /// One request; the answer on stdout, or its error on stderr.
 fn call(port: u16, method: &str, path: &str, body: Option<&str>) -> Result<(), Stop> {
-    let (status, text) = client::request(port, method, path, body)
+    call_within(port, method, path, body, client::PATIENCE)
+}
+
+/// As `call`, waiting up to `patience` for the daemon.
+fn call_within(
+    port: u16,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+    patience: std::time::Duration,
+) -> Result<(), Stop> {
+    let (status, text) = client::request_within(port, method, path, body, patience)
         .map_err(|e| format!("cannot reach the daemon on port {port}: {e}"))?;
     let json = serde_json::from_str::<Value>(&text).ok();
     if status >= 400 {
