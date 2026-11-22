@@ -2551,3 +2551,13 @@ pairing) over AirPlay 2:
   at the same time, the Apple TV connected with pair-verify and no PIN, and
   its session ran on with no refusal in the log. The owner confirmed it
   played.
+
+### AirPlay receivers on and off
+
+The turntable board with the sound bar and the Apple TV in its config, the
+Apple TV with `enabled = false`: `GET /airplay` showed the bar on and
+playing, the Apple TV off and idle, and only the bar was played to.
+`aasctl airplay "Apple TV" enable` connected it (pair-verify, no PIN) and it
+played beside the bar; `disable` ended its session after 9 s (1237 packets,
+none resent) and the state file kept `[airplay."Apple TV".enabled]` with
+`value = false`.
