@@ -8,7 +8,7 @@ use super::bplist::{self, Value};
 use super::channel::Keys;
 use super::events::Events;
 use super::pair::pair_transient;
-use crate::airplay::raop::{MIN_LATENCY, Ports, Setup, random};
+use crate::airplay::raop::{Ports, Setup, random};
 use crate::airplay::rtp::{FRAMES, RATE};
 use crate::airplay::rtsp::{Conn, Request, Response, RtspError};
 use std::net::IpAddr;
@@ -131,7 +131,7 @@ impl Ap2 {
             ("ct", Value::Int(CT_ALAC)),
             ("isMedia", Value::Bool(true)),
             ("latencyMax", Value::Int(LATENCY_MAX)),
-            ("latencyMin", Value::Int(i64::from(MIN_LATENCY))),
+            ("latencyMin", Value::Int(i64::from(setup.min_latency))),
             ("shk", Value::Data(ap2.shk.to_vec())),
             ("spf", Value::Int(FRAMES as i64)),
             ("sr", Value::Int(i64::from(RATE))),
@@ -421,15 +421,37 @@ pub mod tests {
             first_seq: 5,
             first_rtptime: 77,
             volume_db: Some(-12.5),
+            min_latency: crate::airplay::raop::MIN_LATENCY,
         }
     }
 
     fn open_with(
         script: impl Fn(&Seen) -> Answer + Send + 'static,
     ) -> (Result<(Ap2, Ports), RtspError>, FakeReceiver) {
+        open_as(script, &setup())
+    }
+
+    fn open_as(
+        script: impl Fn(&Seen) -> Answer + Send + 'static,
+        setup: &Setup,
+    ) -> (Result<(Ap2, Ports), RtspError>, FakeReceiver) {
         let receiver = FakeReceiver::start(script);
         let conn = Conn::connect("127.0.0.1", receiver.port, Duration::from_secs(2)).unwrap();
-        (Ap2::open(conn, &setup()), receiver)
+        (Ap2::open(conn, setup), receiver)
+    }
+
+    #[test]
+    fn the_stream_setup_offers_the_minimum_latency_it_is_given() {
+        let short = Setup {
+            min_latency: 4410,
+            ..setup()
+        };
+        let (opened, receiver) = open_as(ap2_receiver(6000, 0x4), &short);
+        opened.unwrap().0.teardown();
+        let seen = receiver.finish();
+        let body = bplist::decode(&seen[5].body).unwrap();
+        let stream = &body.get("streams").and_then(Value::as_array).unwrap()[0];
+        assert_eq!(stream.get("latencyMin").and_then(Value::as_int), Some(4410));
     }
 
     fn calls(seen: &[Seen]) -> Vec<(String, String)> {

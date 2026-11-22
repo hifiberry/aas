@@ -489,12 +489,14 @@ impl Output {
         // clock does not move it.
         let line = Line::now();
         let responder = Timing::start(timing, line);
+        let wanted = u64::from(c.latency_ms) * u64::from(rtp::RATE) / 1000;
         let setup = Setup {
             control_port: port(&control),
             timing_port: port(&first_timing),
             first_seq: u16::from_be_bytes(raop::random()),
             first_rtptime: u32::from_be_bytes(raop::random()),
             volume_db: c.volume_db,
+            min_latency: raop::offered_minimum(wanted as u32),
         };
         let (rtsp, ports, audio_latency, shk) = match c.protocol {
             Protocol::AirPlay1 => {
@@ -530,8 +532,13 @@ impl Output {
         // The stream starts now, after the handshake, so that its time is
         // not made up for with a burst.
         let begun = Instant::now();
-        let wanted = u64::from(c.latency_ms) * u64::from(rtp::RATE) / 1000;
         let latency = (wanted as u32).max(audio_latency.unwrap_or(0));
+        eprintln!(
+            "aas: airplay \"{}\": {} ms late, the receiver asks for {}",
+            c.name,
+            u64::from(latency) * 1000 / u64::from(rtp::RATE),
+            audio_latency.map_or("nothing".into(), |f| format!("{f} frames")),
+        );
         let mut stream = Stream::new(
             rate,
             latency,
