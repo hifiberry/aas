@@ -337,6 +337,34 @@ signal is not heard: the session is still being set up. `GET /airplay` gives
 each receiver's `state`, `idle`, `connecting`, `playing` or `retrying`, and the
 last failure as `error` until a session plays again.
 
+### Song metadata
+
+`aas` can pull what is playing from AudioControl and send it to its AirPlay
+receivers: title, artist and album, the cover, and progress when the track's
+length is known.
+
+```toml
+[metadata]
+source = "acr"                      # "acr", or "none" (default)
+url = "http://127.0.0.1:1080/api"   # AudioControl's API; its events at <url>/events
+```
+
+Only the track of AudioControl's active player is taken. A thread follows its
+events WebSocket, reads `<url>/now-playing` on each change, and fetches the
+cover, from AudioControl or from the internet, JPEG or PNG, up to 4 MiB, within
+10 s; the old cover is taken down at once, and a cover that fails is left out
+while the text goes out all the same. When
+AudioControl goes away the track is emptied, and it is tried again every 5 s.
+
+A playing AirPlay session sends what changed as `SET_PARAMETER` requests
+stamped with the stream's rtptime: the text as DMAP (`mlit` with `minm`, `asar`,
+`asal`), the cover as `image/jpeg` or `image/png` (`image/none` clears it) and
+`progress`, an empty bar for a track without a length. They are queued and written as the connection takes them, so a
+cover never holds the audio up, and their answers are not waited for: a
+receiver that refuses them plays on. An emptied track clears the receiver's
+text and cover. On HiFiBerry OS, `aas-config` sets `source = "acr"` where
+AudioControl is installed. `GET /metadata` shows the current track.
+
 ### Recording
 
 The `default` device records the analog input, for example:
@@ -400,6 +428,7 @@ without that prefix.
 | `GET /state` | The rate, the processing format, every output with its card and whether it is `open`, `parked` or `off`, every connected client with its name, rate and whether it runs, and whether the master is bit-perfect, with the reason if not |
 | `GET /outputs`, `GET /outputs/{id}` | Every output, or one |
 | `GET /airplay` | Every AirPlay receiver, with its state and last failure |
+| `GET /metadata` | The current track from the metadata source: `title`, `artist`, `album`, `duration_s`, `position_s`, `playing`, and `cover` as its `mime` and size in `bytes`, or `null` |
 | `PATCH /outputs/{id}` | Change an output's volume and idle rule |
 | `GET /inputs` | The analog input, if enabled, every client that plays and every name given a volume |
 | `GET`, `PATCH /inputs/analog` | The analog input's volume and mute |

@@ -875,6 +875,9 @@ pub struct Control {
     taps_len: usize,
     /// The AirPlay receivers: each a thread, and the monitor tap it reads.
     airplay: Vec<crate::airplay::Receiver>,
+    /// The current track, which the metadata source fills and the AirPlay
+    /// receivers read.
+    now_playing: std::sync::Arc<crate::metadata::NowPlaying>,
     /// The rate and period the output was last told to open at. None while
     /// it is closed.
     output: Option<(u32, u32)>,
@@ -986,6 +989,9 @@ impl Control {
     ) -> Control {
         let mut libraries = Libraries::default();
         let plugins = plugins::entries(1, &config.plugins, &mut libraries);
+        let now_playing = crate::metadata::NowPlaying::new();
+        // The source runs until the daemon ends; its thread is not joined.
+        drop(crate::metadata::start(&config.metadata, now_playing.clone()));
         Control {
             latency_ms,
             startup_latency_ms: latency_ms,
@@ -1012,7 +1018,13 @@ impl Control {
             table_len: 0,
             taps_capacity: INITIAL_TAPS,
             taps_len: 0,
-            airplay: config.airplay.iter().cloned().map(crate::airplay::Receiver::new).collect(),
+            airplay: config
+                .airplay
+                .iter()
+                .cloned()
+                .map(|c| crate::airplay::Receiver::new(c, now_playing.clone()))
+                .collect(),
+            now_playing,
             output: None,
             parked: None,
             reopening: 0,

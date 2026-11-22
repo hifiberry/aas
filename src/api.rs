@@ -38,6 +38,8 @@ pub enum Call {
     Settings,
     /// The AirPlay receivers and their state.
     Airplay,
+    /// `GET /metadata`: the current track.
+    Metadata,
     PatchSettings(SettingsPatch),
 }
 
@@ -543,6 +545,24 @@ pub struct PluginMetrics {
 }
 
 /// The answer to a call whose view serialises, which every view does.
+/// `GET /metadata`: the current track, the cover as its type and size.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MetadataView {
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub album: Option<String>,
+    pub duration_s: Option<f64>,
+    pub position_s: Option<f64>,
+    pub playing: bool,
+    pub cover: Option<CoverView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CoverView {
+    pub mime: &'static str,
+    pub bytes: usize,
+}
+
 pub fn answer<T: Serialize>(view: &T) -> Answer {
     serde_json::to_value(view).map_err(|e| ApiError::internal(e.to_string()))
 }

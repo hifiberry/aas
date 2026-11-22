@@ -3,9 +3,11 @@
 //! every read, on the output's own thread.
 
 use super::ap2::channel::{Keys, Opener, Sealer};
+use std::collections::VecDeque;
 use std::fmt;
 use std::io::{Read, Write};
 use std::net::{IpAddr, TcpStream, ToSocketAddrs};
+use std::os::fd::AsRawFd;
 use std::time::Duration;
 
 /// TCP keepalive on a session's connection, in seconds and probes: idle
@@ -141,6 +143,16 @@ pub fn parse(buf: &[u8]) -> Result<Option<(Response, usize)>, RtspError> {
     )))
 }
 
+/// The most bytes a flush takes from the queue, so that a large cover is
+/// encoded and written a piece at a time, between packets.
+pub const FLUSH_BUDGET: usize = 64 * 1024;
+
+/// The bytes encoded and sealed at a time.
+const PIECE: usize = 16 * 1024;
+
+/// Requests sent without waiting that are remembered for a refusal.
+const ASKED: usize = 64;
+
 /// A connection to a receiver.
 pub struct Conn {
     stream: TcpStream,
@@ -151,6 +163,33 @@ pub struct Conn {
     /// not yet make a whole frame.
     sealed: Option<(Sealer, Opener)>,
     raw: Vec<u8>,
+    /// Requests queued and not yet started, in order.
+    queue: VecDeque<Queued>,
+    /// The request being written, encoded in the clear, and how much of it
+    /// has gone to `wire`.
+    current: Vec<u8>,
+    current_at: usize,
+    /// Bytes on their way to the socket, sealed when the channel is, and
+    /// how many of them are written.
+    wire: Vec<u8>,
+    wire_at: usize,
+    /// What each request sent without waiting was, by its CSeq, so that a
+    /// refusal can be named.
+    asked: VecDeque<(u32, String)>,
+    /// The first refusal not yet told, and whether one was told.
+    refusal: Option<String>,
+    refusal_told: bool,
+}
+
+/// A request waiting to go out, owned.
+struct Queued {
+    /// A newer request with the same key replaces this one.
+    key: Option<&'static str>,
+    method: String,
+    url: String,
+    headers: Vec<(String, String)>,
+    content_type: Option<String>,
+    body: Vec<u8>,
 }
 
 impl Conn {
@@ -173,6 +212,14 @@ impl Conn {
                         buf: Vec::new(),
                         sealed: None,
                         raw: Vec::new(),
+                        queue: VecDeque::new(),
+                        current: Vec::new(),
+                        current_at: 0,
+                        wire: Vec::new(),
+                        wire_at: 0,
+                        asked: VecDeque::new(),
+                        refusal: None,
+                        refusal_told: false,
                     });
                 }
                 Err(e) => last = io(e),
@@ -186,9 +233,32 @@ impl Conn {
         self.sealed = Some((Sealer::new(&keys.write), Opener::new(&keys.read)));
     }
 
-    /// Sends `req` and waits for its answer.
+    /// Sends `req` and waits for its answer. Queued requests not yet
+    /// started are dropped; one under way is finished first, so that the
+    /// stream stays whole.
     pub fn request(&mut self, req: &Request) -> Result<Response, RtspError> {
-        self.send(req)?;
+        let io = |e: std::io::Error| RtspError::Io(format!("{}: {e}", req.method));
+        self.queue.clear();
+        loop {
+            if self.wire_at < self.wire.len() {
+                self.stream
+                    .write_all(&self.wire[self.wire_at..])
+                    .map_err(io)?;
+                self.wire.clear();
+                self.wire_at = 0;
+            }
+            if self.current_at == self.current.len() {
+                break;
+            }
+            self.next_piece(usize::MAX);
+        }
+        self.current.clear();
+        self.current_at = 0;
+        let mut plain = Vec::new();
+        self.encode(req, &mut plain, None);
+        let mut out = Vec::new();
+        self.seal_into(&plain, &mut out);
+        self.stream.write_all(&out).map_err(io)?;
         let mut chunk = [0u8; 4096];
         loop {
             if let Some((response, used)) = parse(&self.buf)? {
@@ -199,12 +269,10 @@ impl Conn {
                 if cseq.is_none_or(|c| c == self.cseq) {
                     return Ok(response);
                 }
+                self.note(&response);
                 continue;
             }
-            let n = self
-                .stream
-                .read(&mut chunk)
-                .map_err(|e| RtspError::Io(format!("{}: {e}", req.method)))?;
+            let n = self.stream.read(&mut chunk).map_err(io)?;
             if n == 0 {
                 return Err(RtspError::Io(format!(
                     "{}: the receiver closed",
@@ -215,21 +283,169 @@ impl Conn {
         }
     }
 
-    /// Sends `req` without waiting for its answer, which `closed` drops.
+    /// Queues `req`, written as the socket takes it, without waiting for
+    /// its answer. A request with the same `key` that has not started is
+    /// replaced, so a receiver that reads slowly gets only the newest.
+    pub fn queue(&mut self, key: Option<&'static str>, req: &Request) -> Result<(), RtspError> {
+        let queued = Queued {
+            key,
+            method: req.method.to_string(),
+            url: req.url.to_string(),
+            headers: req
+                .headers
+                .iter()
+                .map(|(n, v)| (n.to_string(), v.clone()))
+                .collect(),
+            content_type: req.content_type.map(String::from),
+            body: req.body.to_vec(),
+        };
+        match self
+            .queue
+            .iter_mut()
+            .find(|q| key.is_some() && q.key == key)
+        {
+            Some(waiting) => *waiting = queued,
+            None => self.queue.push_back(queued),
+        }
+        self.flush()
+    }
+
+    /// Sends `req` without waiting for its answer, behind the queue.
     pub fn send(&mut self, req: &Request) -> Result<(), RtspError> {
+        self.queue(None, req)
+    }
+
+    /// Writes what the socket takes of the queue now, without blocking,
+    /// and at most `FLUSH_BUDGET` more of it.
+    pub fn flush(&mut self) -> Result<(), RtspError> {
+        let mut budget = FLUSH_BUDGET;
+        loop {
+            while self.wire_at < self.wire.len() {
+                let rest = &self.wire[self.wire_at..];
+                // SAFETY: the pointer and length are those of `rest`, and the
+                // fd is the open stream's.
+                let n = unsafe {
+                    libc::send(
+                        self.stream.as_raw_fd(),
+                        rest.as_ptr().cast(),
+                        rest.len(),
+                        libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+                    )
+                };
+                if n < 0 {
+                    let e = std::io::Error::last_os_error();
+                    if e.kind() == std::io::ErrorKind::WouldBlock {
+                        return Ok(());
+                    }
+                    return Err(RtspError::Io(format!("a queued request: {e}")));
+                }
+                self.wire_at += n as usize;
+            }
+            self.wire.clear();
+            self.wire_at = 0;
+            if budget == 0 {
+                return Ok(());
+            }
+            let moved = self.next_piece(budget);
+            if moved == 0 {
+                return Ok(());
+            }
+            budget -= moved;
+        }
+    }
+
+    /// Moves up to `most` bytes of the current request, or of the next
+    /// one, to `wire`, sealed when the channel is. The bytes moved.
+    fn next_piece(&mut self, most: usize) -> usize {
+        if self.current_at == self.current.len() {
+            self.current.clear();
+            self.current_at = 0;
+            let Some(q) = self.queue.pop_front() else {
+                return 0;
+            };
+            let headers: Vec<(&str, String)> = q
+                .headers
+                .iter()
+                .map(|(n, v)| (n.as_str(), v.clone()))
+                .collect();
+            let req = Request {
+                method: &q.method,
+                url: &q.url,
+                headers: &headers,
+                content_type: q.content_type.as_deref(),
+                body: &q.body,
+            };
+            let mut plain = std::mem::take(&mut self.current);
+            let what = match &q.content_type {
+                Some(t) => format!("{} {t}", q.method),
+                None => q.method.clone(),
+            };
+            self.encode(&req, &mut plain, Some(what));
+            self.current = plain;
+        }
+        let n = (self.current.len() - self.current_at).min(most).min(PIECE);
+        let piece = self.current[self.current_at..self.current_at + n].to_vec();
+        let mut wire = std::mem::take(&mut self.wire);
+        self.seal_into(&piece, &mut wire);
+        self.wire = wire;
+        self.current_at += n;
+        n
+    }
+
+    /// The first answer of an error to a request sent without waiting, as
+    /// its method and type and the status, told once a connection.
+    pub fn refused(&mut self) -> Option<String> {
+        let r = self.refusal.take();
+        if r.is_some() {
+            self.refusal_told = true;
+        }
+        r
+    }
+
+    /// Bytes queued and not yet written.
+    pub fn pending(&self) -> usize {
+        self.queue.iter().map(|q| q.body.len() + 64).sum::<usize>()
+            + (self.current.len() - self.current_at)
+            + (self.wire.len() - self.wire_at)
+    }
+
+    /// `req` in the clear with the next CSeq, and what it was for a later
+    /// refusal when it is not waited for.
+    fn encode(&mut self, req: &Request, plain: &mut Vec<u8>, what: Option<String>) {
         self.cseq += 1;
-        let mut out = Vec::new();
-        match &mut self.sealed {
-            None => req.write(self.cseq, &mut out),
-            Some((sealer, _)) => {
-                let mut plain = Vec::new();
-                req.write_as("HTTP/1.1", self.cseq, &mut plain);
-                sealer.seal(&plain, &mut out);
+        let version = if self.sealed.is_some() {
+            "HTTP/1.1"
+        } else {
+            "RTSP/1.0"
+        };
+        req.write_as(version, self.cseq, plain);
+        if let Some(what) = what {
+            self.asked.push_back((self.cseq, what));
+            if self.asked.len() > ASKED {
+                self.asked.pop_front();
             }
         }
-        self.stream
-            .write_all(&out)
-            .map_err(|e| RtspError::Io(format!("{}: {e}", req.method)))
+    }
+
+    /// `plain` as it goes on the wire: sealed once the channel is.
+    fn seal_into(&mut self, plain: &[u8], out: &mut Vec<u8>) {
+        match &mut self.sealed {
+            None => out.extend_from_slice(plain),
+            Some((sealer, _)) => sealer.seal(plain, out),
+        }
+    }
+
+    /// Keeps the first refusal of a request sent without waiting.
+    fn note(&mut self, answer: &Response) {
+        let cseq = answer.header("CSeq").and_then(|c| c.parse::<u32>().ok());
+        let what = cseq.and_then(|c| {
+            let at = self.asked.iter().position(|(n, _)| *n == c)?;
+            self.asked.remove(at).map(|(_, w)| w)
+        });
+        if answer.status >= 300 && !self.refusal_told && self.refusal.is_none() {
+            let what = what.unwrap_or_else(|| "a request".into());
+            self.refusal = Some(format!("{what}: {}", answer.status));
+        }
     }
 
     /// Takes bytes read from the connection, opening them when sealed.
@@ -267,7 +483,10 @@ impl Conn {
                     // of one stays for the rest to join.
                     loop {
                         match parse(&self.buf) {
-                            Ok(Some((_, used))) => drop(self.buf.drain(..used)),
+                            Ok(Some((answer, used))) => {
+                                self.buf.drain(..used);
+                                self.note(&answer);
+                            }
                             Ok(None) => break,
                             Err(_) => {
                                 self.buf.clear();
@@ -461,6 +680,293 @@ mod tests {
                 .unwrap()
                 .starts_with("GET /info HTTP/1.1\r\nCSeq: 1\r\n")
         );
+    }
+
+    fn set_parameter(body: &[u8]) -> Request<'_> {
+        Request {
+            method: "SET_PARAMETER",
+            url: "*",
+            headers: &[],
+            content_type: Some("image/jpeg"),
+            body,
+        }
+    }
+
+    #[test]
+    fn a_queued_request_the_peer_does_not_read_is_not_waited_for() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let peer = std::thread::spawn(move || {
+            let (s, _) = listener.accept().unwrap();
+            std::thread::sleep(Duration::from_secs(2));
+            drop(s);
+        });
+        let mut conn = Conn::connect("127.0.0.1", port, Duration::from_secs(2)).unwrap();
+        let big = vec![7u8; 8 << 20];
+        let started = std::time::Instant::now();
+        conn.queue(None, &set_parameter(&big)).unwrap();
+        conn.flush().unwrap();
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(conn.pending() > 0);
+        peer.join().unwrap();
+    }
+
+    #[test]
+    fn queued_requests_go_out_in_order_as_the_peer_reads() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let peer = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut got = Vec::new();
+            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut chunk = [0u8; 65536];
+            while !got.ends_with(b"B") {
+                let n = s.read(&mut chunk).unwrap();
+                assert!(n > 0, "closed early");
+                got.extend_from_slice(&chunk[..n]);
+            }
+            got
+        });
+        let mut conn = Conn::connect("127.0.0.1", port, Duration::from_secs(2)).unwrap();
+        let big = vec![b'A'; 2 << 20];
+        conn.queue(None, &set_parameter(&big)).unwrap();
+        conn.queue(None, &set_parameter(b"B")).unwrap();
+        let end = std::time::Instant::now() + Duration::from_secs(5);
+        while conn.pending() > 0 && std::time::Instant::now() < end {
+            conn.flush().unwrap();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(conn.pending(), 0);
+        let got = peer.join().unwrap();
+        let second = got.windows(7).position(|w| w == b"CSeq: 2").unwrap();
+        assert!(got[..second].iter().filter(|&&b| b == b'A').count() >= 2 << 20);
+    }
+
+    /// A peer that reads nothing for `wait`, then everything until it has
+    /// seen `until`, and gives what it read.
+    fn slow_peer(
+        listener: TcpListener,
+        wait: Duration,
+        until: &'static [u8],
+    ) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            std::thread::sleep(wait);
+            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut got = Vec::new();
+            let mut chunk = [0u8; 65536];
+            loop {
+                match s.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => got.extend_from_slice(&chunk[..n]),
+                }
+                // Only the new bytes, and the few before that could start
+                // a match, are searched.
+                let from = got.len().saturating_sub(chunk.len() + until.len());
+                if got[from..].windows(until.len()).any(|w| w == until) {
+                    break;
+                }
+            }
+            got
+        })
+    }
+
+    fn drain(conn: &mut Conn) {
+        let end = std::time::Instant::now() + Duration::from_secs(5);
+        while conn.pending() > 0 && std::time::Instant::now() < end {
+            conn.flush().unwrap();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn a_send_behind_a_queue_the_peer_does_not_read_does_not_wait() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let peer = slow_peer(listener, Duration::from_millis(1500), b"/feedback");
+        let mut conn = Conn::connect("127.0.0.1", port, Duration::from_secs(5)).unwrap();
+        let big = vec![7u8; 8 << 20];
+        conn.queue(Some("cover"), &set_parameter(&big)).unwrap();
+        let feedback = Request {
+            method: "POST",
+            url: "/feedback",
+            headers: &[],
+            content_type: None,
+            body: &[],
+        };
+        let started = std::time::Instant::now();
+        conn.send(&feedback).unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "{:?}",
+            started.elapsed()
+        );
+        drain(&mut conn);
+        let got = peer.join().unwrap();
+        assert!(got.windows(9).any(|w| w == b"/feedback"));
+    }
+
+    #[test]
+    fn a_newer_request_of_a_kind_replaces_one_not_started() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let peer = slow_peer(listener, Duration::from_millis(500), b"second");
+        let mut conn = Conn::connect("127.0.0.1", port, Duration::from_secs(5)).unwrap();
+        let big = vec![7u8; 8 << 20];
+        conn.queue(Some("cover"), &set_parameter(&big)).unwrap();
+        conn.queue(Some("text"), &set_parameter(b"first")).unwrap();
+        conn.queue(Some("text"), &set_parameter(b"second")).unwrap();
+        drain(&mut conn);
+        let got = peer.join().unwrap();
+        assert!(!got.windows(5).any(|w| w == b"first"));
+        assert!(got.windows(6).any(|w| w == b"second"));
+    }
+
+    #[test]
+    fn a_flush_moves_at_most_its_budget() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let _peer = slow_peer(listener, Duration::from_millis(0), b"never");
+        let mut conn = Conn::connect("127.0.0.1", port, Duration::from_secs(5)).unwrap();
+        let big = vec![7u8; 1 << 20];
+        conn.queue(Some("cover"), &set_parameter(&big)).unwrap();
+        let before = conn.pending();
+        conn.flush().unwrap();
+        assert!(
+            before - conn.pending() <= 2 * FLUSH_BUDGET,
+            "{before} {}",
+            conn.pending()
+        );
+        assert!(conn.pending() > 0);
+    }
+
+    #[test]
+    fn a_request_drops_what_has_not_started_and_finishes_what_has() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let peer = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut got = Vec::new();
+            let mut chunk = [0u8; 65536];
+            while !got.windows(7).any(|w| w == b"OPTIONS") || !got.ends_with(b"\r\n\r\n") {
+                let n = s.read(&mut chunk).unwrap();
+                got.extend_from_slice(&chunk[..n]);
+            }
+            let cseq = if got.windows(7).any(|w| w == b"CSeq: 2") {
+                2
+            } else {
+                3
+            };
+            s.write_all(format!("RTSP/1.0 200 OK\r\nCSeq: {cseq}\r\n\r\n").as_bytes())
+                .unwrap();
+            got
+        });
+        let mut conn = Conn::connect("127.0.0.1", port, Duration::from_secs(5)).unwrap();
+        let big = vec![b'A'; 2 << 20];
+        conn.queue(Some("cover"), &set_parameter(&big)).unwrap();
+        conn.queue(Some("text"), &set_parameter(b"dropped"))
+            .unwrap();
+        let options = Request {
+            method: "OPTIONS",
+            url: "*",
+            headers: &[],
+            content_type: None,
+            body: &[],
+        };
+        assert_eq!(conn.request(&options).unwrap().status, 200);
+        assert_eq!(conn.pending(), 0);
+        let got = peer.join().unwrap();
+        assert!(got.iter().filter(|&&b| b == b'A').count() >= 2 << 20);
+        assert!(!got.windows(7).any(|w| w == b"dropped"));
+    }
+
+    #[test]
+    fn a_refused_queued_request_is_told_once() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let peer = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = s.read(&mut buf).unwrap();
+            s.write_all(b"RTSP/1.0 400 Bad Request\r\nCSeq: 1\r\n\r\n")
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+        });
+        let mut conn = Conn::connect("127.0.0.1", port, Duration::from_secs(5)).unwrap();
+        conn.queue(Some("text"), &set_parameter(b"x")).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!conn.closed());
+        assert_eq!(
+            conn.refused().as_deref(),
+            Some("SET_PARAMETER image/jpeg: 400")
+        );
+        assert_eq!(conn.refused(), None);
+        peer.join().unwrap();
+    }
+
+    #[test]
+    fn queued_requests_on_a_sealed_channel_open_in_order() {
+        let keys = Keys {
+            write: [1; 32],
+            read: [2; 32],
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let peer = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut opener = Opener::new(&[1; 32]);
+            let (mut raw, mut plain) = (Vec::new(), Vec::new());
+            let mut buf = [0u8; 65536];
+            while !plain.ends_with(b"tail") {
+                let n = s.read(&mut buf).unwrap();
+                raw.extend_from_slice(&buf[..n]);
+                opener.open(&mut raw, &mut plain).unwrap();
+            }
+            plain
+        });
+        let mut conn = Conn::connect("127.0.0.1", port, Duration::from_secs(5)).unwrap();
+        conn.seal(&keys);
+        let big = vec![b'A'; 300_000];
+        conn.queue(Some("cover"), &set_parameter(&big)).unwrap();
+        conn.queue(Some("text"), &set_parameter(b"tail")).unwrap();
+        drain(&mut conn);
+        let plain = peer.join().unwrap();
+        let first = plain.windows(7).position(|w| w == b"CSeq: 1").unwrap();
+        let second = plain.windows(7).position(|w| w == b"CSeq: 2").unwrap();
+        assert!(first < second);
+        assert!(plain.starts_with(b"SET_PARAMETER * HTTP/1.1"));
+    }
+
+    #[test]
+    fn a_request_writes_the_queue_first() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let peer = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut got = Vec::new();
+            let mut chunk = [0u8; 65536];
+            while !got.windows(7).any(|w| w == b"CSeq: 2") || !got.ends_with(b"\r\n\r\n") {
+                let n = s.read(&mut chunk).unwrap();
+                got.extend_from_slice(&chunk[..n]);
+            }
+            s.write_all(b"RTSP/1.0 200 OK\r\nCSeq: 1\r\n\r\nRTSP/1.0 200 OK\r\nCSeq: 2\r\n\r\n")
+                .unwrap();
+            got
+        });
+        let mut conn = Conn::connect("127.0.0.1", port, Duration::from_secs(5)).unwrap();
+        let big = vec![b'A'; 2 << 20];
+        conn.queue(None, &set_parameter(&big)).unwrap();
+        let options = Request {
+            method: "OPTIONS",
+            url: "*",
+            headers: &[],
+            content_type: None,
+            body: &[],
+        };
+        assert_eq!(conn.request(&options).unwrap().status, 200);
+        assert_eq!(conn.pending(), 0);
+        let got = peer.join().unwrap();
+        assert!(got.windows(7).position(|w| w == b"OPTIONS").unwrap() > 2 << 20);
     }
 
     #[test]

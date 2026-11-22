@@ -127,6 +127,7 @@ fn router(shared: Arc<Shared>) -> Router {
     Router::new()
         .route("/state", get(|s| ask(s, Call::State)))
         .route("/airplay", get(|s| ask(s, Call::Airplay)))
+        .route("/metadata", get(|s| ask(s, Call::Metadata)))
         .route("/outputs", get(|s| ask(s, Call::Outputs)))
         .route("/outputs/{id}", get(get_output).patch(patch_output))
         .route("/inputs", get(|s| ask(s, Call::Inputs)))

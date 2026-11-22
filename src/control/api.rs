@@ -340,6 +340,7 @@ impl Control {
             Call::PatchPlugin(id, patch) => self.patch_plugin(id, patch, now),
             Call::Settings => api::answer(&self.settings_view()),
             Call::Airplay => api::answer(&self.airplay_views()),
+            Call::Metadata => api::answer(&self.metadata_view(now)),
             Call::PatchSettings(patch) => self.patch_settings(patch, now),
         };
         self.publish_changes();
@@ -370,6 +371,22 @@ impl Control {
     /// config's channels are taken until then. Call before `restore`.
     pub fn set_matrix_width(&mut self, width: usize) {
         self.matrices[0].width = width;
+    }
+
+    pub(super) fn metadata_view(&self, now: Instant) -> api::MetadataView {
+        let s = self.now_playing.snapshot(now);
+        api::MetadataView {
+            title: s.track.title,
+            artist: s.track.artist,
+            album: s.track.album,
+            duration_s: s.track.duration_s,
+            position_s: s.position_s,
+            playing: s.track.playing,
+            cover: s.cover.map(|c| api::CoverView {
+                mime: c.mime,
+                bytes: c.bytes.len(),
+            }),
+        }
     }
 
     pub(super) fn airplay_views(&self) -> Vec<api::AirplayView> {
@@ -1574,6 +1591,36 @@ mod tests {
             }],
             ..Config::default()
         }
+    }
+
+    #[test]
+    fn metadata_gives_the_current_track_without_the_cover_bytes() {
+        let (mut control, _engine, _logs, now) = started_with(&Config::default(), Vec::new());
+        assert_eq!(
+            control.call(Call::Metadata, now).unwrap(),
+            json!({"title": null, "artist": null, "album": null, "duration_s": null,
+                   "position_s": null, "playing": false, "cover": null})
+        );
+        control.now_playing.set_track(crate::metadata::Track {
+            title: Some("T".into()),
+            ..Default::default()
+        });
+        control.now_playing.set_cover(Some(crate::metadata::Cover {
+            mime: "image/jpeg",
+            bytes: vec![0xFF, 0xD8, 0xFF],
+        }));
+        assert_eq!(
+            control.call(Call::Metadata, now).unwrap(),
+            json!({"title": "T", "artist": null, "album": null, "duration_s": null,
+                   "position_s": null, "playing": false,
+                   "cover": {"mime": "image/jpeg", "bytes": 3}})
+        );
+    }
+
+    #[test]
+    fn every_receiver_shares_the_one_current_track() {
+        let (control, _engine, _logs, _now) = started_with(&with_a_receiver(), Vec::new());
+        assert!(control.airplay.iter().all(|r| r.shares(&control.now_playing)));
     }
 
     #[test]

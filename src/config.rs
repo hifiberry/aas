@@ -217,6 +217,8 @@ pub struct Config {
     pub pulse_buffer_ms: Option<u16>,
     /// The AirPlay receivers, from the `[[airplay]]` tables.
     pub airplay: Vec<crate::airplay::config::AirplayConfig>,
+    /// Where song metadata comes from, from `[metadata]`.
+    pub metadata: crate::metadata::config::MetadataConfig,
 }
 
 /// The port of the API unless the config names another.
@@ -267,6 +269,7 @@ struct Raw {
     pulse_socket: Option<toml::Value>,
     pulse_buffer_ms: Option<toml::Value>,
     airplay: Option<Vec<toml::Table>>,
+    metadata: Option<toml::Table>,
 }
 
 #[derive(Deserialize)]
@@ -429,6 +432,7 @@ impl Default for Config {
             pulse_socket: None,
             pulse_buffer_ms: None,
             airplay: Vec::new(),
+            metadata: crate::metadata::config::MetadataConfig::default(),
         }
     }
 }
@@ -652,6 +656,8 @@ impl Config {
         }
         let airplay = crate::airplay::config::receivers_from(raw.airplay.unwrap_or_default())
             .map_err(|e| format!("{}: {e}", path.display()))?;
+        let metadata = crate::metadata::config::from_table(raw.metadata)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
         let mut outputs: Vec<OutputConfig> = Vec::new();
         for (i, table) in raw_outputs.into_iter().enumerate() {
             let n = i + 2;
@@ -694,6 +700,7 @@ impl Config {
             pulse_socket,
             pulse_buffer_ms,
             airplay,
+            metadata,
         })
     }
 }
@@ -754,6 +761,19 @@ mod tests {
             let e = err(&format!("volume_limit_db = {bad}\n"));
             assert!(e.contains("volume_limit_db must be"), "{bad}: {e}");
         }
+    }
+
+    #[test]
+    fn the_metadata_table_reaches_the_config() {
+        use crate::metadata::config::Source;
+        assert_eq!(load_str("").unwrap().metadata.source, Source::None);
+        let c = load_str("[metadata]\nsource = \"acr\"\n").unwrap();
+        assert_eq!(c.metadata.source, Source::Acr);
+        let e = load_str("[metadata]\nsource = \"mpd\"\n").unwrap_err();
+        assert!(
+            e.ends_with("aas.toml: metadata: source must be \"acr\" or \"none\""),
+            "{e}"
+        );
     }
 
     #[test]

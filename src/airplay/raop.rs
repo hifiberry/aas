@@ -2,6 +2,7 @@
 //! and TEARDOWN, as PipeWire's RAOP sender does them for a receiver that
 //! takes audio in the clear (`et` 0) or after the auth-setup post (`et` 4).
 
+use super::meta::Meta;
 use super::rtsp::{Conn, Request, Response, RtspError};
 use std::net::IpAddr;
 
@@ -133,6 +134,35 @@ impl Raop {
         }
         let _ = raop.parameter("progress: 0/0/0\r\n");
         Ok((raop, ports))
+    }
+
+    /// Queues a metadata request stamped with `rtptime`, without waiting
+    /// for the answer.
+    pub fn metadata(&mut self, meta: &Meta, rtptime: u32) -> Result<(), RtspError> {
+        let (kind, body) = meta.content();
+        let mut headers = self.headers.clone();
+        headers.push(("RTP-Info", format!("rtptime={rtptime}")));
+        let url = self.url.clone();
+        self.conn.queue(
+            Some(meta.key()),
+            &Request {
+                method: "SET_PARAMETER",
+                url: &url,
+                headers: &headers,
+                content_type: Some(kind),
+                body,
+            },
+        )
+    }
+
+    /// Writes what the socket takes of the queued requests.
+    pub fn flush(&mut self) -> Result<(), RtspError> {
+        self.conn.flush()
+    }
+
+    /// The first refusal of a request sent without waiting, told once.
+    pub fn refused(&mut self) -> Option<String> {
+        self.conn.refused()
     }
 
     /// Whether the receiver has closed the session's connection.

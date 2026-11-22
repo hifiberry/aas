@@ -11,10 +11,12 @@
 use super::ap2::session::Ap2;
 use super::config::{AirplayConfig, Connect, Protocol};
 use super::gate::{Gate, GateEvent};
+use super::meta;
 use super::raop::{self, Raop, Setup};
 use super::rtp;
-use super::rtsp::Conn;
+use super::rtsp::{Conn, RtspError};
 use super::stream::{Outgoing, Stream};
+use crate::metadata::NowPlaying;
 use aas_client::ring::Ring;
 use std::net::UdpSocket;
 use std::sync::atomic::Ordering;
@@ -126,7 +128,7 @@ impl Drop for AirplayHandle {
 }
 
 /// Starts the thread of a receiver. It does nothing until it has a tap.
-pub fn spawn(config: AirplayConfig) -> AirplayHandle {
+pub fn spawn(config: AirplayConfig, now_playing: Arc<NowPlaying>) -> AirplayHandle {
     let status = Arc::new(Mutex::new(Status {
         state: AirplayState::Idle,
         error: None,
@@ -135,7 +137,7 @@ pub fn spawn(config: AirplayConfig) -> AirplayHandle {
     let shared = status.clone();
     let thread = std::thread::Builder::new()
         .name("aas-airplay".into())
-        .spawn(move || Output::new(config, shared).run(rx))
+        .spawn(move || Output::new(config, shared, now_playing).run(rx))
         .expect("the AirPlay thread starts");
     AirplayHandle {
         tx,
@@ -158,6 +160,27 @@ impl Control {
         }
     }
 
+    fn metadata(&mut self, m: &meta::Meta, rtptime: u32) -> Result<(), RtspError> {
+        match self {
+            Control::One(r) => r.metadata(m, rtptime),
+            Control::Two(a) => a.metadata(m, rtptime),
+        }
+    }
+
+    fn flush(&mut self) -> Result<(), RtspError> {
+        match self {
+            Control::One(r) => r.flush(),
+            Control::Two(a) => a.flush(),
+        }
+    }
+
+    fn refused(&mut self) -> Option<String> {
+        match self {
+            Control::One(r) => r.refused(),
+            Control::Two(a) => a.refused(),
+        }
+    }
+
     fn teardown(self) {
         match self {
             Control::One(r) => r.teardown(),
@@ -168,6 +191,8 @@ impl Control {
 
 struct Session {
     rtsp: Control,
+    /// The metadata sent so far.
+    meta: meta::Sent,
     /// When AirPlay 2's next `/feedback` is due.
     feedback_at: Option<Instant>,
     data: UdpSocket,
@@ -243,6 +268,7 @@ struct Output {
     frames: Vec<[i32; 2]>,
     interleaved: Vec<i32>,
     sent: Vec<Outgoing>,
+    now_playing: Arc<NowPlaying>,
 }
 
 /// A line from the monotonic clock to NTP time, taken from the wall clock
@@ -274,8 +300,13 @@ impl Line {
 }
 
 impl Output {
-    fn new(config: AirplayConfig, status: Arc<Mutex<Status>>) -> Output {
+    fn new(
+        config: AirplayConfig,
+        status: Arc<Mutex<Status>>,
+        now_playing: Arc<NowPlaying>,
+    ) -> Output {
         Output {
+            now_playing,
             config,
             status,
             base: Instant::now(),
@@ -558,6 +589,7 @@ impl Output {
             control,
             stream,
             started: begun,
+            meta: meta::Sent::default(),
             resent: 0,
             _timing: responder,
         })
@@ -592,6 +624,24 @@ impl Output {
             // A failure shows as a closed connection at the next look.
             let _ = ap2.feedback();
             s.feedback_at = Some(at + FEEDBACK);
+        }
+        // Metadata goes out queued, as the socket takes it, so that a cover
+        // never holds the packets up; a failure shows as a closed
+        // connection at the next look.
+        let (text, cover, progress) = self.now_playing.generations();
+        let sent = s.meta;
+        if (text, cover, progress) != (sent.text_gen, sent.cover_gen, sent.progress_gen) {
+            let snap = self.now_playing.snapshot(now);
+            for m in meta::due(&mut s.meta, &snap, s.stream.rtptime()) {
+                let _ = s.rtsp.metadata(&m, s.stream.rtptime());
+            }
+        }
+        let _ = s.rtsp.flush();
+        if let Some(what) = s.rtsp.refused() {
+            eprintln!(
+                "aas: airplay \"{}\": the receiver refused {what}",
+                self.config.name
+            );
         }
         self.sent.clear();
         s.stream.due(mono, &mut self.sent);
@@ -640,6 +690,7 @@ mod tests {
     use super::super::config::Protocol;
     use super::super::fake::{Answer, FakeReceiver, Seen, accepting_on};
     use super::*;
+    use crate::metadata::{Cover, Track};
     use std::os::fd::AsFd;
     use std::sync::atomic::AtomicUsize;
 
@@ -705,6 +756,137 @@ mod tests {
         s == AirplayState::Playing
     }
 
+    fn spawn_quiet(c: AirplayConfig) -> AirplayHandle {
+        spawn(c, NowPlaying::new())
+    }
+
+    fn song(title: &str) -> Track {
+        Track {
+            title: Some(title.into()),
+            artist: Some("Artist".into()),
+            album: Some("Album".into()),
+            duration_s: Some(200.0),
+            playing: true,
+        }
+    }
+
+    /// The bodies of the metadata requests of `kind` the receiver saw.
+    fn bodies(seen: &[Seen], kind: &str) -> Vec<Vec<u8>> {
+        seen.iter()
+            .filter(|s| s.method == "SET_PARAMETER" && s.header("Content-Type") == Some(kind))
+            .map(|s| s.body.clone())
+            .collect()
+    }
+
+    /// Plays to `receiver` for `ms` with `np` as the current track.
+    fn play_with(receiver: &FakeReceiver, np: Arc<NowPlaying>, ms: u64, during: impl FnOnce()) {
+        let handle = spawn(config(receiver.port, Connect::Always), np);
+        let (_ring, reader) = tap();
+        handle.tap(reader);
+        assert!(until(&handle, 3.0, playing), "{:?}", handle.status());
+        std::thread::sleep(Duration::from_millis(ms / 2));
+        during();
+        std::thread::sleep(Duration::from_millis(ms / 2));
+        assert_eq!(handle.status().state, AirplayState::Playing);
+        handle.stop();
+    }
+
+    #[test]
+    fn a_session_sends_the_current_track_after_record() {
+        let receiver = streaming();
+        let np = NowPlaying::new();
+        np.set_track(song("One"));
+        np.set_cover(Some(Cover {
+            mime: "image/jpeg",
+            bytes: vec![0xFF, 0xD8, 0xFF, 1],
+        }));
+        np.set_position(10.0, Instant::now());
+        play_with(&receiver, np, 400, || {});
+        let seen = receiver.finish();
+        let record = seen.iter().position(|s| s.method == "RECORD").unwrap();
+        let text = seen
+            .iter()
+            .position(|s| s.header("Content-Type") == Some("application/x-dmap-tagged"))
+            .expect("no text");
+        assert!(text > record);
+        assert!(
+            seen[text]
+                .header("RTP-Info")
+                .is_some_and(|r| r.starts_with("rtptime="))
+        );
+        assert_eq!(
+            bodies(&seen, "application/x-dmap-tagged"),
+            [meta::dmap(&song("One"))]
+        );
+        assert_eq!(bodies(&seen, "image/jpeg"), [vec![0xFF, 0xD8, 0xFF, 1]]);
+        let progress = bodies(&seen, "text/parameters");
+        assert!(
+            progress
+                .iter()
+                .any(|b| b.starts_with(b"progress: ") && b != b"progress: 0/0/0\r\n"),
+            "{progress:?}"
+        );
+    }
+
+    #[test]
+    fn a_new_track_during_the_session_is_sent() {
+        let receiver = streaming();
+        let np = NowPlaying::new();
+        np.set_track(song("One"));
+        let during = np.clone();
+        play_with(&receiver, np, 600, move || during.set_track(song("Two")));
+        let seen = receiver.finish();
+        assert_eq!(
+            bodies(&seen, "application/x-dmap-tagged"),
+            [meta::dmap(&song("One")), meta::dmap(&song("Two"))]
+        );
+    }
+
+    #[test]
+    fn a_receiver_that_refuses_metadata_keeps_playing() {
+        let receiver = FakeReceiver::serving(1, |port| {
+            let accept = accepting_on(port);
+            move |seen: &Seen| {
+                if seen.header("Content-Type") == Some("application/x-dmap-tagged") {
+                    Answer::Status(400, Vec::new())
+                } else {
+                    accept(seen)
+                }
+            }
+        });
+        let np = NowPlaying::new();
+        np.set_track(song("One"));
+        play_with(&receiver, np, 2000, || {});
+        let mut packet = [0u8; 2048];
+        assert!(receiver.data.recv(&mut packet).is_ok());
+        let seen = receiver.finish();
+        assert_eq!(bodies(&seen, "application/x-dmap-tagged").len(), 1);
+    }
+
+    #[test]
+    fn a_skip_storm_sends_only_the_newest() {
+        let receiver = streaming();
+        let np = NowPlaying::new();
+        for i in 0..50 {
+            np.set_track(song(&format!("T{i}")));
+        }
+        play_with(&receiver, np, 400, || {});
+        let seen = receiver.finish();
+        assert_eq!(
+            bodies(&seen, "application/x-dmap-tagged"),
+            [meta::dmap(&song("T49"))]
+        );
+    }
+
+    #[test]
+    fn no_track_sends_no_metadata() {
+        let receiver = streaming();
+        play_with(&receiver, NowPlaying::new(), 400, || {});
+        let seen = receiver.finish();
+        assert!(bodies(&seen, "application/x-dmap-tagged").is_empty());
+        assert!(bodies(&seen, "image/none").is_empty());
+    }
+
     fn streaming() -> FakeReceiver {
         FakeReceiver::serving(1, accepting_on)
     }
@@ -713,7 +895,7 @@ mod tests {
     fn the_receiver_is_offered_the_latency_up_to_250_ms() {
         for (latency_ms, offered) in [(100, 4410), (1500, 11025)] {
             let receiver = streaming();
-            let handle = spawn(AirplayConfig {
+            let handle = spawn_quiet(AirplayConfig {
                 latency_ms,
                 ..config(receiver.port, Connect::Always)
             });
@@ -735,7 +917,7 @@ mod tests {
     #[test]
     fn a_signal_connects_and_silence_tears_down() {
         let receiver = streaming();
-        let handle = spawn(config(receiver.port, Connect::Signal));
+        let handle = spawn_quiet(config(receiver.port, Connect::Signal));
         let (ring, reader) = tap();
         handle.tap(reader);
         play(&ring, 0.3, false);
@@ -766,7 +948,7 @@ mod tests {
         });
         let mut c = config(receiver.port, Connect::Always);
         c.protocol = Protocol::AirPlay2;
-        let handle = spawn(c);
+        let handle = spawn_quiet(c);
         let (_ring, reader) = tap();
         handle.tap(reader);
         assert!(until(&handle, 3.0, playing), "{:?}", handle.status());
@@ -795,7 +977,7 @@ mod tests {
             FakeReceiver::serving(1, |port| ap2_receiver_with(port, 0x4, EventPort::Closing).0);
         let mut c = config(receiver.port, Connect::Always);
         c.protocol = Protocol::AirPlay2;
-        let handle = spawn(c);
+        let handle = spawn_quiet(c);
         let (_ring, reader) = tap();
         handle.tap(reader);
         assert!(until(&handle, 3.0, playing), "{:?}", handle.status());
@@ -812,7 +994,7 @@ mod tests {
     fn a_tap_that_stops_delivering_counts_as_silence() {
         // The master closes when idle: the tap then gets nothing at all.
         let receiver = streaming();
-        let handle = spawn(config(receiver.port, Connect::Signal));
+        let handle = spawn_quiet(config(receiver.port, Connect::Signal));
         let (ring, reader) = tap();
         handle.tap(reader);
         play(&ring, 0.3, true);
@@ -831,7 +1013,7 @@ mod tests {
         let port = gone.local_addr().unwrap().port();
         drop(gone);
         let receiver = FakeReceiver::serving(1, move |_| accepting_on(port));
-        let handle = spawn(config(receiver.port, Connect::Always));
+        let handle = spawn_quiet(config(receiver.port, Connect::Always));
         let (_ring, reader) = tap();
         handle.tap(reader);
         assert!(
@@ -854,7 +1036,7 @@ mod tests {
                 accept(s)
             }
         });
-        let handle = spawn(config(receiver.port, Connect::Always));
+        let handle = spawn_quiet(config(receiver.port, Connect::Always));
         let (_ring, reader) = tap();
         handle.tap(reader);
         let mut packet = [0u8; 2048];
@@ -877,7 +1059,7 @@ mod tests {
     #[test]
     fn a_new_signal_after_a_failed_one_retries_from_1_s() {
         // The discard port: every try is refused.
-        let handle = spawn(config(9, Connect::Signal));
+        let handle = spawn_quiet(config(9, Connect::Signal));
         let (ring, reader) = tap();
         handle.tap(reader);
         play(&ring, 0.1, true);
@@ -902,7 +1084,7 @@ mod tests {
     #[test]
     fn always_connects_without_a_signal() {
         let receiver = streaming();
-        let handle = spawn(config(receiver.port, Connect::Always));
+        let handle = spawn_quiet(config(receiver.port, Connect::Always));
         let (ring, reader) = tap();
         handle.tap(reader);
         play(&ring, 0.2, false);
@@ -927,7 +1109,7 @@ mod tests {
                 }
             }
         });
-        let handle = spawn(config(receiver.port, Connect::Always));
+        let handle = spawn_quiet(config(receiver.port, Connect::Always));
         let (ring, reader) = tap();
         handle.tap(reader);
         assert!(
@@ -962,7 +1144,7 @@ mod tests {
     fn an_unresolvable_host_retries_and_the_thread_goes_on() {
         let mut c = config(7000, Connect::Always);
         c.host = "nonexistent.invalid".into();
-        let handle = spawn(c);
+        let handle = spawn_quiet(c);
         let (_ring, reader) = tap();
         handle.tap(reader);
         assert!(until(&handle, 6.0, |s| matches!(
@@ -979,7 +1161,7 @@ mod tests {
     #[test]
     fn stop_tears_down_and_joins_within_a_second() {
         let receiver = streaming();
-        let handle = spawn(config(receiver.port, Connect::Always));
+        let handle = spawn_quiet(config(receiver.port, Connect::Always));
         let (_ring, reader) = tap();
         handle.tap(reader);
         assert!(until(&handle, 3.0, playing), "{:?}", handle.status());
@@ -1019,7 +1201,7 @@ mod tests {
                 }
             }
         });
-        let handle = spawn(config(receiver.port, Connect::Always));
+        let handle = spawn_quiet(config(receiver.port, Connect::Always));
         let (_ring, reader) = tap();
         handle.tap(reader);
         assert!(until(&handle, 3.0, playing), "{:?}", handle.status());
@@ -1028,7 +1210,7 @@ mod tests {
     #[test]
     fn a_timing_request_is_answered() {
         let receiver = streaming();
-        let handle = spawn(config(receiver.port, Connect::Always));
+        let handle = spawn_quiet(config(receiver.port, Connect::Always));
         let (_ring, reader) = tap();
         handle.tap(reader);
         assert!(until(&handle, 3.0, playing), "{:?}", handle.status());

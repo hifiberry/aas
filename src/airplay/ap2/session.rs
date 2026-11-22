@@ -8,6 +8,7 @@ use super::bplist::{self, Value};
 use super::channel::Keys;
 use super::events::Events;
 use super::pair::pair_transient;
+use crate::airplay::meta::Meta;
 use crate::airplay::raop::{Ports, Setup, random};
 use crate::airplay::rtp::{FRAMES, RATE};
 use crate::airplay::rtsp::{Conn, Request, Response, RtspError};
@@ -198,6 +199,35 @@ impl Ap2 {
         })
     }
 
+    /// Queues a metadata request stamped with `rtptime`, without waiting
+    /// for the answer.
+    pub fn metadata(&mut self, meta: &Meta, rtptime: u32) -> Result<(), RtspError> {
+        let (kind, body) = meta.content();
+        let mut headers = self.headers.clone();
+        headers.push(("RTP-Info", format!("rtptime={rtptime}")));
+        let url = self.url.clone();
+        self.conn.queue(
+            Some(meta.key()),
+            &Request {
+                method: "SET_PARAMETER",
+                url: &url,
+                headers: &headers,
+                content_type: Some(kind),
+                body,
+            },
+        )
+    }
+
+    /// Writes what the socket takes of the queued requests.
+    pub fn flush(&mut self) -> Result<(), RtspError> {
+        self.conn.flush()
+    }
+
+    /// The first refusal of a request sent without waiting, told once.
+    pub fn refused(&mut self) -> Option<String> {
+        self.conn.refused()
+    }
+
     /// Whether the receiver has closed the session's connection.
     pub fn closed(&mut self) -> bool {
         self.conn.closed()
@@ -211,13 +241,16 @@ impl Ap2 {
 
     /// Keeps the session alive, without waiting for the answer.
     pub fn feedback(&mut self) -> Result<(), RtspError> {
-        self.conn.send(&Request {
-            method: "POST",
-            url: "/feedback",
-            headers: &self.headers,
-            content_type: None,
-            body: &[],
-        })
+        self.conn.queue(
+            Some("feedback"),
+            &Request {
+                method: "POST",
+                url: "/feedback",
+                headers: &self.headers,
+                content_type: None,
+                body: &[],
+            },
+        )
     }
 
     /// Sets the receiver's volume, -30 to 0 dB.
