@@ -2536,3 +2536,18 @@ recognised by analog-recognition:
   `statusFlags` 0x644 ask for one-time (HomeKit or PIN) pairing, which aas
   does not do; transient pairing would need its AirPlay access set to
   everyone without a password.
+
+### AirPlay 2 pairing
+
+The turntable board paired with an Apple TV (statusFlags 0x644, one-time
+pairing) over AirPlay 2:
+
+- `aasctl airplay pair "Apple TV"` made it show a PIN once the TV showed the
+  Apple TV's picture; the first try, with the TV on another input, showed
+  none. `aasctl airplay pair "Apple TV" 2519` answered `{"paired": true}`;
+  the keys file `airplay-pairing.toml` came out mode 0600, owned by the
+  service's dynamic user.
+- After `systemctl restart aas`, a record played to it and to the sound bar
+  at the same time, the Apple TV connected with pair-verify and no PIN, and
+  its session ran on with no refusal in the log. The owner confirmed it
+  played.
