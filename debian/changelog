@@ -1,3 +1,21 @@
+aas (0.4.0) trixie; urgency=medium
+
+  * Song metadata: with [metadata] source = "acr", aas follows
+    AudioControl's active player and sends the title, artist, album,
+    cover and progress to its AirPlay receivers. GET /metadata shows the
+    current track. aas-config turns it on where AudioControl is installed.
+  * AirPlay requests that need no answer are queued and written a piece at
+    a time between packets, so a cover never holds up the audio.
+  * AirPlay 2 PIN pairing: a receiver that asks for one-time pairing, an
+    Apple TV for example, is paired once with aasctl airplay pair NAME and
+    the PIN it shows; the keys are kept beside the state file and verified
+    at every session after.
+  * AirPlay receivers can be turned on and off: enabled in the config,
+    PATCH /airplay/NAME or aasctl airplay NAME enable|disable at run time,
+    kept in the state file.
+
+ -- HiFiBerry <info@hifiberry.com>  Sun, 22 Nov 2026 10:14:03 +0000
+
 aas (0.3.0) trixie; urgency=medium
 
   * A volume limit, volume_limit_db in the config or limit_db through the
