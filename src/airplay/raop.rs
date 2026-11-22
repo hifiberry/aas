@@ -143,18 +143,26 @@ impl Raop {
         let mut headers = self.headers.clone();
         headers.push(("RTP-Info", format!("rtptime={rtptime}")));
         let url = self.url.clone();
-        self.conn.queue(&Request {
-            method: "SET_PARAMETER",
-            url: &url,
-            headers: &headers,
-            content_type: Some(kind),
-            body,
-        })
+        self.conn.queue(
+            Some(meta.key()),
+            &Request {
+                method: "SET_PARAMETER",
+                url: &url,
+                headers: &headers,
+                content_type: Some(kind),
+                body,
+            },
+        )
     }
 
     /// Writes what the socket takes of the queued requests.
     pub fn flush(&mut self) -> Result<(), RtspError> {
         self.conn.flush()
+    }
+
+    /// The first refusal of a request sent without waiting, told once.
+    pub fn refused(&mut self) -> Option<String> {
+        self.conn.refused()
     }
 
     /// Whether the receiver has closed the session's connection.

@@ -174,6 +174,13 @@ impl Control {
         }
     }
 
+    fn refused(&mut self) -> Option<String> {
+        match self {
+            Control::One(r) => r.refused(),
+            Control::Two(a) => a.refused(),
+        }
+    }
+
     fn teardown(self) {
         match self {
             Control::One(r) => r.teardown(),
@@ -630,6 +637,12 @@ impl Output {
             }
         }
         let _ = s.rtsp.flush();
+        if let Some(what) = s.rtsp.refused() {
+            eprintln!(
+                "aas: airplay \"{}\": the receiver refused {what}",
+                self.config.name
+            );
+        }
         self.sent.clear();
         s.stream.due(mono, &mut self.sent);
         let mut refused = None;

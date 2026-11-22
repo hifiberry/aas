@@ -20,6 +20,15 @@ pub enum Meta {
 }
 
 impl Meta {
+    /// Which requests replace one another while waiting to go out.
+    pub fn key(&self) -> &'static str {
+        match self {
+            Meta::Text(_) => "text",
+            Meta::Cover(..) | Meta::NoCover => "cover",
+            Meta::Progress(_) => "progress",
+        }
+    }
+
     /// The request's content type and body.
     pub fn content(&self) -> (&'static str, &[u8]) {
         match self {
