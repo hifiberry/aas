@@ -41,6 +41,16 @@ class ConfigFrom(unittest.TestCase):
         self.assertEqual(c["volume_control"], "Softvol")
         self.assertEqual(c["volume_mode"], "follow")
 
+    def test_audiocontrol_turns_metadata_on(self):
+        c = mod.config_from(load("dacplus-adc-pro"), audiocontrol=True)
+        self.assertEqual(c["metadata"], {"source": "acr"})
+
+    def test_no_audiocontrol_no_metadata(self):
+        self.assertNotIn("metadata", mod.config_from(load("dacplus-adc-pro")))
+
+    def test_audiocontrol_is_known_by_its_binary(self):
+        self.assertEqual(mod.AUDIOCONTROL, "/usr/bin/audiocontrol")
+
     def test_digi_as_string(self):
         info = load("digiplus")
         info["soundcard"]["card_type"] = "Digi"
@@ -72,6 +82,11 @@ class Merge(unittest.TestCase):
     def test_table_merged(self):
         m = mod.merge(self.gen, {"analog": {"volume_db": -6}})
         self.assertEqual(m["analog"], {"enabled": True, "volume_db": -6})
+
+    def test_local_turns_metadata_off(self):
+        gen = mod.config_from(load("dacplus-adc-pro"), audiocontrol=True)
+        m = mod.merge(gen, {"metadata": {"source": "none"}})
+        self.assertEqual(m["metadata"]["source"], "none")
 
     def test_array_replaced(self):
         local = {"plugin": [{"place": "mix", "type": "balance", "balance": 1}]}

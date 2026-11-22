@@ -16,6 +16,8 @@ COMMAND = ["/usr/bin/config-soundcard", "--json"]
 TIMEOUT = 20
 OUTPUT = "/etc/aas/aas.toml"
 LOCAL = "/etc/aas/aas.local.toml"
+# Installed with AudioControl; where it is, aas takes song metadata from it.
+AUDIOCONTROL = "/usr/bin/audiocontrol"
 
 HEADER = (
     "# Generated at every boot by aas-config from the HiFiBerry sound card data.\n"
@@ -28,7 +30,7 @@ def log(msg):
     print("aas-config: " + msg, file=sys.stderr)
 
 
-def config_from(systeminfo):
+def config_from(systeminfo, audiocontrol=False):
     card = systeminfo.get("soundcard") if isinstance(systeminfo, dict) else None
     if not isinstance(card, dict):
         card = {}
@@ -53,6 +55,8 @@ def config_from(systeminfo):
             and channels > 0 and "Digi" not in types):
         cfg["analog"] = {"enabled": True}
     cfg["plugin"] = [{"place": "output", "type": "balance", "balance": 0}]
+    if audiocontrol:
+        cfg["metadata"] = {"source": "acr"}
     return cfg
 
 
@@ -204,7 +208,8 @@ def main(argv=None):
         if info is None and os.path.exists(args.output):
             log("keeping the existing %s" % args.output)
             return 0
-        generated = config_from(info) if info is not None else {}
+        acr = os.path.exists(AUDIOCONTROL)
+        generated = config_from(info, acr) if info is not None else {}
         try:
             text = dump(merge(generated, read_local(args.local)))
         except Exception as e:
