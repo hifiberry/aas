@@ -150,6 +150,10 @@ of the two offered); the web UI can use the same API later.
 
 ## How it is confirmed
 
-On the Apple TV from the turntable board: pair with the PIN it shows, restart aas, a
-record plays to it without asking again, and song metadata shows on its
-screen (the open check of the song metadata work).
+The owner decided (2026-11-22): pairing is done only once. On the Apple TV
+from the turntable board (its AirPlay access set to allow everyone on the network, no
+password): pair with the PIN it shows; restart aas; a record plays to it
+without a PIN being asked again, through a whole record side. Whether it
+shows song metadata is noted; if it does not (an Apple TV may want it over
+its MediaRemote channel instead of `SET_PARAMETER`), that is follow-up work,
+not part of this.
