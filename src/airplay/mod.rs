@@ -44,6 +44,11 @@ impl Receiver {
         }
     }
 
+    /// Whether it reads `now_playing`.
+    pub fn shares(&self, now_playing: &std::sync::Arc<crate::metadata::NowPlaying>) -> bool {
+        std::sync::Arc::ptr_eq(&self.now_playing, now_playing)
+    }
+
     /// Starts the thread, once.
     pub fn spawn(&mut self) {
         if self.handle.is_none() {
