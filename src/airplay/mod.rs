@@ -25,6 +25,7 @@ use output::{AirplayHandle, AirplayState, Status, TapReader};
 pub struct Receiver {
     config: AirplayConfig,
     now_playing: std::sync::Arc<crate::metadata::NowPlaying>,
+    pairings: std::sync::Arc<ap2::keys::Pairings>,
     handle: Option<AirplayHandle>,
     tap: Option<(ClientId, u32)>,
     told: Option<Status>,
@@ -34,10 +35,12 @@ impl Receiver {
     pub fn new(
         config: AirplayConfig,
         now_playing: std::sync::Arc<crate::metadata::NowPlaying>,
+        pairings: std::sync::Arc<ap2::keys::Pairings>,
     ) -> Receiver {
         Receiver {
             config,
             now_playing,
+            pairings,
             handle: None,
             tap: None,
             told: None,
@@ -52,7 +55,11 @@ impl Receiver {
     /// Starts the thread, once.
     pub fn spawn(&mut self) {
         if self.handle.is_none() {
-            self.handle = Some(output::spawn(self.config.clone(), self.now_playing.clone()));
+            self.handle = Some(output::spawn(
+                self.config.clone(),
+                self.now_playing.clone(),
+                self.pairings.clone(),
+            ));
         }
     }
 

@@ -16,6 +16,7 @@ use super::raop::{self, Raop, Setup};
 use super::rtp;
 use super::rtsp::{Conn, RtspError};
 use super::stream::{Outgoing, Stream};
+use crate::airplay::ap2::keys::Pairings;
 use crate::metadata::NowPlaying;
 use aas_client::ring::Ring;
 use std::net::UdpSocket;
@@ -128,7 +129,11 @@ impl Drop for AirplayHandle {
 }
 
 /// Starts the thread of a receiver. It does nothing until it has a tap.
-pub fn spawn(config: AirplayConfig, now_playing: Arc<NowPlaying>) -> AirplayHandle {
+pub fn spawn(
+    config: AirplayConfig,
+    now_playing: Arc<NowPlaying>,
+    pairings: Arc<Pairings>,
+) -> AirplayHandle {
     let status = Arc::new(Mutex::new(Status {
         state: AirplayState::Idle,
         error: None,
@@ -137,7 +142,7 @@ pub fn spawn(config: AirplayConfig, now_playing: Arc<NowPlaying>) -> AirplayHand
     let shared = status.clone();
     let thread = std::thread::Builder::new()
         .name("aas-airplay".into())
-        .spawn(move || Output::new(config, shared, now_playing).run(rx))
+        .spawn(move || Output::new(config, shared, now_playing, pairings).run(rx))
         .expect("the AirPlay thread starts");
     AirplayHandle {
         tx,
@@ -269,6 +274,7 @@ struct Output {
     interleaved: Vec<i32>,
     sent: Vec<Outgoing>,
     now_playing: Arc<NowPlaying>,
+    pairings: Arc<Pairings>,
 }
 
 /// A line from the monotonic clock to NTP time, taken from the wall clock
@@ -304,9 +310,11 @@ impl Output {
         config: AirplayConfig,
         status: Arc<Mutex<Status>>,
         now_playing: Arc<NowPlaying>,
+        pairings: Arc<Pairings>,
     ) -> Output {
         Output {
             now_playing,
+            pairings,
             config,
             status,
             base: Instant::now(),
@@ -545,7 +553,23 @@ impl Output {
                 (Control::One(raop), ports, latency, None)
             }
             Protocol::AirPlay2 => {
-                let (ap2, ports) = Ap2::open(conn, &setup).map_err(|e| e.to_string())?;
+                let (ap2, ports) = {
+                    // The identity is made only once a receiver is paired.
+                    let peer = self.pairings.peer(&c.name);
+                    let me = peer.as_ref().map(|_| self.pairings.identity());
+                    let keys = me.as_ref().zip(peer.as_ref());
+                    let name = &c.name;
+                    Ap2::open(conn, &setup, keys).map_err(|e| match e {
+                        RtspError::NeedsPairing => {
+                            format!("the receiver needs pairing: aasctl airplay pair \"{name}\"")
+                        }
+                        RtspError::PairingRefused => format!(
+                            "the receiver refused the pairing: pair again with \
+                             aasctl airplay pair \"{name}\""
+                        ),
+                        e => e.to_string(),
+                    })?
+                };
                 let (latency, shk) = (ap2.audio_latency, ap2.shk);
                 (Control::Two(ap2), ports, latency, Some(shk))
             }
@@ -690,6 +714,7 @@ mod tests {
     use super::super::config::Protocol;
     use super::super::fake::{Answer, FakeReceiver, Seen, accepting_on};
     use super::*;
+    use crate::airplay::ap2::keys::Pairings;
     use crate::metadata::{Cover, Track};
     use std::os::fd::AsFd;
     use std::sync::atomic::AtomicUsize;
@@ -757,7 +782,26 @@ mod tests {
     }
 
     fn spawn_quiet(c: AirplayConfig) -> AirplayHandle {
-        spawn(c, NowPlaying::new())
+        spawn(c, NowPlaying::new(), Pairings::new())
+    }
+
+    #[test]
+    fn the_error_names_the_command_to_pair() {
+        let receiver = FakeReceiver::serving(1, |port| {
+            super::super::ap2::session::tests::ap2_receiver(port, 0x644)
+        });
+        let mut c = config(receiver.port, Connect::Always);
+        c.protocol = Protocol::AirPlay2;
+        let handle = spawn_quiet(c);
+        let (_ring, reader) = tap();
+        handle.tap(reader);
+        let retrying = |s| matches!(s, AirplayState::Retrying { .. });
+        assert!(until(&handle, 3.0, retrying), "{:?}", handle.status());
+        assert_eq!(
+            handle.status().error.as_deref(),
+            Some("the receiver needs pairing: aasctl airplay pair \"test\"")
+        );
+        handle.stop();
     }
 
     fn song(title: &str) -> Track {
@@ -780,7 +824,7 @@ mod tests {
 
     /// Plays to `receiver` for `ms` with `np` as the current track.
     fn play_with(receiver: &FakeReceiver, np: Arc<NowPlaying>, ms: u64, during: impl FnOnce()) {
-        let handle = spawn(config(receiver.port, Connect::Always), np);
+        let handle = spawn(config(receiver.port, Connect::Always), np, Pairings::new());
         let (_ring, reader) = tap();
         handle.tap(reader);
         assert!(until(&handle, 3.0, playing), "{:?}", handle.status());

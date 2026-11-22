@@ -8,6 +8,8 @@ use super::bplist::{self, Value};
 use super::channel::Keys;
 use super::events::Events;
 use super::pair::pair_transient;
+use crate::airplay::ap2::hap;
+use crate::airplay::ap2::keys::{Identity, Peer};
 use crate::airplay::meta::Meta;
 use crate::airplay::raop::{Ports, Setup, random};
 use crate::airplay::rtp::{FRAMES, RATE};
@@ -46,7 +48,11 @@ pub struct Ap2 {
 
 impl Ap2 {
     /// Runs the handshake on `conn` up to RECORD and the first volume.
-    pub fn open(mut conn: Conn, setup: &Setup) -> Result<(Ap2, Ports), RtspError> {
+    pub fn open(
+        mut conn: Conn,
+        setup: &Setup,
+        pairing: Option<(&Identity, &Peer)>,
+    ) -> Result<(Ap2, Ports), RtspError> {
         let session = u32::from_be_bytes(random());
         let (local, peer) = (conn.local_ip(), conn.peer_ip());
         let url = match local {
@@ -65,13 +71,20 @@ impl Ap2 {
         check(&info, "GET /info")?;
         let info = bplist::decode(&info.body).map_err(|e| RtspError::Malformed(e.to_string()))?;
         let flags = info.get("statusFlags").and_then(Value::as_int).unwrap_or(0);
-        if flags & (PIN_REQUIRED | ONE_TIME_PAIRING_REQUIRED) != 0 {
-            return Err(RtspError::Pairing(format!(
-                "the receiver wants a PIN or HomeKit pairing (statusFlags {flags:#x}), \
-                 which this build does not do"
-            )));
+        if flags & PIN_REQUIRED != 0 {
+            return Err(RtspError::Pairing(
+                "the receiver wants a PIN for every connection, which aas does not do".into(),
+            ));
         }
-        let secret = pair_transient(&mut conn, &headers)?;
+        // Kept keys are verified; a receiver that wants pairing and has
+        // none is told to be paired; any other is paired for the session.
+        let secret = match pairing {
+            Some((me, peer)) => hap::verify(&mut conn, &headers, me, peer)?.to_vec(),
+            None if flags & ONE_TIME_PAIRING_REQUIRED != 0 => {
+                return Err(RtspError::NeedsPairing);
+            }
+            None => pair_transient(&mut conn, &headers)?,
+        };
         conn.seal(&Keys::control(&secret));
         let mut ap2 = Ap2 {
             conn,
@@ -307,6 +320,9 @@ fn stream_ports(answer: &Response) -> Result<Ports, RtspError> {
 pub mod tests {
     use super::*;
     use crate::airplay::ap2::channel::{Opener, Sealer};
+    use crate::airplay::ap2::fake_hap::FakeAccessory;
+    use crate::airplay::ap2::hap;
+    use crate::airplay::ap2::keys::{Identity, Pairings, Peer};
     use crate::airplay::ap2::pair::{PIN, tests::pairing};
     use crate::airplay::fake::{Answer, FakeReceiver, Seen};
     use std::io::{Read, Write};
@@ -369,6 +385,19 @@ pub mod tests {
         impl Fn(&Seen) -> Answer + Send + 'static,
         Arc<Mutex<FakeEvents>>,
     ) {
+        ap2_receiver_paired(data_port, status_flags, port, None)
+    }
+
+    /// As `ap2_receiver_with`, with `accessory` answering HomeKit pairing.
+    pub fn ap2_receiver_paired(
+        data_port: u16,
+        status_flags: i64,
+        port: EventPort,
+        accessory: Option<Arc<FakeAccessory>>,
+    ) -> (
+        impl Fn(&Seen) -> Answer + Send + 'static,
+        Arc<Mutex<FakeEvents>>,
+    ) {
         let events = Arc::new(Mutex::new(FakeEvents::default()));
         let key: Arc<Mutex<Option<Vec<u8>>>> = Arc::default();
         let mut event_port = 0;
@@ -404,7 +433,8 @@ pub mod tests {
         }
         let shared = events.clone();
         let script = move |seen: &Seen| {
-            if let Some(answer) = pairing(seen, PIN) {
+            let hap = accessory.as_ref().and_then(|a| a.answer(seen));
+            if let Some(answer) = hap.or_else(|| pairing(seen, PIN)) {
                 if let Answer::SealAfter(_, secret) = &answer {
                     *key.lock().unwrap() = Some(secret.clone());
                 }
@@ -470,7 +500,81 @@ pub mod tests {
     ) -> (Result<(Ap2, Ports), RtspError>, FakeReceiver) {
         let receiver = FakeReceiver::start(script);
         let conn = Conn::connect("127.0.0.1", receiver.port, Duration::from_secs(2)).unwrap();
-        (Ap2::open(conn, setup), receiver)
+        (Ap2::open(conn, setup, None), receiver)
+    }
+
+    /// Pairs with `acc` as aas would and gives the keys to keep.
+    fn pair_with(acc: &Arc<FakeAccessory>) -> (Identity, Peer) {
+        let a = acc.clone();
+        let receiver = FakeReceiver::start(move |seen| {
+            a.answer(seen).unwrap_or(Answer::Status(200, Vec::new()))
+        });
+        let mut conn = Conn::connect("127.0.0.1", receiver.port, Duration::from_secs(2)).unwrap();
+        let me = Pairings::new().identity();
+        let h = vec![("User-Agent", USER_AGENT.to_string())];
+        let started = hap::setup_start(&mut conn, &h).unwrap();
+        let peer = hap::setup_finish(&mut conn, &h, started, "1234", &me).unwrap();
+        (me, peer)
+    }
+
+    fn open_paired(
+        flags: i64,
+        acc: &Arc<FakeAccessory>,
+        keys: Option<(&Identity, &Peer)>,
+    ) -> (Result<(Ap2, Ports), RtspError>, FakeReceiver) {
+        let (script, _) = ap2_receiver_paired(6000, flags, EventPort::None, Some(acc.clone()));
+        let receiver = FakeReceiver::start(script);
+        let conn = Conn::connect("127.0.0.1", receiver.port, Duration::from_secs(2)).unwrap();
+        (Ap2::open(conn, &setup(), keys), receiver)
+    }
+
+    #[test]
+    fn a_receiver_that_needs_pairing_and_has_no_keys_says_so() {
+        let acc = FakeAccessory::new("1234");
+        let (opened, _r) = open_paired(0x644, &acc, None);
+        assert!(
+            matches!(opened, Err(RtspError::NeedsPairing)),
+            "{:?}",
+            opened.err()
+        );
+    }
+
+    #[test]
+    fn stored_keys_verify_and_the_session_plays() {
+        let acc = FakeAccessory::new("1234");
+        let (me, peer) = pair_with(&acc);
+        let (opened, receiver) = open_paired(0x644, &acc, Some((&me, &peer)));
+        opened.unwrap().0.teardown();
+        let seen = receiver.finish();
+        let verify = seen.iter().position(|s| s.url == "/pair-verify").unwrap();
+        assert!(seen[verify..].iter().any(|s| s.method == "SETUP"));
+        assert!(!seen.iter().any(|s| s.url == "/pair-setup"));
+    }
+
+    #[test]
+    fn a_forgotten_pairing_fails_the_session() {
+        let acc = FakeAccessory::new("1234");
+        let (me, peer) = pair_with(&acc);
+        acc.forget();
+        let (opened, _r) = open_paired(0x644, &acc, Some((&me, &peer)));
+        assert!(
+            matches!(opened, Err(RtspError::PairingRefused)),
+            "{:?}",
+            opened.err()
+        );
+    }
+
+    #[test]
+    fn a_pin_for_every_connection_is_not_done() {
+        let acc = FakeAccessory::new("1234");
+        let (opened, _r) = open_paired(0x8, &acc, None);
+        match opened {
+            Err(RtspError::Pairing(why)) => assert_eq!(
+                why,
+                "the receiver wants a PIN for every connection, which aas does not do"
+            ),
+            other => panic!("{:?}", other.err()),
+        }
     }
 
     #[test]
@@ -607,13 +711,16 @@ pub mod tests {
 
     #[test]
     fn a_receiver_that_wants_a_pin_is_refused_before_pairing() {
+        // Without stored keys neither is paired for the session: nothing
+        // goes to /pair-setup.
         for flags in [PIN_REQUIRED, ONE_TIME_PAIRING_REQUIRED] {
             let (opened, receiver) = open_with(ap2_receiver(6000, flags | 0x4));
-            let Err(RtspError::Pairing(why)) = opened else {
-                panic!("{flags:#x} opened");
-            };
-            assert!(why.contains("PIN") || why.contains("HomeKit"), "{why}");
-            drop(receiver);
+            assert!(
+                matches!(opened, Err(RtspError::Pairing(_) | RtspError::NeedsPairing)),
+                "{flags:#x} opened"
+            );
+            let seen = receiver.finish();
+            assert!(!seen.iter().any(|s| s.url == "/pair-setup"), "{flags:#x}");
         }
     }
 

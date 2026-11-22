@@ -878,6 +878,8 @@ pub struct Control {
     /// The current track, which the metadata source fills and the AirPlay
     /// receivers read.
     now_playing: std::sync::Arc<crate::metadata::NowPlaying>,
+    /// The AirPlay 2 pairing keys, beside the state file once it is known.
+    pairings: std::sync::Arc<crate::airplay::ap2::keys::Pairings>,
     /// The rate and period the output was last told to open at. None while
     /// it is closed.
     output: Option<(u32, u32)>,
@@ -990,6 +992,7 @@ impl Control {
         let mut libraries = Libraries::default();
         let plugins = plugins::entries(1, &config.plugins, &mut libraries);
         let now_playing = crate::metadata::NowPlaying::new();
+        let pairings = crate::airplay::ap2::keys::Pairings::new();
         // The source runs until the daemon ends; its thread is not joined.
         drop(crate::metadata::start(&config.metadata, now_playing.clone()));
         Control {
@@ -1022,9 +1025,10 @@ impl Control {
                 .airplay
                 .iter()
                 .cloned()
-                .map(|c| crate::airplay::Receiver::new(c, now_playing.clone()))
+                .map(|c| crate::airplay::Receiver::new(c, now_playing.clone(), pairings.clone()))
                 .collect(),
             now_playing,
+            pairings,
             output: None,
             parked: None,
             reopening: 0,
