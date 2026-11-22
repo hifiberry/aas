@@ -67,6 +67,9 @@ chacha20poly1305 = "0.10.1"
 hkdf = "0.12.4"
 num-bigint = "0.4"
 sha2 = "0.10.9"
+# Song metadata: ACR's REST answers and the covers it points to, which can
+# be on the internet over HTTPS. Used only in the metadata source's thread.
+ureq = { version = "2", default-features = false, features = ["tls"] }
 
 [dev-dependencies]
 # Without its default `disable_release`, so the allocation checks also run

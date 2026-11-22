@@ -4,6 +4,8 @@
 
 pub mod acr;
 pub mod config;
+#[cfg(test)]
+mod fake_acr;
 
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -139,6 +141,25 @@ impl State {
             return Some(p);
         }
         Some(p + now.saturating_duration_since(at).as_secs_f64())
+    }
+}
+
+/// Starts the configured source filling `store`; `None` when there is
+/// none. The source runs until the daemon ends.
+pub fn start(
+    config: &config::MetadataConfig,
+    store: Arc<NowPlaying>,
+) -> Option<std::thread::JoinHandle<()>> {
+    match config.source {
+        config::Source::None => None,
+        config::Source::Acr => {
+            let base = config.url.clone();
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            std::thread::Builder::new()
+                .name("aas-metadata".into())
+                .spawn(move || acr::run(base, store, stop))
+                .ok()
+        }
     }
 }
 
