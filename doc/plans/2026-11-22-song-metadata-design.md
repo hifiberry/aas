@@ -70,6 +70,15 @@ The owner decided (2026-11-22):
 - Metadata must not fail a session: a refusal or a missing answer is logged
   once and ignored.
 
+## How it is confirmed
+
+The owner decided (2026-11-22): first on the sound bar, over AirPlay 2 from
+the turntable board. If the bar does not show metadata (it may not have the feature), on an
+Apple TV. The fake receiver in the unit tests shows what is sent; only a
+receiver shows that it is accepted and displayed. "Sent and not refused" on
+the bar alone is not done if the bar shows nothing; the Apple TV is then the
+test.
+
 ## Approaches
 
 - **A. aas pulls through an internal source interface** *(chosen)*. A source
