@@ -81,8 +81,13 @@ impl NowPlaying {
             s.progress_gen += 1;
             s.position = None;
         } else if track.playing != s.track.playing {
-            // Hold the position where it is when playback stops or starts.
+            // Hold the position where it is when playback stops or starts;
+            // on a resume the receiver's progress, which ran on, is set
+            // again.
             s.position = s.position_at(now).map(|p| (p, now));
+            if track.playing {
+                s.progress_gen += 1;
+            }
         }
         s.track = track;
     }
@@ -112,6 +117,10 @@ impl NowPlaying {
     /// Empties the track, as when the source is gone.
     pub fn clear(&self) {
         let mut s = self.state.lock().unwrap();
+        // Already empty: nothing to tell, however often a source retries.
+        if s.track == Track::default() && s.cover.is_none() && s.position.is_none() {
+            return;
+        }
         *s = State {
             text_gen: s.text_gen + 1,
             cover_gen: s.cover_gen + 1,
@@ -276,6 +285,30 @@ mod tests {
         assert_eq!(s.text_gen, before.text_gen + 1);
         assert_eq!(s.cover_gen, before.cover_gen + 1);
         assert_eq!(s.progress_gen, before.progress_gen + 1);
+    }
+
+    #[test]
+    fn clearing_an_empty_store_moves_nothing() {
+        let np = NowPlaying::new();
+        np.set_track(track("A", true));
+        np.clear();
+        let once = np.generations();
+        np.clear();
+        assert_eq!(np.generations(), once);
+    }
+
+    #[test]
+    fn a_resume_moves_the_progress_generation() {
+        let t0 = Instant::now();
+        let np = NowPlaying::new();
+        np.set_track(track("A", true));
+        np.set_position(10.0, t0);
+        np.set_track(track("A", false));
+        let paused = np.generations();
+        np.set_track(track("A", true));
+        let resumed = np.generations();
+        assert_eq!(resumed.0, paused.0, "a resume is no new text");
+        assert_eq!(resumed.2, paused.2 + 1);
     }
 
     #[test]

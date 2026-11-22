@@ -755,10 +755,16 @@ mod tests {
             s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
             let mut got = Vec::new();
             let mut chunk = [0u8; 65536];
-            while !got.windows(until.len()).any(|w| w == until) {
+            loop {
                 match s.read(&mut chunk) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => got.extend_from_slice(&chunk[..n]),
+                }
+                // Only the new bytes, and the few before that could start
+                // a match, are searched.
+                let from = got.len().saturating_sub(chunk.len() + until.len());
+                if got[from..].windows(until.len()).any(|w| w == until) {
+                    break;
                 }
             }
             got

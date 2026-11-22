@@ -352,13 +352,14 @@ url = "http://127.0.0.1:1080/api"   # AudioControl's API; its events at <url>/ev
 Only the track of AudioControl's active player is taken. A thread follows its
 events WebSocket, reads `<url>/now-playing` on each change, and fetches the
 cover, from AudioControl or from the internet, JPEG or PNG, up to 4 MiB, within
-10 s; a cover that fails is left out and the text goes out all the same. When
+10 s; the old cover is taken down at once, and a cover that fails is left out
+while the text goes out all the same. When
 AudioControl goes away the track is emptied, and it is tried again every 5 s.
 
 A playing AirPlay session sends what changed as `SET_PARAMETER` requests
 stamped with the stream's rtptime: the text as DMAP (`mlit` with `minm`, `asar`,
 `asal`), the cover as `image/jpeg` or `image/png` (`image/none` clears it) and
-`progress`. They are queued and written as the connection takes them, so a
+`progress`, an empty bar for a track without a length. They are queued and written as the connection takes them, so a
 cover never holds the audio up, and their answers are not waited for: a
 receiver that refuses them plays on. An emptied track clears the receiver's
 text and cover. On HiFiBerry OS, `aas-config` sets `source = "acr"` where

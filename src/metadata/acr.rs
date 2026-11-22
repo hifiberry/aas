@@ -130,6 +130,8 @@ impl Follower<'_> {
         }
         if answer.cover_url != self.cover_url {
             self.cover_url = answer.cover_url;
+            // The old cover goes at once, not when the new one has come.
+            self.store.set_cover(None);
             let cover = self.cover_url.as_deref().and_then(|u| self.cover(u));
             self.store.set_cover(cover);
         }
@@ -347,6 +349,19 @@ mod tests {
         let (store, stop) = follow(acr.url());
         assert!(until(&store, 3, |s| title(s) == Some("One")));
         assert!(store.snapshot(Instant::now()).cover.is_none());
+        stop.store(true, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn a_new_cover_url_takes_the_old_cover_down_at_once() {
+        let acr = FakeAcr::start(&playing("One", "/cover.jpg"));
+        let (store, stop) = follow(acr.url());
+        assert!(until(&store, 3, |s| s.cover.is_some()));
+        acr.set_now_playing(&playing("Two", "/slow.jpg"));
+        acr.push(r#"{"type": "song_changed", "player_name": "analog", "player_id": "analog"}"#);
+        assert!(until(&store, 3, |s| title(s) == Some("Two")));
+        // The slow cover takes 10 s; the old one must not stand meanwhile.
+        assert!(until(&store, 1, |s| s.cover.is_none()));
         stop.store(true, Ordering::SeqCst);
     }
 

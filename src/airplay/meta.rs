@@ -78,8 +78,8 @@ pub fn progress(rtp_now: u32, position_s: f64, duration_s: f64) -> String {
     format!("progress: {start}/{rtp_now}/{end}\r\n")
 }
 
-/// What changed since `sent`, which is brought up to date. Progress goes
-/// out only with both a position and a length.
+/// What changed since `sent`, which is brought up to date. Progress
+/// without both a position and a length is an empty bar.
 pub fn due(sent: &mut Sent, snap: &Snapshot, rtp_now: u32) -> Vec<Meta> {
     let mut out = Vec::new();
     if snap.text_gen != sent.text_gen {
@@ -94,9 +94,14 @@ pub fn due(sent: &mut Sent, snap: &Snapshot, rtp_now: u32) -> Vec<Meta> {
         sent.cover_gen = snap.cover_gen;
     }
     if snap.progress_gen != sent.progress_gen {
-        if let (Some(p), Some(d)) = (snap.position_s, snap.track.duration_s) {
-            out.push(Meta::Progress(progress(rtp_now, p, d)));
-        }
+        // Without a length there is no bar to show: an empty one replaces
+        // the last track's.
+        out.push(Meta::Progress(
+            match (snap.position_s, snap.track.duration_s) {
+                (Some(p), Some(d)) => progress(rtp_now, p, d),
+                _ => format!("progress: {rtp_now}/{rtp_now}/{rtp_now}\r\n"),
+            },
+        ));
         sent.progress_gen = snap.progress_gen;
     }
     out
@@ -239,14 +244,20 @@ mod tests {
     }
 
     #[test]
-    fn no_duration_no_progress() {
+    fn a_track_without_a_length_clears_the_progress() {
         let mut sent = Sent::default();
         let t = Track {
             duration_s: None,
             ..tab("T")
         };
-        let due = due(&mut sent, &snap(t.clone(), None, Some(5.0), (1, 0, 1)), 0);
-        assert_eq!(due, [Meta::Text(dmap(&t))]);
+        let due = due(&mut sent, &snap(t.clone(), None, Some(5.0), (1, 0, 1)), 700);
+        assert_eq!(
+            due,
+            [
+                Meta::Text(dmap(&t)),
+                Meta::Progress("progress: 700/700/700\r\n".into())
+            ]
+        );
         assert_eq!(sent.progress_gen, 1);
     }
 
