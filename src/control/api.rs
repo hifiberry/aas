@@ -1622,6 +1622,7 @@ mod tests {
                 idle_s: 120,
                 latency_ms: 1500,
                 volume_db: Some(-25.0),
+                enabled: true,
             }],
             ..Config::default()
         }

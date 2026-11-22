@@ -37,6 +37,8 @@ pub struct AirplayConfig {
     pub latency_ms: u32,
     /// The receiver's volume, sent once a session, in dB; None sends none.
     pub volume_db: Option<f32>,
+    /// Whether it is played to; the API can change it.
+    pub enabled: bool,
 }
 
 /// The receivers of the `[[airplay]]` tables, checked.
@@ -56,7 +58,7 @@ pub fn receivers_from(tables: Vec<toml::Table>) -> Result<Vec<AirplayConfig>, St
     Ok(receivers)
 }
 
-const KEYS: [&str; 9] = [
+const KEYS: [&str; 10] = [
     "host",
     "port",
     "name",
@@ -66,6 +68,7 @@ const KEYS: [&str; 9] = [
     "idle_s",
     "latency_ms",
     "volume_db",
+    "enabled",
 ];
 
 /// A whole number in `range`, or `None` for a key that is not there.
@@ -142,6 +145,11 @@ fn receiver_from(table: toml::Table) -> Result<AirplayConfig, String> {
         idle_s,
         latency_ms,
         volume_db,
+        enabled: match table.get("enabled") {
+            None => true,
+            Some(toml::Value::Boolean(b)) => *b,
+            Some(_) => return Err("enabled must be true or false".into()),
+        },
     })
 }
 
@@ -165,6 +173,21 @@ mod tests {
     }
 
     #[test]
+    fn enabled_is_read_and_true_by_default() {
+        assert!(one("host = \"h\"\n").unwrap().enabled);
+        assert!(!one("host = \"h\"\nenabled = false\n").unwrap().enabled);
+        assert!(one("host = \"h\"\nenabled = true\n").unwrap().enabled);
+    }
+
+    #[test]
+    fn enabled_that_is_not_a_boolean_is_an_error() {
+        assert_eq!(
+            one("host = \"h\"\nenabled = 1\n").unwrap_err(),
+            "airplay 1: enabled must be true or false"
+        );
+    }
+
+    #[test]
     fn a_host_alone_takes_every_default() {
         let r = one("host = \"soundbar.local\"\n").unwrap();
         assert_eq!(
@@ -179,6 +202,7 @@ mod tests {
                 idle_s: 120,
                 latency_ms: 1500,
                 volume_db: Some(0.0),
+                enabled: true,
             }
         );
     }
