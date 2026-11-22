@@ -10,17 +10,8 @@ pub const PATIENCE: Duration = Duration::from_secs(10);
 /// The wait for a pairing step, which the daemon gives 40 s.
 pub const PAIR_PATIENCE: Duration = Duration::from_secs(45);
 
-/// Sends one request and gives the status and the body of the answer.
-pub fn request(
-    port: u16,
-    method: &str,
-    path: &str,
-    body: Option<&str>,
-) -> io::Result<(u16, String)> {
-    request_within(port, method, path, body, PATIENCE)
-}
-
-/// As `request`, waiting up to `patience` for the answer.
+/// Sends one request and gives the status and the body of the answer,
+/// waiting up to `patience` for it.
 pub fn request_within(
     port: u16,
     method: &str,
