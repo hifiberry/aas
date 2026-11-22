@@ -2519,3 +2519,20 @@ applies.
   answer and played throughout (7439 and 7466 packets, none asked for again,
   none short). Neither was timed at the speaker: the board has no microphone,
   and the bar may add a processing delay of its own.
+
+### Song metadata
+
+On the turntable board, aas with `[metadata] source = "acr"` sending to the
+sound bar over AirPlay 2 (`latency_ms = 100`), a record playing and
+recognised by analog-recognition:
+
+- `GET /metadata` followed AudioControl's active player: title, artist and
+  album of each recognised track, no length (the analog player has none).
+- The bar showed the title on its own screen. No metadata request was
+  refused.
+- No cover was sent: AudioControl had none for the tracks played (no
+  `cover_art_url`), so whether the bar shows covers is not yet known.
+- An Apple TV refused the session before any metadata: its `/info`
+  `statusFlags` 0x644 ask for one-time (HomeKit or PIN) pairing, which aas
+  does not do; transient pairing would need its AirPlay access set to
+  everyone without a password.
