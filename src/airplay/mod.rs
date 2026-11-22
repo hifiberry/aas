@@ -13,7 +13,7 @@ pub mod rtsp;
 pub mod stream;
 
 #[cfg(test)]
-mod fake;
+pub mod fake;
 
 use crate::api::{AirplayView, ApiEvent};
 use crate::rate::ClientId;
@@ -29,6 +29,9 @@ pub struct Receiver {
     config_enabled: bool,
     now_playing: std::sync::Arc<crate::metadata::NowPlaying>,
     pairings: std::sync::Arc<ap2::keys::Pairings>,
+    /// A pairing started and waiting for its PIN, kept here so that a
+    /// receiver that is off can be paired too.
+    held: std::sync::Arc<std::sync::Mutex<Option<pairing::Held>>>,
     handle: Option<AirplayHandle>,
     tap: Option<(ClientId, u32)>,
     told: Option<Status>,
@@ -45,6 +48,7 @@ impl Receiver {
             config,
             now_playing,
             pairings,
+            held: Default::default(),
             handle: None,
             tap: None,
             told: None,
@@ -74,16 +78,37 @@ impl Receiver {
         self.config.protocol
     }
 
-    /// Runs a pairing step on the receiver's thread, which is started if
-    /// it is not yet; `answer` gets the result.
+    /// Runs a pairing step in a helper thread, on or off, so that neither
+    /// the control thread nor a session waits for it; `answer` gets the
+    /// result. A start nobody finishes is dropped after `PIN_WAIT`.
     pub fn pair(
         &mut self,
         pin: Option<String>,
         answer: tokio::sync::oneshot::Sender<crate::api::Answer>,
     ) {
-        self.spawn();
-        if let Some(handle) = &self.handle {
-            handle.pair(pin, answer);
+        let (config, pairings, held) = (
+            self.config.clone(),
+            self.pairings.clone(),
+            self.held.clone(),
+        );
+        let spawned = std::thread::Builder::new()
+            .name("aas-pairing".into())
+            .spawn(move || {
+                let starting = pin.is_none();
+                let now = std::time::Instant::now();
+                let result = pairing::step(&config, &pairings, &held, pin.as_deref(), now);
+                let started = starting && result.is_ok();
+                let _ = answer.send(result);
+                if started {
+                    std::thread::sleep(pairing::PIN_WAIT + std::time::Duration::from_secs(1));
+                    pairing::expire(&held, std::time::Instant::now());
+                }
+            });
+        if let Err(e) = spawned {
+            eprintln!(
+                "aas: airplay \"{}\": no pairing thread: {e}",
+                self.config.name
+            );
         }
     }
 

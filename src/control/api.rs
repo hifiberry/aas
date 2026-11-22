@@ -1740,6 +1740,29 @@ mod tests {
     }
 
     #[test]
+    fn a_receiver_that_is_off_can_be_paired() {
+        use crate::airplay::ap2::fake_hap::FakeAccessory;
+        use crate::airplay::fake::{Answer as Reply, FakeReceiver};
+        let acc = FakeAccessory::new("1234");
+        let receiver = FakeReceiver::serving(1, move |_| {
+            move |seen: &crate::airplay::fake::Seen| {
+                acc.answer(seen).unwrap_or(Reply::Status(200, Vec::new()))
+            }
+        });
+        let mut config = off(with_an_airplay2_receiver());
+        config.airplay[0].port = receiver.port;
+        let (mut control, _engine, _logs, now) = started_with(&config, Vec::new());
+        let (answer, answered) = tokio::sync::oneshot::channel();
+        let call = Call::PairAirplay {
+            name: "Study".into(),
+            pin: None,
+        };
+        control.answer(ApiCall { call, answer }, now);
+        assert_eq!(answered.blocking_recv().unwrap().unwrap(), json!({"pin": "shown"}));
+        assert!(!control.airplay[0].running());
+    }
+
+    #[test]
     fn patch_airplay_for_an_unknown_receiver_is_404() {
         let (mut control, _engine, _logs, now) = started_with(&with_a_receiver(), Vec::new());
         let e = patch_enabled(&mut control, "Kitchen", false, now).unwrap_err();
