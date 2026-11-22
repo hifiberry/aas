@@ -240,7 +240,8 @@ Missing:
 
 ## AirPlay: what is not yet tried on a receiver
 
-Both protocols play to a sound bar (`doc/measurements.md`, "AirPlay output").
+Both protocols play to a sound bar, and AirPlay 2 to a paired Apple TV;
+song metadata, covers included, shows on both (`doc/measurements.md`).
 Not tried: an AirPlay 2 session after the receiver has been switched to
 another input and back (the case PipeWire's pause helper handles), a Mac or
 another make of receiver, and a 10-minute run with music. Also missing:
@@ -631,3 +632,28 @@ than the maximum the receiver was given. Either send
 `max(88200, latency)` as `latencyMax` (a field next to `Setup.min_latency`) or
 cap `latency_ms` at 2000 for `protocol = "airplay2"`. Not yet tried on a
 receiver; start in `src/airplay/ap2/session.rs` where `latencyMax` is set.
+
+## AirPlay and song metadata: small findings left from the 0.4.0 reviews
+
+Reviewed and judged minor when song metadata, PIN pairing and receivers on
+and off were merged; none affects playback. Each wants a test that fails
+first.
+
+- Metadata: the ACR WebSocket handshake runs under the 500 ms poll timeout
+  (`src/metadata/acr.rs`, set it after the handshake); one slow or malformed
+  now-playing answer is treated as an outage and clears the track; cover
+  downloads follow redirects to any http(s) address; a doc comment in
+  `src/api.rs` sits on `MetadataView` instead of `answer()`.
+- Pairing (`src/airplay/ap2/keys.rs`, `src/airplay/pairing.rs`): a failed
+  keys write still counts the receiver as paired until a restart; the state
+  directory is not synced after the rename; an unreadable keys file is
+  overwritten instead of kept aside; a PIN sent while its start still runs
+  gets 409; the 40 s API wait can be short behind a session handshake; a
+  non-UTF-8 receiver id is stored lossily; `call()` keeps a placeholder
+  answer for `PairAirplay`.
+- On and off (`src/airplay/mod.rs`, `src/control/api.rs`): off and straight
+  on can give two sessions for a few seconds; the airplay event has no
+  `enabled` field; shutdown does not wait for receivers being turned off; the
+  second assertion of `the_state_does_not_outlast_a_changed_config` cannot
+  fail; no test checks the tap commands of a switch; aasctl cannot switch a
+  receiver named "pair".
