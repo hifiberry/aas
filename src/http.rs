@@ -19,7 +19,7 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
 use axum::http::{StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, patch, post};
 use serde::de::DeserializeOwned;
 use std::future::{Future, poll_fn};
 use std::io;
@@ -128,6 +128,7 @@ fn router(shared: Arc<Shared>) -> Router {
         .route("/state", get(|s| ask(s, Call::State)))
         .route("/airplay", get(|s| ask(s, Call::Airplay)))
         .route("/metadata", get(|s| ask(s, Call::Metadata)))
+        .route("/airplay/{name}", patch(patch_airplay))
         .route("/airplay/{name}/pair", post(pair_airplay))
         .route("/outputs", get(|s| ask(s, Call::Outputs)))
         .route("/outputs/{id}", get(get_output).patch(patch_output))
@@ -339,6 +340,11 @@ async fn pair_airplay(s: State<Arc<Shared>>, name: PathOf<String>, body: BodyOf)
         Ok(body) => axum::Json(body).into_response(),
         Err(e) => e.into_response(),
     }
+}
+
+async fn patch_airplay(s: State<Arc<Shared>>, name: PathOf<String>, body: BodyOf) -> Response {
+    let call = path(name).and_then(|name| Ok(Call::PatchAirplay(name, parse(&body)?)));
+    ask_for(s, call).await
 }
 
 async fn patch_analog(s: State<Arc<Shared>>, body: BodyOf) -> Response {

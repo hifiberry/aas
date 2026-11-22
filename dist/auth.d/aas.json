@@ -4,7 +4,7 @@
   "default_tier": "risky",
   "rules": [
     { "tier": "ok", "methods": ["GET"], "paths": ["/**"] },
-    { "tier": "ok", "methods": ["PATCH"], "paths": ["/outputs/*", "/inputs/**", "/plugins/**"] },
+    { "tier": "ok", "methods": ["PATCH"], "paths": ["/outputs/*", "/inputs/**", "/plugins/**", "/airplay/*"] },
     { "tier": "ok", "methods": ["PUT"], "paths": ["/matrix"] },
     { "tier": "risky", "methods": ["*"], "paths": ["/**"] }
   ]

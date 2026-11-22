@@ -1189,6 +1189,14 @@ impl Control {
             output.volume_db = Stored::resolve(volume_db, &output.config_volume_db);
             output.idle = api::resolve_idle(entry, output.config_idle);
         }
+        for receiver in &mut self.airplay {
+            let entry = stored.airplay.get(receiver.name());
+            let on = Stored::resolve(
+                entry.and_then(|e| e.enabled.as_ref()),
+                &receiver.config_enabled(),
+            );
+            receiver.restore_enabled(on);
+        }
         self.restore_matrices(&stored);
         self.restore_plugins(&stored);
         self.state = stored;

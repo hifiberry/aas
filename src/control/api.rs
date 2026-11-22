@@ -303,7 +303,7 @@ impl Control {
     }
 
     /// Handles one call of the API and gives its answer.
-    pub fn call(&mut self, call: Call, now: Instant) -> api::Answer {
+    pub fn call(&mut self, call: Call, now: Instant) -> crate::api::Answer {
         let answer = match call {
             Call::State => api::answer(&self.state_view()),
             Call::Outputs => {
@@ -342,6 +342,7 @@ impl Control {
             Call::Airplay => api::answer(&self.airplay_views()),
             Call::Metadata => api::answer(&self.metadata_view(now)),
             Call::PairAirplay { .. } => Err(ApiError::internal("not yet")),
+            Call::PatchAirplay(name, patch) => self.patch_airplay(&name, patch, now),
             Call::PatchSettings(patch) => self.patch_settings(patch, now),
         };
         self.publish_changes();
@@ -421,6 +422,34 @@ impl Control {
                 bytes: c.bytes.len(),
             }),
         }
+    }
+
+    /// `PATCH /airplay/{name}`: turns a receiver on or off, and keeps it.
+    fn patch_airplay(&mut self, name: &str, patch: api::AirplayPatch, now: Instant) -> api::Answer {
+        let Some(i) = self.airplay.iter().position(|r| r.name() == name) else {
+            return Err(ApiError::not_found(format!("no AirPlay receiver \"{name}\"")));
+        };
+        if let Some(on) = patch.enabled
+            && on != self.airplay[i].enabled()
+        {
+            let mut batch = Vec::new();
+            if let Some(tap) = self.airplay[i].set_enabled(on) {
+                batch.push(Command::RemoveTap(tap));
+                self.taps_len -= 1;
+            }
+            if on && let Some((rate, _)) = self.output {
+                self.airplay_taps(rate, &mut batch);
+            }
+            if !batch.is_empty() {
+                self.send(batch);
+            }
+            let config = self.airplay[i].config_enabled();
+            self.state.airplay.entry(name.to_string()).or_default().enabled =
+                Some(Stored { value: on, config });
+            self.save_later(now);
+            self.publish_airplay();
+        }
+        api::answer(&self.airplay[i].view())
     }
 
     pub(super) fn airplay_views(&self) -> Vec<api::AirplayView> {
@@ -1645,6 +1674,78 @@ mod tests {
         c
     }
 
+    fn off(mut c: Config) -> Config {
+        c.airplay[0].enabled = false;
+        c
+    }
+
+    fn patch_enabled(control: &mut Control, name: &str, on: bool, now: Instant) -> crate::api::Answer {
+        let patch = crate::api::AirplayPatch { enabled: Some(on) };
+        control.call(Call::PatchAirplay(name.into(), patch), now)
+    }
+
+    #[test]
+    fn a_receiver_that_is_off_has_no_thread_and_says_so() {
+        let (mut control, _engine, _logs, now) = started_with(&off(with_a_receiver()), Vec::new());
+        assert!(!control.airplay[0].running());
+        let view = control.call(Call::Airplay, now).unwrap();
+        assert_eq!(view[0]["enabled"], json!(false));
+    }
+
+    #[test]
+    fn patch_airplay_turns_a_receiver_off_and_on() {
+        let (mut control, _engine, _logs, now) = started_with(&with_a_receiver(), Vec::new());
+        assert!(control.airplay[0].running());
+        let view = patch_enabled(&mut control, "Study", false, now).unwrap();
+        assert_eq!(view["enabled"], json!(false));
+        assert!(!control.airplay[0].running());
+        let view = patch_enabled(&mut control, "Study", true, now).unwrap();
+        assert_eq!(view["enabled"], json!(true));
+        assert!(control.airplay[0].running());
+    }
+
+    #[test]
+    fn patch_airplay_is_kept_in_the_state() {
+        let (mut control, _engine, _logs, now) = started_with(&with_a_receiver(), Vec::new());
+        patch_enabled(&mut control, "Study", false, now).unwrap();
+        assert_eq!(
+            control.state.airplay["Study"].enabled,
+            Some(Stored {
+                value: false,
+                config: true
+            })
+        );
+    }
+
+    #[test]
+    fn the_state_does_not_outlast_a_changed_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        let mut state = State::default();
+        state.airplay.entry("Study".into()).or_default().enabled = Some(Stored {
+            value: false,
+            config: true,
+        });
+        state.save(&path).unwrap();
+        let restore = |config: Config| {
+            let (mut control, _engine, _logs) = unstarted_with(&config, Vec::new());
+            let volume = OutputVolume::new(None, config::BitPerfect::Auto);
+            control.restore(volume, path.clone(), &[]);
+            control.airplay[0].enabled()
+        };
+        // The config still says on: the stored off applies.
+        assert!(!restore(with_a_receiver()));
+        // The config says off now: it wins, and so would on.
+        assert!(!restore(off(with_a_receiver())));
+    }
+
+    #[test]
+    fn patch_airplay_for_an_unknown_receiver_is_404() {
+        let (mut control, _engine, _logs, now) = started_with(&with_a_receiver(), Vec::new());
+        let e = patch_enabled(&mut control, "Kitchen", false, now).unwrap_err();
+        assert_eq!(e.status, 404);
+    }
+
     #[test]
     fn pairing_an_unknown_receiver_is_404() {
         let (mut control, _engine, _logs, now) = started_with(&with_an_airplay2_receiver(), Vec::new());
@@ -1720,7 +1821,8 @@ mod tests {
                 "port": 9,
                 "protocol": "airplay1",
                 "connect": "signal",
-                "state": "idle"
+                "state": "idle",
+                "enabled": true
             }])
         );
         let (mut control, _engine, _logs, now) = started_with(&Config::default(), Vec::new());
