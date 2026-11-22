@@ -14,7 +14,7 @@ pub const USAGE: &str = "usage: aasctl [--port N | --config PATH] COMMAND
   plugin ID set NAME=VALUE... | enable | disable
   settings KEY=VALUE...
   matrix put FILE
-  airplay pair NAME [PIN]
+  airplay pair NAME [PIN] | airplay NAME enable|disable
   events | levels";
 
 #[derive(Debug, PartialEq)]
@@ -138,6 +138,10 @@ fn command(words: &[&str]) -> Result<Command, String> {
         ["airplay", "pair", name, pin] => Ok(Command::Post {
             path: format!("/airplay/{}/pair", encode(name)),
             body: json!({"pin": pin}),
+        }),
+        ["airplay", name, on @ ("enable" | "disable")] => Ok(Command::Patch {
+            path: format!("/airplay/{}", encode(name)),
+            body: json!({"enabled": *on == "enable"}),
         }),
         ["matrix", "put", file] => Ok(Command::Put {
             path: "/matrix".into(),
@@ -267,6 +271,22 @@ mod tests {
         parse(words.iter().map(OsString::from), |_| Ok(9999))
             .unwrap()
             .command
+    }
+
+    #[test]
+    fn airplay_enable() {
+        assert_eq!(
+            words(&["airplay", "Apple TV", "enable"]),
+            patch("/airplay/Apple%20TV", json!({"enabled": true}))
+        );
+    }
+
+    #[test]
+    fn airplay_disable() {
+        assert_eq!(
+            words(&["airplay", "Sound bar", "disable"]),
+            patch("/airplay/Sound%20bar", json!({"enabled": false}))
+        );
     }
 
     #[test]
