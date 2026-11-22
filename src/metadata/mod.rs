@@ -120,6 +120,13 @@ impl NowPlaying {
         };
     }
 
+    /// The text, cover and progress generations, for a cheap look whether
+    /// anything changed.
+    pub fn generations(&self) -> (u64, u64, u64) {
+        let s = self.state.lock().unwrap();
+        (s.text_gen, s.cover_gen, s.progress_gen)
+    }
+
     pub fn snapshot(&self, now: Instant) -> Snapshot {
         let s = self.state.lock().unwrap();
         Snapshot {

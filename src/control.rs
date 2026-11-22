@@ -1012,7 +1012,7 @@ impl Control {
             table_len: 0,
             taps_capacity: INITIAL_TAPS,
             taps_len: 0,
-            airplay: config.airplay.iter().cloned().map(crate::airplay::Receiver::new).collect(),
+            airplay: config.airplay.iter().cloned().map(|c| crate::airplay::Receiver::new(c, crate::metadata::NowPlaying::new())).collect(),
             output: None,
             parked: None,
             reopening: 0,

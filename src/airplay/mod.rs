@@ -4,6 +4,7 @@
 pub mod ap2;
 pub mod config;
 pub mod gate;
+pub mod meta;
 pub mod output;
 pub mod raop;
 pub mod rtp;
@@ -23,15 +24,20 @@ use output::{AirplayHandle, AirplayState, Status, TapReader};
 /// and the id and rate of the monitor tap it reads.
 pub struct Receiver {
     config: AirplayConfig,
+    now_playing: std::sync::Arc<crate::metadata::NowPlaying>,
     handle: Option<AirplayHandle>,
     tap: Option<(ClientId, u32)>,
     told: Option<Status>,
 }
 
 impl Receiver {
-    pub fn new(config: AirplayConfig) -> Receiver {
+    pub fn new(
+        config: AirplayConfig,
+        now_playing: std::sync::Arc<crate::metadata::NowPlaying>,
+    ) -> Receiver {
         Receiver {
             config,
+            now_playing,
             handle: None,
             tap: None,
             told: None,
@@ -41,7 +47,7 @@ impl Receiver {
     /// Starts the thread, once.
     pub fn spawn(&mut self) {
         if self.handle.is_none() {
-            self.handle = Some(output::spawn(self.config.clone()));
+            self.handle = Some(output::spawn(self.config.clone(), self.now_playing.clone()));
         }
     }
 

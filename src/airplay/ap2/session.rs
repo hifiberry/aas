@@ -8,6 +8,7 @@ use super::bplist::{self, Value};
 use super::channel::Keys;
 use super::events::Events;
 use super::pair::pair_transient;
+use crate::airplay::meta::Meta;
 use crate::airplay::raop::{Ports, Setup, random};
 use crate::airplay::rtp::{FRAMES, RATE};
 use crate::airplay::rtsp::{Conn, Request, Response, RtspError};
@@ -196,6 +197,27 @@ impl Ap2 {
             content_type,
             body,
         })
+    }
+
+    /// Queues a metadata request stamped with `rtptime`, without waiting
+    /// for the answer.
+    pub fn metadata(&mut self, meta: &Meta, rtptime: u32) -> Result<(), RtspError> {
+        let (kind, body) = meta.content();
+        let mut headers = self.headers.clone();
+        headers.push(("RTP-Info", format!("rtptime={rtptime}")));
+        let url = self.url.clone();
+        self.conn.queue(&Request {
+            method: "SET_PARAMETER",
+            url: &url,
+            headers: &headers,
+            content_type: Some(kind),
+            body,
+        })
+    }
+
+    /// Writes what the socket takes of the queued requests.
+    pub fn flush(&mut self) -> Result<(), RtspError> {
+        self.conn.flush()
     }
 
     /// Whether the receiver has closed the session's connection.

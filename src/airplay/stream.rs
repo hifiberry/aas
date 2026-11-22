@@ -117,6 +117,12 @@ impl Stream {
         self.primed = false;
     }
 
+    /// The rtptime of the next packet.
+    pub fn rtptime(&self) -> u32 {
+        self.first_rtptime
+            .wrapping_add((self.made * FRAMES as u64) as u32)
+    }
+
     /// Every packet whose time has come by `now`, each sync packet before
     /// the audio packet it belongs to.
     pub fn due(&mut self, now: Duration, out: &mut Vec<Outgoing>) {
