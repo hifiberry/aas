@@ -1,3 +1,19 @@
+aas (0.3.0) trixie; urgency=medium
+
+  * A volume limit, volume_limit_db in the config or limit_db through the
+    API: a ceiling applied in software on top of any volume, which no
+    player and no bit-perfect mode can get around.
+  * clock = "capture": a board whose card only captures, an ADC with no
+    DAC, runs its mix on the capture card's clock and plays nowhere
+    itself; chosen on its own for such a card.
+  * AirPlay outputs: [[airplay]] plays the master mix to one AirPlay
+    receiver, as AirPlay 1 or, with protocol = "airplay2", AirPlay 2
+    with transient pairing and encrypted audio. It connects on signal
+    and disconnects after idle_s of silence, or stays connected with
+    connect = "always". latency_ms is 1500 by default, down to 50.
+
+ -- HiFiBerry <info@hifiberry.com>  Sun, 22 Nov 2026 06:02:22 +0000
+
 aas (0.2.0) trixie; urgency=medium
 
   * Bluetooth audio under aas: drop-ins for bluez-alsa's bluealsa and
