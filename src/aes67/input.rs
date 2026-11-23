@@ -71,8 +71,7 @@ const STOPPED_NS: i128 = 1_000_000_000;
 const DEFAULT_LATENCY_MS: u32 = 20;
 /// Zeros written at most per call while priming: the longest latency.
 const ZEROS: usize = 4800;
-const OFF_PTP: &str =
-    "aas: aes67: stream timestamps do not follow the PTP clock; playing without PTP alignment";
+const OFF_PTP: &str = "aas: aes67: warning: stream timestamps do not follow the PTP clock; playing without PTP alignment";
 /// The thread publishes its status at most this often.
 const STATUS_NS: i128 = 100_000_000;
 /// Datagrams read per round, and the size of each buffer: 8 channels of
@@ -105,6 +104,13 @@ pub struct InputStatus {
     /// Whether the selected stream's multicast group is joined; false when
     /// joining failed, or no stream is selected.
     pub joined: bool,
+    /// Times a stream that was priming or playing started over.
+    pub restarts: u64,
+    /// Why it last started over or left PTP mode: "selection", "latency",
+    /// "grandmaster" (a new PTP generation), "stopped", "resumed",
+    /// "no stored packets", "delay" (the error beyond what the controller
+    /// takes) or "timestamps" (they do not follow the PTP clock).
+    pub last_restart: Option<&'static str>,
 }
 
 #[derive(Debug, Clone)]
@@ -257,6 +263,8 @@ pub struct Receiver {
     skipping: u32,
     /// Restarts of a stream that was playing or priming.
     restarts: u64,
+    /// Why it last started over, or left PTP mode.
+    last_restart: Option<&'static str>,
     /// The ratio last set.
     ratio: f64,
     jitter: Jitter,
@@ -287,6 +295,7 @@ impl Receiver {
             warning: None,
             skipping: 0,
             restarts: 0,
+            last_restart: None,
             ratio: 1.0,
             jitter: Jitter::new(),
             adaptive,
@@ -303,7 +312,7 @@ impl Receiver {
         if session == self.session {
             return;
         }
-        self.restart(Restart::Hard);
+        self.restart(Restart::Hard, "selection");
         self.phase = if session.is_some() {
             Phase::Waiting
         } else {
@@ -320,7 +329,7 @@ impl Receiver {
         if latency_ms == self.latency_ms {
             return;
         }
-        self.restart(Restart::Hard);
+        self.restart(Restart::Hard, "latency");
         self.latency_ms = latency_ms;
         self.drift = drift(latency_ms);
     }
@@ -336,7 +345,7 @@ impl Receiver {
     pub fn step(&mut self, now: &Now, packets: &[(i128, &[u8])], out: &mut impl Output) {
         if self.generation != Some(now.generation) {
             if self.generation.is_some() {
-                self.restart(Restart::Hard);
+                self.restart(Restart::Hard, "grandmaster");
             }
             self.generation = Some(now.generation);
         }
@@ -348,7 +357,7 @@ impl Receiver {
         }
         if self.receiving && now.local_ns - self.last_rx >= STOPPED_NS {
             self.receiving = false;
-            self.restart(Restart::Soft);
+            self.restart(Restart::Soft, "stopped");
         }
         // Packets that all come too late or too early for where the input
         // reads: it starts again on them.
@@ -356,7 +365,7 @@ impl Receiver {
             && matches!(self.phase, Phase::Priming | Phase::Playing)
             && now.local_ns - self.last_stored >= STOPPED_NS
         {
-            self.restart(Restart::Hard);
+            self.restart(Restart::Hard, "no stored packets");
         }
         if self.phase == Phase::Priming {
             self.prime(now, out);
@@ -383,7 +392,7 @@ impl Receiver {
             return;
         }
         if self.receiving && rx_ns - self.last_rx >= STOPPED_NS {
-            self.restart(Restart::Soft);
+            self.restart(Restart::Soft, "resumed");
         }
         self.receiving = true;
         self.last_rx = rx_ns;
@@ -443,6 +452,7 @@ impl Receiver {
                 self.warned = true;
                 self.warning = Some(OFF_PTP);
             }
+            self.last_restart = Some("timestamps");
             self.mode = Some(Mode::Buffer);
             self.drift.reset();
             let Some(buffered) = self.measure(now, out.fill()) else {
@@ -451,9 +461,8 @@ impl Receiver {
             delay = buffered;
         }
         if delay > target {
-            // Due before it arrived: drop what is late.
-            let late = (delay - target).round() as u32;
-            self.jitter.anchor(self.jitter.read_ts().wrapping_add(late));
+            // Due before it arrived: drop what is late, keep what is not.
+            self.jitter.skip((delay - target).round() as u32);
         } else {
             let mut missing = (target - delay).round() as usize;
             while missing > 0 {
@@ -480,7 +489,7 @@ impl Receiver {
                 return;
             };
             if (delay - target).abs() > RESTART_FRAMES {
-                self.restart(Restart::Hard);
+                self.restart(Restart::Hard, "delay");
                 return;
             }
             let need = self.adaptive.input_needed(FRAMES as u32) as usize;
@@ -493,7 +502,7 @@ impl Receiver {
             if self.drift.skipped() > skipped {
                 self.skipping += 1;
                 if self.skipping >= SKIPPED_WRITES {
-                    self.restart(Restart::Hard);
+                    self.restart(Restart::Hard, "delay");
                     return;
                 }
             } else {
@@ -528,14 +537,19 @@ impl Receiver {
         status.receiving = self.receiving;
         status.latency_ms = self.latency_ms;
         (status.lost, status.late) = self.jitter.counts();
+        status.restarts = self.restarts;
+        status.last_restart = self.last_restart;
     }
 
-    fn restart(&mut self, kind: Restart) {
+    /// Starts over, silent until the next packet. `reason` is what the
+    /// status reports for a stream that was priming or playing.
+    fn restart(&mut self, kind: Restart, reason: &'static str) {
         if self.phase == Phase::Idle {
             return;
         }
         if matches!(self.phase, Phase::Priming | Phase::Playing) {
             self.restarts += 1;
+            self.last_restart = Some(reason);
         }
         self.phase = Phase::Waiting;
         self.adaptive.reset();
@@ -927,6 +941,10 @@ mod tests {
         noise: u64,
         /// The longest `step`, wall time.
         slowest: Duration,
+        /// Packets still to leave out, as a network that loses them.
+        drop: usize,
+        /// Frames the sender left out, either way.
+        unsent: u64,
     }
 
     fn m0() -> i128 {
@@ -972,6 +990,8 @@ mod tests {
                 seq: 0,
                 noise: 1,
                 slowest: Duration::ZERO,
+                drop: 0,
+                unsent: 0,
             }
         }
 
@@ -1028,7 +1048,10 @@ mod tests {
                 while Sim::local_of(self.next_media + 48) <= self.now {
                     let media = self.next_media;
                     self.next_media += 48;
-                    if self.sending {
+                    if !self.sending || self.drop > 0 {
+                        self.drop = self.drop.saturating_sub(1);
+                        self.unsent += 48;
+                    } else {
                         let at = Sim::local_of(media + 48) + self.delay();
                         let d = self.datagram(media);
                         self.in_flight.push((at, d));
@@ -1151,6 +1174,8 @@ mod tests {
         sim.generation += 1;
         sim.run(1.0);
         assert_eq!(sim.rx.restarts, 1);
+        assert_eq!(sim.status().restarts, 1);
+        assert_eq!(sim.status().last_restart, Some("grandmaster"));
         // The stream names the old grandmaster: it plays on in buffer mode.
         assert_eq!(sim.status().mode, Some(Mode::Buffer));
         let after = &sim.ring.played[change..];
@@ -1213,6 +1238,7 @@ mod tests {
             );
             assert_eq!(sim.rx.restarts, 0, "{error:#x}");
             assert_eq!(sim.rx.take_warning(), Some(OFF_PTP));
+            assert_eq!(sim.status().last_restart, Some("timestamps"));
             assert_eq!(sim.rx.take_warning(), None);
         }
     }
@@ -1229,6 +1255,7 @@ mod tests {
         let status = sim.status();
         assert!(!status.receiving);
         assert_eq!(status.stream.as_deref(), Some("test"));
+        assert_eq!(status.last_restart, Some("stopped"));
         let n = sim.ring.played.len();
         assert!(sim.ring.played[n - 480..].iter().all(|f| *f == [0; 2]));
         sim.sending = true;
@@ -1257,9 +1284,10 @@ mod tests {
         sim.run(0.03);
         sim.sending = true;
         sim.run(0.5);
-        // Only the part of the gap still ahead of the read position when the
-        // stream came back is a hole in it; what was played before is not.
-        assert!(sim.status().lost > 0, "{:?}", sim.rx.jitter.counts());
+        // Every frame of the gap is lost, whether played before the stream
+        // came back or after.
+        assert_eq!(sim.status().lost, sim.unsent);
+        assert!((1440..=1488).contains(&sim.unsent), "{}", sim.unsent);
         assert_eq!(sim.rx.restarts, 0);
         let delays = edge_delays(&sim, Sim::index(sim.now - 400_000_000));
         assert!(!delays.is_empty());
@@ -1293,6 +1321,34 @@ mod tests {
         assert_eq!(status.latency_ms, 7);
         assert_eq!(status.stream, None);
         drop(handle);
+    }
+
+    #[test]
+    fn a_single_dropped_packet_is_48_frames_lost() {
+        let mut sim = Sim::new(session(2, Some((MASTER, 0))), square, true);
+        sim.run(5.0);
+        sim.drop = 1;
+        sim.run(0.5);
+        let status = sim.status();
+        assert_eq!((status.lost, status.late), (48, 0));
+        assert_eq!(status.restarts, 0);
+    }
+
+    #[test]
+    fn a_backlog_at_the_start_keeps_the_frames_within_the_latency() {
+        let mut sim = Sim::new(session(2, None), square, false);
+        // 60 ms of stream arrives at once, before the first step.
+        let packets: Vec<Vec<u8>> = (0..60).map(|k| sim.datagram(m0() + 48 * k)).collect();
+        let batch: Vec<(i128, &[u8])> = packets.iter().map(|d| (T0, d.as_slice())).collect();
+        sim.now = T0 + 60_000_000;
+        sim.ring.drain(T0);
+        let now = sim.now();
+        sim.rx.step(&now, &batch, &mut sim.ring);
+        // The oldest 40 ms are dropped; the newest 20 ms stay and play.
+        let held = f64::from(sim.rx.jitter.depth()) + sim.ring.fill() as f64;
+        assert!((held - TARGET).abs() <= 1.0, "{held} frames held");
+        assert!(sim.ring.queue.iter().any(|f| f[0] != 0));
+        assert_eq!(sim.status().lost, 0);
     }
 
     #[test]

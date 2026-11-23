@@ -77,6 +77,12 @@ impl Jitter {
             self.frames[slot] = *f;
             self.present[slot] = true;
         }
+        // Frames between the newest stored one and this packet that were
+        // taken before it came were holes: `take` could not tell.
+        if ts_diff(self.read_ts, self.end_ts) > 0 && ts_diff(ts, self.end_ts) > 0 {
+            let until = if d < 0 { ts } else { self.read_ts };
+            self.lost += ts_diff(until, self.end_ts) as u64;
+        }
         let end = ts.wrapping_add(keep as u32);
         if ts_diff(end, self.end_ts) > 0 {
             self.end_ts = end;
@@ -103,6 +109,20 @@ impl Jitter {
             self.present[slot] = false;
             self.read_ts = t.wrapping_add(1);
         }
+    }
+
+    /// Drops the next `n` frames without counting them; the frames after
+    /// them stay. Past everything stored, the same as `anchor` there.
+    pub fn skip(&mut self, n: u32) {
+        if n >= self.depth() {
+            self.anchor(self.read_ts.wrapping_add(n));
+            return;
+        }
+        for i in 0..n {
+            let slot = self.read_ts.wrapping_add(i) as usize % RING;
+            self.present[slot] = false;
+        }
+        self.read_ts = self.read_ts.wrapping_add(n);
     }
 
     /// The next `take` starts at `ts`; whatever is stored is dropped.
@@ -184,10 +204,48 @@ mod tests {
         assert_eq!(&out[..48], &pkt(1, 48)[..]);
         assert!(out[48..].iter().all(|f| *f == [0; 2]));
         assert_eq!(j.counts(), (0, 0));
-        // A packet after a gap makes the gap a hole.
+        // A packet after a gap makes the whole gap a hole: the part taken
+        // already and the part still ahead.
         j.put(1144, &pkt(145, 48));
         take(&mut j, 96);
-        assert_eq!(j.counts(), (48, 0));
+        assert_eq!(j.counts(), (96, 0));
+    }
+
+    #[test]
+    fn frames_taken_before_a_later_packet_came_are_lost() {
+        let mut j = Jitter::new();
+        j.put(1000, &pkt(1, 48));
+        // Read on 96 frames past the newest packet, as a starving input
+        // does; then the stream comes back 144 frames on.
+        take(&mut j, 144);
+        assert_eq!(j.counts(), (0, 0));
+        assert_eq!(j.put(1192, &pkt(193, 48)), Put::Stored);
+        assert_eq!(j.counts(), (96, 0));
+        take(&mut j, 96);
+        assert_eq!(j.counts(), (144, 0));
+        // A packet that straddles the read position counts only up to
+        // where it starts.
+        let mut j = Jitter::new();
+        j.put(1000, &pkt(1, 48));
+        take(&mut j, 96);
+        assert_eq!(j.put(1072, &pkt(73, 48)), Put::Stored);
+        assert_eq!(j.counts(), (24, 0));
+    }
+
+    #[test]
+    fn skip_keeps_the_frames_after_it() {
+        let mut j = Jitter::new();
+        j.put(1000, &pkt(1, 96));
+        j.skip(40);
+        assert_eq!(j.read_ts(), 1040);
+        assert_eq!(j.depth(), 56);
+        assert_eq!(take(&mut j, 56), pkt(41, 56));
+        assert_eq!(j.counts(), (0, 0));
+        // Past everything stored, it anchors there.
+        j.put(2000, &pkt(1, 48));
+        j.skip(5000);
+        assert_eq!(j.read_ts(), 1096 + 5000);
+        assert_eq!(j.depth(), 0);
     }
 
     #[test]
