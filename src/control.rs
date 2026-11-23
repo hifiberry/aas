@@ -2074,31 +2074,45 @@ impl Control {
                 batch.push(Command::RemoveTap(old));
                 self.taps_len -= 1;
             }
-            // Half a second: the thread reads every 20 ms at the least.
-            let made = Ring::create((rate / 2).max(4096)).and_then(|(ring, memfd)| {
-                let reader = Ring::map(memfd.as_fd())?;
-                Ok((ring, reader, eventfd()?))
-            });
-            let (ring, reader, wake) = match made {
-                Ok(made) => made,
-                Err(e) => {
-                    eprintln!("aas: no ring for an AirPlay receiver: {e}");
-                    continue;
-                }
+            let Some((id, reader)) = self.monitor_tap(rate, "an AirPlay receiver", batch) else {
+                continue;
             };
-            let id = self.next_id;
-            self.next_id += 1;
-            if self.taps_len == self.taps_capacity {
-                self.taps_capacity *= 2;
-                batch.push(Command::GrowTaps(Vec::with_capacity(self.taps_capacity)));
-            }
-            let mut tap = Tap::new(id, ring, wake);
-            tap.monitor = true;
-            tap.running = true;
-            batch.push(Command::AddTap(Box::new(tap)));
-            self.taps_len += 1;
             self.airplay[i].give_tap(id, rate, reader);
         }
+    }
+
+    /// A monitor tap of the master at `rate` for a thread that reads it on
+    /// its own timer: added to the engine, and its reading end. Half a
+    /// second: such a thread reads every 20 ms at the least.
+    fn monitor_tap(
+        &mut self,
+        rate: u32,
+        what: &str,
+        batch: &mut Vec<Command>,
+    ) -> Option<(ClientId, Ring)> {
+        let made = Ring::create((rate / 2).max(4096)).and_then(|(ring, memfd)| {
+            let reader = Ring::map(memfd.as_fd())?;
+            Ok((ring, reader, eventfd()?))
+        });
+        let (ring, reader, wake) = match made {
+            Ok(made) => made,
+            Err(e) => {
+                eprintln!("aas: no ring for {what}: {e}");
+                return None;
+            }
+        };
+        let id = self.next_id;
+        self.next_id += 1;
+        if self.taps_len == self.taps_capacity {
+            self.taps_capacity *= 2;
+            batch.push(Command::GrowTaps(Vec::with_capacity(self.taps_capacity)));
+        }
+        let mut tap = Tap::new(id, ring, wake);
+        tap.monitor = true;
+        tap.running = true;
+        batch.push(Command::AddTap(Box::new(tap)));
+        self.taps_len += 1;
+        Some((id, reader))
     }
 
     /// Publishes each AirPlay receiver whose state changed.
@@ -2562,6 +2576,7 @@ impl Control {
         }
         self.end_recorders(rate, batch);
         self.airplay_taps(rate, batch);
+        self.aes67_tap(batch);
         if resumed {
             for output in self.further.iter_mut().filter(|o| o.open) {
                 output.resumed_until = Some(now + RESUME_STARVE);

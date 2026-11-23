@@ -107,7 +107,7 @@ fn send(socket: &UdpSocket, msg: &SapMessage, ttl: u8) {
 }
 
 /// Sends multicast through the interface, whatever the routes say.
-fn multicast_interface(socket: &UdpSocket, interface: Ipv4Addr) -> io::Result<()> {
+pub(super) fn multicast_interface(socket: &UdpSocket, interface: Ipv4Addr) -> io::Result<()> {
     let addr = libc::in_addr {
         s_addr: u32::from(interface).to_be(),
     };

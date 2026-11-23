@@ -1,5 +1,5 @@
-//! AES67 network audio: the PTP clock, the streams announced over SAP, and
-//! the input that plays one of them.
+//! AES67 network audio: the PTP clock, the streams announced over SAP, the
+//! input that plays one of them, and the output that sends the master.
 //!
 //! [`Aes67`] is the control thread's handle on all of it.
 
@@ -9,6 +9,7 @@ pub mod directory;
 pub mod input;
 pub mod jitter;
 pub mod listen;
+pub mod output;
 pub mod ptp;
 pub mod rtp;
 pub mod sap;
@@ -16,6 +17,7 @@ pub mod sap_thread;
 pub mod sdp;
 
 use std::io;
+use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
@@ -24,14 +26,17 @@ use std::time::{Duration, Instant};
 use aas_client::ring::Ring;
 use std::os::fd::{AsFd, OwnedFd};
 
+use crate::airplay::output::TapReader;
 use crate::api::{
     Aes67ClockView, Aes67InputView, Aes67OutputView, Aes67StreamView, Aes67View, ApiEvent,
 };
+use crate::rate::ClientId;
 use crate::state::{Stored, StoredAes67};
 use clock::PtpClock;
 use config::{Aes67Config, Group, Latency, PtpSource};
 use directory::Directory;
 use input::{InputCommand, InputHandle, InputStatus, Mode};
+use output::{OutputHandle, OutputStatus};
 use sdp::{Encoding, Session};
 
 /// Without an address on the interface, it is looked for again this often.
@@ -52,6 +57,22 @@ impl InputPort for InputHandle {
 
     fn status(&self) -> InputStatus {
         InputHandle::status(self)
+    }
+}
+
+/// The output thread as the control thread drives it; a fake in the tests.
+pub trait OutputPort: Send {
+    fn give_tap(&self, tap: TapReader);
+    fn status(&self) -> OutputStatus;
+}
+
+impl OutputPort for OutputHandle {
+    fn give_tap(&self, tap: TapReader) {
+        OutputHandle::give_tap(self, tap);
+    }
+
+    fn status(&self) -> OutputStatus {
+        OutputHandle::status(self)
     }
 }
 
@@ -78,6 +99,14 @@ pub struct Aes67 {
     announce: sap_thread::Announce,
     clock: PtpClock,
     input: Option<Box<dyn InputPort>>,
+    /// The output thread, while the output is enabled and has started.
+    output: Option<Box<dyn OutputPort>>,
+    /// The id and rate of the monitor tap the output reads.
+    output_tap: Option<(ClientId, u32)>,
+    /// The interface's address, once it has one.
+    address: Option<Ipv4Addr>,
+    /// The interface's MAC could not be read, and that has been logged.
+    no_mac_told: bool,
     /// The ring and the rest, until the interface has an address and the
     /// input thread starts.
     link: Option<InputLink>,
@@ -100,6 +129,7 @@ pub struct Aes67 {
     selection: Option<String>,
     latency: Latency,
     input_enabled: bool,
+    output_enabled: bool,
     /// What the API set, for the state file.
     stored: StoredAes67,
     /// What the input was last told to play.
@@ -137,16 +167,26 @@ impl Aes67 {
                 .input_enabled
                 .clone()
                 .filter(|v| v.config == input.enabled),
+            output_enabled: s
+                .output_enabled
+                .clone()
+                .filter(|v| v.config == config.output.enabled),
         });
         let stream = Stored::resolve(stored.stream.as_ref(), &input.stream);
         let latency = Stored::resolve(stored.latency.as_ref(), &config_latency);
         let input_enabled = Stored::resolve(stored.input_enabled.as_ref(), &input.enabled);
+        let output_enabled =
+            Stored::resolve(stored.output_enabled.as_ref(), &config.output.enabled);
         Aes67 {
             model,
             directory: Arc::new(Mutex::new(Directory::new(None))),
             announce: Arc::new(Mutex::new(None)),
             clock: PtpClock::off(),
             input: None,
+            output: None,
+            output_tap: None,
+            address: None,
+            no_mac_told: false,
             link: None,
             ptp_done: config.ptp == PtpSource::Off,
             sap: false,
@@ -159,6 +199,7 @@ impl Aes67 {
             selection: (!stream.is_empty()).then_some(stream),
             latency: latency_from_code(latency),
             input_enabled,
+            output_enabled,
             stored,
             playing: None,
             told: None,
@@ -167,7 +208,8 @@ impl Aes67 {
     }
 
     /// Starts what waits for the interface's address: the PTP listener,
-    /// the SAP thread, then the input thread, which reads the clock.
+    /// the SAP thread, then the input and the output thread, which read
+    /// the clock.
     fn try_start(&mut self, now: Instant) {
         self.retry_at = None;
         let interface = self.config.interface.clone();
@@ -175,6 +217,7 @@ impl Aes67 {
             Ok(addr) => addr,
             Err(e) => return self.wait(e, now),
         };
+        self.address = Some(addr);
         if !self.ptp_done {
             match listen::start(&interface, self.config.domain, self.stop.clone()) {
                 Ok((clock, thread)) => {
@@ -229,6 +272,39 @@ impl Aes67 {
                 }
                 Err(e) => self.failed("no input", e, now),
             }
+        }
+        self.start_output(now);
+    }
+
+    /// Starts the output thread while the output is enabled, once the SAP
+    /// thread that announces it runs.
+    fn start_output(&mut self, now: Instant) {
+        let Some(addr) = self.address else {
+            return;
+        };
+        if !self.output_enabled || !self.sap || self.output.is_some() {
+            return;
+        }
+        let mac = match output::interface_mac(&self.config.interface) {
+            Ok(mac) => mac,
+            Err(e) => {
+                if !std::mem::replace(&mut self.no_mac_told, true) {
+                    eprintln!("aas: aes67: {e}; the output's group comes from the address");
+                }
+                let [.., x, y] = addr.octets();
+                [0, 0, 0, 0, x, y]
+            }
+        };
+        let started = output::start(
+            self.config.output.clone(),
+            addr,
+            mac,
+            self.clock.clone(),
+            self.announce.clone(),
+        );
+        match started {
+            Ok(handle) => self.output = Some(Box::new(handle)),
+            Err(e) => self.failed("no output", e, now),
         }
     }
 
@@ -304,6 +380,7 @@ impl Aes67 {
         let ptp = self.clock.now();
         let status = &self.status;
         let output = &self.config.output;
+        let sending = self.output.as_ref().map(|o| o.status());
         Aes67View {
             clock: Aes67ClockView {
                 source: match self.config.ptp {
@@ -326,11 +403,12 @@ impl Aes67 {
                 lost: status.lost,
             },
             output: Aes67OutputView {
-                enabled: output.enabled,
-                sending: lock(&self.announce).is_some(),
-                group: match output.group {
-                    Group::Addr(addr) => Some(addr.to_string()),
-                    Group::Auto => None,
+                enabled: self.output_enabled,
+                sending: sending.is_some_and(|s| s.sending),
+                group: match (sending, output.group) {
+                    (Some(s), _) => Some(s.group.to_string()),
+                    (None, Group::Addr(addr)) => Some(addr.to_string()),
+                    (None, Group::Auto) => None,
                 },
                 port: output.port,
             },
@@ -424,6 +502,49 @@ impl Aes67 {
         self.sync();
     }
 
+    /// Turns the output on or off. Off stops its thread, which withdraws
+    /// the announcement; the control thread then removes its tap.
+    pub fn set_output_enabled(&mut self, on: bool) {
+        self.output_enabled = on;
+        self.stored.output_enabled = Some(Stored {
+            value: on,
+            config: self.config.output.enabled,
+        });
+        if on {
+            self.start_output(Instant::now());
+        } else {
+            // Dropping the handle joins the thread.
+            self.output = None;
+        }
+    }
+
+    /// Whether the output needs a tap at `rate`: it runs and has none at
+    /// that rate.
+    pub fn output_wants_tap(&self, rate: u32) -> bool {
+        self.output.is_some() && self.output_tap.map(|(_, r)| r) != Some(rate)
+    }
+
+    /// The id of the tap the output had, for the audio thread to remove.
+    pub fn take_output_tap(&mut self) -> Option<ClientId> {
+        self.output_tap.take().map(|(id, _)| id)
+    }
+
+    /// The id of the tap of an output that no longer runs, to remove.
+    pub fn stale_output_tap(&mut self) -> Option<ClientId> {
+        if self.output.is_some() {
+            return None;
+        }
+        self.take_output_tap()
+    }
+
+    /// Hands the output thread the reading end of its new tap.
+    pub fn give_output_tap(&mut self, id: ClientId, rate: u32, reader: Ring) {
+        if let Some(output) = &self.output {
+            output.give_tap(TapReader { ring: reader, rate });
+            self.output_tap = Some((id, rate));
+        }
+    }
+
     /// An event when the view or the list of streams has changed since the
     /// last call, the counters and the clock's rate aside.
     pub fn changed(&mut self) -> Option<ApiEvent> {
@@ -480,8 +601,9 @@ impl Aes67 {
     /// announced.
     pub fn stop(&mut self) {
         self.ask_stop();
-        // Its handle joins the input thread.
+        // Their handles join the input and the output thread.
         self.input = None;
+        self.output = None;
         for thread in self.threads.drain(..) {
             let _ = thread.join();
         }
@@ -571,6 +693,38 @@ pub(crate) mod testing {
         }
     }
 
+    /// An output thread that records the rates of its taps and reports
+    /// what a test sets.
+    #[derive(Clone)]
+    pub(crate) struct FakeOutput {
+        pub(crate) taps: Arc<Mutex<Vec<u32>>>,
+        pub(crate) status: Arc<Mutex<OutputStatus>>,
+    }
+
+    impl Default for FakeOutput {
+        fn default() -> FakeOutput {
+            FakeOutput {
+                taps: Arc::default(),
+                status: Arc::new(Mutex::new(OutputStatus {
+                    enabled: true,
+                    sending: false,
+                    group: Ipv4Addr::new(239, 69, 0, 1),
+                    port: 5004,
+                })),
+            }
+        }
+    }
+
+    impl OutputPort for FakeOutput {
+        fn give_tap(&self, tap: TapReader) {
+            lock(&self.taps).push(tap.rate);
+        }
+
+        fn status(&self) -> OutputStatus {
+            *lock(&self.status)
+        }
+    }
+
     /// The config of an empty `[aes67]` table.
     pub(crate) fn config() -> Aes67Config {
         config::from_table(Some(toml::Table::new()))
@@ -608,12 +762,18 @@ pub(crate) mod testing {
             aes67.attach(Box::new(input));
             aes67
         }
+
+        /// Has the output run on `output`, as if enabled and started.
+        pub(crate) fn with_output(&mut self, output: FakeOutput) {
+            self.output_enabled = true;
+            self.output = Some(Box::new(output));
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::testing::{FakeInput, announce, config, withdraw};
+    use super::testing::{FakeInput, FakeOutput, announce, config, withdraw};
     use super::*;
     use std::net::Ipv4Addr;
 
@@ -709,6 +869,10 @@ mod tests {
                 value: false,
                 config: true,
             }),
+            output_enabled: Some(Stored {
+                value: true,
+                config: false,
+            }),
         };
         let mut c = config();
         c.input.stream = "configured".into();
@@ -718,17 +882,55 @@ mod tests {
         assert_eq!(view.input.stream.as_deref(), Some("picked"));
         assert_eq!((view.input.latency_ms, view.input.latency_auto), (7, false));
         assert!(!view.input.enabled);
+        assert!(view.output.enabled);
         assert_eq!(aes67.stored(), Some(stored.clone()));
         // The config edited: its value wins and the stored one is dropped.
         c.input.stream = "edited".into();
         c.input.latency = Latency::Ms(9);
-        let aes67 = Aes67::with_input(c, Some(&stored), None, fake(), None);
+        let aes67 = Aes67::with_input(c.clone(), Some(&stored), None, fake(), None);
         let view = aes67.view();
         assert_eq!(view.input.stream.as_deref(), Some("edited"));
         assert_eq!(view.input.latency_ms, 9);
         assert!(!view.input.enabled);
         let kept = aes67.stored().unwrap();
         assert_eq!((kept.stream, kept.latency), (None, None));
+        // The output's config edited.
+        c.output.enabled = true;
+        let aes67 = Aes67::with_input(c, Some(&stored), None, fake(), None);
+        assert!(aes67.view().output.enabled);
+        assert_eq!(aes67.stored().unwrap().output_enabled, None);
+    }
+
+    #[test]
+    fn the_output_has_a_tap_at_the_masters_rate() {
+        let (mut aes67, _) = with_stream("");
+        assert!(!aes67.output_wants_tap(48000), "no output thread");
+        let output = FakeOutput::default();
+        aes67.with_output(output.clone());
+        assert!(aes67.output_wants_tap(48000));
+        let (_ring, fd) = Ring::create(4096).unwrap();
+        aes67.give_output_tap(7, 48000, Ring::map(fd.as_fd()).unwrap());
+        assert_eq!(*lock(&output.taps), [48000]);
+        assert!(!aes67.output_wants_tap(48000));
+        // A new rate: the old tap goes, a new one comes.
+        assert!(aes67.output_wants_tap(44100));
+        assert_eq!(aes67.take_output_tap(), Some(7));
+        aes67.give_output_tap(8, 44100, Ring::map(fd.as_fd()).unwrap());
+        assert_eq!(*lock(&output.taps), [48000, 44100]);
+        // The view shows the group the output sends to.
+        lock(&output.status).sending = true;
+        let view = aes67.view().output;
+        assert!(view.enabled && view.sending);
+        assert_eq!(view.group.as_deref(), Some("239.69.0.1"));
+        // Disabled: the thread goes, and its tap with it.
+        assert_eq!(aes67.stale_output_tap(), None);
+        aes67.set_output_enabled(false);
+        assert_eq!(aes67.stale_output_tap(), Some(8));
+        assert_eq!(aes67.stale_output_tap(), None);
+        let view = aes67.view().output;
+        assert!(!view.enabled && !view.sending);
+        assert_eq!(view.group, None);
+        assert!(!aes67.stored().unwrap().output_enabled.unwrap().value);
     }
 
     #[test]

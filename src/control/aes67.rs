@@ -1,5 +1,5 @@
-//! The AES67 input on the control thread: the `aes67` source in the
-//! engine, and the threads [`Aes67`] runs that feed it.
+//! AES67 on the control thread: the `aes67` source in the engine, and the
+//! threads [`Aes67`] runs that feed it; the monitor tap its output reads.
 //!
 //! The source is a client at 48 kHz on the `aes67` bus, named `aes67`: its
 //! volume is a client volume, which starts from the config's `volume_db`.
@@ -123,6 +123,41 @@ impl Control {
         self.aes67_follow(receiving, now);
         self.aes67_delay();
         self.aes67_draining();
+        let mut batch = Vec::new();
+        self.aes67_tap(&mut batch);
+        if !batch.is_empty() {
+            self.send(batch);
+        }
+    }
+
+    /// Gives the AES67 output a monitor tap at the master's rate, in place
+    /// of one at another rate, once its thread runs and the master is
+    /// open; removes the tap of an output that stopped. The RTP timeline
+    /// goes on across a new tap.
+    pub(super) fn aes67_tap(&mut self, batch: &mut Vec<Command>) {
+        let Some(aes67) = &mut self.aes67 else {
+            return;
+        };
+        if let Some(old) = aes67.stale_output_tap() {
+            batch.push(Command::RemoveTap(old));
+            self.taps_len -= 1;
+        }
+        let Some((rate, _)) = self.output else {
+            return;
+        };
+        if !aes67.output_wants_tap(rate) {
+            return;
+        }
+        if let Some(old) = aes67.take_output_tap() {
+            batch.push(Command::RemoveTap(old));
+            self.taps_len -= 1;
+        }
+        let Some((id, reader)) = self.monitor_tap(rate, "the AES67 output", batch) else {
+            return;
+        };
+        if let Some(aes67) = &mut self.aes67 {
+            aes67.give_output_tap(id, rate, reader);
+        }
     }
 
     /// Runs the source while the input receives, as a client's stream
@@ -231,7 +266,7 @@ impl Control {
 mod tests {
     use super::super::tests::{FakeEngine, started};
     use super::*;
-    use crate::aes67::testing::{FakeInput, announce, config};
+    use crate::aes67::testing::{FakeInput, FakeOutput, announce, config};
     use crate::api::InputPatch;
     use crate::config::Config;
     use crate::format::db_to_gain;
@@ -439,6 +474,46 @@ mod tests {
         let delay = PERIODS * period + control.delay.unwrap_or(0) + source.filter;
         assert_eq!(source.output_delay.load(Ordering::Relaxed), delay);
         assert_eq!(source.master_rate.load(Ordering::Relaxed), 44_100);
+    }
+
+    #[test]
+    fn the_output_reads_a_tap_made_again_at_a_new_rate() {
+        let (mut control, mut engine, now, _) = with_aes67(|_| {}, &[]);
+        engine.take(true);
+        let taps = |seen: &[String], what: &str| -> Vec<String> {
+            seen.iter()
+                .filter(|s| s.starts_with(what))
+                .cloned()
+                .collect()
+        };
+        // No output thread: no tap.
+        control.tick(now);
+        assert!(taps(&engine.take(true), "AddTap").is_empty());
+        let output = FakeOutput::default();
+        control.aes67.as_mut().unwrap().with_output(output.clone());
+        control.tick(now);
+        let seen = engine.take(true);
+        let added = taps(&seen, "AddTap");
+        assert_eq!(added.len(), 1, "{seen:?}");
+        let (rate, period) = control.output.unwrap();
+        assert_eq!(*output.taps.lock().unwrap(), [rate]);
+        // Once is enough.
+        control.tick(now);
+        assert!(taps(&engine.take(true), "AddTap").is_empty());
+        // The master at another rate: a new tap, the old one removed.
+        control.output = Some((44_100, period));
+        control.tick(now);
+        let seen = engine.take(true);
+        let old = added[0].trim_start_matches("AddTap ");
+        assert_eq!(taps(&seen, "RemoveTap"), [format!("RemoveTap {old}")]);
+        assert_eq!(taps(&seen, "AddTap").len(), 1, "{seen:?}");
+        assert_eq!(*output.taps.lock().unwrap(), [rate, 44_100]);
+        // The output disabled: its tap goes.
+        control.aes67.as_mut().unwrap().set_output_enabled(false);
+        control.tick(now);
+        let seen = engine.take(true);
+        assert_eq!(taps(&seen, "RemoveTap").len(), 1, "{seen:?}");
+        assert!(taps(&seen, "AddTap").is_empty());
     }
 
     fn has_resampler(seen: &[String]) -> bool {

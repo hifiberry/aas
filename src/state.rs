@@ -130,8 +130,9 @@ pub struct State {
     pub aes67: Option<StoredAes67>,
 }
 
-/// The AES67 input's settings as the API set them. The client volume of
-/// the input is kept with the clients', under the name `aes67`.
+/// The AES67 input's and output's settings as the API set them. The
+/// client volume of the input is kept with the clients', under the name
+/// `aes67`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct StoredAes67 {
     /// The selected stream's name; empty selects none.
@@ -142,6 +143,8 @@ pub struct StoredAes67 {
     pub latency: Option<Stored<u32>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_enabled: Option<Stored<bool>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_enabled: Option<Stored<bool>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -752,6 +755,10 @@ mod tests {
             input_enabled: Some(Stored {
                 value: false,
                 config: true,
+            }),
+            output_enabled: Some(Stored {
+                value: true,
+                config: false,
             }),
         });
         state.save(&path).unwrap();
