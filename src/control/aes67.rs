@@ -19,7 +19,7 @@ use crate::state::{AES67_CLIENT, StoredAes67};
 use aas_client::ring::Ring;
 use std::os::fd::AsFd;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Instant;
 
 /// The `aes67` source as the control thread knows it.
@@ -37,6 +37,8 @@ pub(super) struct Aes67Source {
     /// What the input thread reads of the engine.
     output_delay: Arc<AtomicU32>,
     master_rate: Arc<AtomicU32>,
+    /// Tells the input thread the engine reads the ring.
+    draining: Arc<AtomicBool>,
 }
 
 impl Control {
@@ -61,11 +63,10 @@ impl Control {
     fn add_aes67_source(&mut self, batch: &mut Vec<Command>) -> Option<InputLink> {
         let capacity = min_ring_frames(RATE, self.startup_latency_ms);
         let made = Ring::create(capacity).and_then(|(ring, memfd)| {
-            let theirs = Ring::map(memfd.as_fd())?;
             let view = HeaderView::map(memfd.as_fd())?;
-            Ok((ring, theirs, view, eventfd()?))
+            Ok((ring, memfd, view, eventfd()?))
         });
-        let (ring, theirs, view, wake) = match made {
+        let (ring, memfd, view, wake) = match made {
             Ok(made) => made,
             Err(e) => {
                 eprintln!("aas: aes67: no ring for the input: {e}");
@@ -88,6 +89,7 @@ impl Control {
         self.aes67_input = true;
         let output_delay = Arc::new(AtomicU32::new(0));
         let master_rate = Arc::new(AtomicU32::new(RATE));
+        let draining = Arc::new(AtomicBool::new(false));
         self.aes67_source = Some(Aes67Source {
             id,
             capacity: capacity as usize,
@@ -97,16 +99,18 @@ impl Control {
             view,
             output_delay: output_delay.clone(),
             master_rate: master_rate.clone(),
+            draining: draining.clone(),
         });
         Some(InputLink {
-            ring: theirs,
+            memfd,
             output_delay,
             master_rate,
+            draining,
         })
     }
 
-    /// On the timer: AES67's own tick, its events, the engine's delay for
-    /// the input, and the source running while the input receives.
+    /// On the timer: AES67's own tick, its events, the source running
+    /// while the input receives, and what the input reads of the engine.
     pub(super) fn sync_aes67(&mut self, now: Instant) {
         let Some(aes67) = &mut self.aes67 else {
             return;
@@ -116,7 +120,15 @@ impl Control {
         if let Some(event) = aes67.changed() {
             self.publish(event);
         }
+        self.aes67_follow(receiving, now);
         self.aes67_delay();
+        self.aes67_draining();
+    }
+
+    /// Runs the source while the input receives, as a client's stream
+    /// runs while it plays. A stopped source's ring is emptied, so what
+    /// was left in it does not play at the next start.
+    fn aes67_follow(&mut self, receiving: bool, now: Instant) {
         let urgent = self.running_count() == 0;
         let Some(source) = &mut self.aes67_source else {
             return;
@@ -137,10 +149,22 @@ impl Control {
         } else {
             self.client_changed(AES67_CLIENT, "stopped");
             self.policy.client_stopped(id, t);
+            self.aes67_draining();
             batch.push(Command::SetRunning(id, false));
+            batch.push(Command::Flush(id));
             self.decide(now, false, &mut batch);
         }
         self.send(batch);
+    }
+
+    /// Whether the engine reads the source's ring: it runs and the master
+    /// is open, not reopening. Until then the input writes nothing.
+    fn aes67_draining(&self) {
+        let Some(source) = &self.aes67_source else {
+            return;
+        };
+        let on = source.running && self.output.is_some() && self.reopening == 0;
+        source.draining.store(on, Ordering::Relaxed);
     }
 
     /// Tells the input thread the master's rate and the delay from the
@@ -324,6 +348,42 @@ mod tests {
         assert!(seen.contains(&format!("SetRunning {id} false")), "{seen:?}");
         assert_eq!(control.running_count(), 0);
         assert!(control.idle_since.is_some());
+    }
+
+    #[test]
+    fn draining_follows_the_source_running_and_the_master_open() {
+        let (mut control, mut engine, now, input) =
+            with_aes67(|c| c.input.stream = "studio".into(), &[]);
+        engine.take(true);
+        control.handle_events(now);
+        let draining = |control: &Control| {
+            let source = control.aes67_source.as_ref().unwrap();
+            source.draining.load(Ordering::Relaxed)
+        };
+        let id = control.aes67_source.as_ref().unwrap().id;
+        control.tick(now);
+        assert!(!draining(&control), "not running");
+        announce(control.aes67.as_ref().unwrap(), 1, THEM, "studio");
+        input.set_receiving(true);
+        control.tick(now);
+        engine.take(true);
+        control.handle_events(now);
+        control.tick(now);
+        assert!(control.output.is_some() && control.reopening == 0);
+        assert!(draining(&control));
+        // While the master reopens the engine does not read the ring.
+        control.reopening = 1;
+        control.tick(now);
+        assert!(!draining(&control));
+        control.reopening = 0;
+        control.tick(now);
+        assert!(draining(&control));
+        // Stopped: not read, and the ring is emptied.
+        input.set_receiving(false);
+        control.tick(now);
+        assert!(!draining(&control));
+        let seen = engine.take(true);
+        assert!(seen.contains(&format!("Flush {id}")), "{seen:?}");
     }
 
     #[test]

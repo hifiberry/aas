@@ -158,13 +158,15 @@ impl Drop for InputHandle {
 /// receives on `interface` the stream an `InputCommand::Select` names and
 /// writes it to `ring`. The engine reads the ring every cycle on its own,
 /// so nothing wakes it. `output_delay` is the engine's delay after the
-/// ring, in frames at `master_rate`.
+/// ring, in frames at `master_rate`; `draining` says whether the engine
+/// reads the ring (see [`Receiver::set_draining`]).
 pub fn start(
     interface: Ipv4Addr,
     clock: PtpClock,
     ring: Ring,
     output_delay: Arc<AtomicU32>,
     master_rate: Arc<AtomicU32>,
+    draining: Arc<AtomicBool>,
 ) -> io::Result<InputHandle> {
     let status = Arc::new(Mutex::new(InputStatus {
         latency_ms: DEFAULT_LATENCY_MS,
@@ -181,6 +183,7 @@ pub fn start(
             clock,
             output_delay,
             master_rate,
+            draining,
             status,
             stop,
         };
@@ -255,6 +258,8 @@ pub struct Receiver {
     warned: bool,
     /// A message for the log, which the thread prints outside `step`.
     warning: Option<&'static str>,
+    /// The engine reads the ring; see `set_draining`.
+    draining: bool,
     /// Writes in a row whose reading the controller skipped.
     skipping: u32,
     /// Restarts of a stream that was playing or priming.
@@ -289,6 +294,7 @@ impl Receiver {
             last_stored: 0,
             warned: false,
             warning: None,
+            draining: true,
             skipping: 0,
             restarts: 0,
             last_restart: None,
@@ -328,6 +334,27 @@ impl Receiver {
         self.restart(Restart::Hard, "latency");
         self.latency_ms = latency_ms;
         self.drift = drift(latency_ms);
+    }
+
+    /// Whether the engine reads the ring. While it does not, packets still
+    /// count, so `receiving` tells the control thread to start the source,
+    /// but nothing starts and nothing is written: a ring filled ahead of
+    /// the engine would play late, and the delay error would restart the
+    /// stream. A stream under way pauses, as on a short gap: the next
+    /// packet after the engine reads again starts it, counting what is
+    /// left in the ring. A pause is not counted in `restarts`.
+    pub fn set_draining(&mut self, on: bool) {
+        if on == self.draining {
+            return;
+        }
+        self.draining = on;
+        if !on && matches!(self.phase, Phase::Priming | Phase::Playing) {
+            self.phase = Phase::Waiting;
+            self.adaptive.reset();
+            self.ratio = 1.0;
+            self.skipping = 0;
+            self.drift.reprime();
+        }
     }
 
     /// The stream channels played as left and right, counted from 1. Takes
@@ -392,6 +419,9 @@ impl Receiver {
         }
         self.receiving = true;
         self.last_rx = rx_ns;
+        if !self.draining {
+            return;
+        }
         if self.phase == Phase::Waiting {
             self.start(p.ts, now);
         }
@@ -600,6 +630,8 @@ struct Shared {
     clock: PtpClock,
     output_delay: Arc<AtomicU32>,
     master_rate: Arc<AtomicU32>,
+    /// The engine reads the ring, as the control thread sees it.
+    draining: Arc<AtomicBool>,
     status: Arc<Mutex<InputStatus>>,
     stop: Arc<AtomicBool>,
 }
@@ -663,6 +695,7 @@ fn run(shared: Shared, mut out: RingOut, commands: mpsc::Receiver<InputCommand>)
             generation,
             output_delay: f64::from(delay) * f64::from(RATE) / f64::from(rate),
         };
+        rx.set_draining(shared.draining.load(Ordering::Relaxed));
         rx.step(&now, &packets[..count], &mut out);
         if let Some(warning) = rx.take_warning() {
             eprintln!("{warning}");
@@ -851,6 +884,9 @@ mod tests {
         capacity: usize,
         queue: VecDeque<[i32; 2]>,
         played: Vec<[i32; 2]>,
+        /// The engine runs the source; when not, it plays zeros and leaves
+        /// the ring alone.
+        reading: bool,
     }
 
     impl Output for FakeRing {
@@ -871,7 +907,11 @@ mod tests {
         fn drain(&mut self, now: i128) {
             let due = ((now - T0) * 48_000 / 1_000_000_000) as usize;
             while self.played.len() < due {
-                let f = self.queue.pop_front().unwrap_or([0; 2]);
+                let f = if self.reading {
+                    self.queue.pop_front().unwrap_or([0; 2])
+                } else {
+                    [0; 2]
+                };
                 self.played.push(f);
             }
         }
@@ -947,6 +987,7 @@ mod tests {
                     capacity: 4096,
                     queue: VecDeque::new(),
                     played: Vec::new(),
+                    reading: true,
                 },
                 now: T0,
                 channels,
@@ -1268,6 +1309,43 @@ mod tests {
     }
 
     #[test]
+    fn nothing_is_written_while_the_engine_does_not_read() {
+        let mut sim = Sim::new(session(2, Some((MASTER, 0))), square, true);
+        let reading = |sim: &mut Sim, on: bool| {
+            sim.rx.set_draining(on);
+            sim.ring.reading = on;
+        };
+        reading(&mut sim, false);
+        sim.run(0.5);
+        assert_eq!(sim.ring.fill(), 0);
+        let status = sim.status();
+        assert!(status.receiving);
+        assert_eq!(status.mode, None);
+        // The engine reads: it starts at the next packet, at its target.
+        reading(&mut sim, true);
+        sim.run(3.0);
+        let status = sim.status();
+        assert_eq!((status.mode, status.restarts), (Some(Mode::Ptp), 0));
+        let delays = edge_delays(&sim, Sim::index(sim.now - 400_000_000));
+        assert!(!delays.is_empty());
+        for d in &delays {
+            assert!((d - TARGET).abs() <= 12.0, "delay {:.2} ms", d / 48.0);
+        }
+        // A pause, such as the card reopening, is no restart either, and
+        // what was left in the ring is counted when it starts again.
+        reading(&mut sim, false);
+        sim.run(0.3);
+        assert_eq!(sim.status().mode, None);
+        reading(&mut sim, true);
+        sim.run(3.0);
+        let status = sim.status();
+        assert_eq!((status.mode, status.restarts), (Some(Mode::Ptp), 0));
+        for d in &edge_delays(&sim, Sim::index(sim.now - 400_000_000)) {
+            assert!((d - TARGET).abs() <= 12.0, "delay {:.2} ms", d / 48.0);
+        }
+    }
+
+    #[test]
     fn the_thread_takes_commands_and_stops_with_its_handle() {
         let (ring, _memfd) = Ring::create(1024).unwrap();
         let handle = start(
@@ -1276,6 +1354,7 @@ mod tests {
             ring,
             Arc::new(AtomicU32::new(0)),
             Arc::new(AtomicU32::new(48_000)),
+            Arc::new(AtomicBool::new(true)),
         )
         .unwrap();
         handle.command(InputCommand::Latency(7));

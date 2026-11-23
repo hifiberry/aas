@@ -22,6 +22,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use aas_client::ring::Ring;
+use std::os::fd::{AsFd, OwnedFd};
 
 use crate::api::{
     Aes67ClockView, Aes67InputView, Aes67OutputView, Aes67StreamView, Aes67View, ApiEvent,
@@ -58,10 +59,14 @@ impl InputPort for InputHandle {
 /// source, and the engine's delay after it and its rate, which the control
 /// thread keeps up to date.
 pub struct InputLink {
-    pub ring: Ring,
+    /// The ring's memory, mapped for the input thread at each try to
+    /// start it.
+    pub memfd: OwnedFd,
     /// Frames at `master_rate` from the ring to the card.
     pub output_delay: Arc<AtomicU32>,
     pub master_rate: Arc<AtomicU32>,
+    /// The engine reads the ring: the source runs and the master is open.
+    pub draining: Arc<AtomicBool>,
 }
 
 pub struct Aes67 {
@@ -78,8 +83,12 @@ pub struct Aes67 {
     link: Option<InputLink>,
     /// The PTP listener was started, or failed for good.
     ptp_done: bool,
-    /// The threads are started.
-    started: bool,
+    /// The SAP thread is started.
+    sap: bool,
+    /// A failure to start the SAP or the input thread has been logged.
+    failing_told: bool,
+    /// The input's status, read once per tick.
+    status: InputStatus,
     /// When the interface is looked at again.
     retry_at: Option<Instant>,
     /// Waiting for the interface's address has been logged.
@@ -140,7 +149,9 @@ impl Aes67 {
             input: None,
             link: None,
             ptp_done: config.ptp == PtpSource::Off,
-            started: false,
+            sap: false,
+            failing_told: false,
+            status: InputStatus::default(),
             retry_at: None,
             waiting_told: false,
             stop: Arc::new(AtomicBool::new(false)),
@@ -183,32 +194,54 @@ impl Aes67 {
             }
             self.ptp_done = true;
         }
-        eprintln!("aas: aes67: on {interface}");
-        *lock(&self.directory) = Directory::new(Some(addr));
-        let sap = sap_thread::start(
-            addr,
-            self.directory.clone(),
-            self.announce.clone(),
-            self.stop.clone(),
-        );
-        match sap {
-            Ok(thread) => self.threads.push(thread),
-            Err(e) => eprintln!("aas: aes67: no SAP listener: {e}"),
-        }
-        if let Some(link) = self.link.take() {
-            let started = input::start(
+        if !self.sap {
+            eprintln!("aas: aes67: on {interface}");
+            *lock(&self.directory) = Directory::new(Some(addr));
+            let sap = sap_thread::start(
                 addr,
-                self.clock.clone(),
-                link.ring,
-                link.output_delay,
-                link.master_rate,
+                self.directory.clone(),
+                self.announce.clone(),
+                self.stop.clone(),
             );
-            match started {
-                Ok(handle) => self.attach(Box::new(handle)),
-                Err(e) => eprintln!("aas: aes67: no input: {e}"),
+            match sap {
+                Ok(thread) => {
+                    self.threads.push(thread);
+                    self.sap = true;
+                }
+                Err(e) => self.failed("no SAP listener", e, now),
             }
         }
-        self.started = true;
+        if let Some(link) = &self.link {
+            let started = Ring::map(link.memfd.as_fd()).and_then(|ring| {
+                input::start(
+                    addr,
+                    self.clock.clone(),
+                    ring,
+                    link.output_delay.clone(),
+                    link.master_rate.clone(),
+                    link.draining.clone(),
+                )
+            });
+            match started {
+                Ok(handle) => {
+                    self.link = None;
+                    self.attach(Box::new(handle));
+                }
+                Err(e) => self.failed("no input", e, now),
+            }
+        }
+    }
+
+    /// The SAP or the input thread did not start: tried again in 5 s,
+    /// logged once.
+    fn failed(&mut self, what: &str, e: io::Error, now: Instant) {
+        if !std::mem::replace(&mut self.failing_told, true) {
+            eprintln!(
+                "aas: aes67: {what}: {e}, trying again every {} s",
+                RETRY.as_secs()
+            );
+        }
+        self.retry_at = Some(now + RETRY);
     }
 
     /// Tries again in 5 s, saying so once.
@@ -232,8 +265,11 @@ impl Aes67 {
     /// input play the selection when it is announced and stop it when it
     /// goes. Call on the control thread's timer.
     pub fn tick(&mut self, now: Instant) {
-        if !self.started && self.retry_at.is_some_and(|at| now >= at) {
+        if self.retry_at.is_some_and(|at| now >= at) {
             self.try_start(now);
+        }
+        if let Some(input) = &self.input {
+            self.status = input.status();
         }
         self.sync();
     }
@@ -266,7 +302,7 @@ impl Aes67 {
 
     pub fn view(&self) -> Aes67View {
         let ptp = self.clock.now();
-        let status = self.input.as_ref().map(|i| i.status()).unwrap_or_default();
+        let status = &self.status;
         let output = &self.config.output;
         Aes67View {
             clock: Aes67ClockView {
@@ -283,7 +319,7 @@ impl Aes67 {
                 enabled: self.input_enabled,
                 stream: self.selection.clone(),
                 mode: status.mode.map(mode_name),
-                receiving: self.receiving_in(&status),
+                receiving: self.receiving_in(status),
                 latency_ms: self.latency_ms(),
                 latency_auto: self.latency == Latency::Auto,
                 late: status.late,
@@ -404,12 +440,10 @@ impl Aes67 {
         Some(ApiEvent::Aes67(view))
     }
 
-    /// Whether the input plays a stream that arrives: the `aes67` source
-    /// then counts as a running client.
+    /// Whether the input plays a stream that arrives, as of the last
+    /// `tick`: the `aes67` source then counts as a running client.
     pub fn receiving(&self) -> bool {
-        self.input
-            .as_ref()
-            .is_some_and(|i| self.receiving_in(&i.status()))
+        self.receiving_in(&self.status)
     }
 
     fn receiving_in(&self, status: &InputStatus) -> bool {
@@ -569,7 +603,8 @@ pub(crate) mod testing {
         ) -> Aes67 {
             let mut aes67 = Aes67::new(config, stored, model.map(str::to_owned));
             *lock(&aes67.directory) = Directory::new(own);
-            aes67.started = true;
+            aes67.ptp_done = true;
+            aes67.sap = true;
             aes67.attach(Box::new(input));
             aes67
         }
