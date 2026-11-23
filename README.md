@@ -415,7 +415,7 @@ name = "aas"
 | `domain` | 0 to 255 | 0 | The PTP domain to follow. |
 | `input.enabled` | `true`, `false` | `true` | Whether the selected stream is played. |
 | `input.stream` | a stream's name | none | The SDP session name of the stream to play. Empty selects none. |
-| `input.latency_ms` | 1 to 100, or `"auto"` | `"auto"` | The input's buffer. `"auto"` is 3 ms on a CM5 or Pi 5 and 20 ms on any other board. |
+| `input.latency_ms` | 1 to 100, or `"auto"` | `"auto"` | The delay from a sample's capture at the sender to the sound card, aas's own buffering included; for a stream without PTP time, the depth of the input's buffer. `"auto"` is 5 ms on a CM5 or Pi 5 and 20 ms on any other board. |
 | `input.channels` | two numbers, 1 to 8 | `[1, 2]` | The two channels of the stream played as left and right. |
 | `input.volume_db` | -60 to 0 | 0 | The start value of the `aes67` client's volume. |
 | `output.enabled` | `true`, `false` | `false` | Whether the master is sent. |

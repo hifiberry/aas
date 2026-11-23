@@ -79,7 +79,7 @@ pub fn latency_ms(latency: Latency, model: Option<&str>) -> u32 {
                 let m = m.to_ascii_lowercase();
                 m.contains("compute module 5") || m.contains("pi 5")
             });
-            if fast { 3 } else { 20 }
+            if fast { 5 } else { 20 }
         }
     }
 }
@@ -380,9 +380,9 @@ ttl = 4
                 Latency::Auto,
                 Some("Raspberry Pi Compute Module 5 Lite Rev 1.0")
             ),
-            3
+            5
         );
-        assert_eq!(latency_ms(Latency::Auto, Some("Raspberry Pi 5 Model B")), 3);
+        assert_eq!(latency_ms(Latency::Auto, Some("Raspberry Pi 5 Model B")), 5);
         assert_eq!(
             latency_ms(Latency::Auto, Some("Raspberry Pi 4 Model B Rev 1.1")),
             20
