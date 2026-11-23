@@ -545,27 +545,82 @@ mod tests {
         assert_eq!(streams[0]["mode"], "buffer");
     }
 
+    /// The `Aes67` events published since the last time.
+    fn aes67_events(rx: &mut tokio::sync::broadcast::Receiver<ApiEvent>) -> usize {
+        let mut n = 0;
+        while let Ok(event) = rx.try_recv() {
+            n += usize::from(matches!(event, ApiEvent::Aes67(_)));
+        }
+        n
+    }
+
     #[test]
     fn patch_input_selects_and_stores() {
         let (mut control, _engine, now, _) = with_aes67(|_| {}, &[]);
         let (tx, mut rx) = tokio::sync::broadcast::channel(16);
         control.set_api(tx);
         announce(control.aes67.as_ref().unwrap(), 1, THEM, "studio");
+        control.tick(now);
+        aes67_events(&mut rx);
+        let dir = tempfile::tempdir().unwrap();
+        control.saver = Some(crate::state::Saver::new(dir.path().join("state.toml")));
+        control.save_at = None;
         // An unknown stream is refused, and nothing changes.
         let e = control
             .call(input_patch(json!({"stream": "nowhere"})), now)
             .unwrap_err();
-        assert_eq!(e.status, 400);
+        assert_eq!(e.status, 422);
         assert!(e.message.contains("nowhere"), "{}", e.message);
         assert_eq!(control.state.aes67, None);
-        // A bad latency names the field.
-        for bad in [json!(0), json!(101), json!("fast"), json!(2.5), json!(true)] {
+        assert_eq!(control.save_at, None);
+        // A bad latency names the field: out of range is 422, a wrong
+        // type 400.
+        for (bad, status) in [
+            (json!(0), 422),
+            (json!(101), 422),
+            (json!(2.5), 422),
+            (json!("fast"), 400),
+            (json!(true), 400),
+        ] {
             let e = control
                 .call(input_patch(json!({"latency_ms": bad})), now)
                 .unwrap_err();
-            assert_eq!(e.status, 400);
+            assert_eq!(e.status, status);
             assert!(e.message.starts_with("latency_ms"), "{}", e.message);
         }
+        // A valid stream with a bad latency changes nothing.
+        let before = control.call(Call::Aes67, now).unwrap();
+        let e = control
+            .call(
+                input_patch(json!({"stream": "studio", "latency_ms": 0, "volume_db": -5.0})),
+                now,
+            )
+            .unwrap_err();
+        assert_eq!(e.status, 422);
+        assert_eq!(control.call(Call::Aes67, now).unwrap(), before);
+        assert_eq!(control.state.aes67, None);
+        assert!(!control.state.clients.contains_key("aes67"));
+        assert_eq!(control.save_at, None);
+        assert_eq!(aes67_events(&mut rx), 0);
+        // A refused client volume leaves the stream alone too.
+        for i in 0..crate::state::MAX_CLIENTS {
+            let input = StoredInput {
+                volume_db: -1.0,
+                muted: false,
+            };
+            control.state.clients.insert(format!("c{i}"), input);
+        }
+        let e = control
+            .call(
+                input_patch(json!({"stream": "studio", "volume_db": -5.0})),
+                now,
+            )
+            .unwrap_err();
+        assert_eq!(e.status, 422);
+        assert_eq!(control.state.aes67, None);
+        assert_eq!(control.call(Call::Aes67, now).unwrap(), before);
+        control.state.clients.clear();
+        // The change itself: stored, saved, told once.
         let view = control
             .call(
                 input_patch(json!({"stream": "studio", "latency_ms": 7})),
@@ -578,12 +633,20 @@ mod tests {
         let stored = control.state.aes67.clone().unwrap();
         assert_eq!(stored.stream.unwrap().value, "studio");
         assert_eq!(stored.latency.unwrap().value, 7);
-        assert!(control.save_at.is_some() || control.saver.is_none());
-        let mut told = false;
-        while let Ok(event) = rx.try_recv() {
-            told |= matches!(event, ApiEvent::Aes67(_));
-        }
-        assert!(told, "no aes67 event");
+        assert!(control.save_at.is_some());
+        assert_eq!(aes67_events(&mut rx), 1);
+        control.tick(now);
+        assert_eq!(aes67_events(&mut rx), 0, "the tick told it again");
+        // The same again changes nothing: no save, no event.
+        control.save_at = None;
+        control
+            .call(
+                input_patch(json!({"stream": "studio", "latency_ms": 7, "enabled": true})),
+                now,
+            )
+            .unwrap();
+        assert_eq!(control.save_at, None);
+        assert_eq!(aes67_events(&mut rx), 0);
         // null deselects, "auto" is the board's.
         let view = control
             .call(
@@ -625,11 +688,36 @@ mod tests {
     #[test]
     fn patch_output_enables() {
         let (mut control, _engine, now, _) = with_aes67(|_| {}, &[]);
+        let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+        control.set_api(tx);
+        let dir = tempfile::tempdir().unwrap();
+        control.saver = Some(crate::state::Saver::new(dir.path().join("state.toml")));
+        control.tick(now);
+        aes67_events(&mut rx);
+        control.save_at = None;
+        // As it is already: nothing happens.
+        let view = control.call(Call::Aes67, now).unwrap();
+        let enabled = view["output"]["enabled"].as_bool();
+        assert!(enabled.is_some());
+        let same = Call::PatchAes67Output(Aes67OutputPatch { enabled });
+        control.call(same, now).unwrap();
+        assert_eq!((control.save_at, aes67_events(&mut rx)), (None, 0));
+        // Turned on first, so that the next patch turns it off.
+        let on = Call::PatchAes67Output(Aes67OutputPatch {
+            enabled: Some(true),
+        });
+        control.call(on, now).unwrap();
+        aes67_events(&mut rx);
+        control.save_at = None;
         let patch = |on| Call::PatchAes67Output(Aes67OutputPatch { enabled: Some(on) });
         let view = control.call(patch(false), now).unwrap();
         assert_eq!(view["output"]["enabled"], false);
         let stored = control.state.aes67.clone().unwrap();
         assert!(!stored.output_enabled.unwrap().value);
+        assert!(control.save_at.is_some());
+        assert_eq!(aes67_events(&mut rx), 1);
+        control.tick(now);
+        assert_eq!(aes67_events(&mut rx), 0);
         let view = control.call(patch(true), now).unwrap();
         assert_eq!(view["output"]["enabled"], true);
     }
@@ -648,8 +736,9 @@ mod tests {
     }
 
     #[test]
-    fn unknown_field_is_400() {
-        // The API thread parses the body; a field it does not know fails.
+    fn the_patch_bodies_refuse_unknown_fields_and_read_null() {
+        // The API thread parses the body with these types; a field they
+        // do not know fails there, as a 400.
         assert!(serde_json::from_str::<Aes67InputPatch>(r#"{"volume":1}"#).is_err());
         assert!(serde_json::from_str::<Aes67OutputPatch>(r#"{"on":true}"#).is_err());
         // null and a name both parse for the stream; a number does not.

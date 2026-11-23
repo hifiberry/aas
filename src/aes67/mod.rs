@@ -472,7 +472,19 @@ impl Aes67 {
     /// cannot play are refused.
     pub fn select(&mut self, name: Option<String>) -> Result<(), String> {
         let name = name.filter(|n| !n.is_empty());
-        if let Some(name) = &name {
+        self.check_select(name.as_deref())?;
+        self.selection = name;
+        self.stored.stream = Some(Stored {
+            value: self.selection.clone().unwrap_or_default(),
+            config: self.config.input.stream.clone(),
+        });
+        self.sync();
+        Ok(())
+    }
+
+    /// Why `select` would refuse `name`, if it would.
+    pub fn check_select(&self, name: Option<&str>) -> Result<(), String> {
+        if let Some(name) = name.filter(|n| !n.is_empty()) {
             let directory = lock(&self.directory);
             let Some(listed) = directory.by_name(name) else {
                 return Err(format!("no stream {name:?} is announced"));
@@ -484,12 +496,6 @@ impl Aes67 {
                 return Err(format!("{name:?} cannot be played: its {field}"));
             }
         }
-        self.selection = name;
-        self.stored.stream = Some(Stored {
-            value: self.selection.clone().unwrap_or_default(),
-            config: self.config.input.stream.clone(),
-        });
-        self.sync();
         Ok(())
     }
 

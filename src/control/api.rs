@@ -483,51 +483,83 @@ impl Control {
         }
     }
 
-    /// `PATCH /aes67/input`. Every value is checked before one applies.
+    /// `PATCH /aes67/input`. Every value is checked before one applies, and
+    /// only a value that changes is stored.
     fn patch_aes67_input(&mut self, patch: api::Aes67InputPatch, now: Instant) -> api::Answer {
         use crate::aes67::config::Latency;
-        self.aes67_ref()?;
+        let current = self.aes67_ref()?.view().input;
         let latency = match &patch.latency_ms {
             None => None,
             Some(serde_json::Value::String(s)) if s == "auto" => Some(Latency::Auto),
-            Some(v) => match v.as_u64() {
+            Some(serde_json::Value::Number(n)) => match n.as_u64() {
                 Some(ms @ 1..=100) => Some(Latency::Ms(ms as u32)),
                 _ => {
-                    return Err(ApiError::bad_request(
-                        "latency_ms is a number from 1 to 100, or \"auto\"",
+                    return Err(ApiError::unprocessable(
+                        "latency_ms is from 1 to 100 ms, or \"auto\"",
                     ));
                 }
             },
+            Some(_) => {
+                return Err(ApiError::bad_request(
+                    "latency_ms is a number from 1 to 100, or \"auto\"",
+                ));
+            }
         };
+        let stream = patch.stream.clone().map(|s| s.filter(|n| !n.is_empty()));
+        if let Some(stream) = &stream {
+            let aes67 = self.aes67_ref()?;
+            aes67
+                .check_select(stream.as_deref())
+                .map_err(ApiError::unprocessable)?;
+        }
+        // The one step that can still fail goes first, so that a refusal
+        // leaves everything as it was.
         let client = api::InputPatch {
             volume_db: patch.volume_db,
             muted: patch.mute,
         };
-        check_input(&client)?;
+        if client != api::InputPatch::default() {
+            self.set_client_input(AES67_CLIENT.into(), client, now)?;
+        }
         let aes67 = self.aes67.as_mut().expect("checked above");
-        if let Some(stream) = patch.stream {
-            aes67.select(stream).map_err(ApiError::bad_request)?;
+        let mut changed = false;
+        if let Some(stream) = stream
+            && stream != current.stream
+        {
+            aes67.select(stream).map_err(ApiError::unprocessable)?;
+            changed = true;
         }
         if let Some(latency) = latency {
-            aes67.set_latency(latency);
+            let same = match latency {
+                Latency::Auto => current.latency_auto,
+                Latency::Ms(ms) => !current.latency_auto && current.latency_ms == ms,
+            };
+            if !same {
+                aes67.set_latency(latency);
+                changed = true;
+            }
         }
-        if let Some(on) = patch.enabled {
+        if let Some(on) = patch.enabled
+            && on != current.enabled
+        {
             aes67.set_input_enabled(on);
+            changed = true;
         }
-        if client != api::InputPatch::default() {
-            self.set_client_input(crate::state::AES67_CLIENT.into(), client, now)?;
+        if changed {
+            self.aes67_changed(now);
         }
-        self.aes67_changed(now);
         api::answer(&self.aes67_ref()?.view())
     }
 
     /// `PATCH /aes67/output`.
     fn patch_aes67_output(&mut self, patch: api::Aes67OutputPatch, now: Instant) -> api::Answer {
-        self.aes67_ref()?;
-        if let (Some(on), Some(aes67)) = (patch.enabled, &mut self.aes67) {
+        let current = self.aes67_ref()?.view().output.enabled;
+        if let (Some(on), Some(aes67)) = (patch.enabled, &mut self.aes67)
+            && on != current
+        {
             aes67.set_output_enabled(on);
+            self.aes67_changed(now);
         }
-        self.aes67_changed(now);
         api::answer(&self.aes67_ref()?.view())
     }
 
