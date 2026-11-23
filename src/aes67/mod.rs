@@ -195,7 +195,6 @@ impl Aes67 {
             self.ptp_done = true;
         }
         if !self.sap {
-            eprintln!("aas: aes67: on {interface}");
             *lock(&self.directory) = Directory::new(Some(addr));
             let sap = sap_thread::start(
                 addr,
@@ -205,6 +204,7 @@ impl Aes67 {
             );
             match sap {
                 Ok(thread) => {
+                    eprintln!("aas: aes67: on {interface}");
                     self.threads.push(thread);
                     self.sap = true;
                 }

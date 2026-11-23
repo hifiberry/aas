@@ -3100,6 +3100,9 @@ impl Control {
     /// commands every cycle, so room comes within a period. A wait of a
     /// second means it is stuck, and is logged once.
     fn send(&mut self, batch: Vec<Command>) {
+        // Every open, reopen and close of the master goes out through here,
+        // and every answer to one is taken before it.
+        self.aes67_draining();
         let capacity = self.commands.buffer().capacity();
         let mut waiting_since: Option<Instant> = None;
         let mut warned = false;

@@ -158,8 +158,9 @@ impl Control {
     }
 
     /// Whether the engine reads the source's ring: it runs and the master
-    /// is open, not reopening. Until then the input writes nothing.
-    fn aes67_draining(&self) {
+    /// is open, not reopening. Until then the input writes nothing. Called
+    /// by `send`, so it follows every change of the output as it is sent.
+    pub(super) fn aes67_draining(&self) {
         let Some(source) = &self.aes67_source else {
             return;
         };
@@ -384,6 +385,35 @@ mod tests {
         assert!(!draining(&control));
         let seen = engine.take(true);
         assert!(seen.contains(&format!("Flush {id}")), "{seen:?}");
+    }
+
+    #[test]
+    fn a_settled_rate_switch_stops_draining_until_the_card_is_open() {
+        let (mut control, mut engine, now, input) =
+            with_aes67(|c| c.input.stream = "studio".into(), &[]);
+        let draining = |control: &Control| {
+            let source = control.aes67_source.as_ref().unwrap();
+            source.draining.load(Ordering::Relaxed)
+        };
+        announce(control.aes67.as_ref().unwrap(), 1, THEM, "studio");
+        input.set_receiving(true);
+        control.tick(now);
+        engine.take(true);
+        control.handle_events(now);
+        control.tick(now);
+        assert!(draining(&control));
+        // The master at another rate, its switch to 48 kHz due now: the
+        // tick reopens the card, and the ring is not read meanwhile.
+        let (_, period) = control.output.unwrap();
+        control.output = Some((44_100, period));
+        control.switch_at = Some(now);
+        control.tick(now);
+        assert_eq!(control.reopening, 1);
+        assert!(!draining(&control));
+        engine.take(true);
+        control.handle_events(now);
+        assert_eq!(control.reopening, 0);
+        assert!(draining(&control));
     }
 
     #[test]
