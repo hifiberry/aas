@@ -21,8 +21,6 @@ pub enum Put {
 
 pub struct Jitter {
     frames: Vec<[i32; 2]>,
-    /// The timestamp each slot was written for.
-    stamps: Vec<u32>,
     /// Whether the slot holds a frame not yet taken.
     present: Vec<bool>,
     anchored: bool,
@@ -43,7 +41,6 @@ impl Jitter {
     pub fn new() -> Jitter {
         Jitter {
             frames: vec![[0; 2]; RING],
-            stamps: vec![0; RING],
             present: vec![false; RING],
             anchored: false,
             read_ts: 0,
@@ -73,7 +70,6 @@ impl Jitter {
             let t = ts.wrapping_add(i as u32);
             let slot = t as usize % RING;
             self.frames[slot] = *f;
-            self.stamps[slot] = t;
             self.present[slot] = true;
         }
         let end = ts.wrapping_add(frames.len() as u32);
@@ -89,7 +85,7 @@ impl Jitter {
         for o in out.iter_mut() {
             let t = self.read_ts;
             let slot = t as usize % RING;
-            if self.present[slot] && self.stamps[slot] == t {
+            if self.present[slot] {
                 *o = self.frames[slot];
             } else {
                 *o = [0; 2];
@@ -221,6 +217,16 @@ mod tests {
     }
 
     #[test]
+    fn anchor_back_does_not_replay_stored_frames() {
+        let mut j = Jitter::new();
+        j.put(1000, &pkt(1, 48));
+        j.anchor(1000 - 48);
+        let out = take(&mut j, 96);
+        assert!(out.iter().all(|f| *f == [0; 2]));
+        assert_eq!(j.counts(), (96, 0));
+    }
+
+    #[test]
     fn take_and_put_do_not_allocate() {
         let mut j = Jitter::new();
         let p = pkt(1, 48);
@@ -228,7 +234,12 @@ mod tests {
         assert_no_alloc(|| {
             for i in 0..400u32 {
                 j.put(i * 48, &p);
-                j.put(i * 48 + 100_000, &p);
+                // A real store ahead, a late packet, then the take.
+                assert_eq!(j.put(i * 48 + 48, &p), Put::Stored);
+                assert_eq!(
+                    j.put(0, &p[..1]),
+                    if i == 0 { Put::Stored } else { Put::Late }
+                );
                 j.take(&mut out);
             }
             j.anchor(0);
