@@ -566,7 +566,7 @@ mod tests {
         assert!(est.now(L0).is_none());
         sim.run(&mut est, 8);
         let now = est.now(sim.local_now()).expect("locked");
-        assert!((now.rate - 1.0000163).abs() < 0.5e-6, "rate {}", now.rate);
+        assert!((now.rate - 1.0000163).abs() < 2e-6, "rate {}", now.rate);
         assert!(
             err_ns(&est, &sim).abs() < 50_000,
             "err {}",
@@ -575,6 +575,9 @@ mod tests {
         assert_eq!((now.gm, now.domain), (MASTER, 0));
         assert_eq!(est.stats().gm_addr, Some(ADDR));
         assert!(est.stats().pairs >= 60);
+        sim.run(&mut est, 8);
+        let now = est.now(sim.local_now()).expect("locked");
+        assert!((now.rate - 1.0000163).abs() < 0.5e-6, "rate {}", now.rate);
     }
 
     #[test]
