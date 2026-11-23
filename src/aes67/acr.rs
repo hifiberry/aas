@@ -23,12 +23,12 @@ struct Slot {
 }
 
 type Shared = Arc<(Mutex<Slot>, Condvar)>;
-type Warn = Box<dyn Fn(&str) + Send>;
+type Warn = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// The helper thread `aas-aes67-acr`, started by the first `report`.
 pub struct Acr {
     url: String,
-    warn: Option<Warn>,
+    warn: Warn,
     shared: Shared,
     thread: Option<JoinHandle<()>>,
 }
@@ -37,14 +37,14 @@ impl Acr {
     pub fn new(url: &str) -> Self {
         Self::with_warn(
             url,
-            Box::new(|e| eprintln!("aas: aes67: warning: ACR: {e}")),
+            Arc::new(|e| eprintln!("aas: aes67: warning: ACR: {e}")),
         )
     }
 
     pub fn with_warn(url: &str, warn: Warn) -> Self {
         Acr {
             url: url.to_string(),
-            warn: Some(warn),
+            warn,
             shared: Shared::default(),
             thread: None,
         }
@@ -56,14 +56,15 @@ impl Acr {
         if self.thread.is_none() {
             let shared = self.shared.clone();
             let url = self.url.clone();
-            let warn = self.warn.take().expect("the helper starts once");
+            let warn = self.warn.clone();
             let spawned = std::thread::Builder::new()
                 .name("aas-aes67-acr".into())
                 .spawn(move || run(&shared, &url, warn));
             match spawned {
                 Ok(handle) => self.thread = Some(handle),
+                // The next report tries again.
                 Err(e) => {
-                    eprintln!("aas: aes67: warning: ACR: {e}");
+                    (self.warn)(&e.to_string());
                     return;
                 }
             }
@@ -73,7 +74,8 @@ impl Acr {
         wake.notify_one();
     }
 
-    /// Ends the thread; a POST under way is waited for, at most 5 s.
+    /// Ends the thread after it has sent what is pending; a POST under way
+    /// is waited for, at most 5 s.
     pub fn stop(&mut self) {
         let (slot, wake) = &*self.shared;
         lock(slot).stop = true;
@@ -97,11 +99,12 @@ fn run(shared: &Shared, url: &str, warn: Warn) {
         let state = {
             let mut guard = lock(slot);
             loop {
-                if guard.stop {
-                    return;
-                }
+                // What is pending goes out before the stop is heeded.
                 if let Some(state) = guard.state.take() {
                     break state;
+                }
+                if guard.stop {
+                    return;
                 }
                 guard = wake.wait(guard).unwrap_or_else(|e| e.into_inner());
             }
@@ -134,7 +137,10 @@ pub(crate) mod testing {
 
     /// A fake ACR that answers each request and passes on its request line
     /// and body.
-    pub(crate) fn fake_acr() -> (String, mpsc::Receiver<(String, String)>) {
+    /// The request line, the content type and the body.
+    pub(crate) type Request = (String, String, String);
+
+    pub(crate) fn fake_acr() -> (String, mpsc::Receiver<Request>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!(
             "http://{}/api/player/aes67/update",
@@ -148,6 +154,7 @@ pub(crate) mod testing {
                 let mut line = String::new();
                 reader.read_line(&mut line).unwrap();
                 let mut length = 0;
+                let mut kind = String::new();
                 loop {
                     let mut header = String::new();
                     reader.read_line(&mut header).unwrap();
@@ -158,6 +165,9 @@ pub(crate) mod testing {
                         if name.eq_ignore_ascii_case("content-length") {
                             length = value.trim().parse().unwrap();
                         }
+                        if name.eq_ignore_ascii_case("content-type") {
+                            kind = value.trim().to_string();
+                        }
                     }
                 }
                 let mut body = vec![0; length];
@@ -165,7 +175,11 @@ pub(crate) mod testing {
                 let _ = stream.write_all(
                     b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                 );
-                let _ = tx.send((line.trim().to_string(), String::from_utf8(body).unwrap()));
+                let _ = tx.send((
+                    line.trim().to_string(),
+                    kind,
+                    String::from_utf8(body).unwrap(),
+                ));
             }
         });
         (url, rx)
@@ -184,16 +198,32 @@ mod tests {
         let (url, requests) = fake_acr();
         let mut acr = Acr::new(&url);
         acr.report("playing");
-        let (line, body) = requests.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (line, kind, body) = requests.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(line, "POST /api/player/aes67/update HTTP/1.1");
+        assert_eq!(kind, "application/json");
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(
             json,
             serde_json::json!({"type": "state_changed", "state": "playing"})
         );
         acr.report("stopped");
-        let (_, body) = requests.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (_, _, body) = requests.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(body.contains("\"stopped\""));
+    }
+
+    #[test]
+    fn a_pending_state_is_sent_before_the_stop() {
+        let (url, requests) = fake_acr();
+        let mut acr = Acr::new(&url);
+        acr.report("playing");
+        acr.report("stopped");
+        acr.stop();
+        let mut states = Vec::new();
+        while let Ok((_, _, body)) = requests.recv_timeout(Duration::from_millis(300)) {
+            states.push(body);
+        }
+        // The first may have been overtaken, the last never is.
+        assert!(states.last().unwrap().contains("\"stopped\""));
     }
 
     #[test]
@@ -210,7 +240,7 @@ mod tests {
         let counter = warned.clone();
         let mut acr = Acr::with_warn(
             &url,
-            Box::new(move |_| {
+            Arc::new(move |_| {
                 counter.fetch_add(1, Ordering::SeqCst);
             }),
         );

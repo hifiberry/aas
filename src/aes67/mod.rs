@@ -634,6 +634,10 @@ impl Aes67 {
         // Their handles join the input and the output thread.
         self.input = None;
         self.output = None;
+        // ACR is told the input is gone, as the helper flushes before it ends.
+        if std::mem::take(&mut self.reported_playing) {
+            self.acr.report("stopped");
+        }
         self.acr.stop();
         for thread in self.threads.drain(..) {
             let _ = thread.join();
@@ -791,7 +795,7 @@ pub(crate) mod testing {
             aes67.ptp_done = true;
             aes67.sap = true;
             // Tests never reach a real ACR.
-            aes67.acr = acr::Acr::with_warn("http://127.0.0.1:1/", Box::new(|_| {}));
+            aes67.acr = acr::Acr::with_warn("http://127.0.0.1:1/", Arc::new(|_| {}));
             aes67.attach(Box::new(input));
             aes67
         }
@@ -1010,9 +1014,9 @@ mod tests {
     }
 
     /// The states a fake ACR is told, as the JSON bodies' `state`.
-    fn told(requests: &std::sync::mpsc::Receiver<(String, String)>) -> Vec<String> {
+    fn told(requests: &std::sync::mpsc::Receiver<acr::testing::Request>) -> Vec<String> {
         let mut states = Vec::new();
-        while let Ok((_, body)) = requests.recv_timeout(Duration::from_millis(300)) {
+        while let Ok((_, _, body)) = requests.recv_timeout(Duration::from_millis(300)) {
             let json: serde_json::Value = serde_json::from_str(&body).unwrap();
             states.push(json["state"].as_str().unwrap().to_string());
         }
@@ -1033,6 +1037,19 @@ mod tests {
         assert_eq!(told(&requests), ["playing"]);
         input.set_receiving(false);
         aes67.tick(now);
+        assert_eq!(told(&requests), ["stopped"]);
+    }
+
+    #[test]
+    fn stopping_while_playing_tells_acr_stopped() {
+        let (url, requests) = acr::testing::fake_acr();
+        let (mut aes67, input) = with_stream("studio");
+        aes67.acr = acr::Acr::new(&url);
+        announce(&aes67, 3, THEM, "studio");
+        input.set_receiving(true);
+        aes67.tick(Instant::now());
+        assert_eq!(told(&requests), ["playing"]);
+        aes67.stop();
         assert_eq!(told(&requests), ["stopped"]);
     }
 
