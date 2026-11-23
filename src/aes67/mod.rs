@@ -425,6 +425,8 @@ impl Aes67 {
                 latency_auto: self.latency == Latency::Auto,
                 late: status.late,
                 lost: status.lost,
+                restarts: status.restarts,
+                last_restart: status.last_restart,
             },
             output: Aes67OutputView {
                 enabled: self.output_enabled,
@@ -583,6 +585,8 @@ impl Aes67 {
         steady.clock.rate_ppm = None;
         steady.input.late = 0;
         steady.input.lost = 0;
+        steady.input.restarts = 0;
+        steady.input.last_restart = None;
         let now = (steady, lock(&self.directory).changes());
         if self.told.as_ref() == Some(&now) {
             return None;
@@ -988,6 +992,29 @@ mod tests {
         let model = Some("Raspberry Pi 5 Model B Rev 1.0");
         let pi5 = Aes67::with_input(config(), None, model, FakeInput::default(), None);
         assert_eq!(pi5.view().input.latency_ms, 3);
+    }
+
+    #[test]
+    fn the_view_carries_restarts_and_their_reason() {
+        let (mut aes67, input) = with_stream("studio");
+        let view = aes67.view();
+        assert_eq!((view.input.restarts, view.input.last_restart), (0, None));
+        {
+            let mut status = lock(&input.status);
+            status.restarts = 3;
+            status.last_restart = Some("delay");
+        }
+        aes67.tick(Instant::now());
+        let view = aes67.view();
+        assert_eq!(view.input.restarts, 3);
+        assert_eq!(view.input.last_restart, Some("delay"));
+        let json = serde_json::to_value(&view).unwrap();
+        assert_eq!(json["input"]["restarts"], 3);
+        assert_eq!(json["input"]["last_restart"], "delay");
+        assert_eq!(aes67.changed().is_some(), true);
+        lock(&input.status).restarts = 4;
+        aes67.tick(Instant::now());
+        assert_eq!(aes67.changed(), None, "a counter is no event");
     }
 
     #[test]

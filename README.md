@@ -464,7 +464,17 @@ as stopped, and plays on from its next packet.
 The latency is how long a frame waits before it plays, and the room the network
 has to deliver it in. A packet that arrives after its play time counts in
 `input.late`; frames that never came play as silence and count in
-`input.lost`. `input.receiving` says whether packets arrive now. The latency,
+`input.lost`. `input.restarts` counts the times a stream that was starting or
+playing started over, and `input.last_restart` says why, so the lowest latency
+that stays stable on a board is the lowest one with no restarts and no `late`
+or `lost` over a long run. The reasons are `selection` and `latency` (changed
+by the user), `grandmaster` (a new PTP time, as the grandmaster changed or PTP
+time came back), `stopped` and `resumed` (the stream paused for 1 s and came
+back), `no stored packets` (every packet came too late or too early to be
+kept), `delay` (the delay from the stream to the output went more than 50 ms
+off its target) and `timestamps` (a stream in `ptp` mode whose timestamps do
+not follow the PTP clock, which then plays in `buffer` mode; this one does not
+count as a restart). `input.receiving` says whether packets arrive now. The latency,
 the selection and `enabled` can be changed at run time with
 `PATCH /aes67/input`; the changes are kept in the state file.
 
@@ -576,7 +586,7 @@ without that prefix.
 | `GET /airplay` | Every AirPlay receiver, with its state and last failure |
 | `PATCH /airplay/{name}` | `{"enabled": true\|false}`: turns a receiver on, or off with TEARDOWN; the answer is the receiver as `GET /airplay` gives it |
 | `POST /airplay/{name}/pair` | `{}` makes the receiver show its PIN, `{"pin": "1234"}` pairs; answered when the receiver has, within 40 s |
-| `GET /aes67` | The AES67 clock, input and output: whether there is PTP time and its grandmaster, the input's stream, mode, latency, `late` and `lost`, and whether the output sends; 404 when there is no `[aes67]` |
+| `GET /aes67` | The AES67 clock, input and output: whether there is PTP time and its grandmaster, the input's stream, mode, latency, `late`, `lost`, `restarts` and `last_restart`, and whether the output sends; 404 when there is no `[aes67]` |
 | `GET /aes67/streams` | Every announced stream, whether it can be selected and in which mode it would play |
 | `PATCH /aes67/input` | `stream` (a name, or `null` for none), `latency_ms` (1 to 100, or `"auto"`), `enabled`, `volume_db` and `mute`, all or none apply; a value that is refused is 422, a wrong type or an unknown field 400 |
 | `PATCH /aes67/output` | `{"enabled": true\|false}` |

@@ -474,6 +474,12 @@ pub struct Aes67InputView {
     pub late: u64,
     /// Frames played as silence because they never came.
     pub lost: u64,
+    /// Times a stream that was priming or playing started over.
+    pub restarts: u64,
+    /// Why it last did: `"selection"`, `"latency"`, `"grandmaster"`,
+    /// `"stopped"`, `"resumed"`, `"no stored packets"`, `"delay"` or
+    /// `"timestamps"` (a stream in PTP mode that fell back to buffer mode).
+    pub last_restart: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
