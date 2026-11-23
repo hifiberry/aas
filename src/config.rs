@@ -987,6 +987,32 @@ mod tests {
     }
 
     #[test]
+    fn aes67_names_are_valid_route_sources() {
+        let c = load_str(
+            "[[matrix]]\nfrom = \"aes67.left\"\nto = 3\n\
+             [[matrix]]\nfrom = \"aes67.right\"\nto = 4\ngain_db = -3\n",
+        )
+        .unwrap();
+        assert_eq!(
+            c.matrix.unwrap(),
+            vec![
+                Route {
+                    from: 4,
+                    to: 3,
+                    gain_db: 0.0
+                },
+                Route {
+                    from: 5,
+                    to: 4,
+                    gain_db: -3.0
+                },
+            ]
+        );
+        let e = route_from_parts(1, "aes67", 1, 0.0).unwrap_err();
+        assert!(e.contains("\"aes67.left\", \"aes67.right\""), "{e}");
+    }
+
+    #[test]
     fn a_matrix_route_with_an_unknown_source_is_an_error() {
         let e = err("[[matrix]]\nfrom = \"players.left\"\nto = 1\n\
              [[matrix]]\nfrom = \"players\"\nto = 1\n");

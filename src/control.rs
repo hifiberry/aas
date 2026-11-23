@@ -951,6 +951,8 @@ pub struct Control {
     analog_config: StoredInput,
     /// None unless the config enables the input and the card has an ADC.
     analog: Option<AnalogInput>,
+    /// The AES67 input's source is in the engine, on the `aes67` bus.
+    aes67_input: bool,
     /// The further outputs, in the order of the config.
     further: Vec<FurtherOutput>,
     /// Since when no player runs and the analog input has no signal.
@@ -1062,6 +1064,7 @@ impl Control {
             analog_input: api::config_input(config),
             analog_config: api::config_input(config),
             analog: None,
+            aes67_input: false,
             further: Vec::new(),
             quiet_since: None,
             delay: None,

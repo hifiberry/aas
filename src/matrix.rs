@@ -6,9 +6,9 @@ use crate::format::db_to_gain;
 /// The most channels a block, a chain or a card has.
 pub const MAX_CHANNELS: usize = 8;
 
-/// The inputs of the matrix: `players.left`, `players.right`, `analog.left`
-/// and `analog.right`.
-pub const INPUTS: usize = 4;
+/// The inputs of the matrix: `players.left`, `players.right`, `analog.left`,
+/// `analog.right`, `aes67.left` and `aes67.right`.
+pub const INPUTS: usize = 6;
 
 /// The names of the inputs, by index.
 pub const INPUT_NAMES: [&str; INPUTS] = [
@@ -16,6 +16,8 @@ pub const INPUT_NAMES: [&str; INPUTS] = [
     "players.right",
     "analog.left",
     "analog.right",
+    "aes67.left",
+    "aes67.right",
 ];
 
 /// A source of audio that enters the matrix as a pair of channels.
@@ -23,17 +25,20 @@ pub const INPUT_NAMES: [&str; INPUTS] = [
 pub enum Bus {
     Players,
     Analog,
+    /// The AES67 input.
+    Aes67,
 }
 
 impl Bus {
     /// Every bus, in the order of `index`.
-    pub const ALL: [Bus; 2] = [Bus::Players, Bus::Analog];
+    pub const ALL: [Bus; 3] = [Bus::Players, Bus::Analog, Bus::Aes67];
 
     /// Where the bus is in `ALL`, for a table kept by bus.
     pub fn index(self) -> usize {
         match self {
             Bus::Players => 0,
             Bus::Analog => 1,
+            Bus::Aes67 => 2,
         }
     }
 
@@ -42,6 +47,17 @@ impl Bus {
         match self {
             Bus::Players => [0, 1],
             Bus::Analog => [2, 3],
+            Bus::Aes67 => [4, 5],
+        }
+    }
+}
+
+/// Left to channel 1 and right to channel 2 for `bus`, as far as `width`
+/// goes, at 0 dB.
+fn place_by_default(gains: &mut [[f32; MAX_CHANNELS]; INPUTS], bus: Bus, width: usize) {
+    for (side, input) in bus.inputs().into_iter().enumerate() {
+        if side < width {
+            gains[input][side] = 1.0;
         }
     }
 }
@@ -55,25 +71,27 @@ pub struct Matrix {
 }
 
 impl Matrix {
-    /// Left to channel 1 and right to channel 2 for both buses, as far as
+    /// Left to channel 1 and right to channel 2 for every bus, as far as
     /// `width` goes.
     pub fn default_for(width: usize) -> Matrix {
         let mut gains = [[0.0; MAX_CHANNELS]; INPUTS];
-        for bus in [Bus::Players, Bus::Analog] {
-            for (side, input) in bus.inputs().into_iter().enumerate() {
-                if side < width {
-                    gains[input][side] = 1.0;
-                }
-            }
+        for bus in Bus::ALL {
+            place_by_default(&mut gains, bus, width);
         }
         Matrix { gains, width }
     }
 
     /// Builds the matrix from the routes of the config. Fails for a channel
     /// above `width`, or the same `from` and `to` twice. Errors name the
-    /// route by its position in `routes`, from 1.
+    /// route by its position in `routes`, from 1. Routes that name no
+    /// `aes67` input place the `aes67` bus as the default matrix does, so
+    /// that a matrix from before there was one still plays it.
     pub fn from_routes(routes: &[Route], width: usize) -> Result<Matrix, String> {
         let mut gains = [[0.0; MAX_CHANNELS]; INPUTS];
+        let aes67 = Bus::Aes67.inputs();
+        if !routes.iter().any(|route| aes67.contains(&route.from)) {
+            place_by_default(&mut gains, Bus::Aes67, width);
+        }
         let mut seen = [[0usize; MAX_CHANNELS]; INPUTS];
         for (i, route) in routes.iter().enumerate() {
             let n = i + 1;
@@ -266,6 +284,42 @@ mod tests {
             m.routing(Bus::Players, true),
             Some([Some(0), Some(1), None, None, None, None, None, None])
         );
+    }
+
+    #[test]
+    fn aes67_defaults_like_players_unless_named() {
+        let pure = |m: &Matrix| m.routing(Bus::Aes67, false).unwrap();
+        let stereo = [Some(0), Some(1), None, None, None, None, None, None];
+        // The default matrix, and one that names no aes67 route.
+        for m in [
+            Matrix::default_for(2),
+            Matrix::from_routes(&[route(0, 2, 0.0), route(2, 1, -6.0)], 2).unwrap(),
+        ] {
+            assert_eq!(m.gain(4, 0), 1.0);
+            assert_eq!(m.gain(5, 1), 1.0);
+            assert_eq!(m.gain(4, 1), 0.0);
+            assert_eq!(m.gain(5, 0), 0.0);
+            assert_eq!(pure(&m), stereo);
+        }
+        assert_eq!(
+            pure(&Matrix::default_for(1)),
+            [Some(0), None, None, None, None, None, None, None]
+        );
+        // One aes67 route named: only it.
+        let m = Matrix::from_routes(&[route(0, 1, 0.0), route(5, 3, -6.0)], 4).unwrap();
+        assert!((m.gain(5, 2) - 0.5012).abs() < 1e-3);
+        for channel in 0..4 {
+            assert_eq!(m.gain(4, channel), 0.0);
+            if channel != 2 {
+                assert_eq!(m.gain(5, channel), 0.0);
+            }
+        }
+        // Its own routes, apart from the players'.
+        let m = Matrix::from_routes(&[route(4, 3, 0.0), route(5, 4, 0.0)], 4).unwrap();
+        assert_eq!(pure(&m)[..4], [None, None, Some(0), Some(1)]);
+        assert_eq!(m.routing(Bus::Players, false), Some([None; MAX_CHANNELS]));
+        assert_eq!(Bus::ALL.map(Bus::index), [0, 1, 2]);
+        assert_eq!(INPUT_NAMES[4..], ["aes67.left", "aes67.right"]);
     }
 
     #[test]

@@ -61,11 +61,7 @@ pub trait Processing: 'static {
     /// have full scale at 1.0 and are not clipped. An `i32` block is clipped
     /// to S32. `acc` holds interleaved frames of `channels` samples, and
     /// `scratch` must hold as many.
-    fn to_block<'s>(
-        acc: &mut [Self::Acc],
-        channels: usize,
-        scratch: &'s mut BlockStore,
-    ) -> Block<'s>;
+    fn to_block<'s>(acc: &[Self::Acc], channels: usize, scratch: &'s mut BlockStore) -> Block<'s>;
     /// Copies a block that `to_block` gave back into `acc`.
     fn from_block(block: Block<'_>, acc: &mut [Self::Acc]);
 }
@@ -139,7 +135,7 @@ impl Processing for I32 {
         acc.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
     }
 
-    fn to_block<'s>(acc: &mut [i64], channels: usize, scratch: &'s mut BlockStore) -> Block<'s> {
+    fn to_block<'s>(acc: &[i64], channels: usize, scratch: &'s mut BlockStore) -> Block<'s> {
         debug_assert_eq!(acc.len() % channels, 0, "a whole number of frames");
         let samples = &mut scratch.i32[..acc.len()];
         for (b, a) in samples.iter_mut().zip(acc.iter()) {
@@ -186,7 +182,7 @@ impl Processing for F32 {
     }
 
     /// The accumulator already has full scale at 1.0, so this is a copy.
-    fn to_block<'s>(acc: &mut [f32], channels: usize, scratch: &'s mut BlockStore) -> Block<'s> {
+    fn to_block<'s>(acc: &[f32], channels: usize, scratch: &'s mut BlockStore) -> Block<'s> {
         debug_assert_eq!(acc.len() % channels, 0, "a whole number of frames");
         let samples = &mut scratch.f32[..acc.len()];
         samples.copy_from_slice(acc);
@@ -229,7 +225,7 @@ impl Processing for F64 {
     }
 
     /// The accumulator already has full scale at 1.0, so this is a copy.
-    fn to_block<'s>(acc: &mut [f64], channels: usize, scratch: &'s mut BlockStore) -> Block<'s> {
+    fn to_block<'s>(acc: &[f64], channels: usize, scratch: &'s mut BlockStore) -> Block<'s> {
         debug_assert_eq!(acc.len() % channels, 0, "a whole number of frames");
         let samples = &mut scratch.f64[..acc.len()];
         samples.copy_from_slice(acc);
@@ -775,9 +771,8 @@ mod tests {
         where
             P::Acc: PartialEq + std::fmt::Debug,
         {
-            let mut acc = values;
             let mut store = BlockStore::new(2, 3);
-            let block = P::to_block(&mut acc, 3, &mut store);
+            let block = P::to_block(&values, 3, &mut store);
             assert_eq!(block.channels, 3);
             assert_eq!(block.frames(), 2);
             let mut back = [P::zero(); 6];

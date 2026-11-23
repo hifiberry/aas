@@ -199,19 +199,24 @@ impl OutputMatrix {
 }
 
 /// The routes of the default matrix: left to channel 1 and right to
-/// channel 2 for both buses, as far as `width` goes.
+/// channel 2 for every bus, as far as `width` goes.
 fn default_routes(width: usize) -> Vec<Route> {
-    let sides = Bus::ALL
+    Bus::ALL
         .into_iter()
-        .flat_map(|bus| bus.inputs().into_iter().enumerate());
+        .flat_map(|bus| bus_default_routes(bus, width))
+        .collect()
+}
+
+/// The routes of `bus` in the default matrix, `width` channels wide.
+fn bus_default_routes(bus: Bus, width: usize) -> impl Iterator<Item = Route> {
+    let sides = bus.inputs().into_iter().enumerate();
     sides
-        .filter(|&(side, _)| side < width)
+        .filter(move |&(side, _)| side < width)
         .map(|(side, from)| Route {
             from,
             to: side + 1,
             gain_db: 0.0,
         })
-        .collect()
 }
 
 /// The matrix of `routes`, `width` channels wide, with the config's rules
@@ -744,14 +749,18 @@ impl Control {
     /// written out route by route.
     pub(super) fn route_views(&self, index: usize) -> Vec<RouteJson> {
         let slot = &self.matrices[index];
-        let default;
-        let routes = if slot.routes.is_empty() {
-            default = default_routes(slot.width);
-            &default
-        } else {
-            &slot.routes
-        };
-        routes.iter().map(route_json).collect()
+        if slot.routes.is_empty() {
+            return default_routes(slot.width).iter().map(route_json).collect();
+        }
+        let mut views: Vec<RouteJson> = slot.routes.iter().map(route_json).collect();
+        // Routes that name no `aes67` input play it as the default matrix
+        // does, as `Matrix::from_routes` says.
+        let aes67 = Bus::Aes67.inputs();
+        if !slot.routes.iter().any(|r| aes67.contains(&r.from)) {
+            let width = slot.width;
+            views.extend(bus_default_routes(Bus::Aes67, width).map(|r| route_json(&r)));
+        }
+        views
     }
 
     fn matrix_view(&self) -> MatrixPut {
@@ -2806,13 +2815,19 @@ mod tests {
             {"from": "players.right", "to": 2, "gain_db": 0.0},
             {"from": "analog.left", "to": 1, "gain_db": 0.0},
             {"from": "analog.right", "to": 2, "gain_db": 0.0},
+            {"from": "aes67.left", "to": 1, "gain_db": 0.0},
+            {"from": "aes67.right", "to": 2, "gain_db": 0.0},
         ])
     }
 
+    /// `swap()` as `GET /matrix` gives it: it names no `aes67` route, so
+    /// the `aes67` bus plays as in the default matrix.
     fn swap_routes() -> serde_json::Value {
         json!([
             {"from": "players.left", "to": 2, "gain_db": 0.0},
             {"from": "players.right", "to": 1, "gain_db": 0.0},
+            {"from": "aes67.left", "to": 1, "gain_db": 0.0},
+            {"from": "aes67.right", "to": 2, "gain_db": 0.0},
         ])
     }
 
@@ -2829,6 +2844,22 @@ mod tests {
             engine.matrices.clear();
             assert_eq!(routes_of(&mut control, id, now), swap_routes(), "{id}");
         }
+    }
+
+    #[test]
+    fn a_matrix_that_names_an_aes67_route_shows_only_the_routes_named() {
+        let (mut control, mut engine, now) = open(&Config::default(), None);
+        let routes = vec![
+            route("players.left", 1, None),
+            route("aes67.right", 2, Some(-3.0)),
+        ];
+        assert_eq!(status(control.call(put(vec![(1, routes)]), now)), 200);
+        engine.take(true);
+        let want = json!([
+            {"from": "players.left", "to": 1, "gain_db": 0.0},
+            {"from": "aes67.right", "to": 2, "gain_db": -3.0},
+        ]);
+        assert_eq!(routes_of(&mut control, 1, now), want);
     }
 
     #[test]
@@ -2849,6 +2880,7 @@ mod tests {
         let mono = json!([
             {"from": "players.left", "to": 1, "gain_db": 0.0},
             {"from": "analog.left", "to": 1, "gain_db": 0.0},
+            {"from": "aes67.left", "to": 1, "gain_db": 0.0},
         ]);
         assert_eq!(routes_of(&mut control, 2, now), mono);
     }
@@ -3024,6 +3056,8 @@ mod tests {
             routes: vec![
                 route("players.left", 2, Some(0.0)),
                 route("players.right", 1, Some(0.0)),
+                route("aes67.left", 1, Some(0.0)),
+                route("aes67.right", 2, Some(0.0)),
             ],
         };
         assert_eq!(events(&mut published), [want]);
@@ -3134,7 +3168,11 @@ mod tests {
         let configured = Matrix::from_routes(&[right], 2).unwrap();
         assert!(engine.matrices.is_empty());
         assert_eq!(engine.mixes, [(1, configured)]);
-        let want = json!([{"from": "players.right", "to": 1, "gain_db": -6.0}]);
+        let want = json!([
+            {"from": "players.right", "to": 1, "gain_db": -6.0},
+            {"from": "aes67.left", "to": 1, "gain_db": 0.0},
+            {"from": "aes67.right", "to": 2, "gain_db": 0.0},
+        ]);
         for id in [1, 2] {
             assert_eq!(routes_of(&mut control, id, now), want, "{id}");
         }
