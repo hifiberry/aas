@@ -3,6 +3,7 @@
 //!
 //! [`Aes67`] is the control thread's handle on all of it.
 
+pub mod acr;
 pub mod clock;
 pub mod config;
 pub mod directory;
@@ -120,6 +121,11 @@ pub struct Aes67 {
     output_failing_told: bool,
     /// The input's status, read once per tick.
     status: InputStatus,
+    /// What ACR was last told: the input plays. A start is "stopped", so a
+    /// daemon that starts idle sends nothing.
+    reported_playing: bool,
+    /// The helper that tells ACR; it starts with the first report.
+    acr: acr::Acr,
     /// When the interface is looked at again.
     retry_at: Option<Instant>,
     /// Waiting for the interface's address has been logged.
@@ -195,6 +201,8 @@ impl Aes67 {
             failing_told: false,
             output_failing_told: false,
             status: InputStatus::default(),
+            reported_playing: false,
+            acr: acr::Acr::new(acr::URL),
             retry_at: None,
             waiting_told: false,
             stop: Arc::new(AtomicBool::new(false)),
@@ -359,6 +367,11 @@ impl Aes67 {
             self.status = input.status();
         }
         self.sync();
+        let playing = self.receiving();
+        if playing != self.reported_playing {
+            self.reported_playing = playing;
+            self.acr.report(if playing { "playing" } else { "stopped" });
+        }
     }
 
     /// The session the input should play: the selection, while the input
@@ -621,6 +634,7 @@ impl Aes67 {
         // Their handles join the input and the output thread.
         self.input = None;
         self.output = None;
+        self.acr.stop();
         for thread in self.threads.drain(..) {
             let _ = thread.join();
         }
@@ -776,6 +790,8 @@ pub(crate) mod testing {
             *lock(&aes67.directory) = Directory::new(own);
             aes67.ptp_done = true;
             aes67.sap = true;
+            // Tests never reach a real ACR.
+            aes67.acr = acr::Acr::with_warn("http://127.0.0.1:1/", Box::new(|_| {}));
             aes67.attach(Box::new(input));
             aes67
         }
@@ -991,5 +1007,50 @@ mod tests {
             panic!("no event");
         };
         assert!(view.input.receiving);
+    }
+
+    /// The states a fake ACR is told, as the JSON bodies' `state`.
+    fn told(requests: &std::sync::mpsc::Receiver<(String, String)>) -> Vec<String> {
+        let mut states = Vec::new();
+        while let Ok((_, body)) = requests.recv_timeout(Duration::from_millis(300)) {
+            let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+            states.push(json["state"].as_str().unwrap().to_string());
+        }
+        states
+    }
+
+    #[test]
+    fn playing_when_selected_and_receiving() {
+        let (url, requests) = acr::testing::fake_acr();
+        let (mut aes67, input) = with_stream("studio");
+        aes67.acr = acr::Acr::new(&url);
+        let now = Instant::now();
+        input.set_receiving(true);
+        aes67.tick(now);
+        assert!(told(&requests).is_empty(), "nothing selected plays nothing");
+        announce(&aes67, 3, THEM, "studio");
+        aes67.tick(now);
+        assert_eq!(told(&requests), ["playing"]);
+        input.set_receiving(false);
+        aes67.tick(now);
+        assert_eq!(told(&requests), ["stopped"]);
+    }
+
+    #[test]
+    fn only_changes_are_sent() {
+        let (url, requests) = acr::testing::fake_acr();
+        let (mut aes67, input) = with_stream("studio");
+        aes67.acr = acr::Acr::new(&url);
+        let now = Instant::now();
+        for _ in 0..3 {
+            aes67.tick(now);
+        }
+        assert!(told(&requests).is_empty(), "an idle start sends nothing");
+        announce(&aes67, 3, THEM, "studio");
+        input.set_receiving(true);
+        for _ in 0..3 {
+            aes67.tick(now);
+        }
+        assert_eq!(told(&requests), ["playing"]);
     }
 }
