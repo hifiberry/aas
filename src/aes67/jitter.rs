@@ -6,7 +6,8 @@ use super::rtp::ts_diff;
 
 /// Ring size in frames. A power of two, a little over `HORIZON`.
 const RING: usize = 16384;
-/// How far ahead of `read_ts` a packet may start: 200 ms at 48 kHz.
+/// How far ahead of `read_ts` a frame may be stored, start and end alike:
+/// 200 ms at 48 kHz. Below `RING`, so no two stored frames share a slot.
 const HORIZON: i32 = 9600;
 
 /// What `put` did with a packet.
@@ -15,7 +16,8 @@ pub enum Put {
     Stored,
     /// Entirely older than the read position; dropped.
     Late,
-    /// Starts more than 200 ms ahead of the read position; dropped.
+    /// Starts 200 ms or more ahead of the read position; dropped. (A packet
+    /// that starts inside the horizon keeps only the frames inside it.)
     TooEarly,
 }
 
@@ -66,13 +68,16 @@ impl Jitter {
             self.late += 1;
             return Put::Late;
         }
-        for (i, f) in frames.iter().enumerate().skip(skip) {
+        // Frames at or beyond read_ts + HORIZON are dropped, so a stored
+        // frame is always less than RING ahead of read_ts.
+        let keep = (HORIZON as i64 - d as i64).min(frames.len() as i64) as usize;
+        for (i, f) in frames.iter().enumerate().take(keep).skip(skip) {
             let t = ts.wrapping_add(i as u32);
             let slot = t as usize % RING;
             self.frames[slot] = *f;
             self.present[slot] = true;
         }
-        let end = ts.wrapping_add(frames.len() as u32);
+        let end = ts.wrapping_add(keep as u32);
         if ts_diff(end, self.end_ts) > 0 {
             self.end_ts = end;
         }
@@ -224,6 +229,34 @@ mod tests {
         let out = take(&mut j, 96);
         assert!(out.iter().all(|f| *f == [0; 2]));
         assert_eq!(j.counts(), (96, 0));
+    }
+
+    #[test]
+    fn a_long_packet_never_wraps_onto_the_slots_behind_it() {
+        let mut j = Jitter::new();
+        j.anchor(50_000);
+        let long = pkt(1, 7000);
+        assert_eq!(j.put(50_000 + 9599, &long), Put::Stored);
+        assert_eq!(j.depth(), 9600);
+        // Everything before the one stored frame is silence, and the lap
+        // after it (where the dropped tail would have landed) as well.
+        let out = take(&mut j, 9599 + 1 + 7000);
+        assert!(out[..9599].iter().all(|f| *f == [0; 2]));
+        assert_eq!(out[9599], [1, -1]);
+        assert!(out[9600..].iter().all(|f| *f == [0; 2]));
+        assert_eq!(j.counts(), (9599 + 7000, 0));
+    }
+
+    #[test]
+    fn a_straddling_packet_longer_than_the_ring_keeps_only_the_horizon() {
+        let mut j = Jitter::new();
+        j.anchor(1000);
+        let long = pkt(1, 20_000);
+        assert_eq!(j.put(1000 - 100, &long), Put::Stored);
+        assert_eq!(j.depth(), 9600);
+        assert_eq!(take(&mut j, 9600), pkt(101, 9600));
+        assert!(take(&mut j, 7000).iter().all(|f| *f == [0; 2]));
+        assert_eq!(j.counts(), (7000, 0));
     }
 
     #[test]
