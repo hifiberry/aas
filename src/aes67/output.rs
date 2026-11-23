@@ -473,6 +473,7 @@ fn run(
     // The session version announced, `None` for nothing.
     let mut told: Option<u64> = None;
     let mut failing = false;
+    let mut sleep_failed = false;
     while !stop.load(Ordering::Relaxed) {
         loop {
             match taps.try_recv() {
@@ -524,12 +525,18 @@ fn run(
             }
             _ => idle,
         };
-        sleep_until(wake);
+        if let Err(e) = sleep_until(wake) {
+            // Never spin at real-time priority.
+            if !std::mem::replace(&mut sleep_failed, true) {
+                eprintln!("aas: aes67: output: cannot sleep until the next packet: {e}");
+            }
+            thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 }
 
 /// Sleeps until CLOCK_REALTIME reaches `ns`.
-fn sleep_until(ns: i128) {
+fn sleep_until(ns: i128) -> io::Result<()> {
     let ts = libc::timespec {
         tv_sec: ns.div_euclid(1_000_000_000) as libc::time_t,
         tv_nsec: ns.rem_euclid(1_000_000_000) as libc::c_long,
@@ -544,8 +551,10 @@ fn sleep_until(ns: i128) {
                 std::ptr::null_mut(),
             )
         };
-        if r != libc::EINTR {
-            break;
+        match r {
+            0 => return Ok(()),
+            libc::EINTR => {}
+            e => return Err(io::Error::from_raw_os_error(e)),
         }
     }
 }
@@ -849,10 +858,20 @@ mod tests {
         let mut master = Master::new(48000, 0.0, 256, G0, true);
         let mid = G0 + 2000 * MS;
         run(&mut s, Some(&mut master), (G0, mid, MS), GM, 1, &mut out);
+        // The new tap comes while the packet at `mid` waits to be sent, and
+        // the steps go on off the grid: a timeline anchored again would
+        // start at the next whole millisecond and skip that packet.
         s.set_rate(44100);
         let mut master = Master::new(44100, 0.0, 256, mid, true);
         let end = mid + 2000 * MS;
-        run(&mut s, Some(&mut master), (mid, end, MS), GM, 1, &mut out);
+        run(
+            &mut s,
+            Some(&mut master),
+            (mid + 370_000, end, MS),
+            GM,
+            1,
+            &mut out,
+        );
         assert_eq!(out.len(), 4000);
         for w in out.windows(2) {
             let (a, b) = (header(&w[0]), header(&w[1]));

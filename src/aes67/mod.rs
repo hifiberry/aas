@@ -116,6 +116,8 @@ pub struct Aes67 {
     sap: bool,
     /// A failure to start the SAP or the input thread has been logged.
     failing_told: bool,
+    /// The same for the output thread, which can start later.
+    output_failing_told: bool,
     /// The input's status, read once per tick.
     status: InputStatus,
     /// When the interface is looked at again.
@@ -191,6 +193,7 @@ impl Aes67 {
             ptp_done: config.ptp == PtpSource::Off,
             sap: false,
             failing_told: false,
+            output_failing_told: false,
             status: InputStatus::default(),
             retry_at: None,
             waiting_told: false,
@@ -304,7 +307,15 @@ impl Aes67 {
         );
         match started {
             Ok(handle) => self.output = Some(Box::new(handle)),
-            Err(e) => self.failed("no output", e, now),
+            Err(e) => {
+                if !std::mem::replace(&mut self.output_failing_told, true) {
+                    eprintln!(
+                        "aas: aes67: no output: {e}, trying again every {} s",
+                        RETRY.as_secs()
+                    );
+                }
+                self.retry_at = Some(now + RETRY);
+            }
         }
     }
 
