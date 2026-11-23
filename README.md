@@ -424,7 +424,7 @@ name = "aas"
 | `output.port` | 1 to 65535 | 5004 | The RTP port. |
 | `output.ttl` | 1 to 255 | 16 | The multicast TTL. |
 
-`aas` receives PTP and never sends it: the clock is the grandmaster's, and
+`aas` receives PTP and never sends it: the clock is the grandmaster's.
 A thread reads the PTP packets through a
 packet socket, which needs `CAP_NET_RAW`; `aas.service` grants that capability
 and nothing else uses it. It does not bind ports 319 and 320, so it runs beside
@@ -467,16 +467,22 @@ has to deliver it in. A packet that arrives after its play time counts in
 `input.lost`. `input.restarts` counts the times a stream that was starting or
 playing started over, and `input.last_restart` says why, so the lowest latency
 that stays stable on a board is the lowest one with no restarts and no `late`
-or `lost` over a long run. The reasons are `selection` and `latency` (changed
-by the user), `grandmaster` (a new PTP time, as the grandmaster changed or PTP
-time came back), `stopped` and `resumed` (the stream paused for 1 s and came
-back), `no stored packets` (every packet came too late or too early to be
-kept), `delay` (the delay from the stream to the output went more than 50 ms
-off its target) and `timestamps` (a stream in `ptp` mode whose timestamps do
-not follow the PTP clock, which then plays in `buffer` mode; this one does not
-count as a restart). `input.receiving` says whether packets arrive now. The latency,
-the selection and `enabled` can be changed at run time with
-`PATCH /aes67/input`; the changes are kept in the state file.
+or `lost` over a long run. The reasons are:
+
+- `selection`, `latency`: changed by the user.
+- `grandmaster`: a new PTP time, as the grandmaster changed or PTP time came
+  back.
+- `stopped`, `resumed`: the stream paused for 1 s and came back.
+- `no stored packets`: every packet came too late or too early to be kept.
+- `delay`: the delay from the stream to the output went more than 50 ms off its
+  target.
+- `timestamps`: a stream in `ptp` mode whose timestamps do not follow the PTP
+  clock, which then plays in `buffer` mode. This one is not counted in
+  `restarts`.
+
+`input.receiving` says whether packets arrive now. The latency, the selection
+and `enabled` can be changed at run time with `PATCH /aes67/input`; the
+changes are kept in the state file.
 
 The input is a client named `aes67`, with a volume and a mute at
 `/inputs/clients/aes67`, and `volume_db` and `mute` in the same `PATCH`. It
@@ -490,8 +496,9 @@ played. The input's level is not in `/levels`.
 The output sends what the master plays, as the AirPlay output takes it: after
 the mix, the plugins, the master gain and the volume limit. The stream is L24,
 48 kHz, stereo, in packets of 1 ms. The master's rate is resampled to 48 kHz,
-following the PTP clock. When the mix is quiet, silence is sent, because a Dante
-receiver expects the stream to be there.
+following the PTP clock. A quiet mix is sent as it is. Zeros go out, because a
+Dante receiver expects the stream to be there, until the path is filled at
+start and whenever the master delivers no frames, as when it is parked or closed.
 
 Nothing is sent without PTP time: the packets' timestamps are PTP time, and a
 receiver cannot place them without it. The stream is announced over SAP every

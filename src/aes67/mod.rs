@@ -1011,7 +1011,7 @@ mod tests {
         let json = serde_json::to_value(&view).unwrap();
         assert_eq!(json["input"]["restarts"], 3);
         assert_eq!(json["input"]["last_restart"], "delay");
-        assert_eq!(aes67.changed().is_some(), true);
+        assert!(aes67.changed().is_some());
         lock(&input.status).restarts = 4;
         aes67.tick(Instant::now());
         assert_eq!(aes67.changed(), None, "a counter is no event");
