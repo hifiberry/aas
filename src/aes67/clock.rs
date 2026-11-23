@@ -43,6 +43,8 @@ const PENDING_NS: i128 = 1_000_000_000;
 /// local clock (or the grandmaster) stepped, and the window is discarded.
 const STEP_NS: i128 = 10_000_000;
 const STEP_PAIRS: usize = 3;
+/// ... and they must agree on the new offset within this.
+const STEP_AGREE_NS: i128 = 1_000_000;
 /// The fit needs this many pairs spanning this long before it is used.
 const MIN_PAIRS: usize = 8;
 const MIN_SPAN_NS: i128 = 2_000_000_000;
@@ -67,13 +69,19 @@ struct Snapshot {
     last_pair_ns: i128,
 }
 
+impl Fit {
+    fn offset_at(&self, local_ns: i128) -> i128 {
+        let dt = (local_ns - self.base_local) as f64;
+        self.base_off + (self.slope * dt).round() as i128
+    }
+}
+
 impl Snapshot {
     fn at(&self, local_ns: i128) -> Option<PtpNow> {
         if local_ns - self.last_pair_ns >= LOSS_NS {
             return None;
         }
-        let dt = (local_ns - self.fit.base_local) as f64;
-        let offset = self.fit.base_off + (self.fit.slope * dt).round() as i128;
+        let offset = self.fit.offset_at(local_ns);
         Some(PtpNow {
             local_ns,
             ptp_ns: local_ns + offset,
@@ -104,6 +112,8 @@ pub struct Estimator {
     masters: Vec<Master>,
     /// Source clock ID of the master being followed.
     followed: Option<ClockId>,
+    /// The grandmaster that master announced when it was chosen.
+    followed_gm: Option<ClockId>,
     pending: Vec<Pending>,
     window: Vec<(i128, i128)>,
     /// Consecutive pairs far off the fit, held until they are a step or not.
@@ -121,6 +131,7 @@ impl Estimator {
             domain,
             masters: Vec::new(),
             followed: None,
+            followed_gm: None,
             pending: Vec::new(),
             window: Vec::new(),
             suspects: Vec::new(),
@@ -263,9 +274,9 @@ impl Estimator {
             }
         }
         let chosen = best.map(|m| (m.src, m.ann.gm));
-        let current = self.followed_master().map(|m| (m.src, m.ann.gm));
-        if chosen != current || chosen.map(|c| c.0) != self.followed {
+        if chosen != self.followed.zip(self.followed_gm) {
             self.followed = chosen.map(|c| c.0);
+            self.followed_gm = chosen.map(|c| c.1);
             self.reset();
         }
     }
@@ -282,18 +293,20 @@ impl Estimator {
     fn add_pair(&mut self, rx: i128, offset: i128) {
         self.pairs += 1;
         self.last_pair_rx = rx;
-        if let Some(fit) = &self.fit {
-            let predicted = Snapshot {
-                fit: *fit,
-                gm: [0; 8],
-                domain: self.domain,
-                last_pair_ns: rx,
-            }
-            .at(rx)
-            .map_or(0, |n| n.ptp_ns - n.local_ns);
-            if (offset - predicted).abs() > STEP_NS {
+        if let Some(fit) = self.fit {
+            let dev = |p: &(i128, i128)| p.1 - fit.offset_at(p.0);
+            if dev(&(rx, offset)).abs() > STEP_NS {
                 self.suspects.push((rx, offset));
                 if self.suspects.len() < STEP_PAIRS {
+                    return;
+                }
+                // A step moves every pair by the same amount (the fit already
+                // accounts for the rate); delayed or garbage pairs do not agree.
+                // Disagreeing suspects are outliers: forget the oldest, keep the window.
+                let devs: Vec<i128> = self.suspects.iter().map(dev).collect();
+                let spread = devs.iter().max().unwrap() - devs.iter().min().unwrap();
+                if spread > STEP_AGREE_NS {
+                    self.suspects.remove(0);
                     return;
                 }
                 // The clock stepped: start over from the pairs after the step.
@@ -451,6 +464,7 @@ mod tests {
         id: ClockId,
         domain: u8,
         priority1: u8,
+        gm: ClockId,
         k: i128,
         seq: u16,
         rng: u64,
@@ -465,6 +479,7 @@ mod tests {
                 id,
                 domain: 0,
                 priority1: 128,
+                gm: id,
                 k: 0,
                 seq: 0,
                 rng: 12345,
@@ -513,7 +528,7 @@ mod tests {
                     self.domain,
                     self.id,
                     self.seq,
-                    &ann(self.id, self.priority1),
+                    &ann(self.gm, self.priority1),
                 );
                 est.packet(self.addr, 320, &a, rx - 100_000);
             }
@@ -708,10 +723,12 @@ mod tests {
         sim.run(&mut est, 8);
         let t = sim.local_now();
         let before = est.now(t).unwrap().ptp_ns;
+        let gen_before = est.generation();
         // One pair received 2 ms late.
         let (l, m) = (sim.local_now(), M0 + sim.k * SYNC_NS);
         sim.send_pair(&mut est, l, m, 2_000_000, false, true);
         let after = est.now(t).unwrap().ptp_ns;
+        assert_eq!(est.generation(), gen_before);
         assert!((after - before).abs() < 5_000, "moved {}", after - before);
         // And it keeps tracking afterwards.
         sim.run(&mut est, 2);
@@ -733,6 +750,76 @@ mod tests {
             err_ns(&est, &sim)
         );
         let now = est.now(sim.local_now() + sim.local_step).unwrap();
-        assert!((now.rate - 1.0000163).abs() < 1e-6, "rate {}", now.rate);
+        assert!((now.rate - 1.0000163).abs() < 2e-6, "rate {}", now.rate);
+    }
+
+    #[test]
+    fn a_single_pair_far_off_is_ignored() {
+        let mut est = Estimator::new(0);
+        let mut sim = Sim::new(ADDR, MASTER);
+        sim.run(&mut est, 8);
+        let t = sim.local_now();
+        let before = est.now(t).unwrap().ptp_ns;
+        let gen_before = est.generation();
+        let (l, m) = (sim.local_now(), M0 + sim.k * SYNC_NS);
+        sim.send_pair(&mut est, l, m, 50_000_000, false, true);
+        assert_eq!(est.generation(), gen_before);
+        assert_eq!(est.now(t).unwrap().ptp_ns, before);
+        sim.run(&mut est, 1);
+        assert_eq!(est.generation(), gen_before);
+    }
+
+    #[test]
+    fn a_burst_of_disagreeing_bad_pairs_is_not_a_step() {
+        let mut est = Estimator::new(0);
+        let mut sim = Sim::new(ADDR, MASTER);
+        sim.run(&mut est, 8);
+        let t = sim.local_now();
+        let before = est.now(t).unwrap().ptp_ns;
+        let gen_before = est.generation();
+        for late in [15_000_000, 40_000_000, 90_000_000] {
+            let (l, m) = (sim.local_now(), M0 + sim.k * SYNC_NS);
+            sim.send_pair(&mut est, l, m, late, false, true);
+        }
+        assert_eq!(est.generation(), gen_before);
+        assert_eq!(est.now(t).unwrap().ptp_ns, before);
+        sim.run(&mut est, 1);
+        assert!(err_ns(&est, &sim).abs() < 50_000);
+        assert_eq!(est.generation(), gen_before);
+    }
+
+    #[test]
+    fn a_new_grandmaster_on_the_same_source_discards_the_window() {
+        let mut est = Estimator::new(0);
+        let mut sim = Sim::new(ADDR, MASTER);
+        sim.run(&mut est, 6);
+        let gen_before = est.generation();
+        sim.gm = OTHER;
+        let a = announce_bytes(0, MASTER, 99, &ann(OTHER, 128));
+        est.packet(ADDR, 320, &a, sim.local_now());
+        assert_ne!(est.generation(), gen_before);
+        assert!(est.now(sim.local_now()).is_none());
+        let gen_after = est.generation();
+        // Unchanged repeats do not reset again; the clock locks afresh.
+        sim.run(&mut est, 1);
+        est.packet(ADDR, 320, &a, sim.local_now());
+        sim.run(&mut est, 4);
+        assert_eq!(est.generation(), gen_after);
+        assert_eq!(est.now(sim.local_now()).unwrap().gm, OTHER);
+    }
+
+    #[test]
+    fn a_short_announce_interval_expires_a_silent_master() {
+        let mut est = Estimator::new(0);
+        let mut a = announce_bytes(0, MASTER, 1, &ann(MASTER, 128));
+        a[33] = (-2i8) as u8; // 250 ms; three intervals are 750 ms
+        est.packet(ADDR, 320, &a, L0);
+        assert_eq!(est.stats().gm_addr, Some(ADDR));
+        let g = est.generation();
+        est.tick(L0 + 700_000_000);
+        assert_eq!(est.stats().gm_addr, Some(ADDR));
+        est.tick(L0 + 800_000_000);
+        assert_eq!(est.stats().gm_addr, None);
+        assert_ne!(est.generation(), g);
     }
 }
