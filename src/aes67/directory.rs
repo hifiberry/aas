@@ -20,7 +20,7 @@ pub struct Listed {
     /// Announced by us: the SDP origin or the SAP source is our address.
     pub own: bool,
     pub last_seen: Instant,
-    /// Measured time between the last two announcements.
+    /// Measured time between the last two announcements, at least 30 s.
     pub interval: Duration,
 }
 
@@ -58,7 +58,9 @@ impl Directory {
                     .is_some_and(|a| a == session.origin || a == source);
                 match self.streams.get_mut(&(source, hash)) {
                     Some(listed) => {
-                        listed.interval = now.saturating_duration_since(listed.last_seen);
+                        listed.interval = now
+                            .saturating_duration_since(listed.last_seen)
+                            .max(DEFAULT_INTERVAL);
                         listed.last_seen = now;
                         listed.own = own;
                         if listed.session == session {
@@ -96,9 +98,10 @@ impl Directory {
     /// The most recently seen stream with this name; callers check `own`.
     pub fn by_name(&self, name: &str) -> Option<&Listed> {
         self.streams
-            .values()
-            .filter(|l| l.session.name == name)
-            .max_by_key(|l| l.last_seen)
+            .iter()
+            .filter(|(_, l)| l.session.name == name)
+            .max_by_key(|(k, l)| (l.last_seen, **k))
+            .map(|(_, l)| l)
     }
 
     pub fn all(&self) -> impl Iterator<Item = &Listed> {
@@ -198,16 +201,35 @@ mod tests {
         d.message(announce(1, SRC, "one", 1), t);
         assert!(!d.expire(t + s(299)));
         assert!(d.expire(t + s(300)));
-        // Measured interval 10 s: gone after 100 s.
+        // A measured interval below 30 s is floored at 30 s.
         d.message(announce(1, SRC, "one", 1), t);
         d.message(announce(1, SRC, "one", 1), t + s(10));
-        assert!(!d.expire(t + s(109)));
-        assert!(d.expire(t + s(110)));
+        assert!(!d.expire(t + s(10 + 299)));
+        assert!(d.expire(t + s(10 + 300)));
+        // Measured interval 60 s: gone after 600 s.
+        d.message(announce(1, SRC, "one", 1), t);
+        d.message(announce(1, SRC, "one", 1), t + s(60));
+        assert!(!d.expire(t + s(60 + 599)));
+        assert!(d.expire(t + s(60 + 600)));
         // Measured interval 1000 s: capped at 3600 s.
         d.message(announce(1, SRC, "one", 1), t);
         d.message(announce(1, SRC, "one", 1), t + s(1000));
         assert!(!d.expire(t + s(1000 + 3599)));
         assert!(d.expire(t + s(1000 + 3600)));
+    }
+
+    #[test]
+    fn a_quick_second_announcement_does_not_shorten_the_expiry() {
+        let t = Instant::now();
+        let s = Duration::from_secs;
+        let mut d = Directory::new(None);
+        d.message(announce(1, SRC, "one", 1), t);
+        // A version change 1 s later, then one at the same instant.
+        d.message(announce(1, SRC, "one", 2), t + s(1));
+        d.message(announce(1, SRC, "one", 3), t + s(1));
+        assert!(!d.expire(t + s(1 + 11)));
+        assert!(!d.expire(t + s(1 + 299)));
+        assert!(d.expire(t + s(1 + 300)));
     }
 
     #[test]
@@ -242,5 +264,10 @@ mod tests {
         d.message(announce(1, OTHER, "same", 1), t + Duration::from_secs(5));
         assert_eq!(d.all().count(), 2);
         assert!(d.by_name("same").unwrap().session.origin == OTHER);
+        // Equal last_seen: the higher (source, hash) wins, every time.
+        d.message(announce(2, SRC, "tie", 1), t);
+        d.message(announce(3, SRC, "tie", 1), t);
+        assert_eq!(d.by_name("tie").unwrap().session.origin, SRC);
+        assert_eq!(d.all().filter(|l| l.session.name == "tie").count(), 2);
     }
 }
