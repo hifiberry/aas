@@ -657,3 +657,18 @@ first.
   second assertion of `the_state_does_not_outlast_a_changed_config` cannot
   fail; no test checks the tap commands of a switch; aasctl cannot switch a
   receiver named "pair".
+
+## Config snippets from a directory
+
+`aas` reads one file (`--config`, default `/etc/aas/aas.toml`) and has no
+include syntax. On HiFiBerry OS, `aas-config` merges one overlay,
+`/etc/aas/aas.local.toml`, over the generated file at boot. Wanted: a
+`conf.d`-style directory, so that packages can each drop in their own table
+(an `[aes67]`, an `[[airplay]]`) without editing a shared file.
+
+Open: who merges (the daemon at load, or `aas-config` at boot); the merge
+rule for arrays of tables such as `[[airplay]]` and `[[output]]` (append or
+replace; today's overlay replaces them whole); the order between snippets and
+`aas.local.toml`; and how a config error names the file it came from. First
+step: decide where the merge happens, then extend `Config::load` or
+`dist/hifiberryos/aas-config` and its tests.
