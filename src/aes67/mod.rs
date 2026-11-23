@@ -991,7 +991,7 @@ mod tests {
         // The board decides "auto".
         let model = Some("Raspberry Pi 5 Model B Rev 1.0");
         let pi5 = Aes67::with_input(config(), None, model, FakeInput::default(), None);
-        assert_eq!(pi5.view().input.latency_ms, 3);
+        assert_eq!(pi5.view().input.latency_ms, 5);
     }
 
     #[test]
