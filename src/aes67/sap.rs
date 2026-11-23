@@ -143,6 +143,30 @@ mod tests {
         assert_eq!(sap_parse(&sap_build(&d)), Some(d));
     }
 
+    #[test]
+    fn a_captured_dante_announcement_parses() {
+        // Received from a Dante device in AES67 mode; addresses, clock ID and
+        // the name's MAC suffix replaced. The SDP ends with CRLF, no NUL.
+        let p = include_bytes!("../../tests/fixtures/aes67/sap-dante.bin");
+        let Some(SapMessage::Announce { source, sdp, .. }) = sap_parse(p) else {
+            panic!("not an announce");
+        };
+        assert_eq!(source, SRC);
+        assert!(sdp.ends_with("\r\n"));
+        let s = sdp::parse(&sdp).unwrap();
+        assert_eq!(s.name, "AU-U22-000002 : 1");
+        assert_eq!(s.group, Ipv4Addr::new(239, 69, 0, 121));
+        assert_eq!((s.port, s.payload_type, s.channels), (5004, 97, 2));
+        assert_eq!(s.encoding, sdp::Encoding::L24);
+        assert_eq!(s.ptime_us, 1000);
+        assert_eq!(
+            s.refclk,
+            Some(([0x00, 0x11, 0x22, 0xff, 0xfe, 0x33, 0x44, 0x55], 0))
+        );
+        assert_eq!(s.mediaclk_offset, 0);
+        assert!(sdp::selectable(&s).is_ok());
+    }
+
     fn bytes_type(b: &[u8]) -> u8 {
         (b[0] >> 2) & 1
     }

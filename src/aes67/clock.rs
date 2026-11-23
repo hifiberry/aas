@@ -421,7 +421,7 @@ impl PtpClock {
     }
 }
 
-fn realtime_ns() -> i128 {
+pub(crate) fn realtime_ns() -> i128 {
     let mut ts = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,

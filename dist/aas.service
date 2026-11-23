@@ -18,6 +18,10 @@ Restart=always
 RestartSec=1
 LimitRTPRIO=70
 LimitMEMLOCK=infinity
+# For the AES67 PTP listener's packet socket, receive only: aas never
+# sends a PTP packet. Nothing else in aas uses the capability.
+AmbientCapabilities=CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_RAW
 
 [Install]
 WantedBy=multi-user.target
