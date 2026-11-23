@@ -33,6 +33,8 @@ impl Listed {
 pub struct Directory {
     own_origin: Option<Ipv4Addr>,
     streams: HashMap<(Ipv4Addr, u16), Listed>,
+    /// Counts the changes `message` and `expire` report.
+    changes: u64,
 }
 
 impl Directory {
@@ -40,13 +42,26 @@ impl Directory {
         Directory {
             own_origin,
             streams: HashMap::new(),
+            changes: 0,
         }
+    }
+
+    /// How many times the list has changed, so a reader can tell whether
+    /// it has since it last looked.
+    pub fn changes(&self) -> u64 {
+        self.changes
     }
 
     /// Apply a SAP message. True when the visible list changed: a stream
     /// appeared, changed version or went away. A repeat only refreshes
     /// `last_seen`. An announcement whose SDP does not parse is ignored.
     pub fn message(&mut self, msg: SapMessage, now: Instant) -> bool {
+        let changed = self.apply(msg, now);
+        self.changes += u64::from(changed);
+        changed
+    }
+
+    fn apply(&mut self, msg: SapMessage, now: Instant) -> bool {
         match msg {
             SapMessage::Delete { hash, source } => self.streams.remove(&(source, hash)).is_some(),
             SapMessage::Announce { hash, source, sdp } => {
@@ -92,7 +107,9 @@ impl Directory {
     pub fn expire(&mut self, now: Instant) -> bool {
         let before = self.streams.len();
         self.streams.retain(|_, l| l.expires_at() > now);
-        self.streams.len() != before
+        let changed = self.streams.len() != before;
+        self.changes += u64::from(changed);
+        changed
     }
 
     /// The most recently seen stream with this name; callers check `own`.
@@ -161,6 +178,17 @@ mod tests {
         };
         assert!(!d.message(msg, Instant::now()));
         assert_eq!(d.all().count(), 0);
+    }
+
+    #[test]
+    fn changes_count_what_message_and_expire_report() {
+        let t = Instant::now();
+        let mut d = Directory::new(None);
+        d.message(announce(1, SRC, "one", 1), t);
+        d.message(announce(1, SRC, "one", 1), t);
+        assert_eq!(d.changes(), 1);
+        d.expire(t + Duration::from_secs(300));
+        assert_eq!(d.changes(), 2);
     }
 
     #[test]

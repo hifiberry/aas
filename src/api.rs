@@ -358,6 +358,10 @@ pub enum ApiEvent {
         latency_ms: f32,
         default_rate: u32,
     },
+    /// Something of `GET /aes67` or `GET /aes67/streams` changed: the
+    /// clock's lock or grandmaster, the input or output, or the list of
+    /// streams. Carries `GET /aes67` as it is now.
+    Aes67(Aes67View),
     /// The subscriber fell behind and should read `/state` again.
     Resync,
 }
@@ -421,6 +425,79 @@ pub struct AirplayView {
     /// The last failure, until a session plays again.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+/// AES67 as `GET /aes67` gives it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Aes67View {
+    pub clock: Aes67ClockView,
+    pub input: Aes67InputView,
+    pub output: Aes67OutputView,
+}
+
+/// The PTP clock the AES67 threads follow.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Aes67ClockView {
+    /// `"listen"` or `"off"`, as the config says.
+    pub source: &'static str,
+    pub domain: u8,
+    /// Whether there is PTP time now.
+    pub locked: bool,
+    /// The grandmaster's clock ID, as `00-11-22-FF-FE-33-44-55`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grandmaster: Option<String>,
+    /// How fast PTP time runs against the local clock, in ppm.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_ppm: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Aes67InputView {
+    pub enabled: bool,
+    /// The selected stream's name, also while it is not announced.
+    pub stream: Option<String>,
+    /// `"ptp"` or `"buffer"` while a stream plays.
+    pub mode: Option<&'static str>,
+    pub receiving: bool,
+    pub latency_ms: u32,
+    /// Whether the latency is the board's default.
+    pub latency_auto: bool,
+    /// Packets that came after their play time.
+    pub late: u64,
+    /// Frames played as silence because they never came.
+    pub lost: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Aes67OutputView {
+    pub enabled: bool,
+    pub sending: bool,
+    /// The multicast group; absent while `"auto"` is not resolved.
+    pub group: Option<String>,
+    pub port: u16,
+}
+
+/// An announced stream as `GET /aes67/streams` gives it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Aes67StreamView {
+    pub name: String,
+    pub origin: String,
+    pub group: String,
+    pub port: u16,
+    /// `"L16"`, `"L24"` or `"other"`.
+    pub format: &'static str,
+    pub rate: u32,
+    pub channels: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grandmaster: Option<String>,
+    /// Whether the input can play it; not our own and of a format it takes.
+    pub selectable: bool,
+    /// Why it cannot be selected: `"own"`, or the field it fails on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
+    /// `"ptp"` or `"buffer"`: how it would play now, when selectable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<&'static str>,
 }
 
 /// An input as `GET /inputs` gives it.

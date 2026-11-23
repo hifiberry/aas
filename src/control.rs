@@ -5,6 +5,7 @@
 //! back is freed here. Commands that belong together go into the queue in
 //! one commit, so the audio thread never sees half a decision.
 
+mod aes67;
 mod api;
 mod graph;
 pub use graph::to_dot;
@@ -953,6 +954,12 @@ pub struct Control {
     analog: Option<AnalogInput>,
     /// The AES67 input's source is in the engine, on the `aes67` bus.
     aes67_input: bool,
+    /// The `[aes67]` table; None without one.
+    aes67_config: Option<crate::aes67::config::Aes67Config>,
+    /// AES67's threads, once started.
+    aes67: Option<crate::aes67::Aes67>,
+    /// The `aes67` source in the engine.
+    aes67_source: Option<aes67::Aes67Source>,
     /// The further outputs, in the order of the config.
     further: Vec<FurtherOutput>,
     /// Since when no player runs and the analog input has no signal.
@@ -1065,6 +1072,9 @@ impl Control {
             analog_config: api::config_input(config),
             analog: None,
             aes67_input: false,
+            aes67_config: config.aes67.clone(),
+            aes67: None,
+            aes67_source: None,
             further: Vec::new(),
             quiet_since: None,
             delay: None,
@@ -1272,6 +1282,9 @@ impl Control {
         if self.analog.is_some() {
             batch.push(Command::SetAnalogGain(api::input_gain(&self.analog_input)));
         }
+        self.start_aes67(&mut batch, |config, stored, link| {
+            crate::aes67::Aes67::start(config, stored, link, now)
+        });
         self.open_output(now, &mut batch);
         self.idle_since = Some(now);
         self.send(batch);
@@ -1289,6 +1302,9 @@ impl Control {
         for receiver in &self.airplay {
             receiver.ask_stop();
         }
+        if let Some(aes67) = &self.aes67 {
+            aes67.ask_stop();
+        }
         self.send(vec![Command::Shutdown]);
         if self.save_at.is_some() {
             self.save();
@@ -1298,6 +1314,9 @@ impl Control {
         }
         for receiver in &mut self.airplay {
             receiver.stop();
+        }
+        if let Some(aes67) = &mut self.aes67 {
+            aes67.stop();
         }
     }
 
@@ -2156,8 +2175,10 @@ impl Control {
         self.conns.values_mut().filter_map(|c| c.stream.as_mut())
     }
 
+    /// The clients' running streams, and the AES67 input while it
+    /// receives.
     fn running_count(&self) -> usize {
-        self.streams().filter(|s| s.running).count()
+        self.streams().filter(|s| s.running).count() + usize::from(self.aes67_running())
     }
 
     /// Whether a DoP stream at `rate` can have the output: the card takes
@@ -2883,6 +2904,7 @@ impl Control {
             });
             batch.push(Command::SetResampler(stream.id, resampler));
         }
+        self.sync_aes67_resampler(batch);
     }
 
     /// The card's rates have changed, such as when a card that was missing
@@ -2991,6 +3013,7 @@ impl Control {
     /// output is being opened.
     pub fn tick(&mut self, now: Instant) {
         self.publish_airplay();
+        self.sync_aes67(now);
         self.follow_card(now);
         let mut batch = Vec::new();
         let before = self.policy.current();
@@ -3826,6 +3849,8 @@ mod tests {
         pub(super) outputs: Vec<(usize, f32)>,
         /// Every source added, with the gain it comes with.
         pub(super) added: Vec<(ClientId, f32)>,
+        /// The bus of every source added.
+        pub(super) buses: Vec<(ClientId, crate::matrix::Bus)>,
         /// Every matrix a `SetMatrix` brought, by output.
         pub(super) matrices: Vec<(usize, Matrix)>,
         /// The matrix of each further output's mix put in place, by index.
@@ -3854,6 +3879,7 @@ mod tests {
                 gains: Vec::new(),
                 outputs: Vec::new(),
                 added: Vec::new(),
+                buses: Vec::new(),
                 matrices: Vec::new(),
                 mixes: Vec::new(),
                 in_place: BTreeMap::new(),
@@ -3872,6 +3898,7 @@ mod tests {
                 let (name, answer) = match command {
                     Command::Add(source) => {
                         self.added.push((source.id, source.gain));
+                        self.buses.push((source.id, source.bus));
                         ("Add".into(), None)
                     }
                     Command::Remove(_) => ("Remove".into(), None),

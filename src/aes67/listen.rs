@@ -155,8 +155,8 @@ fn run(socket: &OwnedFd, mut est: Estimator, clock: &PtpClock, stop: &AtomicBool
     }
 }
 
-/// The first IPv4 address of `interface`.
-fn interface_ipv4(interface: &str) -> io::Result<Ipv4Addr> {
+/// The first IPv4 address of `interface`; `NotFound` while it has none.
+pub(super) fn interface_ipv4(interface: &str) -> io::Result<Ipv4Addr> {
     let mut list: *mut libc::ifaddrs = ptr::null_mut();
     // SAFETY: list is a valid out pointer; it is freed below.
     if unsafe { libc::getifaddrs(&mut list) } != 0 {

@@ -156,13 +156,13 @@ impl Drop for InputHandle {
 
 /// Starts the `aas-aes67-in` thread at [`rt::WRITER_PRIORITY`]. It
 /// receives on `interface` the stream an `InputCommand::Select` names and
-/// writes it to `ring`, writing `wake` after each write. `output_delay` is
-/// the engine's delay after the ring, in frames at `master_rate`.
+/// writes it to `ring`. The engine reads the ring every cycle on its own,
+/// so nothing wakes it. `output_delay` is the engine's delay after the
+/// ring, in frames at `master_rate`.
 pub fn start(
     interface: Ipv4Addr,
     clock: PtpClock,
     ring: Ring,
-    wake: OwnedFd,
     output_delay: Arc<AtomicU32>,
     master_rate: Arc<AtomicU32>,
 ) -> io::Result<InputHandle> {
@@ -175,11 +175,7 @@ pub fn start(
     let thread = {
         let status = status.clone();
         let stop = stop.clone();
-        let out = RingOut {
-            ring,
-            wake,
-            wrote: false,
-        };
+        let out = RingOut { ring };
         let shared = Shared {
             interface,
             clock,
@@ -579,11 +575,9 @@ fn media_now(ptp: &PtpNow, local_ns: i128, offset: u32) -> (u32, f64) {
     (rtp::media_ts(ptp_ns, offset), fraction)
 }
 
-/// The ring and its wake-up.
+/// The ring the engine reads.
 struct RingOut {
     ring: Ring,
-    wake: OwnedFd,
-    wrote: bool,
 }
 
 impl Output for RingOut {
@@ -596,29 +590,7 @@ impl Output for RingOut {
     }
 
     fn write(&mut self, frames: &[[i32; 2]]) -> usize {
-        let n = self.ring.write(frames);
-        self.wrote |= n > 0;
-        n
-    }
-}
-
-impl RingOut {
-    /// Writes the wake-up once if anything was written since the last.
-    fn signal(&mut self) {
-        if !self.wrote {
-            return;
-        }
-        self.wrote = false;
-        let one = 1u64;
-        // SAFETY: 8 bytes to an eventfd. A full counter only means the
-        // reader has plenty of wake-ups waiting.
-        unsafe {
-            libc::write(
-                self.wake.as_raw_fd(),
-                (&raw const one).cast(),
-                mem::size_of::<u64>(),
-            )
-        };
+        self.ring.write(frames)
     }
 }
 
@@ -692,7 +664,6 @@ fn run(shared: Shared, mut out: RingOut, commands: mpsc::Receiver<InputCommand>)
             output_delay: f64::from(delay) * f64::from(RATE) / f64::from(rate),
         };
         rx.step(&now, &packets[..count], &mut out);
-        out.signal();
         if let Some(warning) = rx.take_warning() {
             eprintln!("{warning}");
         }
@@ -741,7 +712,7 @@ fn apply(
 
 /// A UDP socket bound to `group:port`, joined to the group on `interface`,
 /// with kernel receive timestamps.
-fn join(group: Ipv4Addr, port: u16, interface: Ipv4Addr) -> io::Result<UdpSocket> {
+pub(super) fn join(group: Ipv4Addr, port: u16, interface: Ipv4Addr) -> io::Result<UdpSocket> {
     // SAFETY: plain socket call; the fd is owned from here on.
     let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
     if fd < 0 {
@@ -1299,12 +1270,10 @@ mod tests {
     #[test]
     fn the_thread_takes_commands_and_stops_with_its_handle() {
         let (ring, _memfd) = Ring::create(1024).unwrap();
-        let wake = crate::control::eventfd().unwrap();
         let handle = start(
             Ipv4Addr::LOCALHOST,
             PtpClock::off(),
             ring,
-            wake,
             Arc::new(AtomicU32::new(0)),
             Arc::new(AtomicU32::new(48_000)),
         )

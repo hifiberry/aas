@@ -21,7 +21,9 @@ use crate::latency::{PERIODS, period_frames};
 use crate::matrix::{Bus, INPUT_NAMES, Matrix};
 use crate::plugin::build::widths;
 use crate::rate::{MAX_RATE, MIN_RATE};
-use crate::state::{MAX_CLIENTS, State, Stored, StoredInput, StoredOutput, StoredRoute};
+use crate::state::{
+    AES67_CLIENT, MAX_CLIENTS, State, Stored, StoredInput, StoredOutput, StoredRoute,
+};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -540,7 +542,19 @@ impl Control {
 
     /// The gain the streams of a client called `name` play at.
     pub(super) fn client_gain(&self, name: &str) -> f32 {
-        input_gain(self.state.clients.get(name).unwrap_or(&UNITY))
+        input_gain(&self.client_input(name))
+    }
+
+    /// What a client without a stored volume plays at: 0 dB, and for the
+    /// AES67 input its config's `volume_db`.
+    fn client_default(&self, name: &str) -> StoredInput {
+        match &self.aes67_config {
+            Some(c) if name == AES67_CLIENT => StoredInput {
+                volume_db: c.input.volume_db,
+                muted: false,
+            },
+            _ => UNITY,
+        }
     }
 
     /// The engine index of the output with API id `id`: the master is 1.
@@ -955,7 +969,7 @@ impl Control {
     }
 
     fn client_view(&self, name: &str) -> InputView {
-        let input = self.state.clients.get(name).unwrap_or(&UNITY);
+        let input = self.client_input(name);
         InputView {
             id: format!("clients/{name}"),
             volume_db: input.volume_db,
@@ -989,9 +1003,10 @@ impl Control {
             return Err(ApiError::unprocessable(message));
         }
         check_input(&patch)?;
+        let default = self.client_default(&name);
         let stored = self.state.clients.get(&name);
-        let input = patched_input(stored.unwrap_or(&UNITY), &patch);
-        if input == *stored.unwrap_or(&UNITY) {
+        let input = patched_input(stored.unwrap_or(&default), &patch);
+        if input == *stored.unwrap_or(&default) {
             return Ok(self.client_view(&name));
         }
         if stored.is_none() && self.state.clients.len() >= MAX_CLIENTS {
@@ -1000,16 +1015,19 @@ impl Control {
             )));
         }
         let gain = input_gain(&input);
-        if input == UNITY {
+        if input == default {
             self.state.clients.remove(&name);
         } else {
             self.state.clients.insert(name.clone(), input.clone());
         }
         let streams = self.conns.values().filter(|c| c.name == name);
-        let batch = streams
+        let mut batch: Vec<Command> = streams
             .filter_map(|c| c.stream.as_ref())
             .map(|s| Command::SetSourceGain(s.id, gain))
             .collect();
+        if let Some(source) = self.aes67_source.as_ref().filter(|_| name == AES67_CLIENT) {
+            batch.push(Command::SetSourceGain(source.id, gain));
+        }
         self.send(batch);
         let notice = Reply::ClientVolumeChanged {
             db_millis: (input.volume_db * 1000.0).round() as i32,
@@ -1031,17 +1049,21 @@ impl Control {
     }
 
     /// A client's gain, as the state file has it. A client without one
-    /// plays at 0 dB.
+    /// plays at 0 dB, the AES67 input at its config's volume.
     pub(super) fn client_input(&self, name: &str) -> StoredInput {
-        self.state.clients.get(name).cloned().unwrap_or(UNITY)
+        let stored = self.state.clients.get(name).cloned();
+        stored.unwrap_or_else(|| self.client_default(name))
     }
 
     /// The analog input, if there is one, and every client known by name:
     /// those with a stored volume and those with a stream.
-    fn input_views(&self) -> Vec<InputView> {
+    pub(super) fn input_views(&self) -> Vec<InputView> {
         let mut names: BTreeSet<&str> = self.state.clients.keys().map(String::as_str).collect();
         let streams = self.conns.values().filter(|c| c.stream.is_some());
         names.extend(streams.map(|c| c.name.as_str()));
+        if self.aes67_source.is_some() {
+            names.insert(AES67_CLIENT);
+        }
         let analog = self.analog.as_ref().map(|_| self.analog_view());
         analog
             .into_iter()
