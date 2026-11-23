@@ -267,10 +267,11 @@ mod tests {
     use super::super::tests::{FakeEngine, started};
     use super::*;
     use crate::aes67::testing::{FakeInput, FakeOutput, announce, config};
-    use crate::api::InputPatch;
+    use crate::api::{Aes67InputPatch, Aes67OutputPatch, ApiEvent, Call, InputPatch};
     use crate::config::Config;
     use crate::format::db_to_gain;
     use crate::state::StoredInput;
+    use serde_json::json;
     use std::net::Ipv4Addr;
 
     const THEM: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 10);
@@ -514,6 +515,149 @@ mod tests {
         let seen = engine.take(true);
         assert_eq!(taps(&seen, "RemoveTap").len(), 1, "{seen:?}");
         assert!(taps(&seen, "AddTap").is_empty());
+    }
+
+    fn input_patch(json: serde_json::Value) -> Call {
+        Call::PatchAes67Input(serde_json::from_value::<Aes67InputPatch>(json).unwrap())
+    }
+
+    #[test]
+    fn get_aes67_shows_clock_input_output() {
+        let (mut control, _engine, now, _) = with_aes67(|c| c.input.stream = "studio".into(), &[]);
+        let view = control.call(Call::Aes67, now).unwrap();
+        assert_eq!(view["clock"]["domain"], 0);
+        assert_eq!(view["clock"]["locked"], false);
+        assert_eq!(view["input"]["stream"], "studio");
+        assert_eq!(view["input"]["enabled"], true);
+        assert_eq!(view["input"]["receiving"], false);
+        assert!(view["output"]["port"].is_number());
+    }
+
+    #[test]
+    fn streams_lists_mode_and_selectable() {
+        let (mut control, _engine, now, _) = with_aes67(|_| {}, &[]);
+        announce(control.aes67.as_ref().unwrap(), 1, THEM, "studio");
+        let streams = control.call(Call::Aes67Streams, now).unwrap();
+        let streams = streams.as_array().unwrap();
+        assert_eq!(streams.len(), 1);
+        assert_eq!(streams[0]["name"], "studio");
+        assert_eq!(streams[0]["selectable"], true);
+        assert_eq!(streams[0]["mode"], "buffer");
+    }
+
+    #[test]
+    fn patch_input_selects_and_stores() {
+        let (mut control, _engine, now, _) = with_aes67(|_| {}, &[]);
+        let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+        control.set_api(tx);
+        announce(control.aes67.as_ref().unwrap(), 1, THEM, "studio");
+        // An unknown stream is refused, and nothing changes.
+        let e = control
+            .call(input_patch(json!({"stream": "nowhere"})), now)
+            .unwrap_err();
+        assert_eq!(e.status, 400);
+        assert!(e.message.contains("nowhere"), "{}", e.message);
+        assert_eq!(control.state.aes67, None);
+        // A bad latency names the field.
+        for bad in [json!(0), json!(101), json!("fast"), json!(2.5), json!(true)] {
+            let e = control
+                .call(input_patch(json!({"latency_ms": bad})), now)
+                .unwrap_err();
+            assert_eq!(e.status, 400);
+            assert!(e.message.starts_with("latency_ms"), "{}", e.message);
+        }
+        let view = control
+            .call(
+                input_patch(json!({"stream": "studio", "latency_ms": 7})),
+                now,
+            )
+            .unwrap();
+        assert_eq!(view["input"]["stream"], "studio");
+        assert_eq!(view["input"]["latency_ms"], 7);
+        assert_eq!(view["input"]["latency_auto"], false);
+        let stored = control.state.aes67.clone().unwrap();
+        assert_eq!(stored.stream.unwrap().value, "studio");
+        assert_eq!(stored.latency.unwrap().value, 7);
+        assert!(control.save_at.is_some() || control.saver.is_none());
+        let mut told = false;
+        while let Ok(event) = rx.try_recv() {
+            told |= matches!(event, ApiEvent::Aes67(_));
+        }
+        assert!(told, "no aes67 event");
+        // null deselects, "auto" is the board's.
+        let view = control
+            .call(
+                input_patch(json!({"stream": null, "latency_ms": "auto", "enabled": false})),
+                now,
+            )
+            .unwrap();
+        assert_eq!(view["input"]["stream"], serde_json::Value::Null);
+        assert_eq!(view["input"]["latency_auto"], true);
+        assert_eq!(view["input"]["enabled"], false);
+        assert_eq!(control.state.aes67.unwrap().latency.unwrap().value, 0);
+    }
+
+    #[test]
+    fn patch_input_volume_is_the_client_volume() {
+        let (mut control, mut engine, now, _) = with_aes67(|_| {}, &[]);
+        engine.take(true);
+        let id = control.aes67_source.as_ref().unwrap().id;
+        control
+            .call(input_patch(json!({"volume_db": -9.0, "mute": true})), now)
+            .unwrap();
+        let client = control.client_input("aes67");
+        assert_eq!((client.volume_db, client.muted), (-9.0, true));
+        let seen = engine.take(true);
+        let want = format!(
+            "SetSourceGain {id} {}",
+            super::super::api::input_gain(&client)
+        );
+        assert!(seen.contains(&want), "{seen:?}");
+        let view = control.call(Call::Client("aes67".into()), now).unwrap();
+        assert_eq!(view["volume_db"], -9.0);
+        // Out of range is refused as it is for any client.
+        let e = control
+            .call(input_patch(json!({"volume_db": 3.0})), now)
+            .unwrap_err();
+        assert_eq!(e.status, 422);
+    }
+
+    #[test]
+    fn patch_output_enables() {
+        let (mut control, _engine, now, _) = with_aes67(|_| {}, &[]);
+        let patch = |on| Call::PatchAes67Output(Aes67OutputPatch { enabled: Some(on) });
+        let view = control.call(patch(false), now).unwrap();
+        assert_eq!(view["output"]["enabled"], false);
+        let stored = control.state.aes67.clone().unwrap();
+        assert!(!stored.output_enabled.unwrap().value);
+        let view = control.call(patch(true), now).unwrap();
+        assert_eq!(view["output"]["enabled"], true);
+    }
+
+    #[test]
+    fn no_aes67_is_404() {
+        let (mut control, _engine, now) = started(&Config::default(), None);
+        for call in [
+            Call::Aes67,
+            Call::Aes67Streams,
+            Call::PatchAes67Input(Aes67InputPatch::default()),
+            Call::PatchAes67Output(Aes67OutputPatch::default()),
+        ] {
+            assert_eq!(control.call(call, now).unwrap_err().status, 404);
+        }
+    }
+
+    #[test]
+    fn unknown_field_is_400() {
+        // The API thread parses the body; a field it does not know fails.
+        assert!(serde_json::from_str::<Aes67InputPatch>(r#"{"volume":1}"#).is_err());
+        assert!(serde_json::from_str::<Aes67OutputPatch>(r#"{"on":true}"#).is_err());
+        // null and a name both parse for the stream; a number does not.
+        let p: Aes67InputPatch = serde_json::from_str(r#"{"stream":null}"#).unwrap();
+        assert_eq!(p.stream, Some(None));
+        let p: Aes67InputPatch = serde_json::from_str("{}").unwrap();
+        assert_eq!(p.stream, None);
+        assert!(serde_json::from_str::<Aes67InputPatch>(r#"{"stream":3}"#).is_err());
     }
 
     fn has_resampler(seen: &[String]) -> bool {

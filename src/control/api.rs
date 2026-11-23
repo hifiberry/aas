@@ -350,6 +350,10 @@ impl Control {
             Call::Metadata => api::answer(&self.metadata_view(now)),
             Call::PairAirplay { .. } => Err(ApiError::internal("not yet")),
             Call::PatchAirplay(name, patch) => self.patch_airplay(&name, patch, now),
+            Call::Aes67 => self.aes67_ref().and_then(|a| api::answer(&a.view())),
+            Call::Aes67Streams => self.aes67_ref().and_then(|a| api::answer(&a.streams())),
+            Call::PatchAes67Input(patch) => self.patch_aes67_input(patch, now),
+            Call::PatchAes67Output(patch) => self.patch_aes67_output(patch, now),
             Call::PatchSettings(patch) => self.patch_settings(patch, now),
         };
         self.publish_changes();
@@ -457,6 +461,74 @@ impl Control {
             self.publish_airplay();
         }
         api::answer(&self.airplay[i].view())
+    }
+
+    fn aes67_ref(&self) -> Result<&crate::aes67::Aes67, ApiError> {
+        self.aes67
+            .as_ref()
+            .ok_or_else(|| ApiError::not_found("this device has no AES67"))
+    }
+
+    /// Keeps what the API set of AES67 in the state, and tells the
+    /// subscribers what changed.
+    fn aes67_changed(&mut self, now: Instant) {
+        let Some(aes67) = &mut self.aes67 else {
+            return;
+        };
+        self.state.aes67 = aes67.stored();
+        let event = aes67.changed();
+        self.save_later(now);
+        if let Some(event) = event {
+            self.publish(event);
+        }
+    }
+
+    /// `PATCH /aes67/input`. Every value is checked before one applies.
+    fn patch_aes67_input(&mut self, patch: api::Aes67InputPatch, now: Instant) -> api::Answer {
+        use crate::aes67::config::Latency;
+        self.aes67_ref()?;
+        let latency = match &patch.latency_ms {
+            None => None,
+            Some(serde_json::Value::String(s)) if s == "auto" => Some(Latency::Auto),
+            Some(v) => match v.as_u64() {
+                Some(ms @ 1..=100) => Some(Latency::Ms(ms as u32)),
+                _ => {
+                    return Err(ApiError::bad_request(
+                        "latency_ms is a number from 1 to 100, or \"auto\"",
+                    ));
+                }
+            },
+        };
+        let client = api::InputPatch {
+            volume_db: patch.volume_db,
+            muted: patch.mute,
+        };
+        check_input(&client)?;
+        let aes67 = self.aes67.as_mut().expect("checked above");
+        if let Some(stream) = patch.stream {
+            aes67.select(stream).map_err(ApiError::bad_request)?;
+        }
+        if let Some(latency) = latency {
+            aes67.set_latency(latency);
+        }
+        if let Some(on) = patch.enabled {
+            aes67.set_input_enabled(on);
+        }
+        if client != api::InputPatch::default() {
+            self.set_client_input(crate::state::AES67_CLIENT.into(), client, now)?;
+        }
+        self.aes67_changed(now);
+        api::answer(&self.aes67_ref()?.view())
+    }
+
+    /// `PATCH /aes67/output`.
+    fn patch_aes67_output(&mut self, patch: api::Aes67OutputPatch, now: Instant) -> api::Answer {
+        self.aes67_ref()?;
+        if let (Some(on), Some(aes67)) = (patch.enabled, &mut self.aes67) {
+            aes67.set_output_enabled(on);
+        }
+        self.aes67_changed(now);
+        api::answer(&self.aes67_ref()?.view())
     }
 
     pub(super) fn airplay_views(&self) -> Vec<api::AirplayView> {

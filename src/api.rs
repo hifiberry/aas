@@ -48,6 +48,14 @@ pub enum Call {
     },
     /// `PATCH /airplay/{name}`.
     PatchAirplay(String, AirplayPatch),
+    /// `GET /aes67`.
+    Aes67,
+    /// `GET /aes67/streams`.
+    Aes67Streams,
+    /// `PATCH /aes67/input`.
+    PatchAes67Input(Aes67InputPatch),
+    /// `PATCH /aes67/output`.
+    PatchAes67Output(Aes67OutputPatch),
     PatchSettings(SettingsPatch),
 }
 
@@ -640,6 +648,36 @@ pub struct PluginMetrics {
 #[serde(deny_unknown_fields)]
 pub struct AirplayPatch {
     pub enabled: Option<bool>,
+}
+
+/// The body of `PATCH /aes67/input`. A field left out stays as it is.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Aes67InputPatch {
+    /// A stream's name; `null` selects none.
+    #[serde(default, deserialize_with = "some_or_null")]
+    pub stream: Option<Option<String>>,
+    /// A number of ms from 1 to 100, or `"auto"`; checked by the control
+    /// thread, which names the field when it is neither.
+    pub latency_ms: Option<serde_json::Value>,
+    pub enabled: Option<bool>,
+    /// The client volume named `aes67`, as `PATCH /inputs/clients/aes67`.
+    pub volume_db: Option<f32>,
+    pub mute: Option<bool>,
+}
+
+/// The body of `PATCH /aes67/output`.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Aes67OutputPatch {
+    pub enabled: Option<bool>,
+}
+
+/// A field present as `null` is `Some(None)`, one left out `None`.
+fn some_or_null<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<Option<String>>, D::Error> {
+    Option::<String>::deserialize(d).map(Some)
 }
 
 /// `GET /metadata`: the current track, the cover as its type and size.
