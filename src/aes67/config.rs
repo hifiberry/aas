@@ -69,6 +69,20 @@ const OUTPUT_KEYS: [&str; 5] = ["enabled", "name", "address", "port", "ttl"];
 /// The lowest and highest latency, in ms.
 const LATENCY_RANGE: (i64, i64) = (1, 100);
 
+/// The output's name when the config sets none: `aas-` and the host name,
+/// or plain `aas` without one.
+pub fn default_name(host: Option<&str>) -> String {
+    match host.map(str::trim).filter(|h| !h.is_empty()) {
+        Some(h) => format!("aas-{h}"),
+        None => "aas".into(),
+    }
+}
+
+/// The machine's host name, from `/proc/sys/kernel/hostname`.
+fn hostname() -> Option<String> {
+    std::fs::read_to_string("/proc/sys/kernel/hostname").ok()
+}
+
 /// The latency to run with, in ms. `model` is the board's name, from
 /// `/proc/device-tree/model`.
 pub fn latency_ms(latency: Latency, model: Option<&str>) -> u32 {
@@ -238,7 +252,7 @@ fn output_from(table: &toml::Table) -> Result<OutputConfig, String> {
     };
     Ok(OutputConfig {
         enabled: boolean(table, P, false)?,
-        name: string(table, "name", P, "aas")?,
+        name: string(table, "name", P, &default_name(hostname().as_deref()))?,
         group,
         port: whole(table, "port", P, 1, 65535)?.unwrap_or(5004) as u16,
         ttl: whole(table, "ttl", P, 1, 255)?.unwrap_or(16) as u8,
@@ -282,7 +296,7 @@ mod tests {
                 },
                 output: OutputConfig {
                     enabled: false,
-                    name: "aas".into(),
+                    name: default_name(hostname().as_deref()),
                     group: Group::Auto,
                     port: 5004,
                     ttl: 16,
@@ -389,5 +403,12 @@ ttl = 4
         );
         assert_eq!(latency_ms(Latency::Auto, None), 20);
         assert_eq!(latency_ms(Latency::Ms(7), None), 7);
+    }
+
+    #[test]
+    fn default_name_is_aas_and_the_host_name() {
+        assert_eq!(default_name(Some("studio\n")), "aas-studio");
+        assert_eq!(default_name(Some("")), "aas");
+        assert_eq!(default_name(None), "aas");
     }
 }

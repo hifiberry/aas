@@ -405,7 +405,7 @@ stream = "Studio"         # the stream's name; also set at run time
 
 [aes67.output]
 enabled = true            # off by default
-name = "aas"
+name = "aas-studio"
 ```
 
 | Key | Values | Default | |
@@ -419,7 +419,7 @@ name = "aas"
 | `input.channels` | two numbers, 1 to 8 | `[1, 2]` | The two channels of the stream played as left and right. |
 | `input.volume_db` | -60 to 0 | 0 | The start value of the `aes67` client's volume. |
 | `output.enabled` | `true`, `false` | `false` | Whether the master is sent. |
-| `output.name` | text | `"aas"` | The stream's name, as a receiver lists it. |
+| `output.name` | text | `"aas-"` and the host name | The stream's name, as a receiver lists it. |
 | `output.address` | `"auto"`, or a multicast address | `"auto"` | The group. `"auto"` is 239.69.x.y, with x and y the last two bytes of the interface's MAC address; a y of 0 or 255 becomes 1. |
 | `output.port` | 1 to 65535 | 5004 | The RTP port. |
 | `output.ttl` | 1 to 255 | 16 | The multicast TTL. |
