@@ -188,7 +188,7 @@ fn interface_ipv4(interface: &str) -> io::Result<Ipv4Addr> {
     })
 }
 
-fn set_option<T>(fd: &OwnedFd, name: libc::c_int, value: &T) -> io::Result<()> {
+pub(super) fn set_option<T>(fd: &OwnedFd, name: libc::c_int, value: &T) -> io::Result<()> {
     // SAFETY: value points to a T of the size passed.
     let r = unsafe {
         libc::setsockopt(
