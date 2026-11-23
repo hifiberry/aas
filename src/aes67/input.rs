@@ -43,7 +43,7 @@ use std::time::Duration;
 use aas_client::ring::Ring;
 
 use super::clock::{PtpClock, PtpNow, realtime_ns};
-use super::jitter::Jitter;
+use super::jitter::{Jitter, Put};
 use super::listen::set_option;
 use super::rtp::{self, ts_diff};
 use super::sdp::Session;
@@ -71,6 +71,8 @@ const STOPPED_NS: i128 = 1_000_000_000;
 const DEFAULT_LATENCY_MS: u32 = 20;
 /// Zeros written at most per call while priming: the longest latency.
 const ZEROS: usize = 4800;
+const OFF_PTP: &str =
+    "aas: aes67: stream timestamps do not follow the PTP clock; playing without PTP alignment";
 /// The thread publishes its status at most this often.
 const STATUS_NS: i128 = 100_000_000;
 /// Datagrams read per round, and the size of each buffer: 8 channels of
@@ -100,6 +102,9 @@ pub struct InputStatus {
     pub lost: u64,
     /// Packets dropped because they came after their play time.
     pub late: u64,
+    /// Whether the selected stream's multicast group is joined; false when
+    /// joining failed, or no stream is selected.
+    pub joined: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -242,6 +247,12 @@ pub struct Receiver {
     receiving: bool,
     /// Receive time of the last packet, CLOCK_REALTIME ns.
     last_rx: i128,
+    /// Receive time of the last packet the jitter buffer stored.
+    last_stored: i128,
+    /// The stream's timestamps were found not to follow the PTP clock.
+    warned: bool,
+    /// A message for the log, which the thread prints outside `step`.
+    warning: Option<&'static str>,
     /// Writes in a row whose reading the controller skipped.
     skipping: u32,
     /// Restarts of a stream that was playing or priming.
@@ -271,6 +282,9 @@ impl Receiver {
             generation: None,
             receiving: false,
             last_rx: 0,
+            last_stored: 0,
+            warned: false,
+            warning: None,
             skipping: 0,
             restarts: 0,
             ratio: 1.0,
@@ -297,6 +311,7 @@ impl Receiver {
         };
         self.session = session;
         self.mode = None;
+        self.warned = false;
         self.receiving = false;
     }
 
@@ -335,6 +350,14 @@ impl Receiver {
             self.receiving = false;
             self.restart(Restart::Soft);
         }
+        // Packets that all come too late or too early for where the input
+        // reads: it starts again on them.
+        if self.receiving
+            && matches!(self.phase, Phase::Priming | Phase::Playing)
+            && now.local_ns - self.last_stored >= STOPPED_NS
+        {
+            self.restart(Restart::Hard);
+        }
         if self.phase == Phase::Priming {
             self.prime(now, out);
         }
@@ -367,7 +390,9 @@ impl Receiver {
         if self.phase == Phase::Waiting {
             self.start(p.ts, now);
         }
-        self.jitter.put(p.ts, &self.decoded[..n]);
+        if self.jitter.put(p.ts, &self.decoded[..n]) == Put::Stored {
+            self.last_stored = rx_ns;
+        }
     }
 
     /// Starts on a packet at `ts`, in the mode the clock allows now.
@@ -404,20 +429,31 @@ impl Receiver {
     }
 
     /// Zeros ahead of the first frame until it is at its target delay, or
-    /// frames dropped when it is past it already.
+    /// frames dropped when it is past it already. A stream in PTP mode
+    /// whose first frame is further than the restart bound from its target
+    /// has timestamps that do not follow the PTP time and its SDP offset:
+    /// it plays in buffer mode for this start.
     fn prime(&mut self, now: &Now, out: &mut impl Output) {
         let target = self.target();
-        let Some(delay) = self.measure(now, out.fill()) else {
+        let Some(mut delay) = self.measure(now, out.fill()) else {
             return;
         };
+        if self.mode == Some(Mode::Ptp) && (delay - target).abs() > RESTART_FRAMES {
+            if !self.warned {
+                self.warned = true;
+                self.warning = Some(OFF_PTP);
+            }
+            self.mode = Some(Mode::Buffer);
+            self.drift.reset();
+            let Some(buffered) = self.measure(now, out.fill()) else {
+                return;
+            };
+            delay = buffered;
+        }
         if delay > target {
             // Due before it arrived: drop what is late.
-            let mut late = (delay - target).round() as usize;
-            while late > 0 {
-                let n = late.min(self.input.len());
-                self.jitter.take(&mut self.input[..n]);
-                late -= n;
-            }
+            let late = (delay - target).round() as u32;
+            self.jitter.anchor(self.jitter.read_ts().wrapping_add(late));
         } else {
             let mut missing = (target - delay).round() as usize;
             while missing > 0 {
@@ -472,6 +508,11 @@ impl Receiver {
             );
             out.write(&self.output[..made]);
         }
+    }
+
+    /// A message for the log since the last call, once per selection.
+    pub fn take_warning(&mut self) -> Option<&'static str> {
+        self.warning.take()
     }
 
     /// Copies the state into `status`, the name only when it changed.
@@ -627,19 +668,24 @@ fn run(shared: Shared, mut out: RingOut, commands: mpsc::Receiver<InputCommand>)
         for (p, (&(rx_ns, len), buf)) in packets.iter_mut().zip(received.iter().zip(&bufs)) {
             *p = (rx_ns, &buf[..len]);
         }
-        let ptp = shared.clock.now();
+        let (ptp, generation) = shared.clock.snapshot();
         let rate = shared.master_rate.load(Ordering::Relaxed).max(1);
         let delay = shared.output_delay.load(Ordering::Relaxed);
         let now = Now {
             local_ns: ptp.map_or_else(realtime_ns, |p| p.local_ns),
             ptp,
-            generation: shared.clock.generation(),
+            generation,
             output_delay: f64::from(delay) * f64::from(RATE) / f64::from(rate),
         };
         rx.step(&now, &packets[..count], &mut out);
         out.signal();
+        if let Some(warning) = rx.take_warning() {
+            eprintln!("{warning}");
+        }
         if (now.local_ns - published).abs() >= STATUS_NS {
-            rx.publish(&mut shared.status.lock().unwrap_or_else(|e| e.into_inner()));
+            let mut status = shared.status.lock().unwrap_or_else(|e| e.into_inner());
+            rx.publish(&mut status);
+            status.joined = joined.is_some();
             published = now.local_ns;
         }
     }
@@ -666,7 +712,9 @@ fn apply(
                                 socket,
                             })
                         }
-                        Err(e) => eprintln!("aas: aes67: input: {group}:{port}: {e}"),
+                        Err(e) => {
+                            eprintln!("aas: aes67: warning: input: {group}:{port}: {e}")
+                        }
                     }
                 }
             }
@@ -782,7 +830,8 @@ mod tests {
     const T0: i128 = 1_700_000_000_000_000_000;
     /// PTP time at the start, ns: an arbitrary timescale, whole seconds.
     const P0: i128 = 123_456_789_000_000_000;
-    const OFFSET: u32 = 0x9abc_def0;
+    /// Puts the RTP timestamp 10 s before its wrap at the start.
+    const OFFSET: u32 = 0x4343_cb80;
     /// The simulation's step, ns.
     const TICK_NS: i128 = 250_000;
     /// The engine's delay after the ring, frames at 48 kHz.
@@ -871,8 +920,13 @@ mod tests {
         ptp_known: bool,
         gm: ClockId,
         generation: u64,
+        /// Frames the PTP time and the sender's media clock have jumped by,
+        /// as when a grandmaster comes back on another timescale.
+        shift: i128,
         seq: u16,
         noise: u64,
+        /// The longest `step`, wall time.
+        slowest: Duration,
     }
 
     fn m0() -> i128 {
@@ -914,8 +968,10 @@ mod tests {
                 ptp_known,
                 gm: MASTER,
                 generation: 1,
+                shift: 0,
                 seq: 0,
                 noise: 1,
+                slowest: Duration::ZERO,
             }
         }
 
@@ -927,6 +983,7 @@ mod tests {
         }
 
         fn datagram(&mut self, media: i128) -> Vec<u8> {
+            let media = media + self.shift;
             let ts = media.rem_euclid(1 << 32) as u32;
             let mut d = rtp::header(self.seq, ts, 0x1234_5678, 98).to_vec();
             self.seq = self.seq.wrapping_add(1);
@@ -953,7 +1010,7 @@ mod tests {
                 local_ns: self.now,
                 ptp: self.ptp_known.then(|| PtpNow {
                     local_ns: self.now,
-                    ptp_ns: ptp_at(self.now),
+                    ptp_ns: ptp_at(self.now) + self.shift * 1_000_000_000 / 48_000,
                     gm: self.gm,
                     domain: 0,
                     rate: rate(),
@@ -988,7 +1045,9 @@ mod tests {
                 self.ring.queue.reserve(self.ring.capacity);
                 self.ring.played.reserve(48_000);
                 let (rx, ring) = (&mut self.rx, &mut self.ring);
+                let started = std::time::Instant::now();
                 assert_no_alloc(|| rx.step(&now, &packets, ring));
+                self.slowest = self.slowest.max(started.elapsed());
             }
         }
 
@@ -1112,6 +1171,53 @@ mod tests {
     }
 
     #[test]
+    fn a_new_timescale_plays_at_the_target_delay_again() {
+        let mut sim = Sim::new(session(2, Some((MASTER, 0))), square, true);
+        sim.run(5.0);
+        // The grandmaster comes back 1234 s further on; the sender follows
+        // it, and its RTP timestamps jump with it.
+        sim.shift = 1234 * 48_000;
+        sim.generation += 1;
+        sim.run(4.0);
+        assert!(sim.rx.restarts >= 1);
+        assert_eq!(sim.status().mode, Some(Mode::Ptp));
+        let delays = edge_delays(&sim, Sim::index(sim.now - 1_000_000_000));
+        assert!(delays.len() >= 15, "{} edges", delays.len());
+        for d in &delays {
+            assert!((d - TARGET).abs() <= 12.0, "delay {:.2} ms", d / 48.0);
+        }
+    }
+
+    #[test]
+    fn a_stream_off_the_ptp_clock_plays_in_buffer_mode() {
+        for error in [
+            0x4000_0000u32,
+            0xc000_0000,
+            48_000,
+            48_000u32.wrapping_neg(),
+        ] {
+            let mut s = session(2, Some((MASTER, 0)));
+            s.mediaclk_offset = OFFSET.wrapping_add(error);
+            let mut sim = Sim::new(s, square, true);
+            sim.run(1.0);
+            assert_eq!(sim.status().mode, Some(Mode::Buffer), "{error:#x}");
+            let audible = sim.ring.played.iter().position(|f| f[0] != 0);
+            assert!(
+                audible.is_some_and(|n| n <= ((LATENCY_MS + 100) * 48) as usize),
+                "{error:#x}: audible at {audible:?}"
+            );
+            assert!(
+                sim.slowest < Duration::from_millis(50),
+                "{error:#x}: a step took {:?}",
+                sim.slowest
+            );
+            assert_eq!(sim.rx.restarts, 0, "{error:#x}");
+            assert_eq!(sim.rx.take_warning(), Some(OFF_PTP));
+            assert_eq!(sim.rx.take_warning(), None);
+        }
+    }
+
+    #[test]
     fn a_stream_that_stops_plays_silence_and_resumes() {
         let mut sim = Sim::new(session(2, Some((MASTER, 0))), square, true);
         sim.run(3.0);
@@ -1151,7 +1257,9 @@ mod tests {
         sim.run(0.03);
         sim.sending = true;
         sim.run(0.5);
-        assert!(sim.status().lost >= 30 * 48, "{:?}", sim.rx.jitter.counts());
+        // Only the part of the gap still ahead of the read position when the
+        // stream came back is a hole in it; what was played before is not.
+        assert!(sim.status().lost > 0, "{:?}", sim.rx.jitter.counts());
         assert_eq!(sim.rx.restarts, 0);
         let delays = edge_delays(&sim, Sim::index(sim.now - 400_000_000));
         assert!(!delays.is_empty());

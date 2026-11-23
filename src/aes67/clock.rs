@@ -419,6 +419,15 @@ impl PtpClock {
     pub fn generation(&self) -> u64 {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).generation
     }
+
+    /// `now` and `generation` together, under one lock, so the two agree.
+    pub fn snapshot(&self) -> (Option<PtpNow>, u64) {
+        let s = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        (
+            s.snapshot.and_then(|snap| snap.at(realtime_ns())),
+            s.generation,
+        )
+    }
 }
 
 pub(crate) fn realtime_ns() -> i128 {

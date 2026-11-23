@@ -85,7 +85,9 @@ impl Jitter {
     }
 
     /// Fills `out` from `read_ts` on. A frame that never arrived reads as
-    /// zeros and counts once in `lost` (the unit is frames).
+    /// zeros; it counts once in `lost` (the unit is frames) when it lies
+    /// before the end of the newest stored frame, a hole in the stream. A
+    /// frame beyond it, taken before the stream got there, is not lost.
     pub fn take(&mut self, out: &mut [[i32; 2]]) {
         for o in out.iter_mut() {
             let t = self.read_ts;
@@ -94,7 +96,9 @@ impl Jitter {
                 *o = self.frames[slot];
             } else {
                 *o = [0; 2];
-                self.lost += 1;
+                if ts_diff(t, self.end_ts) < 0 {
+                    self.lost += 1;
+                }
             }
             self.present[slot] = false;
             self.read_ts = t.wrapping_add(1);
@@ -173,6 +177,20 @@ mod tests {
     }
 
     #[test]
+    fn taking_beyond_the_newest_packet_is_not_lost() {
+        let mut j = Jitter::new();
+        j.put(1000, &pkt(1, 48));
+        let out = take(&mut j, 96);
+        assert_eq!(&out[..48], &pkt(1, 48)[..]);
+        assert!(out[48..].iter().all(|f| *f == [0; 2]));
+        assert_eq!(j.counts(), (0, 0));
+        // A packet after a gap makes the gap a hole.
+        j.put(1144, &pkt(145, 48));
+        take(&mut j, 96);
+        assert_eq!(j.counts(), (48, 0));
+    }
+
+    #[test]
     fn a_packet_older_than_read_ts_is_late() {
         let mut j = Jitter::new();
         j.put(1000, &pkt(1, 48));
@@ -228,7 +246,8 @@ mod tests {
         j.anchor(1000 - 48);
         let out = take(&mut j, 96);
         assert!(out.iter().all(|f| *f == [0; 2]));
-        assert_eq!(j.counts(), (96, 0));
+        // Nothing is stored any more, so nothing taken is a hole.
+        assert_eq!(j.counts(), (0, 0));
     }
 
     #[test]
@@ -244,7 +263,7 @@ mod tests {
         assert!(out[..9599].iter().all(|f| *f == [0; 2]));
         assert_eq!(out[9599], [1, -1]);
         assert!(out[9600..].iter().all(|f| *f == [0; 2]));
-        assert_eq!(j.counts(), (9599 + 7000, 0));
+        assert_eq!(j.counts(), (9599, 0));
     }
 
     #[test]
@@ -256,7 +275,7 @@ mod tests {
         assert_eq!(j.depth(), 9600);
         assert_eq!(take(&mut j, 9600), pkt(101, 9600));
         assert!(take(&mut j, 7000).iter().all(|f| *f == [0; 2]));
-        assert_eq!(j.counts(), (7000, 0));
+        assert_eq!(j.counts(), (0, 0));
     }
 
     #[test]
