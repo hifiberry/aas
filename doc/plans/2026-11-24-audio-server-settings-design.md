@@ -81,7 +81,8 @@ look like a bug, so the page says so before the user finds out by ear.
    a new latency keeps the stream and the switch for the same reason.
 3. **`"auto"` never sits below the floor.** The input holds at least its
    floor already (`latency_floor_ms`). With `latency_ms = "auto"` it does so
-   without the log warning, and `GET /aes67` gives the latency held: on a CM5
+   without the log warning, and the page shows the higher of `latency_ms` and
+   `latency_floor_ms` as the automatic value: on a CM5
    the automatic 5 ms is held at the 6 ms floor without a complaint, since the
    user chose nothing. A number the user set below the floor still warns.
 
