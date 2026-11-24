@@ -178,9 +178,10 @@ pub fn run_outputs(
         ));
     }
     raise_file_limit();
+    let board = board::detect();
     let latency_ms = config
         .latency_ms
-        .unwrap_or_else(|| board::detect().default_latency_ms());
+        .unwrap_or_else(|| board.default_latency_ms());
     // Before the socket, so that a failure here leaves no socket file.
     let supported = sink.supported_rates();
     let others = if supported.is_empty() {
@@ -324,6 +325,7 @@ pub fn run_outputs(
         events,
         audio.thread().clone(),
     );
+    control.set_board(board);
     control.set_plugins(libraries, chains);
     for setup in setups {
         control.add_output(setup);

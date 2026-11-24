@@ -122,7 +122,7 @@ is kept in `/var/lib/aas/state.toml`.
 
 | Key | Values | Default | Meaning |
 |---|---|---|---|
-| `latency_ms` | a number above 0 | 4 on a Pi 5 or CM5, 12 elsewhere | Target for the latency of the card's buffer. The period is the largest power of two that keeps two periods within it. |
+| `latency_ms` | a number above 0 | 5 on a Pi 5 or CM5, 12 elsewhere | Target for the latency of the card's buffer. The period is the largest power of two that keeps two periods within it. |
 | `card` | an ALSA card id or index | the first card that is not `Loopback`, `Headphones` or HDMI | The card to play to. |
 | `channels` | 1 to 8 | 2 | The number of channels the card is opened with. A card that does not take the count is not opened: the output plays to nothing and the reason is logged once. |
 | `clock` | `"auto"`, `"playback"`, `"capture"` | `"auto"` | What clocks the output. `capture` runs it on the card's capture, which then also feeds the analog input, and plays nowhere: the mix reaches only the monitor and the further outputs. `auto` does that for a card that captures and does not play, such as the HiFiBerry ADC, and plays to any other. See [A card that only captures](#a-card-that-only-captures). |
@@ -711,7 +711,11 @@ disabled, nor can a plugin whose channel counts differ: both are 422.
 `GET /settings` gives `bit_perfect`, `latency_ms` and `default_rate`, which
 `PATCH` changes with the values and messages of the config keys, and `format`
 and `resampling`, which change only in the config: naming either in a `PATCH`
-is 422. A change lasts until the next restart; it is not kept in the state file.
+is 422. It also gives `latency_recommended_ms` and `latency_min_ms`, read-only: the
+board's default latency (5 on a Pi 5 or CM5, 12 elsewhere) and the lowest it holds
+safely (3 and 6). A Pi 4 counts as "other" until it has been measured. Naming
+either in a `PATCH` is 422 unless it is the value it has. A change lasts until
+the next restart; it is not kept in the state file.
 A new `bit_perfect` applies at once, with no reopen: while something plays, the
 output fades out over a period and in again over 10 ms. `forced` is 422 while a
 chain changes the channel count, as in the config. A new `latency_ms` reopens

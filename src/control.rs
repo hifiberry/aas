@@ -836,6 +836,8 @@ struct AnalogInput {
 }
 
 pub struct Control {
+    /// The board the daemon runs on, for the latency figures it reports.
+    board: crate::board::Board,
     latency_ms: f32,
     /// The latency the daemon started with, which the rings, the feeds and
     /// the delay line were sized for: the API may not go above it.
@@ -1005,6 +1007,7 @@ impl Control {
         // The source runs until the daemon ends; its thread is not joined.
         drop(crate::metadata::start(&config.metadata, now_playing.clone()));
         Control {
+            board: crate::board::Board::Other,
             latency_ms,
             startup_latency_ms: latency_ms,
             latency_due: false,
@@ -1138,6 +1141,12 @@ impl Control {
         } else {
             self.volume.further_gain(output.volume_db)
         }
+    }
+
+    /// Sets the board whose latency figures `GET /settings` reports. Without
+    /// it they are those of `Other`.
+    pub fn set_board(&mut self, board: crate::board::Board) {
+        self.board = board;
     }
 
     /// Takes over the libraries loaded at startup, and the chains built

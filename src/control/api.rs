@@ -1293,6 +1293,8 @@ impl Control {
             default_rate: self.default_rate,
             format: format_name(self.format).to_string(),
             resampling: quality_name(self.quality).to_string(),
+            latency_recommended_ms: self.board.default_latency_ms(),
+            latency_min_ms: self.board.min_latency_ms(),
         }
     }
 
@@ -1307,6 +1309,22 @@ impl Control {
             if given.as_deref().is_some_and(|g| g != now) {
                 let message = format!("{key} changes only in the config");
                 return Err(ApiError::unprocessable(message));
+            }
+        }
+        for (key, given, now) in [
+            (
+                "latency_recommended_ms",
+                patch.latency_recommended_ms,
+                self.board.default_latency_ms(),
+            ),
+            (
+                "latency_min_ms",
+                patch.latency_min_ms,
+                self.board.min_latency_ms(),
+            ),
+        ] {
+            if given.is_some_and(|g| g != now) {
+                return Err(ApiError::unprocessable(format!("{key} is read-only")));
             }
         }
         let mode = match patch.bit_perfect.as_deref() {
@@ -3372,7 +3390,8 @@ mod tests {
         assert_eq!(
             view,
             json!({"bit_perfect": "auto", "latency_ms": 10.0, "default_rate": 44100,
-                   "format": "f64", "resampling": "high"})
+                   "format": "f64", "resampling": "high",
+                   "latency_recommended_ms": 12.0, "latency_min_ms": 6.0})
         );
     }
 
@@ -3393,6 +3412,17 @@ mod tests {
             let e = settings(&mut control, patch, now).unwrap_err();
             assert_eq!(e.status, 422, "{key}");
             assert_eq!(e.message, format!("{key} changes only in the config"));
+        }
+        // GET /settings has the board's figures; a PATCH naming either is 422.
+        let view = control.call(Call::Settings, now).unwrap();
+        // The test control's board is Other.
+        assert_eq!(view["latency_recommended_ms"], json!(12.0));
+        assert_eq!(view["latency_min_ms"], json!(6.0));
+        for key in ["latency_recommended_ms", "latency_min_ms"] {
+            let patch: SettingsPatch = serde_json::from_value(json!({ key: 1 })).unwrap();
+            let e = settings(&mut control, patch, now).unwrap_err();
+            assert_eq!(e.status, 422, "{key}");
+            assert_eq!(e.message, format!("{key} is read-only"));
         }
         // The refused patches changed nothing.
         let view = control.call(Call::Settings, now).unwrap();

@@ -35,8 +35,17 @@ impl Board {
     /// The latency target in milliseconds when the config sets none.
     pub fn default_latency_ms(self) -> f32 {
         match self {
-            Board::Pi5Class => 4.0,
+            Board::Pi5Class => 5.0,
             Board::Other => 12.0,
+        }
+    }
+
+    /// The lowest latency in milliseconds the board holds safely. A Pi 4 is
+    /// `Other` until it has been measured.
+    pub fn min_latency_ms(self) -> f32 {
+        match self {
+            Board::Pi5Class => 3.0,
+            Board::Other => 6.0,
         }
     }
 }
@@ -84,7 +93,15 @@ mod tests {
 
     #[test]
     fn defaults_follow_the_board() {
-        assert_eq!(Board::Pi5Class.default_latency_ms(), 4.0);
+        assert_eq!(Board::Pi5Class.default_latency_ms(), 5.0);
         assert_eq!(Board::Other.default_latency_ms(), 12.0);
+    }
+
+    #[test]
+    fn the_latency_figures_by_board() {
+        assert_eq!(Board::Pi5Class.default_latency_ms(), 5.0);
+        assert_eq!(Board::Pi5Class.min_latency_ms(), 3.0);
+        assert_eq!(Board::Other.default_latency_ms(), 12.0);
+        assert_eq!(Board::Other.min_latency_ms(), 6.0);
     }
 }

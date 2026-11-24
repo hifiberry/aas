@@ -74,6 +74,10 @@ pub struct SettingsPatch {
     /// another.
     pub format: Option<String>,
     pub resampling: Option<String>,
+    /// The board's figures, read-only like the two above: accepted when
+    /// they are what they are, 422 when they are not.
+    pub latency_recommended_ms: Option<f32>,
+    pub latency_min_ms: Option<f32>,
 }
 
 /// `GET /settings`.
@@ -85,6 +89,9 @@ pub struct SettingsView {
     /// The processing format, which is the engine's type.
     pub format: String,
     pub resampling: String,
+    /// The board's default latency, and the lowest it holds safely.
+    pub latency_recommended_ms: f32,
+    pub latency_min_ms: f32,
 }
 
 impl SettingsView {
