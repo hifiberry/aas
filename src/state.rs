@@ -15,6 +15,9 @@ pub const DEFAULT_PATH: &str = "/var/lib/aas/state.toml";
 /// The most clients whose volume is kept.
 pub const MAX_CLIENTS: usize = 64;
 
+/// The client name the AES67 input's volume is kept under.
+pub const AES67_CLIENT: &str = "aes67";
+
 /// A value set at run time, with what the config said when it was set. The
 /// value applies only while the config still says the same.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -122,6 +125,26 @@ pub struct State {
     /// AirPlay receivers, keyed by name.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub airplay: BTreeMap<String, StoredReceiver>,
+    /// The `[aes67]` settings the API changed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aes67: Option<StoredAes67>,
+}
+
+/// The AES67 input's and output's settings as the API set them. The
+/// client volume of the input is kept with the clients', under the name
+/// `aes67`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct StoredAes67 {
+    /// The selected stream's name; empty selects none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<Stored<String>>,
+    /// In ms, 1 to 100, or 0 for `"auto"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency: Option<Stored<u32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_enabled: Option<Stored<bool>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_enabled: Option<Stored<bool>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -141,6 +164,7 @@ impl Default for State {
             clients: BTreeMap::new(),
             outputs: BTreeMap::new(),
             airplay: BTreeMap::new(),
+            aes67: None,
         }
     }
 }
@@ -185,8 +209,10 @@ impl State {
             ok
         });
         // 0 dB unmuted is what a name without a volume plays at: it needs
-        // no place among the 64.
-        self.clients.retain(|_, i| i.volume_db != 0.0 || i.muted);
+        // no place among the 64. Not for the AES67 input, which without
+        // one plays at its config's `volume_db`.
+        self.clients
+            .retain(|name, i| i.volume_db != 0.0 || i.muted || name == AES67_CLIENT);
         while self.clients.len() > MAX_CLIENTS {
             if let Some(name) = self.clients.keys().next_back().cloned() {
                 eprintln!(
@@ -195,6 +221,13 @@ impl State {
                 );
                 self.clients.remove(&name);
             }
+        }
+        if let Some(a) = &mut self.aes67
+            && let Some(l) = &a.latency
+            && (l.value > 100 || l.config > 100)
+        {
+            say("the AES67 input's latency");
+            a.latency = None;
         }
         for (card, o) in &mut self.outputs {
             if let Some(v) = &o.volume_db {
@@ -696,6 +729,49 @@ mod tests {
              [clients.quiet]\nvolume_db = 0.0\nmuted = true\n"
         ));
         assert_eq!(s.clients.keys().collect::<Vec<_>>(), ["keep", "quiet"]);
+    }
+
+    #[test]
+    fn the_aes67_client_at_0_db_is_kept() {
+        let s = load_text("[clients.aes67]\nvolume_db = 0.0\nmuted = false\n");
+        assert!(s.clients.contains_key(AES67_CLIENT));
+    }
+
+    #[test]
+    fn aes67_settings_round_trip_and_a_bad_latency_is_dropped_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.toml");
+        let mut state = State::default();
+        let stored = |value: &str, config: &str| Stored {
+            value: value.to_string(),
+            config: config.to_string(),
+        };
+        state.aes67 = Some(StoredAes67 {
+            stream: Some(stored("one", "")),
+            latency: Some(Stored {
+                value: 5,
+                config: 0,
+            }),
+            input_enabled: Some(Stored {
+                value: false,
+                config: true,
+            }),
+            output_enabled: Some(Stored {
+                value: true,
+                config: false,
+            }),
+        });
+        state.save(&path).unwrap();
+        assert_eq!(State::load(&path), state);
+        let s = load_text(
+            "[aes67.latency]\nvalue = 101\nconfig = 0\n\
+             [aes67.stream]\nvalue = \"one\"\nconfig = \"\"\n",
+        );
+        let a = s.aes67.unwrap();
+        assert!(a.latency.is_none());
+        assert_eq!(a.stream, Some(stored("one", "")));
+        // A file from before AES67 loads.
+        assert_eq!(load_text(KEEP).aes67, None);
     }
 
     fn load_text(text: &str) -> State {

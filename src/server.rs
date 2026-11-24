@@ -178,9 +178,10 @@ pub fn run_outputs(
         ));
     }
     raise_file_limit();
+    let board = board::detect();
     let latency_ms = config
         .latency_ms
-        .unwrap_or_else(|| board::detect().default_latency_ms());
+        .unwrap_or_else(|| board.default_latency_ms());
     // Before the socket, so that a failure here leaves no socket file.
     let supported = sink.supported_rates();
     let others = if supported.is_empty() {
@@ -324,6 +325,7 @@ pub fn run_outputs(
         events,
         audio.thread().clone(),
     );
+    control.set_board(board);
     control.set_plugins(libraries, chains);
     for setup in setups {
         control.add_output(setup);
@@ -1112,15 +1114,18 @@ mod tests {
     fn the_matrix_is_logged_route_by_route_with_gains_off_0_db() {
         assert_eq!(
             describe(&Matrix::default_for(2)),
-            "players.left to 1, players.right to 2, analog.left to 1, analog.right to 2"
+            "players.left to 1, players.right to 2, analog.left to 1, analog.right to 2, \
+             aes67.left to 1, aes67.right to 2"
         );
         let route = |from, to, gain_db| crate::config::Route { from, to, gain_db };
         let m = Matrix::from_routes(&[route(1, 1, 0.0), route(0, 2, -6.0)], 2).unwrap();
         assert_eq!(
             describe(&m),
-            "players.left to 2 at -6.00 dB, players.right to 1"
+            "players.left to 2 at -6.00 dB, players.right to 1, aes67.left to 1, aes67.right to 2"
         );
-        let m = Matrix::from_routes(&[], 2).unwrap();
+        let m = Matrix::from_routes(&[route(4, 2, -100.0)], 2).unwrap();
+        assert_eq!(describe(&m), "aes67.left to 2 at -100.00 dB");
+        let m = Matrix::from_routes(&[], 0).unwrap();
         assert_eq!(describe(&m), "no routes, every channel is silent");
     }
 

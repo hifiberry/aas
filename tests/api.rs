@@ -371,8 +371,13 @@ fn lowering_the_latency_while_playing() {
     running_client(&daemon);
     let period = |daemon: &Daemon| daemon.get("/metrics").1["master"]["period_frames"].clone();
     assert_eq!(period(&daemon), json!(64));
-    let (status, settings) = daemon.get("/settings");
+    let (status, mut settings) = daemon.get("/settings");
     assert_eq!(status, 200);
+    // The board's figures depend on the machine the test runs on.
+    for key in ["latency_recommended_ms", "latency_min_ms"] {
+        assert!(settings[key].is_number(), "{key}");
+        settings.as_object_mut().unwrap().remove(key);
+    }
     assert_eq!(
         settings,
         json!({"bit_perfect": "auto", "latency_ms": LATENCY_MS, "default_rate": 48000,

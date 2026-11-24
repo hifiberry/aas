@@ -5,6 +5,7 @@
 //! back is freed here. Commands that belong together go into the queue in
 //! one commit, so the audio thread never sees half a decision.
 
+mod aes67;
 mod api;
 mod graph;
 pub use graph::to_dot;
@@ -835,6 +836,8 @@ struct AnalogInput {
 }
 
 pub struct Control {
+    /// The board the daemon runs on, for the latency figures it reports.
+    board: crate::board::Board,
     latency_ms: f32,
     /// The latency the daemon started with, which the rings, the feeds and
     /// the delay line were sized for: the API may not go above it.
@@ -951,6 +954,14 @@ pub struct Control {
     analog_config: StoredInput,
     /// None unless the config enables the input and the card has an ADC.
     analog: Option<AnalogInput>,
+    /// The AES67 input's source is in the engine, on the `aes67` bus.
+    aes67_input: bool,
+    /// The `[aes67]` table; None without one.
+    aes67_config: Option<crate::aes67::config::Aes67Config>,
+    /// AES67's threads, once started.
+    aes67: Option<crate::aes67::Aes67>,
+    /// The `aes67` source in the engine.
+    aes67_source: Option<aes67::Aes67Source>,
     /// The further outputs, in the order of the config.
     further: Vec<FurtherOutput>,
     /// Since when no player runs and the analog input has no signal.
@@ -996,6 +1007,7 @@ impl Control {
         // The source runs until the daemon ends; its thread is not joined.
         drop(crate::metadata::start(&config.metadata, now_playing.clone()));
         Control {
+            board: crate::board::Board::Other,
             latency_ms,
             startup_latency_ms: latency_ms,
             latency_due: false,
@@ -1062,6 +1074,10 @@ impl Control {
             analog_input: api::config_input(config),
             analog_config: api::config_input(config),
             analog: None,
+            aes67_input: false,
+            aes67_config: config.aes67.clone(),
+            aes67: None,
+            aes67_source: None,
             further: Vec::new(),
             quiet_since: None,
             delay: None,
@@ -1125,6 +1141,12 @@ impl Control {
         } else {
             self.volume.further_gain(output.volume_db)
         }
+    }
+
+    /// Sets the board whose latency figures `GET /settings` reports. Without
+    /// it they are those of `Other`.
+    pub fn set_board(&mut self, board: crate::board::Board) {
+        self.board = board;
     }
 
     /// Takes over the libraries loaded at startup, and the chains built
@@ -1269,6 +1291,9 @@ impl Control {
         if self.analog.is_some() {
             batch.push(Command::SetAnalogGain(api::input_gain(&self.analog_input)));
         }
+        self.start_aes67(&mut batch, |config, stored, link| {
+            crate::aes67::Aes67::start(config, stored, link, now)
+        });
         self.open_output(now, &mut batch);
         self.idle_since = Some(now);
         self.send(batch);
@@ -1286,6 +1311,9 @@ impl Control {
         for receiver in &self.airplay {
             receiver.ask_stop();
         }
+        if let Some(aes67) = &self.aes67 {
+            aes67.ask_stop();
+        }
         self.send(vec![Command::Shutdown]);
         if self.save_at.is_some() {
             self.save();
@@ -1295,6 +1323,9 @@ impl Control {
         }
         for receiver in &mut self.airplay {
             receiver.stop();
+        }
+        if let Some(aes67) = &mut self.aes67 {
+            aes67.stop();
         }
     }
 
@@ -2052,31 +2083,47 @@ impl Control {
                 batch.push(Command::RemoveTap(old));
                 self.taps_len -= 1;
             }
-            // Half a second: the thread reads every 20 ms at the least.
-            let made = Ring::create((rate / 2).max(4096)).and_then(|(ring, memfd)| {
-                let reader = Ring::map(memfd.as_fd())?;
-                Ok((ring, reader, eventfd()?))
-            });
-            let (ring, reader, wake) = match made {
-                Ok(made) => made,
-                Err(e) => {
-                    eprintln!("aas: no ring for an AirPlay receiver: {e}");
-                    continue;
-                }
+            let Some((id, reader, _)) = self.monitor_tap(rate, "an AirPlay receiver", batch) else {
+                continue;
             };
-            let id = self.next_id;
-            self.next_id += 1;
-            if self.taps_len == self.taps_capacity {
-                self.taps_capacity *= 2;
-                batch.push(Command::GrowTaps(Vec::with_capacity(self.taps_capacity)));
-            }
-            let mut tap = Tap::new(id, ring, wake);
-            tap.monitor = true;
-            tap.running = true;
-            batch.push(Command::AddTap(Box::new(tap)));
-            self.taps_len += 1;
             self.airplay[i].give_tap(id, rate, reader);
         }
+    }
+
+    /// A monitor tap of the master at `rate` for a thread that reads it on
+    /// its own timer: added to the engine, and its reading end. Half a
+    /// second: such a thread reads every 20 ms at the least.
+    fn monitor_tap(
+        &mut self,
+        rate: u32,
+        what: &str,
+        batch: &mut Vec<Command>,
+    ) -> Option<(ClientId, Ring, Option<OwnedFd>)> {
+        let made = Ring::create((rate / 2).max(4096)).and_then(|(ring, memfd)| {
+            let reader = Ring::map(memfd.as_fd())?;
+            Ok((ring, reader, eventfd()?))
+        });
+        let (ring, reader, wake) = match made {
+            Ok(made) => made,
+            Err(e) => {
+                eprintln!("aas: no ring for {what}: {e}");
+                return None;
+            }
+        };
+        let id = self.next_id;
+        self.next_id += 1;
+        if self.taps_len == self.taps_capacity {
+            self.taps_capacity *= 2;
+            batch.push(Command::GrowTaps(Vec::with_capacity(self.taps_capacity)));
+        }
+        // The reader's copy of the eventfd, for one that waits for frames.
+        let theirs = wake.try_clone().ok();
+        let mut tap = Tap::new(id, ring, wake);
+        tap.monitor = true;
+        tap.running = true;
+        batch.push(Command::AddTap(Box::new(tap)));
+        self.taps_len += 1;
+        Some((id, reader, theirs))
     }
 
     /// Publishes each AirPlay receiver whose state changed.
@@ -2153,8 +2200,10 @@ impl Control {
         self.conns.values_mut().filter_map(|c| c.stream.as_mut())
     }
 
+    /// The clients' running streams, and the AES67 input while it
+    /// receives.
     fn running_count(&self) -> usize {
-        self.streams().filter(|s| s.running).count()
+        self.streams().filter(|s| s.running).count() + usize::from(self.aes67_running())
     }
 
     /// Whether a DoP stream at `rate` can have the output: the card takes
@@ -2538,6 +2587,7 @@ impl Control {
         }
         self.end_recorders(rate, batch);
         self.airplay_taps(rate, batch);
+        self.aes67_tap(batch);
         if resumed {
             for output in self.further.iter_mut().filter(|o| o.open) {
                 output.resumed_until = Some(now + RESUME_STARVE);
@@ -2880,6 +2930,7 @@ impl Control {
             });
             batch.push(Command::SetResampler(stream.id, resampler));
         }
+        self.sync_aes67_resampler(batch);
     }
 
     /// The card's rates have changed, such as when a card that was missing
@@ -2988,6 +3039,7 @@ impl Control {
     /// output is being opened.
     pub fn tick(&mut self, now: Instant) {
         self.publish_airplay();
+        self.sync_aes67(now);
         self.follow_card(now);
         let mut batch = Vec::new();
         let before = self.policy.current();
@@ -3074,6 +3126,9 @@ impl Control {
     /// commands every cycle, so room comes within a period. A wait of a
     /// second means it is stuck, and is logged once.
     fn send(&mut self, batch: Vec<Command>) {
+        // Every open, reopen and close of the master goes out through here,
+        // and every answer to one is taken before it.
+        self.aes67_draining();
         let capacity = self.commands.buffer().capacity();
         let mut waiting_since: Option<Instant> = None;
         let mut warned = false;
@@ -3823,6 +3878,8 @@ mod tests {
         pub(super) outputs: Vec<(usize, f32)>,
         /// Every source added, with the gain it comes with.
         pub(super) added: Vec<(ClientId, f32)>,
+        /// The bus of every source added.
+        pub(super) buses: Vec<(ClientId, crate::matrix::Bus)>,
         /// Every matrix a `SetMatrix` brought, by output.
         pub(super) matrices: Vec<(usize, Matrix)>,
         /// The matrix of each further output's mix put in place, by index.
@@ -3851,6 +3908,7 @@ mod tests {
                 gains: Vec::new(),
                 outputs: Vec::new(),
                 added: Vec::new(),
+                buses: Vec::new(),
                 matrices: Vec::new(),
                 mixes: Vec::new(),
                 in_place: BTreeMap::new(),
@@ -3869,6 +3927,7 @@ mod tests {
                 let (name, answer) = match command {
                     Command::Add(source) => {
                         self.added.push((source.id, source.gain));
+                        self.buses.push((source.id, source.bus));
                         ("Add".into(), None)
                     }
                     Command::Remove(_) => ("Remove".into(), None),

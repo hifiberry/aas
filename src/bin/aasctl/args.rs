@@ -6,7 +6,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 pub const USAGE: &str = "usage: aasctl [--port N | --config PATH] COMMAND
-  state | metrics | outputs | inputs | matrix | plugins | settings
+  state | metrics | outputs | inputs | matrix | plugins | settings | aes67
   graph [--dot]
   output N volume V | volume-db X | idle off|zeros [DELAY]
   analog volume-db X | mute | unmute
@@ -15,6 +15,7 @@ pub const USAGE: &str = "usage: aasctl [--port N | --config PATH] COMMAND
   settings KEY=VALUE...
   matrix put FILE
   airplay pair NAME [PIN] | airplay NAME enable|disable
+  aes67 select NAME|none
   events | levels";
 
 #[derive(Debug, PartialEq)]
@@ -58,8 +59,8 @@ pub struct Args {
     pub command: Command,
 }
 
-const GETS: [&str; 7] = [
-    "state", "metrics", "outputs", "inputs", "matrix", "plugins", "settings",
+const GETS: [&str; 8] = [
+    "state", "metrics", "outputs", "inputs", "matrix", "plugins", "settings", "aes67",
 ];
 
 /// Reads the command line, without the program's name. `config_port` gives
@@ -142,6 +143,10 @@ fn command(words: &[&str]) -> Result<Command, String> {
         ["airplay", name, on @ ("enable" | "disable")] => Ok(Command::Patch {
             path: format!("/airplay/{}", encode(name)),
             body: json!({"enabled": *on == "enable"}),
+        }),
+        ["aes67", "select", name] => Ok(Command::Patch {
+            path: "/aes67/input".into(),
+            body: json!({"stream": if *name == "none" { Value::Null } else { json!(name) }}),
         }),
         ["matrix", "put", file] => Ok(Command::Put {
             path: "/matrix".into(),
@@ -279,6 +284,19 @@ mod tests {
             words(&["airplay", "Apple TV", "enable"]),
             patch("/airplay/Apple%20TV", json!({"enabled": true}))
         );
+    }
+
+    #[test]
+    fn aes67_select_and_none() {
+        assert_eq!(
+            words(&["aes67", "select", "studio"]),
+            patch("/aes67/input", json!({"stream": "studio"}))
+        );
+        assert_eq!(
+            words(&["aes67", "select", "none"]),
+            patch("/aes67/input", json!({"stream": null}))
+        );
+        assert_eq!(words(&["aes67"]), Command::Get("aes67"));
     }
 
     #[test]

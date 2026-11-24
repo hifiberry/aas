@@ -164,7 +164,12 @@ impl Receiver {
     /// Hands the thread the reading end of its new tap.
     pub fn give_tap(&mut self, id: ClientId, rate: u32, reader: Ring) {
         if let Some(handle) = &self.handle {
-            handle.tap(TapReader { ring: reader, rate });
+            handle.tap(TapReader {
+                ring: reader,
+                rate,
+                period: 0,
+                wake: None,
+            });
             self.tap = Some((id, rate));
         }
     }

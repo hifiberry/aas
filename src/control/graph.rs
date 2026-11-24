@@ -13,9 +13,11 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::sync::atomic::Ordering::Relaxed;
 
-/// The width of the players bus and of the analog input and bus.
+/// The width of the players bus, of the analog input and bus, and of the
+/// AES67 input and bus.
 const PLAYER_CHANNELS: usize = 2;
 const ANALOG_CHANNELS: usize = 2;
+const AES67_CHANNELS: usize = 2;
 
 /// Nodes and edges, in the order they are made.
 #[derive(Default)]
@@ -110,6 +112,21 @@ impl Control {
             g.path(&path);
         }
 
+        // The AES67 input and its bus.
+        if self.aes67_input {
+            // It reaches the engine at the rate of the wire, as a client
+            // at its own rate.
+            let extra = json!({"rate": 48000, "channels": AES67_CHANNELS});
+            g.node("aes67", "aes67", "AES67 input", extra);
+            g.node(
+                "bus/aes67",
+                "bus",
+                "aes67",
+                with_rate(json!({"format": format, "channels": AES67_CHANNELS})),
+            );
+            g.edge("aes67", "bus/aes67");
+        }
+
         for index in 0..=self.further.len() {
             self.output_nodes(&mut g, index);
         }
@@ -163,9 +180,14 @@ impl Control {
         g.node(&matrix, "matrix", "matrix", extra(node));
         // A bus feeds the matrix when a route starts from it.
         let routes = self.route_views(index);
-        for (bus, prefix) in [("bus/players", "players"), ("bus/analog", "analog")] {
+        let buses = [
+            ("bus/players", "players.", true),
+            ("bus/analog", "analog.", self.analog.is_some()),
+            ("bus/aes67", "aes67.", self.aes67_input),
+        ];
+        for (bus, prefix, present) in buses {
             let used = routes.iter().any(|r| r.from.starts_with(prefix));
-            if used && (prefix == "players" || self.analog.is_some()) {
+            if used && present {
                 g.edge(bus, &matrix);
             }
         }
@@ -422,6 +444,39 @@ mod tests {
         let bus = at(("out/1/analog/0", "bus/analog")).unwrap();
         assert_eq!(chain + 1, bus);
         assert!(at(("bus/analog", "out/1/matrix")).is_some());
+    }
+
+    #[test]
+    fn the_aes67_input_has_its_own_bus() {
+        let (mut control, _engine, now) = started(&Config::default(), None);
+        assert!(!ids(&graph(&mut control, now)).contains(&"bus/aes67".to_string()));
+        control.aes67_input = true;
+        let g = graph(&mut control, now);
+        for edge in [("aes67", "bus/aes67"), ("bus/aes67", "out/1/matrix")] {
+            assert!(
+                edges(&g).contains(&(edge.0.into(), edge.1.into())),
+                "{edge:?}"
+            );
+        }
+        assert_eq!(node(&g, "aes67")["rate"], 48000);
+        let bus = node(&g, "bus/aes67");
+        assert_eq!(bus["kind"], "bus");
+        assert_eq!(bus["channels"], 2);
+        // A matrix that names no `aes67` route still plays it.
+        let players = vec![crate::api::RouteJson {
+            from: "players.left".into(),
+            to: 1,
+            gain_db: None,
+        }];
+        let put = crate::api::MatrixPut {
+            outputs: vec![crate::api::OutputRoutes {
+                output: 1,
+                routes: players,
+            }],
+        };
+        control.call(Call::PutMatrix(put), now).unwrap();
+        let g = graph(&mut control, now);
+        assert!(edges(&g).contains(&("bus/aes67".into(), "out/1/matrix".into())));
     }
 
     #[test]

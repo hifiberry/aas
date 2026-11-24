@@ -21,6 +21,7 @@ use crate::airplay::ap2::keys::Pairings;
 use crate::metadata::NowPlaying;
 use aas_client::ring::Ring;
 use std::net::UdpSocket;
+use std::os::fd::OwnedFd;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
@@ -47,6 +48,11 @@ const FEEDBACK: Duration = Duration::from_secs(2);
 pub struct TapReader {
     pub ring: Ring,
     pub rate: u32,
+    /// The master's period in frames; 0 where the reader does not use it.
+    pub period: u32,
+    /// The eventfd the engine writes after a period, for a reader that
+    /// waits for the frames rather than reading on its own timer.
+    pub wake: Option<OwnedFd>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -792,6 +798,8 @@ mod tests {
             TapReader {
                 ring: reader,
                 rate: RATE,
+                period: 0,
+                wake: None,
             },
         )
     }

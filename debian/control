@@ -9,6 +9,12 @@ Homepage: https://github.com/hifiberry/aas
 Package: aas
 Architecture: any
 Depends: ${shlibs:Depends}, ${misc:Depends}, libasound2-plugin-aas (= ${binary:Version}), python3 (>= 3.11)
+# aas's AES67 input replaces the PipeWire-based hifiberry-aes67 extension, on
+# PipeWire devices too: the web UI lists aas's AES67 as a player that needs
+# aas, and the old one is removed so the two never show side by side. Both
+# register the AudioControl player "aes67".
+Conflicts: hifiberry-aes67
+Replaces: hifiberry-aes67
 Description: Alternative audio server
  A small audio server that owns the sound card and mixes the streams of
  its clients. It is an alternative to PipeWire on HiFiBerry OS.

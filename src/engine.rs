@@ -6,9 +6,9 @@
 //!
 //! The engine plays to the master card, whose wait is the only one, and
 //! feeds the further outputs. Each cycle reads the sources once into the
-//! `players` and `analog` buses, and every output mixes them through its
-//! own [`OutputMix`]. A further output's period goes into its [`Feed`]; the
-//! master's goes through its delay line to the card.
+//! `players`, `analog` and `aes67` buses, and every output mixes them
+//! through its own [`OutputMix`]. A further output's period goes into its
+//! [`Feed`]; the master's goes through its delay line to the card.
 
 use crate::bitperfect::{NotBitPerfect, Situation, code_of, decide, plugins_apply, volumes_apply};
 use crate::capture::Capture;
@@ -77,6 +77,10 @@ pub struct Source {
     pub wake: OwnedFd,
     /// The client's sample rate.
     pub rate: u32,
+    /// The bus the source is mixed into: `Players`, or `Aes67` for the
+    /// AES67 input. Set here before `Add`. `Analog` is the analog input's
+    /// alone.
+    pub bus: Bus,
     /// Boxed so that swapping one moves a pointer and frees nothing.
     pub resampler: Option<Box<Resampler>>,
     /// The gain the source plays at, or moves to while `glide` runs. Set
@@ -131,13 +135,15 @@ pub struct Source {
 }
 
 impl Source {
-    /// A stopped source at unity gain, with no resampler.
+    /// A stopped source at unity gain, with no resampler, on the `players`
+    /// bus.
     pub fn new(id: ClientId, ring: Ring, wake: OwnedFd, rate: u32) -> Source {
         Source {
             id,
             ring,
             wake,
             rate,
+            bus: Bus::Players,
             resampler: None,
             gain: 1.0,
             running: false,
@@ -1541,6 +1547,8 @@ pub struct Engine<P: Processing, S: Sink> {
     players: Vec<[P::Acc; 2]>,
     /// The `analog` bus: the analog input, at its gain and the output's.
     analog_bus: Vec<[P::Acc; 2]>,
+    /// The `aes67` bus: the sources on it, at their gains and the output's.
+    aes67_bus: Vec<[P::Acc; 2]>,
     /// Where the analog input is handed to its chain.
     store: BlockStore,
     analog: Analog<P>,
@@ -1611,6 +1619,7 @@ impl<P: Processing, S: Sink> Engine<P, S> {
             scratch: vec![[0; 2]; frames * MAX_DOWNSAMPLING + dop::MIN_FRAMES],
             players: vec![[P::zero(); 2]; frames],
             analog_bus: vec![[P::zero(); 2]; frames],
+            aes67_bus: vec![[P::zero(); 2]; frames],
             store: BlockStore::new(frames, 2),
             analog: Analog::new(frames),
             taps: Taps::new(frames),
@@ -2050,6 +2059,11 @@ impl<P: Processing, S: Sink> Engine<P, S> {
     }
 
     fn add(&mut self, source: Box<Source>) {
+        debug_assert_ne!(
+            source.bus,
+            Bus::Analog,
+            "a client is never on the analog bus"
+        );
         if self.table.len() < self.table.capacity() {
             self.table.push(source);
         } else {
@@ -2546,12 +2560,13 @@ impl<P: Processing, S: Sink> Engine<P, S> {
     }
 
     /// The bus of the one source the copy path would copy: the analog
-    /// input's while it is audible, else the players'.
+    /// input's while it is audible, else that of the client heard, the
+    /// players' when there is none.
     fn copy_bus(&self) -> Bus {
         if self.analog.audible {
             Bus::Analog
         } else {
-            Bus::Players
+            self.audible().next().map_or(Bus::Players, |s| s.bus)
         }
     }
 
@@ -2583,12 +2598,12 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         }
     }
 
-    /// Mixes the sources into the `players` bus and the analog input, while
-    /// it is audible, into the `analog` bus, or copies the one that is
-    /// bit-perfect. A mix then goes through the matrix and runs the mix
-    /// chain and the output chain, in that order, except in forced
-    /// bit-perfect, which bypasses them. Returns whether a chain with
-    /// plugins ran.
+    /// Mixes the sources into the `players` and `aes67` buses, as each says,
+    /// and the analog input, while it is audible, into the `analog` bus, or
+    /// copies the one that is bit-perfect. A mix then goes through the
+    /// matrix and runs the mix chain and the output chain, in that order,
+    /// except in forced bit-perfect, which bypasses them. Returns whether a
+    /// chain with plugins ran.
     fn play_pcm(&mut self, fade_out: bool) -> bool {
         let (rate, period, channels) = (self.rate, self.period, self.master.channels);
         let volumes = volumes_apply(self.mode);
@@ -2615,10 +2630,10 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         let feeding = self.feeding;
         let fade_step = self.master.next_fade_step(period);
         let (next_gain, fade_frames) = fade_step;
-        // A matrix that passes both buses to channels 1 and 2 as they are
-        // adds nothing to what the buses hold: the analog input is mixed
-        // straight into the players' bus, which is then the mix itself.
-        // Not while other outputs read the buses too.
+        // A matrix that passes every bus to channels 1 and 2 as they are
+        // adds nothing to what the buses hold: the analog input and the
+        // `aes67` sources are mixed straight into the players' bus, which is
+        // then the mix itself. Not while other outputs read the buses too.
         let direct = !feeding && self.master.direct(period);
         let (from, to) = if self.master_gain_applies() && !feeding {
             (self.master.gain, next_gain)
@@ -2634,9 +2649,12 @@ impl<P: Processing, S: Sink> Engine<P, S> {
         let out = &mut self.out[..period];
         let scratch = &mut self.scratch[..period];
         let players = &mut self.players[..period];
+        let aes67_bus = &mut self.aes67_bus[..period];
         if !copy {
             mix_clear::<P>(players);
         }
+        // The `aes67` bus is heard once a source is mixed into it.
+        let mut aes67_heard = false;
         // Monitors of a stream get it as mixed, not while parked.
         let streams = !self.parked && self.taps.streams();
         // An input's gain moves on in the cycles it is mixed in. Where it
@@ -2665,7 +2683,15 @@ impl<P: Processing, S: Sink> Engine<P, S> {
                 if streams {
                     self.taps.deliver_stream(source.id, scratch, level);
                 }
-                fade.add_moving(scratch, level, players, mix_add::<P>);
+                let bus = if source.bus != Bus::Aes67 || direct {
+                    &mut *players
+                } else {
+                    if !std::mem::replace(&mut aes67_heard, true) {
+                        mix_clear::<P>(aes67_bus);
+                    }
+                    &mut *aes67_bus
+                };
+                fade.add_moving(scratch, level, bus, mix_add::<P>);
                 source.glide.advance(step);
             }
         }
@@ -2688,17 +2714,24 @@ impl<P: Processing, S: Sink> Engine<P, S> {
             self.analog.glide.advance(step);
         }
         if feeding {
-            return self.mix_outputs(copy_routing, fade_step);
+            return self.mix_outputs(copy_routing, fade_step, aes67_heard);
         }
         if let Some(routing) = copy_routing {
             self.place_unaltered(&routing);
             self.master.step_fade(fade_step);
             return false;
         }
-        let analog = self.analog.audible.then_some(&*analog_bus);
+        let analog = if self.analog.audible {
+            &*analog_bus
+        } else {
+            &[]
+        };
+        let aes67 = if aes67_heard { &*aes67_bus } else { &[] };
+        // By `Bus::index`.
+        let buses = [&*players, analog, aes67];
         let samples = &mut self.samples[..period * channels];
         let plugins = plugins_apply(self.mode);
-        let chains_ran = self.master.mix(players, analog, samples, rate, plugins);
+        let chains_ran = self.master.mix(&buses, samples, rate, plugins);
         self.master.step_fade(fade_step);
         chains_ran
     }
@@ -2718,29 +2751,45 @@ impl<P: Processing, S: Sink> Engine<P, S> {
     /// gain, and each further output's period goes to its feed. While the
     /// master copies its one source, the others mix it from the buses.
     /// Out of line, so that the master alone plays as it did before there
-    /// were further outputs.
+    /// were further outputs. `aes67_heard` says whether the `aes67` bus
+    /// holds the period.
     #[inline(never)]
-    fn mix_outputs(&mut self, copy_routing: Option<Routing>, fade_step: (f32, usize)) -> bool {
+    fn mix_outputs(
+        &mut self,
+        copy_routing: Option<Routing>,
+        fade_step: (f32, usize),
+        mut aes67_heard: bool,
+    ) -> bool {
         let (rate, period, channels) = (self.rate, self.period, self.master.channels);
         let master_gain = self.master_gain_applies();
         let plugins = plugins_apply(self.mode);
         let woke = self.stamp();
+        let copied = self.copy_bus();
         let out = &self.out[..period];
         let players = &mut self.players[..period];
         let analog_bus = &mut self.analog_bus[..period];
+        let aes67_bus = &mut self.aes67_bus[..period];
         if copy_routing.is_some() {
             // The one source the master copies, at unity, for the others.
             mix_clear::<P>(players);
             mix_clear::<P>(analog_bus);
-            let bus = if self.analog.audible {
-                &mut *analog_bus
-            } else {
-                &mut *players
+            mix_clear::<P>(aes67_bus);
+            let bus = match copied {
+                Bus::Players => &mut *players,
+                Bus::Analog => &mut *analog_bus,
+                Bus::Aes67 => &mut *aes67_bus,
             };
             mix_add::<P>(out, Ramp::flat(1.0), bus);
+            aes67_heard = copied == Bus::Aes67;
         }
-        let players = &*players;
-        let analog = self.analog.audible.then_some(&*analog_bus);
+        let analog = if self.analog.audible {
+            &*analog_bus
+        } else {
+            &[]
+        };
+        let aes67 = if aes67_heard { &*aes67_bus } else { &[] };
+        // By `Bus::index`.
+        let buses = [&*players, analog, aes67];
         let samples = &mut self.samples[..period * channels];
         let chains_ran = match copy_routing {
             Some(routing) => {
@@ -2750,14 +2799,14 @@ impl<P: Processing, S: Sink> Engine<P, S> {
             }
             None => self
                 .master
-                .mix_shared(players, analog, samples, rate, plugins, master_gain),
+                .mix_shared(&buses, samples, rate, plugins, master_gain),
         };
         for (slot, output) in self.further.iter_mut().enumerate() {
             let Some(output) = output else { continue };
             let samples = &mut self.further_samples[..period * output.mix.channels];
             let mix = &mut output.mix;
             // Never bit-perfect: their gains and chains apply in every mode.
-            let ran = mix.mix_shared(players, analog, samples, rate, true, true);
+            let ran = mix.mix_shared(&buses, samples, rate, true, true);
             mix.chains_ran(ran);
             output.feed.push_at(samples, woke);
             if let Some(levels) = &self.levels {
@@ -6508,7 +6557,7 @@ mod tests {
 
     /// The format a rig of `P` processes in.
     fn format_of<P: Processing>() -> Format {
-        P::to_block(&mut [], 2, &mut BlockStore::new(0, 2)).format()
+        P::to_block(&[], 2, &mut BlockStore::new(0, 2)).format()
     }
 
     /// A chain in the processing format of `P`, built for the longest period,
@@ -9621,6 +9670,140 @@ mod tests {
         assert_eq!(decide(&rig.engine.situation()), Ok(()));
         let want: Vec<Vec<i32>> = input.iter().map(|f| vec![0, f[0], 0, f[1]]).collect();
         assert_eq!(rig.last_wide(1), want);
+    }
+
+    /// A client on the `aes67` bus.
+    fn aes67_client(id: ClientId) -> Client {
+        let mut c = client(id);
+        c.source.as_mut().unwrap().bus = Bus::Aes67;
+        c
+    }
+
+    /// Players on channels 1 and 2, the `aes67` bus on 3 and 4.
+    fn players_and_aes67() -> Matrix {
+        matrix(
+            &[
+                route(0, 1, 0.0),
+                route(1, 2, 0.0),
+                route(4, 3, 0.0),
+                route(5, 4, 0.0),
+            ],
+            4,
+        )
+    }
+
+    /// The `aes67` bus alone, left to channel 2 and right to channel 1.
+    fn aes67_swapped() -> Matrix {
+        matrix(&[route(4, 2, 0.0), route(5, 1, 0.0)], 2)
+    }
+
+    #[test]
+    fn an_aes67_source_goes_to_its_own_routes() {
+        fn check<P: Processing>() {
+            let what = format_of::<P>();
+            let mut rig = Rig::<P>::wide(BitPerfect::Auto, players_and_aes67(), 4);
+            let mut one = add_output(&mut rig, 1, aes67_swapped());
+            let (mut player, mut aes67) = (client(1), aes67_client(2));
+            rig.add(&mut player);
+            rig.add(&mut aes67);
+            let mut got = Vec::new();
+            for _ in 0..3 {
+                player.ring.write(&frames(1 << 24, PERIOD));
+                aes67.ring.write(&frames(3 << 20, PERIOD));
+                got = cycle_outputs(&mut rig, &mut [&mut one]);
+            }
+            let want = vec![vec![1 << 24, -(1 << 24), 3 << 20, -(3 << 20)]; PERIOD];
+            assert_eq!(rig.last_wide(1), want, "{what:?}");
+            // A further output mixes the bus through its own routes.
+            assert_eq!(got, [vec![[-(3 << 20), 3 << 20]; PERIOD]], "{what:?}");
+
+            // On the default matrix, which takes the direct path, the two
+            // play together on channels 1 and 2.
+            let mut rig = Rig::<P>::wide(BitPerfect::Auto, stereo(), 2);
+            let (mut player, mut aes67) = (client(1), aes67_client(2));
+            rig.add(&mut player);
+            rig.add(&mut aes67);
+            for _ in 0..3 {
+                player.ring.write(&frames(1 << 24, PERIOD));
+                aes67.ring.write(&frames(3 << 20, PERIOD));
+                rig.cycle();
+            }
+            let sum = (1 << 24) + (3 << 20);
+            assert_eq!(rig.last_periods(1), frames(sum, PERIOD), "{what:?}");
+        }
+        check::<I32>();
+        check::<F32>();
+        check::<F64>();
+    }
+
+    #[test]
+    fn a_lone_aes67_source_is_copied_bit_perfect() {
+        let mut rig = Rig::<F32>::wide(BitPerfect::Auto, players_and_aes67(), 4);
+        let mut one = add_output(&mut rig, 1, aes67_swapped());
+        let mut a = aes67_client(1);
+        rig.add(&mut a);
+        // The further output mixes the copied source from the `aes67` bus,
+        // through its own routes.
+        let mut got = Vec::new();
+        for _ in 0..3 {
+            a.ring.write(&exact(PERIOD));
+            got = cycle_outputs(&mut rig, &mut [&mut one]);
+        }
+        let swapped: Vec<[i32; 2]> = exact(PERIOD).iter().map(|f| [f[1], f[0]]).collect();
+        assert_eq!(got, [swapped]);
+        // Values `f32` cannot hold reach the master unaltered, on the
+        // channels of the `aes67` routes.
+        let input: Vec<[i32; 2]> = (0..PERIOD)
+            .map(|i| [EDGES[i % EDGES.len()], EDGES[(i + 2) % EDGES.len()]])
+            .collect();
+        a.ring.write(&input);
+        rig.cycle();
+        assert_eq!(decide(&rig.engine.situation()), Ok(()));
+        let want: Vec<Vec<i32>> = input.iter().map(|f| vec![0, 0, f[0], f[1]]).collect();
+        assert_eq!(rig.last_wide(1), want);
+    }
+
+    #[test]
+    fn mixing_three_buses_does_not_allocate() {
+        fn check<P: Processing>() {
+            let what = format_of::<P>();
+            let all = matrix(
+                &[
+                    route(0, 1, 0.0),
+                    route(1, 2, 0.0),
+                    route(2, 3, 0.0),
+                    route(3, 4, 0.0),
+                    route(4, 1, -6.0),
+                    route(5, 4, -6.0),
+                ],
+                4,
+            );
+            let (mut rig, feed) = wide_with_capture::<P>(BitPerfect::Auto, all, 4);
+            let mut one = add_output_with(&mut rig, 1, aes67_swapped(), 256 * PERIOD);
+            let (mut a, mut b) = (client(1), aes67_client(2));
+            rig.add(&mut a);
+            rig.add(&mut b);
+            rig.cycle();
+            rig.events();
+            let input = frames(1 << 24, PERIOD);
+            let engine = &mut rig.engine;
+            assert_no_alloc(|| {
+                for _ in 0..200 {
+                    a.ring.write(&input);
+                    b.ring.write(&input);
+                    feed.push(&input);
+                    engine.cycle().unwrap();
+                }
+            });
+            let last = rig.last_wide(1).pop().unwrap();
+            assert!(last.iter().all(|&v| v != 0), "{what:?}: {last:?}");
+            assert!(last[0] > 1 << 24, "{what:?}: {last:?}");
+            let further = stereo_frames(&one.take());
+            assert_eq!(further.last(), Some(&[-(1 << 24), 1 << 24]), "{what:?}");
+        }
+        check::<I32>();
+        check::<F32>();
+        check::<F64>();
     }
 
     #[test]

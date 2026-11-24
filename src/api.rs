@@ -48,6 +48,14 @@ pub enum Call {
     },
     /// `PATCH /airplay/{name}`.
     PatchAirplay(String, AirplayPatch),
+    /// `GET /aes67`.
+    Aes67,
+    /// `GET /aes67/streams`.
+    Aes67Streams,
+    /// `PATCH /aes67/input`.
+    PatchAes67Input(Aes67InputPatch),
+    /// `PATCH /aes67/output`.
+    PatchAes67Output(Aes67OutputPatch),
     PatchSettings(SettingsPatch),
 }
 
@@ -66,6 +74,10 @@ pub struct SettingsPatch {
     /// another.
     pub format: Option<String>,
     pub resampling: Option<String>,
+    /// The board's figures, read-only like the two above: accepted when
+    /// they are what they are, 422 when they are not.
+    pub latency_recommended_ms: Option<f32>,
+    pub latency_min_ms: Option<f32>,
 }
 
 /// `GET /settings`.
@@ -77,6 +89,9 @@ pub struct SettingsView {
     /// The processing format, which is the engine's type.
     pub format: String,
     pub resampling: String,
+    /// The board's default latency, and the lowest it holds safely.
+    pub latency_recommended_ms: f32,
+    pub latency_min_ms: f32,
 }
 
 impl SettingsView {
@@ -358,6 +373,10 @@ pub enum ApiEvent {
         latency_ms: f32,
         default_rate: u32,
     },
+    /// Something of `GET /aes67` or `GET /aes67/streams` changed: the
+    /// clock's lock or grandmaster, the input or output, or the list of
+    /// streams. Carries `GET /aes67` as it is now.
+    Aes67(Aes67View),
     /// The subscriber fell behind and should read `/state` again.
     Resync,
 }
@@ -421,6 +440,113 @@ pub struct AirplayView {
     /// The last failure, until a session plays again.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+/// AES67 as `GET /aes67` gives it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Aes67View {
+    pub clock: Aes67ClockView,
+    pub input: Aes67InputView,
+    pub output: Aes67OutputView,
+}
+
+/// The PTP clock the AES67 threads follow.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Aes67ClockView {
+    /// `"listen"` or `"off"`, as the config says.
+    pub source: &'static str,
+    pub domain: u8,
+    /// Whether there is PTP time now.
+    pub locked: bool,
+    /// The grandmaster's clock ID, as `00-11-22-FF-FE-33-44-55`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grandmaster: Option<String>,
+    /// How fast PTP time runs against the local clock, in ppm.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_ppm: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Aes67InputView {
+    pub enabled: bool,
+    /// The selected stream's name, also while it is not announced.
+    pub stream: Option<String>,
+    /// `"ptp"` or `"buffer"` while a stream plays.
+    pub mode: Option<&'static str>,
+    pub receiving: bool,
+    pub latency_ms: u32,
+    /// Whether the latency is the board's default.
+    pub latency_auto: bool,
+    /// While a stream plays, the least latency the board holds now; a
+    /// lower `latency_ms` is held at this.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latency_floor_ms: Option<u32>,
+    /// Packets that came after their play time.
+    pub late: u64,
+    /// Frames played as silence because they never came.
+    pub lost: u64,
+    /// Times a stream that was priming or playing started over.
+    pub restarts: u64,
+    /// Why it last did: `"selection"`, `"latency"`, `"grandmaster"`,
+    /// `"stopped"`, `"resumed"`, `"no stored packets"`, `"delay"` or
+    /// `"timestamps"` (a stream in PTP mode that fell back to buffer mode).
+    pub last_restart: Option<&'static str>,
+    /// In PTP mode, the delay the controller holds at `latency_ms`, by part.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delay: Option<Aes67DelayView>,
+}
+
+/// The delay of a stream in PTP mode, as the controller last read it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Aes67DelayView {
+    pub total_ms: f64,
+    /// From a frame's media-clock time to where the jitter buffer reads.
+    pub network_ms: f64,
+    /// The resampler's filter.
+    pub filter_ms: f64,
+    /// The ring to the engine.
+    pub ring_ms: f64,
+    /// The engine's delay after the ring: its card buffer and filters.
+    pub engine_ms: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Aes67OutputView {
+    pub enabled: bool,
+    pub sending: bool,
+    /// The multicast group; absent while `"auto"` is not resolved.
+    pub group: Option<String>,
+    pub port: u16,
+    /// While sending, the delay from the master's tap to the network as
+    /// the controller last read it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delay_ms: Option<f64>,
+    /// Packets sent as zeros as the master's frames ran out, since the
+    /// output started.
+    pub padded: u64,
+}
+
+/// An announced stream as `GET /aes67/streams` gives it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Aes67StreamView {
+    pub name: String,
+    pub origin: String,
+    pub group: String,
+    pub port: u16,
+    /// `"L16"`, `"L24"` or `"other"`.
+    pub format: &'static str,
+    pub rate: u32,
+    pub channels: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grandmaster: Option<String>,
+    /// Whether the input can play it; not our own and of a format it takes.
+    pub selectable: bool,
+    /// Why it cannot be selected: `"own"`, or the field it fails on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
+    /// `"ptp"` or `"buffer"`: how it would play now, when selectable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<&'static str>,
 }
 
 /// An input as `GET /inputs` gives it.
@@ -563,6 +689,36 @@ pub struct PluginMetrics {
 #[serde(deny_unknown_fields)]
 pub struct AirplayPatch {
     pub enabled: Option<bool>,
+}
+
+/// The body of `PATCH /aes67/input`. A field left out stays as it is.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Aes67InputPatch {
+    /// A stream's name; `null` selects none.
+    #[serde(default, deserialize_with = "some_or_null")]
+    pub stream: Option<Option<String>>,
+    /// A number of ms from 1 to 100, or `"auto"`; checked by the control
+    /// thread, which names the field when it is neither.
+    pub latency_ms: Option<serde_json::Value>,
+    pub enabled: Option<bool>,
+    /// The client volume named `aes67`, as `PATCH /inputs/clients/aes67`.
+    pub volume_db: Option<f32>,
+    pub mute: Option<bool>,
+}
+
+/// The body of `PATCH /aes67/output`.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Aes67OutputPatch {
+    pub enabled: Option<bool>,
+}
+
+/// A field present as `null` is `Some(None)`, one left out `None`.
+fn some_or_null<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<Option<String>>, D::Error> {
+    Option::<String>::deserialize(d).map(Some)
 }
 
 /// `GET /metadata`: the current track, the cover as its type and size.

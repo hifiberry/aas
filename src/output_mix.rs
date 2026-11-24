@@ -1,16 +1,17 @@
 //! The mix of one output: the buses through its matrix, its mix and output
 //! chains and its gain, into the samples its card gets.
 //!
-//! The engine reads the sources once a cycle into the `players` and
-//! `analog` buses and hands them to each output's mix. The copy path and
+//! The engine reads the sources once a cycle into the `players`, `analog`
+//! and `aes67` buses and hands them to each output's mix. The copy path and
 //! DoP play to the master only, and stay in the engine; they read the
 //! master's routes from here.
 //!
 //! The master alone mixes with [`OutputMix::mix`]: its buses come at its
-//! gain, and on the direct path the analog input is added into the
-//! players' bus, which is then the mix. With further outputs every output,
-//! the master too, mixes with [`OutputMix::mix_shared`] from buses at
-//! unity that it only reads, and applies its own gain.
+//! gain, and on the direct path the analog input and the `aes67` sources
+//! are added into the players' bus, which is then the mix. With further
+//! outputs every output, the master too, mixes with
+//! [`OutputMix::mix_shared`] from buses at unity that it only reads, and
+//! applies its own gain.
 
 use crate::engine::{FADE_MS, Place};
 use crate::format::{BlockStore, Processing, Ramp, matrix_add, mix_finish_wide, scale_wide};
@@ -65,18 +66,19 @@ fn bus_gains(matrix: &Matrix, bus: Bus, forced: bool) -> [[Ramp; MAX_CHANNELS]; 
     gains
 }
 
-/// The gains of both buses, as `bus_gains` gives them, by bus.
-type Gains = [[[Ramp; MAX_CHANNELS]; 2]; 2];
+/// The gains of every bus, as `bus_gains` gives them, by `Bus::index`.
+type Gains = [[[Ramp; MAX_CHANNELS]; 2]; Bus::ALL.len()];
 
-/// `bus_gains` of both buses.
+/// `bus_gains` of every bus.
 fn gains_of(matrix: &Matrix, forced: bool) -> Gains {
-    [
-        bus_gains(matrix, Bus::Players, forced),
-        bus_gains(matrix, Bus::Analog, forced),
-    ]
+    Bus::ALL.map(|bus| bus_gains(matrix, bus, forced))
 }
 
-/// Whether `gains`, of a matrix `width` wide, take each bus to channels 1
+/// A period of each bus, by `Bus::index`. A bus with no frames is silent
+/// this cycle and is not read.
+pub(crate) type Buses<'a, A> = [&'a [[A; 2]]; Bus::ALL.len()];
+
+/// Whether `gains`, of a matrix `width` wide, take every bus to channels 1
 /// and 2 unchanged: left to 1 and right to 2 at exactly 0 dB, nothing
 /// else. Adding a bus through them then adds it as it is, in every format.
 fn passes_through(gains: &Gains, width: usize) -> bool {
@@ -94,12 +96,12 @@ fn passes_through(gains: &Gains, width: usize) -> bool {
 pub(crate) struct Routes {
     /// How the copy path places each bus, by `Bus::index`, as the engine's
     /// `copy_routing` says.
-    pub(crate) copy: [Option<Routing>; 2],
+    pub(crate) copy: [Option<Routing>; Bus::ALL.len()],
     /// The `players` routing for a DoP stream, if it keeps the sink's pairs
     /// whole, as `routing_for_dop` says before its checks of the ramp and
     /// the chains.
     dop: Option<Routing>,
-    /// The gains pass both buses through, as `passes_through` says.
+    /// The gains pass every bus through, as `passes_through` says.
     pub(crate) passes: bool,
 }
 
@@ -115,7 +117,7 @@ impl Routes {
 }
 
 /// Where each of `gains` ends.
-fn levels(gains: &Gains) -> [[[f32; MAX_CHANNELS]; 2]; 2] {
+fn levels(gains: &Gains) -> [[[f32; MAX_CHANNELS]; 2]; Bus::ALL.len()] {
     gains.map(|bus| bus.map(|side| side.map(|ramp| ramp.to)))
 }
 
@@ -163,13 +165,13 @@ pub struct OutputMix<P: Processing> {
     pub(crate) channels: usize,
     /// The gains from the buses to the channels of the output.
     pub(crate) matrix: Matrix,
-    /// The same, by bus: `players` and then `analog`. In forced bit-perfect
-    /// every route that is not off is at 0 dB. While a change of matrix
-    /// ramps, these are the gains it goes to.
+    /// The same, by `Bus::index`. In forced bit-perfect every route that
+    /// is not off is at 0 dB. While a change of matrix ramps, these are the
+    /// gains it goes to.
     gains: Gains,
     /// While a change of matrix ramps: where each gain is at the start of
     /// the next cycle.
-    ramp_from: [[[f32; MAX_CHANNELS]; 2]; 2],
+    ramp_from: [[[f32; MAX_CHANNELS]; 2]; Bus::ALL.len()],
     /// Frames until the gains reach `gains`. No ramp runs at 0.
     pub(crate) ramp_left: usize,
     /// What the matrix gives the copy path and DoP, and whether it passes
@@ -404,9 +406,9 @@ impl<P: Processing> OutputMix<P> {
     }
 
     /// Whether this cycle's mix takes the direct path: a matrix that passes
-    /// both buses to channels 1 and 2 as they are, and no ramp. The analog
-    /// input is then mixed straight into the players' bus, which is the mix
-    /// itself.
+    /// every bus to channels 1 and 2 as they are, and no ramp. The analog
+    /// input and the `aes67` sources are then mixed straight into the
+    /// players' bus, which is the mix itself.
     pub(crate) fn direct(&self, period: usize) -> bool {
         self.ramp_left.min(period) == 0 && self.routes.passes
     }
@@ -474,29 +476,29 @@ impl<P: Processing> OutputMix<P> {
         }
     }
 
-    /// Mixes one period of the buses into `out`, interleaved frames of the
-    /// card's channels: `players`, and `analog` while the analog input is
-    /// audible, through the matrix, then the mix chain and the output
-    /// chain, in that order, when `plugins` apply. On the direct path, as
-    /// `direct` says, the analog input is already in `players` and
-    /// `analog` is not read. The buses come at the output's gain; the
+    /// Mixes one period of `buses` into `out`, interleaved frames of the
+    /// card's channels: through the matrix, then the mix chain and the
+    /// output chain, in that order, when `plugins` apply. The `players` bus
+    /// always has the period; the others have it while they are heard. On
+    /// the direct path, as `direct` says, the other buses are already in
+    /// `players` and are not read. The buses come at the output's gain; the
     /// caller moves the fade on. Returns whether a chain with plugins ran.
     ///
-    /// Only for the master while it is the only output: the direct path
-    /// alters `players`.
+    /// Only for the master while it is the only output: for the direct
+    /// path the engine mixes the other buses into `players`.
     pub(crate) fn mix(
         &mut self,
-        players: &mut [[P::Acc; 2]],
-        analog: Option<&[[P::Acc; 2]]>,
+        buses: &Buses<'_, P::Acc>,
         out: &mut [i32],
         rate: u32,
         plugins: bool,
     ) -> bool {
+        let players = buses[Bus::Players.index()];
         let period = players.len();
         if self.direct(period) {
-            self.finish(Some(players.as_flattened_mut()), period, out, rate, plugins)
+            self.finish(Some(players.as_flattened()), period, out, rate, plugins)
         } else {
-            self.through_matrix(players, analog);
+            self.through_matrix(buses);
             self.finish(None, period, out, rate, plugins)
         }
     }
@@ -507,16 +509,15 @@ impl<P: Processing> OutputMix<P> {
     /// `volumes` apply.
     pub(crate) fn mix_shared(
         &mut self,
-        players: &[[P::Acc; 2]],
-        analog: Option<&[[P::Acc; 2]]>,
+        buses: &Buses<'_, P::Acc>,
         out: &mut [i32],
         rate: u32,
         plugins: bool,
         volumes: bool,
     ) -> bool {
-        let period = players.len();
+        let period = buses[Bus::Players.index()].len();
         let step = self.next_fade_step(period);
-        self.through_matrix(players, analog);
+        self.through_matrix(buses);
         if volumes {
             let width = self.matrix.width();
             let (to, frames) = step;
@@ -535,19 +536,20 @@ impl<P: Processing> OutputMix<P> {
         self.finish(None, period, out, rate, plugins)
     }
 
-    /// Adds the buses through the matrix, along a ramp of it, into `wide`.
+    /// Adds the buses heard through the matrix, along a ramp of it, into
+    /// `wide`.
     #[inline(always)]
-    fn through_matrix(&mut self, players: &[[P::Acc; 2]], analog: Option<&[[P::Acc; 2]]>) {
-        let period = players.len();
+    fn through_matrix(&mut self, buses: &Buses<'_, P::Acc>) {
+        let period = buses[Bus::Players.index()].len();
         let ramp_frames = self.ramp_left.min(period);
         let width = self.matrix.width();
         let (step, _) = self.next_matrix_step(period);
         let wide = &mut self.wide[..period * width];
         wide.fill(P::zero());
-        let gains = &self.gains;
-        matrix_add_ramped::<P>(players, &step[0], ramp_frames, &gains[0], width, wide);
-        if let Some(analog) = analog {
-            matrix_add_ramped::<P>(analog, &step[1], ramp_frames, &gains[1], width, wide);
+        for ((bus, step), gains) in buses.iter().zip(&step).zip(&self.gains) {
+            if !bus.is_empty() {
+                matrix_add_ramped::<P>(bus, step, ramp_frames, gains, width, wide);
+            }
         }
         // The ramp moves on, whether this period is heard or not.
         if ramp_frames > 0 {
@@ -561,7 +563,7 @@ impl<P: Processing> OutputMix<P> {
     #[inline(always)]
     fn finish(
         &mut self,
-        direct: Option<&mut [P::Acc]>,
+        direct: Option<&[P::Acc]>,
         period: usize,
         out: &mut [i32],
         rate: u32,
@@ -569,9 +571,9 @@ impl<P: Processing> OutputMix<P> {
     ) -> bool {
         let channels = self.channels;
         let width = self.matrix.width();
-        let mixed: &mut [P::Acc] = match direct {
+        let mixed: &[P::Acc] = match direct {
             Some(players) => players,
-            None => &mut self.wide[..period * width],
+            None => &self.wide[..period * width],
         };
         let samples = &mut out[..period * channels];
         let has_plugins = !self.mix.is_empty() || !self.output.is_empty();

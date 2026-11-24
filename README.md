@@ -122,7 +122,7 @@ is kept in `/var/lib/aas/state.toml`.
 
 | Key | Values | Default | Meaning |
 |---|---|---|---|
-| `latency_ms` | a number above 0 | 4 on a Pi 5 or CM5, 12 elsewhere | Target for the latency of the card's buffer. The period is the largest power of two that keeps two periods within it. |
+| `latency_ms` | a number above 0 | 5 on a Pi 5 or CM5, 12 elsewhere | Target for the latency of the card's buffer. The period is the largest power of two that keeps two periods within it. |
 | `card` | an ALSA card id or index | the first card that is not `Loopback`, `Headphones` or HDMI | The card to play to. |
 | `channels` | 1 to 8 | 2 | The number of channels the card is opened with. A card that does not take the count is not opened: the output plays to nothing and the reason is logged once. |
 | `clock` | `"auto"`, `"playback"`, `"capture"` | `"auto"` | What clocks the output. `capture` runs it on the card's capture, which then also feeds the analog input, and plays nowhere: the mix reaches only the monitor and the further outputs. `auto` does that for a card that captures and does not play, such as the HiFiBerry ADC, and plays to any other. See [A card that only captures](#a-card-that-only-captures). |
@@ -387,6 +387,172 @@ receiver that refuses them plays on. An emptied track clears the receiver's
 text and cover. On HiFiBerry OS, `aas-config` sets `source = "acr"` where
 AudioControl is installed. `GET /metadata` shows the current track.
 
+### AES67
+
+`aas` can play one AES67 stream, such as a Dante flow, as an input, and send
+what the master plays as an AES67 stream of its own. Both need wired Ethernet
+and a switch that does IGMP snooping with a querier, or the multicast streams
+and the PTP time reach every port or none. Without an `[aes67]` table there is
+no AES67. On HiFiBerry OS, `aas-config` writes the table at boot on a device
+with wired Ethernet, with `interface` set to `eth0` (or the first wired
+interface by name), `ptp = "listen"` and the input and output disabled, so the
+web UI can switch AES67 on through the API. A device without wired Ethernet
+gets no table. To change anything, or to turn it on at boot, put the keys in
+`/etc/aas/aas.local.toml`, which `aas-config` merges over the generated file,
+key by key:
+
+```toml
+[aes67]
+interface = "eth0"
+
+[aes67.input]
+stream = "Studio"         # the stream's name; also set at run time
+
+[aes67.output]
+enabled = true            # off by default
+name = "aas-studio"
+```
+
+| Key | Values | Default | |
+|---|---|---|---|
+| `interface` | an interface name | `"eth0"` | The wired interface for PTP, SAP and the streams. Its first IPv4 address is the source of what is sent. |
+| `ptp` | `"listen"`, `"off"` | `"listen"` | `"listen"` follows the network's PTP grandmaster. `"off"` has no PTP time: the input plays in buffer mode only and the output sends nothing. |
+| `domain` | 0 to 255 | 0 | The PTP domain to follow. |
+| `input.enabled` | `true`, `false` | `true` | Whether the selected stream is played. |
+| `input.stream` | a stream's name | none | The SDP session name of the stream to play. Empty selects none. |
+| `input.latency_ms` | 1 to 100, or `"auto"` | `"auto"` | The delay from a sample's capture at the sender to the sound card, aas's own buffering included; for a stream without PTP time, the depth of the input's buffer. `"auto"` is 5 ms on a CM5 or Pi 5 and 20 ms on any other board. |
+| `input.channels` | two numbers, 1 to 8 | `[1, 2]` | The two channels of the stream played as left and right. |
+| `input.volume_db` | -60 to 0 | 0 | The start value of the `aes67` client's volume. |
+| `output.enabled` | `true`, `false` | `false` | Whether the master is sent. |
+| `output.name` | text | `"aas-"` and the host name | The stream's name, as a receiver lists it. |
+| `output.address` | `"auto"`, or a multicast address | `"auto"` | The group. `"auto"` is 239.69.x.y, with x and y the last two bytes of the interface's MAC address; a y of 0 or 255 becomes 1. |
+| `output.port` | 1 to 65535 | 5004 | The RTP port. |
+| `output.ttl` | 1 to 255 | 16 | The multicast TTL. |
+
+`aas` receives PTP and never sends it: the clock is the grandmaster's.
+A thread reads the PTP packets through a
+packet socket, which needs `CAP_NET_RAW`; `aas.service` grants that capability
+and nothing else uses it. It does not bind ports 319 and 320, so it runs beside
+`nqptp`, and AirPlay 2 reception through Shairport Sync keeps working. Without
+a grandmaster on the network there is no PTP time; it is lost after 5 s without
+the grandmaster's messages. `GET /aes67` shows `clock`: whether it is `locked`,
+the `grandmaster` and the `rate_ppm` of its time against the local clock.
+
+Streams are announced over SAP. `aas` lists them as they come, and forgets one
+that has not been announced for ten of its announcement intervals. The input
+takes streams of 48 kHz, L16 or L24, with 1 to 8 channels and packets of up to
+4 ms. `GET /aes67/streams` lists every stream with its `selectable` flag and,
+when it cannot be selected, the `reason`; `aasctl aes67 select NAME` selects
+one and `aasctl aes67 select none` none. The selection is kept in the state
+file, and applies while the config stays as it was.
+
+#### Input
+
+The input plays the one selected stream. It has two modes, chosen when the
+stream starts, and `GET /aes67` gives the one playing as `input.mode`:
+
+- `ptp`: the stream's SDP names the grandmaster and domain `aas` follows. The
+  RTP timestamps are then PTP time, and the input plays each frame at its
+  timestamp plus the latency. Every device that does the same plays in step.
+- `buffer`: any other stream, or any stream while there is no PTP time. The
+  input holds the stream in a jitter buffer of the latency's size and follows
+  the sender's pace with a resampler. The sound is the same; it is not aligned
+  with other devices.
+
+A stream in `ptp` mode whose timestamps do not follow the PTP clock and its
+SDP offset, because the sender does not stamp them so, plays in `buffer` mode
+instead, and the log says so once. When the grandmaster changes while it plays,
+or PTP time comes back, the input starts again in the mode that applies, which
+is a short gap and no step in pitch. A stream that sends nothing for 1 s counts
+as stopped, and plays on from its next packet.
+
+The latency is how long a frame waits before it plays, and the room the network
+has to deliver it in. A packet that arrives after its play time counts in
+`input.late`; frames that never came play as silence and count in
+`input.lost`. `input.restarts` counts the times a stream that was starting or
+playing started over, and `input.last_restart` says why, so the lowest latency
+that stays stable on a board is the lowest one with no restarts and no `late`
+or `lost` over a long run. The reasons are:
+
+- `selection`, `latency`: changed by the user.
+- `grandmaster`: a new PTP time, as PTP time started, the grandmaster changed
+  or PTP time came back. A stream that started in `buffer` mode before PTP
+  time moves to `ptp` mode this way.
+- `stopped`, `resumed`: the stream paused for 1 s and came back.
+- `no stored packets`: every packet came too late or too early to be kept.
+- `delay`: the delay from the stream to the output went more than 50 ms off its
+  target.
+- `timestamps`: a stream in `ptp` mode whose timestamps do not follow the PTP
+  clock, which then plays in `buffer` mode. This one is not counted in
+  `restarts`.
+
+While a stream plays in `ptp` mode, `input.delay` gives the delay the latency
+is held at, in parts: `network_ms` from a frame's timestamp to where the
+jitter buffer reads, `filter_ms` for the resampler, `ring_ms` to the engine,
+`engine_ms` for the engine and the card, and `total_ms`. The engine and the
+card take a share that a smaller latency cannot remove. While a stream plays,
+`input.latency_floor_ms` gives the least latency the board holds now: one and a
+half times the engine's delay after the ring, as the ring holds about a period
+for it, and the filter, rounded up to whole milliseconds. A lower `latency_ms`
+is held at the floor, with a warning in the log, and stays as set; with
+`"auto"` the floor is held without a warning; on a CM5 at
+the default 64-frame periods the floor is 6 ms, on a Pi 3 at 256-frame periods
+18 ms.
+
+`input.receiving` says whether packets arrive now. The latency, the selection
+and `enabled` can be changed at run time with `PATCH /aes67/input`; the
+changes are kept in the state file.
+
+The input is a client named `aes67`, with a volume and a mute at
+`/inputs/clients/aes67`, and `volume_db` and `mute` in the same `PATCH`. It
+enters the matrix as `aes67.left` and `aes67.right`. A matrix that names no
+route from them plays the input as it plays a player, as the default matrix
+does; once a matrix names an `aes67` route, only the routes it names are
+played. The input's level is not in `/levels`.
+
+#### Output
+
+The output sends what the master plays, as the AirPlay output takes it: after
+the mix, the plugins, the master gain and the volume limit. The stream is L24,
+48 kHz, stereo, in packets of 1 ms. The master's rate is resampled to 48 kHz,
+following the PTP clock. A quiet mix is sent as it is. Zeros go out, because a
+Dante receiver expects the stream to be there, until the path is filled at
+start and whenever the master delivers no frames, as when it is parked or closed.
+
+Nothing is sent without PTP time: the packets' timestamps are PTP time, and a
+receiver cannot place them without it. The stream is announced over SAP every
+30 s while it is sent and withdrawn when it stops. `GET /aes67` shows
+`output.sending`, the `group` and the `port`, and while sending, `delay_ms`:
+the time from the master's tap to the network. It is held at one master
+period, the resampler's filter and 2 ms: 4.7 ms with the 64-frame periods of a
+5 ms latency, 8.7 ms with 256-frame periods. `output.padded` counts the packets
+sent as zeros because the master's frames ran out. `PATCH /aes67/output` with
+`{"enabled": true|false}` turns the output on or off; that is kept in the state
+file while the config stays as it was.
+
+#### Dante
+
+A Dante device takes part once it is in AES67 mode.
+
+- Input: in Dante Controller, enable AES67 mode on the device, and reboot it.
+  Create a multicast flow for the channels to send, with a name. It is
+  announced over SAP and listed by `GET /aes67/streams`; select it with
+  `aasctl aes67 select NAME`.
+- Output: enable AES67 mode on the receiving device, reboot it, and subscribe
+  one of its receivers to the `aas` flow, as the name set by `output.name`
+  lists it.
+
+The Dante device and `aas` need the same PTP domain.
+
+#### ACR
+
+`aas` tells AudioControl whether the input plays: the player `aes67` is
+`playing` while the selected stream's packets arrive, and `stopped` otherwise.
+The report goes out on its own thread; one that fails is logged and the next
+change of state is the next try. AudioControl knows the player from
+`/etc/audiocontrol/players.d/aes67.json`, which the package installs; it reads
+the file when it starts.
+
 ### Recording
 
 The `default` device records the analog input, for example:
@@ -452,6 +618,10 @@ without that prefix.
 | `GET /airplay` | Every AirPlay receiver, with its state and last failure |
 | `PATCH /airplay/{name}` | `{"enabled": true\|false}`: turns a receiver on, or off with TEARDOWN; the answer is the receiver as `GET /airplay` gives it |
 | `POST /airplay/{name}/pair` | `{}` makes the receiver show its PIN, `{"pin": "1234"}` pairs; answered when the receiver has, within 40 s |
+| `GET /aes67` | The AES67 clock, input and output: whether there is PTP time and its grandmaster, the input's stream, mode, latency, `late`, `lost`, `restarts`, `last_restart` and `delay` by part, and whether the output sends and its `delay_ms`; 404 when there is no `[aes67]` |
+| `GET /aes67/streams` | Every announced stream, whether it can be selected and in which mode it would play |
+| `PATCH /aes67/input` | `stream` (a name, or `null` for none), `latency_ms` (1 to 100, or `"auto"`), `enabled`, `volume_db` and `mute`, all or none apply; a value that is refused is 422, a wrong type or an unknown field 400 |
+| `PATCH /aes67/output` | `{"enabled": true\|false}` |
 | `GET /metadata` | The current track from the metadata source: `title`, `artist`, `album`, `duration_s`, `position_s`, `playing`, and `cover` as its `mime` and size in `bytes`, or `null` |
 | `PATCH /outputs/{id}` | Change an output's volume and idle rule |
 | `GET /inputs` | The analog input, if enabled, every client that plays and every name given a volume |
@@ -547,7 +717,11 @@ disabled, nor can a plugin whose channel counts differ: both are 422.
 `GET /settings` gives `bit_perfect`, `latency_ms` and `default_rate`, which
 `PATCH` changes with the values and messages of the config keys, and `format`
 and `resampling`, which change only in the config: naming either in a `PATCH`
-is 422. A change lasts until the next restart; it is not kept in the state file.
+is 422. It also gives `latency_recommended_ms` and `latency_min_ms`, read-only: the
+board's default latency (5 on a Pi 5 or CM5, 12 elsewhere) and the lowest it holds
+safely (3 and 6). A Pi 4 counts as "other" until it has been measured. Naming
+either in a `PATCH` is 422 unless it is the value it has. A change lasts until
+the next restart; it is not kept in the state file.
 A new `bit_perfect` applies at once, with no reopen: while something plays, the
 output fades out over a period and in again over 10 ms. `forced` is 422 while a
 chain changes the channel count, as in the config. A new `latency_ms` reopens
@@ -691,6 +865,7 @@ aasctl settings latency_ms=5 bit_perfect=off
 aasctl matrix put matrix.json        # the body of PUT /matrix
 aasctl airplay pair "Apple TV" 1234  # see "Pairing an AirPlay 2 receiver"
 aasctl airplay "Apple TV" enable     # or: disable
+aasctl aes67                         # the clock, input and output; or: aes67 select NAME|none
 aasctl events                        # one JSON line per event, until stopped
 aasctl levels                        # one line per frame
 ```

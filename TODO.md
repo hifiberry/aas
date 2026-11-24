@@ -657,3 +657,37 @@ first.
   second assertion of `the_state_does_not_outlast_a_changed_config` cannot
   fail; no test checks the tap commands of a switch; aasctl cannot switch a
   receiver named "pair".
+
+## Config snippets from a directory
+
+`aas` reads one file (`--config`, default `/etc/aas/aas.toml`) and has no
+include syntax. On HiFiBerry OS, `aas-config` merges one overlay,
+`/etc/aas/aas.local.toml`, over the generated file at boot. Wanted: a
+`conf.d`-style directory, so that packages can each drop in their own table
+(an `[aes67]`, an `[[airplay]]`) without editing a shared file.
+
+Open: who merges (the daemon at load, or `aas-config` at boot); the merge
+rule for arrays of tables such as `[[airplay]]` and `[[output]]` (append or
+replace; today's overlay replaces them whole); the order between snippets and
+`aas.local.toml`; and how a config error names the file it came from. First
+step: decide where the merge happens, then extend `Config::load` or
+`dist/hifiberryos/aas-config` and its tests.
+
+## AES67 input level in /levels
+
+`/levels` has no meter for the AES67 input: clients are not metered, and the
+input is a client. The input plays, and its volume and mute work, but nothing
+shows its level. Wanted: an engine meter per client, or one for the `aes67` bus.
+Open: whether the audio thread can take a meter per client without a cost for
+players that have none. First step: see how the analog input's meter is built in
+the engine and decide whether the `aes67` bus can have one the same way.
+
+## AES67: follow a change of the interface's address
+
+The AES67 threads take the interface's first IPv4 address when they start, and
+keep it as the origin of the announcements, the source of the output and the
+address their sockets join groups on. When the interface gets another address,
+for example after DHCP renews it differently, they go on with the first. Wanted:
+notice the change and restart the sockets and the origin on the new address.
+First step: have the control thread's timer compare the interface's address with
+the one `Aes67` started with, and restart `Aes67` when they differ.

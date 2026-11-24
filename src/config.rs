@@ -219,6 +219,8 @@ pub struct Config {
     pub airplay: Vec<crate::airplay::config::AirplayConfig>,
     /// Where song metadata comes from, from `[metadata]`.
     pub metadata: crate::metadata::config::MetadataConfig,
+    /// AES67 network audio, from `[aes67]`; None without the table.
+    pub aes67: Option<crate::aes67::config::Aes67Config>,
 }
 
 /// The port of the API unless the config names another.
@@ -270,6 +272,7 @@ struct Raw {
     pulse_buffer_ms: Option<toml::Value>,
     airplay: Option<Vec<toml::Table>>,
     metadata: Option<toml::Table>,
+    aes67: Option<toml::Table>,
 }
 
 #[derive(Deserialize)]
@@ -433,6 +436,7 @@ impl Default for Config {
             pulse_buffer_ms: None,
             airplay: Vec::new(),
             metadata: crate::metadata::config::MetadataConfig::default(),
+            aes67: None,
         }
     }
 }
@@ -658,6 +662,8 @@ impl Config {
             .map_err(|e| format!("{}: {e}", path.display()))?;
         let metadata = crate::metadata::config::from_table(raw.metadata)
             .map_err(|e| format!("{}: {e}", path.display()))?;
+        let aes67 = crate::aes67::config::from_table(raw.aes67)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
         let mut outputs: Vec<OutputConfig> = Vec::new();
         for (i, table) in raw_outputs.into_iter().enumerate() {
             let n = i + 2;
@@ -701,6 +707,7 @@ impl Config {
             pulse_buffer_ms,
             airplay,
             metadata,
+            aes67,
         })
     }
 }
@@ -774,6 +781,15 @@ mod tests {
             e.ends_with("aas.toml: metadata: source must be \"acr\" or \"none\""),
             "{e}"
         );
+    }
+
+    #[test]
+    fn the_aes67_table_reaches_the_config() {
+        assert!(load_str("").unwrap().aes67.is_none());
+        let c = load_str("[aes67]\ninterface = \"eth1\"\n").unwrap();
+        assert_eq!(c.aes67.unwrap().interface, "eth1");
+        let e = load_str("[aes67]\nptp = \"x\"\n").unwrap_err();
+        assert!(e.ends_with("aas.toml: aes67: ptp must be \"listen\" or \"off\""), "{e}");
     }
 
     #[test]
@@ -968,6 +984,32 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn aes67_names_are_valid_route_sources() {
+        let c = load_str(
+            "[[matrix]]\nfrom = \"aes67.left\"\nto = 3\n\
+             [[matrix]]\nfrom = \"aes67.right\"\nto = 4\ngain_db = -3\n",
+        )
+        .unwrap();
+        assert_eq!(
+            c.matrix.unwrap(),
+            vec![
+                Route {
+                    from: 4,
+                    to: 3,
+                    gain_db: 0.0
+                },
+                Route {
+                    from: 5,
+                    to: 4,
+                    gain_db: -3.0
+                },
+            ]
+        );
+        let e = route_from_parts(1, "aes67", 1, 0.0).unwrap_err();
+        assert!(e.contains("\"aes67.left\", \"aes67.right\""), "{e}");
     }
 
     #[test]

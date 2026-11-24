@@ -1,6 +1,7 @@
 //! Alternative audio server.
 
 pub mod adaptive;
+pub mod aes67;
 pub mod airplay;
 pub mod api;
 pub mod bitperfect;

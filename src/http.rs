@@ -130,6 +130,10 @@ fn router(shared: Arc<Shared>) -> Router {
         .route("/metadata", get(|s| ask(s, Call::Metadata)))
         .route("/airplay/{name}", patch(patch_airplay))
         .route("/airplay/{name}/pair", post(pair_airplay))
+        .route("/aes67", get(|s| ask(s, Call::Aes67)))
+        .route("/aes67/streams", get(|s| ask(s, Call::Aes67Streams)))
+        .route("/aes67/input", patch(patch_aes67_input))
+        .route("/aes67/output", patch(patch_aes67_output))
         .route("/outputs", get(|s| ask(s, Call::Outputs)))
         .route("/outputs/{id}", get(get_output).patch(patch_output))
         .route("/inputs", get(|s| ask(s, Call::Inputs)))
@@ -345,6 +349,14 @@ async fn pair_airplay(s: State<Arc<Shared>>, name: PathOf<String>, body: BodyOf)
 async fn patch_airplay(s: State<Arc<Shared>>, name: PathOf<String>, body: BodyOf) -> Response {
     let call = path(name).and_then(|name| Ok(Call::PatchAirplay(name, parse(&body)?)));
     ask_for(s, call).await
+}
+
+async fn patch_aes67_input(s: State<Arc<Shared>>, body: BodyOf) -> Response {
+    ask_for(s, parse(&body).map(Call::PatchAes67Input)).await
+}
+
+async fn patch_aes67_output(s: State<Arc<Shared>>, body: BodyOf) -> Response {
+    ask_for(s, parse(&body).map(Call::PatchAes67Output)).await
 }
 
 async fn patch_analog(s: State<Arc<Shared>>, body: BodyOf) -> Response {

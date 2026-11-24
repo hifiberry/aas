@@ -21,7 +21,9 @@ use crate::latency::{PERIODS, period_frames};
 use crate::matrix::{Bus, INPUT_NAMES, Matrix};
 use crate::plugin::build::widths;
 use crate::rate::{MAX_RATE, MIN_RATE};
-use crate::state::{MAX_CLIENTS, State, Stored, StoredInput, StoredOutput, StoredRoute};
+use crate::state::{
+    AES67_CLIENT, MAX_CLIENTS, State, Stored, StoredInput, StoredOutput, StoredRoute,
+};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -199,19 +201,24 @@ impl OutputMatrix {
 }
 
 /// The routes of the default matrix: left to channel 1 and right to
-/// channel 2 for both buses, as far as `width` goes.
+/// channel 2 for every bus, as far as `width` goes.
 fn default_routes(width: usize) -> Vec<Route> {
-    let sides = Bus::ALL
+    Bus::ALL
         .into_iter()
-        .flat_map(|bus| bus.inputs().into_iter().enumerate());
+        .flat_map(|bus| bus_default_routes(bus, width))
+        .collect()
+}
+
+/// The routes of `bus` in the default matrix, `width` channels wide.
+fn bus_default_routes(bus: Bus, width: usize) -> impl Iterator<Item = Route> {
+    let sides = bus.inputs().into_iter().enumerate();
     sides
-        .filter(|&(side, _)| side < width)
+        .filter(move |&(side, _)| side < width)
         .map(|(side, from)| Route {
             from,
             to: side + 1,
             gain_db: 0.0,
         })
-        .collect()
 }
 
 /// The matrix of `routes`, `width` channels wide, with the config's rules
@@ -343,6 +350,10 @@ impl Control {
             Call::Metadata => api::answer(&self.metadata_view(now)),
             Call::PairAirplay { .. } => Err(ApiError::internal("not yet")),
             Call::PatchAirplay(name, patch) => self.patch_airplay(&name, patch, now),
+            Call::Aes67 => self.aes67_ref().and_then(|a| api::answer(&a.view())),
+            Call::Aes67Streams => self.aes67_ref().and_then(|a| api::answer(&a.streams())),
+            Call::PatchAes67Input(patch) => self.patch_aes67_input(patch, now),
+            Call::PatchAes67Output(patch) => self.patch_aes67_output(patch, now),
             Call::PatchSettings(patch) => self.patch_settings(patch, now),
         };
         self.publish_changes();
@@ -452,6 +463,106 @@ impl Control {
         api::answer(&self.airplay[i].view())
     }
 
+    fn aes67_ref(&self) -> Result<&crate::aes67::Aes67, ApiError> {
+        self.aes67
+            .as_ref()
+            .ok_or_else(|| ApiError::not_found("this device has no AES67"))
+    }
+
+    /// Keeps what the API set of AES67 in the state, and tells the
+    /// subscribers what changed.
+    fn aes67_changed(&mut self, now: Instant) {
+        let Some(aes67) = &mut self.aes67 else {
+            return;
+        };
+        self.state.aes67 = aes67.stored();
+        let event = aes67.changed();
+        self.save_later(now);
+        if let Some(event) = event {
+            self.publish(event);
+        }
+    }
+
+    /// `PATCH /aes67/input`. Every value is checked before one applies, and
+    /// only a value that changes is stored.
+    fn patch_aes67_input(&mut self, patch: api::Aes67InputPatch, now: Instant) -> api::Answer {
+        use crate::aes67::config::Latency;
+        let current = self.aes67_ref()?.view().input;
+        let latency = match &patch.latency_ms {
+            None => None,
+            Some(serde_json::Value::String(s)) if s == "auto" => Some(Latency::Auto),
+            Some(serde_json::Value::Number(n)) => match n.as_u64() {
+                Some(ms @ 1..=100) => Some(Latency::Ms(ms as u32)),
+                _ => {
+                    return Err(ApiError::unprocessable(
+                        "latency_ms is from 1 to 100 ms, or \"auto\"",
+                    ));
+                }
+            },
+            Some(_) => {
+                return Err(ApiError::bad_request(
+                    "latency_ms is a number from 1 to 100, or \"auto\"",
+                ));
+            }
+        };
+        let stream = patch.stream.clone().map(|s| s.filter(|n| !n.is_empty()));
+        if let Some(stream) = &stream {
+            let aes67 = self.aes67_ref()?;
+            aes67
+                .check_select(stream.as_deref())
+                .map_err(ApiError::unprocessable)?;
+        }
+        // The one step that can still fail goes first, so that a refusal
+        // leaves everything as it was.
+        let client = api::InputPatch {
+            volume_db: patch.volume_db,
+            muted: patch.mute,
+        };
+        if client != api::InputPatch::default() {
+            self.set_client_input(AES67_CLIENT.into(), client, now)?;
+        }
+        let aes67 = self.aes67.as_mut().expect("checked above");
+        let mut changed = false;
+        if let Some(stream) = stream
+            && stream != current.stream
+        {
+            aes67.select(stream).map_err(ApiError::unprocessable)?;
+            changed = true;
+        }
+        if let Some(latency) = latency {
+            let same = match latency {
+                Latency::Auto => current.latency_auto,
+                Latency::Ms(ms) => !current.latency_auto && current.latency_ms == ms,
+            };
+            if !same {
+                aes67.set_latency(latency);
+                changed = true;
+            }
+        }
+        if let Some(on) = patch.enabled
+            && on != current.enabled
+        {
+            aes67.set_input_enabled(on);
+            changed = true;
+        }
+        if changed {
+            self.aes67_changed(now);
+        }
+        api::answer(&self.aes67_ref()?.view())
+    }
+
+    /// `PATCH /aes67/output`.
+    fn patch_aes67_output(&mut self, patch: api::Aes67OutputPatch, now: Instant) -> api::Answer {
+        let current = self.aes67_ref()?.view().output.enabled;
+        if let (Some(on), Some(aes67)) = (patch.enabled, &mut self.aes67)
+            && on != current
+        {
+            aes67.set_output_enabled(on);
+            self.aes67_changed(now);
+        }
+        api::answer(&self.aes67_ref()?.view())
+    }
+
     pub(super) fn airplay_views(&self) -> Vec<api::AirplayView> {
         self.airplay.iter().map(crate::airplay::Receiver::view).collect()
     }
@@ -535,7 +646,19 @@ impl Control {
 
     /// The gain the streams of a client called `name` play at.
     pub(super) fn client_gain(&self, name: &str) -> f32 {
-        input_gain(self.state.clients.get(name).unwrap_or(&UNITY))
+        input_gain(&self.client_input(name))
+    }
+
+    /// What a client without a stored volume plays at: 0 dB, and for the
+    /// AES67 input its config's `volume_db`.
+    fn client_default(&self, name: &str) -> StoredInput {
+        match &self.aes67_config {
+            Some(c) if name == AES67_CLIENT => StoredInput {
+                volume_db: c.input.volume_db,
+                muted: false,
+            },
+            _ => UNITY,
+        }
     }
 
     /// The engine index of the output with API id `id`: the master is 1.
@@ -744,14 +867,18 @@ impl Control {
     /// written out route by route.
     pub(super) fn route_views(&self, index: usize) -> Vec<RouteJson> {
         let slot = &self.matrices[index];
-        let default;
-        let routes = if slot.routes.is_empty() {
-            default = default_routes(slot.width);
-            &default
-        } else {
-            &slot.routes
-        };
-        routes.iter().map(route_json).collect()
+        if slot.routes.is_empty() {
+            return default_routes(slot.width).iter().map(route_json).collect();
+        }
+        let mut views: Vec<RouteJson> = slot.routes.iter().map(route_json).collect();
+        // Routes that name no `aes67` input play it as the default matrix
+        // does, as `Matrix::from_routes` says.
+        let aes67 = Bus::Aes67.inputs();
+        if !slot.routes.iter().any(|r| aes67.contains(&r.from)) {
+            let width = slot.width;
+            views.extend(bus_default_routes(Bus::Aes67, width).map(|r| route_json(&r)));
+        }
+        views
     }
 
     fn matrix_view(&self) -> MatrixPut {
@@ -946,7 +1073,7 @@ impl Control {
     }
 
     fn client_view(&self, name: &str) -> InputView {
-        let input = self.state.clients.get(name).unwrap_or(&UNITY);
+        let input = self.client_input(name);
         InputView {
             id: format!("clients/{name}"),
             volume_db: input.volume_db,
@@ -980,9 +1107,10 @@ impl Control {
             return Err(ApiError::unprocessable(message));
         }
         check_input(&patch)?;
+        let default = self.client_default(&name);
         let stored = self.state.clients.get(&name);
-        let input = patched_input(stored.unwrap_or(&UNITY), &patch);
-        if input == *stored.unwrap_or(&UNITY) {
+        let input = patched_input(stored.unwrap_or(&default), &patch);
+        if input == *stored.unwrap_or(&default) {
             return Ok(self.client_view(&name));
         }
         if stored.is_none() && self.state.clients.len() >= MAX_CLIENTS {
@@ -991,16 +1119,19 @@ impl Control {
             )));
         }
         let gain = input_gain(&input);
-        if input == UNITY {
+        if input == default {
             self.state.clients.remove(&name);
         } else {
             self.state.clients.insert(name.clone(), input.clone());
         }
         let streams = self.conns.values().filter(|c| c.name == name);
-        let batch = streams
+        let mut batch: Vec<Command> = streams
             .filter_map(|c| c.stream.as_ref())
             .map(|s| Command::SetSourceGain(s.id, gain))
             .collect();
+        if let Some(source) = self.aes67_source.as_ref().filter(|_| name == AES67_CLIENT) {
+            batch.push(Command::SetSourceGain(source.id, gain));
+        }
         self.send(batch);
         let notice = Reply::ClientVolumeChanged {
             db_millis: (input.volume_db * 1000.0).round() as i32,
@@ -1022,17 +1153,21 @@ impl Control {
     }
 
     /// A client's gain, as the state file has it. A client without one
-    /// plays at 0 dB.
+    /// plays at 0 dB, the AES67 input at its config's volume.
     pub(super) fn client_input(&self, name: &str) -> StoredInput {
-        self.state.clients.get(name).cloned().unwrap_or(UNITY)
+        let stored = self.state.clients.get(name).cloned();
+        stored.unwrap_or_else(|| self.client_default(name))
     }
 
     /// The analog input, if there is one, and every client known by name:
     /// those with a stored volume and those with a stream.
-    fn input_views(&self) -> Vec<InputView> {
+    pub(super) fn input_views(&self) -> Vec<InputView> {
         let mut names: BTreeSet<&str> = self.state.clients.keys().map(String::as_str).collect();
         let streams = self.conns.values().filter(|c| c.stream.is_some());
         names.extend(streams.map(|c| c.name.as_str()));
+        if self.aes67_source.is_some() {
+            names.insert(AES67_CLIENT);
+        }
         let analog = self.analog.as_ref().map(|_| self.analog_view());
         analog
             .into_iter()
@@ -1158,6 +1293,8 @@ impl Control {
             default_rate: self.default_rate,
             format: format_name(self.format).to_string(),
             resampling: quality_name(self.quality).to_string(),
+            latency_recommended_ms: self.board.default_latency_ms(),
+            latency_min_ms: self.board.min_latency_ms(),
         }
     }
 
@@ -1172,6 +1309,22 @@ impl Control {
             if given.as_deref().is_some_and(|g| g != now) {
                 let message = format!("{key} changes only in the config");
                 return Err(ApiError::unprocessable(message));
+            }
+        }
+        for (key, given, now) in [
+            (
+                "latency_recommended_ms",
+                patch.latency_recommended_ms,
+                self.board.default_latency_ms(),
+            ),
+            (
+                "latency_min_ms",
+                patch.latency_min_ms,
+                self.board.min_latency_ms(),
+            ),
+        ] {
+            if given.is_some_and(|g| g != now) {
+                return Err(ApiError::unprocessable(format!("{key} is read-only")));
             }
         }
         let mode = match patch.bit_perfect.as_deref() {
@@ -2806,13 +2959,19 @@ mod tests {
             {"from": "players.right", "to": 2, "gain_db": 0.0},
             {"from": "analog.left", "to": 1, "gain_db": 0.0},
             {"from": "analog.right", "to": 2, "gain_db": 0.0},
+            {"from": "aes67.left", "to": 1, "gain_db": 0.0},
+            {"from": "aes67.right", "to": 2, "gain_db": 0.0},
         ])
     }
 
+    /// `swap()` as `GET /matrix` gives it: it names no `aes67` route, so
+    /// the `aes67` bus plays as in the default matrix.
     fn swap_routes() -> serde_json::Value {
         json!([
             {"from": "players.left", "to": 2, "gain_db": 0.0},
             {"from": "players.right", "to": 1, "gain_db": 0.0},
+            {"from": "aes67.left", "to": 1, "gain_db": 0.0},
+            {"from": "aes67.right", "to": 2, "gain_db": 0.0},
         ])
     }
 
@@ -2829,6 +2988,22 @@ mod tests {
             engine.matrices.clear();
             assert_eq!(routes_of(&mut control, id, now), swap_routes(), "{id}");
         }
+    }
+
+    #[test]
+    fn a_matrix_that_names_an_aes67_route_shows_only_the_routes_named() {
+        let (mut control, mut engine, now) = open(&Config::default(), None);
+        let routes = vec![
+            route("players.left", 1, None),
+            route("aes67.right", 2, Some(-3.0)),
+        ];
+        assert_eq!(status(control.call(put(vec![(1, routes)]), now)), 200);
+        engine.take(true);
+        let want = json!([
+            {"from": "players.left", "to": 1, "gain_db": 0.0},
+            {"from": "aes67.right", "to": 2, "gain_db": -3.0},
+        ]);
+        assert_eq!(routes_of(&mut control, 1, now), want);
     }
 
     #[test]
@@ -2849,6 +3024,7 @@ mod tests {
         let mono = json!([
             {"from": "players.left", "to": 1, "gain_db": 0.0},
             {"from": "analog.left", "to": 1, "gain_db": 0.0},
+            {"from": "aes67.left", "to": 1, "gain_db": 0.0},
         ]);
         assert_eq!(routes_of(&mut control, 2, now), mono);
     }
@@ -3024,6 +3200,8 @@ mod tests {
             routes: vec![
                 route("players.left", 2, Some(0.0)),
                 route("players.right", 1, Some(0.0)),
+                route("aes67.left", 1, Some(0.0)),
+                route("aes67.right", 2, Some(0.0)),
             ],
         };
         assert_eq!(events(&mut published), [want]);
@@ -3134,7 +3312,11 @@ mod tests {
         let configured = Matrix::from_routes(&[right], 2).unwrap();
         assert!(engine.matrices.is_empty());
         assert_eq!(engine.mixes, [(1, configured)]);
-        let want = json!([{"from": "players.right", "to": 1, "gain_db": -6.0}]);
+        let want = json!([
+            {"from": "players.right", "to": 1, "gain_db": -6.0},
+            {"from": "aes67.left", "to": 1, "gain_db": 0.0},
+            {"from": "aes67.right", "to": 2, "gain_db": 0.0},
+        ]);
         for id in [1, 2] {
             assert_eq!(routes_of(&mut control, id, now), want, "{id}");
         }
@@ -3208,7 +3390,8 @@ mod tests {
         assert_eq!(
             view,
             json!({"bit_perfect": "auto", "latency_ms": 10.0, "default_rate": 44100,
-                   "format": "f64", "resampling": "high"})
+                   "format": "f64", "resampling": "high",
+                   "latency_recommended_ms": 12.0, "latency_min_ms": 6.0})
         );
     }
 
@@ -3229,6 +3412,17 @@ mod tests {
             let e = settings(&mut control, patch, now).unwrap_err();
             assert_eq!(e.status, 422, "{key}");
             assert_eq!(e.message, format!("{key} changes only in the config"));
+        }
+        // GET /settings has the board's figures; a PATCH naming either is 422.
+        let view = control.call(Call::Settings, now).unwrap();
+        // The test control's board is Other.
+        assert_eq!(view["latency_recommended_ms"], json!(12.0));
+        assert_eq!(view["latency_min_ms"], json!(6.0));
+        for key in ["latency_recommended_ms", "latency_min_ms"] {
+            let patch: SettingsPatch = serde_json::from_value(json!({ key: 1 })).unwrap();
+            let e = settings(&mut control, patch, now).unwrap_err();
+            assert_eq!(e.status, 422, "{key}");
+            assert_eq!(e.message, format!("{key} is read-only"));
         }
         // The refused patches changed nothing.
         let view = control.call(Call::Settings, now).unwrap();

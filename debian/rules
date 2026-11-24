@@ -69,6 +69,7 @@ override_dh_auto_install:
 	install -D -m 0644 dist/90-aas.conf $(PKG)/usr/share/aas/90-aas.conf
 	install -D -m 0644 dist/nginx/hifiberry-aas.nginx $(PKG)/etc/nginx/hifiberry-api.d/hifiberry-aas.nginx
 	install -D -m 0644 dist/auth.d/aas.json $(PKG)/etc/hifiberry/auth.d/aas.json
+	install -D -m 0644 dist/hifiberryos/audiocontrol-aes67.json $(PKG)/etc/audiocontrol/players.d/aes67.json
 	install -D -m 0644 target/release/libaas_alsa.so $(PLUGIN)/$(ALSA_DIR)/libasound_module_pcm_aas.so
 	ln -sf libasound_module_pcm_aas.so $(PLUGIN)/$(ALSA_DIR)/libasound_module_ctl_aas.so
 
