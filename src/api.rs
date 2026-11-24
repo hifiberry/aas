@@ -510,6 +510,9 @@ pub struct Aes67OutputView {
     /// the controller last read it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delay_ms: Option<f64>,
+    /// Packets sent as zeros as the master's frames ran out, since the
+    /// output started.
+    pub padded: u64,
 }
 
 /// An announced stream as `GET /aes67/streams` gives it.

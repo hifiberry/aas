@@ -142,10 +142,10 @@ impl Control {
             batch.push(Command::RemoveTap(old));
             self.taps_len -= 1;
         }
-        let Some((rate, _)) = self.output else {
+        let Some((rate, period)) = self.output else {
             return;
         };
-        if !aes67.output_wants_tap(rate) {
+        if !aes67.output_wants_tap(rate, period) {
             return;
         }
         if let Some(old) = aes67.take_output_tap() {
@@ -156,7 +156,7 @@ impl Control {
             return;
         };
         if let Some(aes67) = &mut self.aes67 {
-            aes67.give_output_tap(id, rate, reader, wake);
+            aes67.give_output_tap(id, (rate, period), reader, wake);
         }
     }
 

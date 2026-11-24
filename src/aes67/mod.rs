@@ -104,7 +104,7 @@ pub struct Aes67 {
     /// The output thread, while the output is enabled and has started.
     output: Option<Box<dyn OutputPort>>,
     /// The id and rate of the monitor tap the output reads.
-    output_tap: Option<(ClientId, u32)>,
+    output_tap: Option<(ClientId, u32, u32)>,
     /// The interface's address, once it has one.
     address: Option<Ipv4Addr>,
     /// The interface's MAC could not be read, and that has been logged.
@@ -446,6 +446,7 @@ impl Aes67 {
                 },
                 port: output.port,
                 delay_ms: sending.and_then(|s| s.delay_us).map(|us| us as f64 / 1e3),
+                padded: sending.map_or(0, |s| s.padded),
             },
         }
     }
@@ -559,15 +560,15 @@ impl Aes67 {
         }
     }
 
-    /// Whether the output needs a tap at `rate`: it runs and has none at
-    /// that rate.
-    pub fn output_wants_tap(&self, rate: u32) -> bool {
-        self.output.is_some() && self.output_tap.map(|(_, r)| r) != Some(rate)
+    /// Whether the output needs a tap at `rate` and `period`: it runs and
+    /// has none at those, as the delay it holds follows the period.
+    pub fn output_wants_tap(&self, rate: u32, period: u32) -> bool {
+        self.output.is_some() && self.output_tap.map(|(_, r, p)| (r, p)) != Some((rate, period))
     }
 
     /// The id of the tap the output had, for the audio thread to remove.
     pub fn take_output_tap(&mut self) -> Option<ClientId> {
-        self.output_tap.take().map(|(id, _)| id)
+        self.output_tap.take().map(|(id, _, _)| id)
     }
 
     /// The id of the tap of an output that no longer runs, to remove.
@@ -583,7 +584,7 @@ impl Aes67 {
     pub fn give_output_tap(
         &mut self,
         id: ClientId,
-        rate: u32,
+        (rate, period): (u32, u32),
         reader: Ring,
         wake: Option<OwnedFd>,
     ) {
@@ -591,9 +592,10 @@ impl Aes67 {
             output.give_tap(TapReader {
                 ring: reader,
                 rate,
+                period,
                 wake,
             });
-            self.output_tap = Some((id, rate));
+            self.output_tap = Some((id, rate, period));
         }
     }
 
@@ -770,6 +772,7 @@ pub(crate) mod testing {
                     group: Ipv4Addr::new(239, 69, 0, 1),
                     port: 5004,
                     delay_us: None,
+                    padded: 0,
                 })),
             }
         }
@@ -966,18 +969,20 @@ mod tests {
     #[test]
     fn the_output_has_a_tap_at_the_masters_rate() {
         let (mut aes67, _) = with_stream("");
-        assert!(!aes67.output_wants_tap(48000), "no output thread");
+        assert!(!aes67.output_wants_tap(48000, 256), "no output thread");
         let output = FakeOutput::default();
         aes67.with_output(output.clone());
-        assert!(aes67.output_wants_tap(48000));
+        assert!(aes67.output_wants_tap(48000, 256));
         let (_ring, fd) = Ring::create(4096).unwrap();
-        aes67.give_output_tap(7, 48000, Ring::map(fd.as_fd()).unwrap(), None);
+        aes67.give_output_tap(7, (48000, 256), Ring::map(fd.as_fd()).unwrap(), None);
         assert_eq!(*lock(&output.taps), [48000]);
-        assert!(!aes67.output_wants_tap(48000));
+        assert!(!aes67.output_wants_tap(48000, 256));
+        // A new period: the delay the output holds follows it.
+        assert!(aes67.output_wants_tap(48000, 128));
         // A new rate: the old tap goes, a new one comes.
-        assert!(aes67.output_wants_tap(44100));
+        assert!(aes67.output_wants_tap(44100, 256));
         assert_eq!(aes67.take_output_tap(), Some(7));
-        aes67.give_output_tap(8, 44100, Ring::map(fd.as_fd()).unwrap(), None);
+        aes67.give_output_tap(8, (44100, 256), Ring::map(fd.as_fd()).unwrap(), None);
         assert_eq!(*lock(&output.taps), [48000, 44100]);
         // The view shows the group the output sends to.
         lock(&output.status).sending = true;

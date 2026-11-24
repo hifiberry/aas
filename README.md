@@ -511,7 +511,10 @@ Nothing is sent without PTP time: the packets' timestamps are PTP time, and a
 receiver cannot place them without it. The stream is announced over SAP every
 30 s while it is sent and withdrawn when it stops. `GET /aes67` shows
 `output.sending`, the `group` and the `port`, and while sending, `delay_ms`:
-the time from the master's tap to the network, held at 20 ms. `PATCH /aes67/output` with
+the time from the master's tap to the network. It is held at one master
+period, the resampler's filter and 2 ms: 4.7 ms with the 64-frame periods of a
+5 ms latency, 8.7 ms with 256-frame periods. `output.padded` counts the packets
+sent as zeros because the master's frames ran out. `PATCH /aes67/output` with
 `{"enabled": true|false}` turns the output on or off; that is kept in the state
 file while the config stays as it was.
 

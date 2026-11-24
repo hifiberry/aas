@@ -167,6 +167,7 @@ impl Receiver {
             handle.tap(TapReader {
                 ring: reader,
                 rate,
+                period: 0,
                 wake: None,
             });
             self.tap = Some((id, rate));

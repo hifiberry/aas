@@ -48,6 +48,8 @@ const FEEDBACK: Duration = Duration::from_secs(2);
 pub struct TapReader {
     pub ring: Ring,
     pub rate: u32,
+    /// The master's period in frames; 0 where the reader does not use it.
+    pub period: u32,
     /// The eventfd the engine writes after a period, for a reader that
     /// waits for the frames rather than reading on its own timer.
     pub wake: Option<OwnedFd>,
@@ -796,6 +798,7 @@ mod tests {
             TapReader {
                 ring: reader,
                 rate: RATE,
+                period: 0,
                 wake: None,
             },
         )

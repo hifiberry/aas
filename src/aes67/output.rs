@@ -63,8 +63,10 @@ const PACKET_NS: i128 = 1_000_000;
 pub const PAYLOAD_TYPE: u8 = 96;
 /// RTP header and 48 frames of L24 stereo.
 const PACKET_BYTES: usize = 12 + FRAMES * 6;
-/// The tap-to-send delay the path holds, in 48 kHz frames: 20 ms.
-const TARGET: f64 = 960.0;
+/// What the tap-to-send delay holds beyond a master period and the
+/// filter, in 48 kHz frames: the packet's 1 ms, and 1 ms for the thread to
+/// wake late and the engine to write late.
+const MARGIN: f64 = 96.0;
 /// A delay this far above the target, in 48 kHz frames, is cut back to it:
 /// 8 ms, where the controller stops believing a reading.
 const EXCESS: f64 = 384.0;
@@ -89,6 +91,9 @@ pub struct OutputStatus {
     pub port: u16,
     /// The tap-to-send delay as the controller last read it, in µs.
     pub delay_us: Option<i64>,
+    /// Packets sent as zeros since the path first held its delay, as the
+    /// master's frames ran out.
+    pub padded: u64,
 }
 
 /// What the sender needs to know of the world at a step.
@@ -128,6 +133,8 @@ pub struct Sender {
     drift: Drift,
     /// Until the path first holds its target, packets go out as zeros.
     primed: bool,
+    /// The tap-to-send delay the path holds, 48 kHz frames.
+    target: f64,
     /// The delay as the drift last read it.
     measured: f64,
     /// Packets that had to be zeros after priming.
@@ -138,9 +145,16 @@ pub struct Sender {
 
 impl Sender {
     /// A sender of `session`, not sending until it has PTP time, with the
-    /// master at `master_rate`. Allocates everything it will use.
-    pub fn new(session: Session, ssrc: u32, first_seq: u16, master_rate: u32) -> Sender {
-        let (adaptive, drift, capacity) = path(master_rate);
+    /// master at `master_rate` writing `master_period` frames at a time.
+    /// Allocates everything it will use.
+    pub fn new(
+        session: Session,
+        ssrc: u32,
+        first_seq: u16,
+        master_rate: u32,
+        master_period: u32,
+    ) -> Sender {
+        let (adaptive, drift, capacity, target) = path(master_rate, master_period);
         Sender {
             ssrc,
             seq: first_seq,
@@ -156,6 +170,7 @@ impl Sender {
             adaptive,
             drift,
             primed: false,
+            target,
             measured: 0.0,
             padded: 0,
             out: vec![[0; 2]; FRAMES],
@@ -163,11 +178,13 @@ impl Sender {
         }
     }
 
-    /// A new master rate, from a new tap: the frames at the old one are
-    /// dropped and the path primes again. The RTP timeline goes on.
-    pub fn set_rate(&mut self, master_rate: u32) {
-        let (adaptive, drift, capacity) = path(master_rate);
+    /// A new master rate or period, from a new tap: the frames at the old
+    /// one are dropped and the path primes again at the new target. The RTP
+    /// timeline goes on.
+    pub fn set_master(&mut self, master_rate: u32, master_period: u32) {
+        let (adaptive, drift, capacity, target) = path(master_rate, master_period);
         self.master_rate = master_rate;
+        self.target = target;
         self.adaptive = adaptive;
         self.drift = drift;
         self.capacity = capacity;
@@ -193,8 +210,8 @@ impl Sender {
         }
         self.input.extend_from_slice(frames);
         let delay = self.delay(local_ns);
-        if delay > TARGET + EXCESS {
-            self.drop_frames(self.master_frames(delay - TARGET));
+        if delay > self.target + EXCESS {
+            self.drop_frames(self.master_frames(delay - self.target));
             self.drift.reprime();
         }
     }
@@ -251,12 +268,12 @@ impl Sender {
     fn frames(&mut self, local_ns: i128) {
         let mut delay = self.delay(local_ns);
         if !self.primed {
-            if delay < TARGET {
+            if delay < self.target {
                 self.out.fill([0; 2]);
                 return;
             }
             // Frames that waited for PTP time are late: they go.
-            self.drop_frames(self.master_frames(delay - TARGET));
+            self.drop_frames(self.master_frames(delay - self.target));
             self.primed = true;
             delay = self.delay(local_ns);
         }
@@ -312,6 +329,11 @@ impl Sender {
     }
 
     /// The tap-to-send delay as the drift last read it, 48 kHz frames.
+    /// The tap-to-send delay the path holds, 48 kHz frames.
+    pub fn target(&self) -> f64 {
+        self.target
+    }
+
     pub fn measured(&self) -> f64 {
         self.measured
     }
@@ -324,7 +346,12 @@ impl Sender {
 
 /// A resampler from the master's rate to 48 kHz, its drift controller,
 /// and the most master-rate frames waiting: a second.
-fn path(master_rate: u32) -> (Adaptive, Drift, usize) {
+/// The resampler, the controller, the frames the path keeps at most and
+/// the delay it holds, for a master at `master_rate` writing
+/// `master_period` frames at a time. The delay is one period, which the
+/// newest frames are ahead of real time by at most, the filter and
+/// [`MARGIN`].
+fn path(master_rate: u32, master_period: u32) -> (Adaptive, Drift, usize, f64) {
     let adaptive = Adaptive::new(
         master_rate,
         RATE,
@@ -333,8 +360,10 @@ fn path(master_rate: u32) -> (Adaptive, Drift, usize) {
         Quality::High,
         Format::I32,
     );
-    let drift = Drift::new(TARGET, RATE, FRAMES as u32);
-    (adaptive, drift, master_rate.max(RATE) as usize)
+    let period = f64::from(master_period) * f64::from(RATE) / f64::from(master_rate);
+    let target = (period + adaptive.delay_frames() + MARGIN).ceil();
+    let drift = Drift::new(target, RATE, FRAMES as u32);
+    (adaptive, drift, master_rate.max(RATE) as usize, target)
 }
 
 /// The default group: 239.69.x.y, x and y the last two bytes of the MAC;
@@ -436,13 +465,14 @@ pub fn start(
     };
     let ssrc = u32::from_be_bytes([random[4], random[5], random[6], random[7]]);
     let first_seq = u16::from_be_bytes([random[8], random[9]]);
-    let sender = Sender::new(session, ssrc, first_seq, RATE);
+    let sender = Sender::new(session, ssrc, first_seq, RATE, 0);
     let status = Arc::new(Mutex::new(OutputStatus {
         enabled: true,
         sending: false,
         group,
         port: config.port,
         delay_us: None,
+        padded: 0,
     }));
     let stop = Arc::new(AtomicBool::new(false));
     let (taps, received) = mpsc::channel();
@@ -495,7 +525,7 @@ fn run(
                     // when they came; without, it reads on its own timer.
                     let wake_at = if new.wake.is_some() { 0 } else { u64::MAX };
                     new.ring.header().wake_at.store(wake_at, Ordering::SeqCst);
-                    sender.set_rate(new.rate);
+                    sender.set_master(new.rate, new.period);
                     tap = Some(new);
                 }
                 Err(TryRecvError::Empty) => break,
@@ -537,6 +567,7 @@ fn run(
             let mut st = lock(status);
             st.delay_us =
                 version.map(|_| (sender.measured() * 1e6 / f64::from(RATE)).round() as i64);
+            st.padded = sender.padded();
         }
         let idle = now.local_ns + IDLE_NS;
         let wake = match (sender.next_ptp(), ptp) {
@@ -637,8 +668,6 @@ mod tests {
     const MS: i128 = 1_000_000;
     /// The first whole millisecond of PTP time from the start.
     const G0: i128 = P0 + 700_000;
-    /// The tap-to-send delay the path holds, 48 kHz frames.
-    const HOLD: f64 = 960.0;
 
     fn session() -> Session {
         Session {
@@ -660,7 +689,7 @@ mod tests {
     }
 
     fn sender(first_seq: u16) -> Sender {
-        Sender::new(session(), 0x1234_5678, first_seq, 48000)
+        Sender::new(session(), 0x1234_5678, first_seq, 48000, 256)
     }
 
     /// The world at `ptp_ns` of PTP time, `gm` the grandmaster.
@@ -714,7 +743,7 @@ mod tests {
 
         /// Hands the sender every period made by `ptp_ns`.
         fn feed(&mut self, s: &mut Sender, ptp_ns: i128) {
-            self.feed_with(s, ptp_ns, false);
+            self.feed_with(s, ptp_ns, true);
         }
 
         /// Hands the sender every period made by `ptp_ns`, stamped with
@@ -799,10 +828,11 @@ mod tests {
         );
         let waiting = s.input.len() as f64 + s.adaptive.delay_frames();
         assert!(
-            (waiting - HOLD).abs() < 256.0 + 48.0,
-            "frames waiting {waiting:.0}, want {HOLD} within a period"
+            (waiting - s.target()).abs() < 256.0 + 48.0,
+            "frames waiting {waiting:.0}, want {} within a period",
+            s.target()
         );
-        assert!((s.measured() - HOLD).abs() < 48.0, "{}", s.measured());
+        assert!((s.measured() - s.target()).abs() < 48.0, "{}", s.measured());
     }
 
     /// A card 16 ppm off PTP slides its periods of 64 frames by 1/3 ms
@@ -813,6 +843,7 @@ mod tests {
     #[test]
     fn periods_taken_when_made_keep_the_delay_steady() {
         let mut s = sender(0);
+        s.set_master(48000, 64);
         let mut master = Master::new(48000, 16.0, 64, P0, true);
         let mut t = P0 + 370_000;
         let (mut low, mut high) = (f64::MAX, f64::MIN);
@@ -826,8 +857,26 @@ mod tests {
             t += MS;
         }
         assert!(high - low < 4.0, "the delay swung {low:.1}..{high:.1}");
-        assert!((low - HOLD).abs() < 8.0, "{low:.1}");
+        assert!((low - s.target()).abs() < 8.0, "{low:.1}");
         assert_eq!(s.padded(), 0);
+    }
+
+    /// The delay held is a master period at 48 kHz, the filter and 2 ms:
+    /// under 5 ms with the 64-frame periods of a short latency.
+    #[test]
+    fn the_delay_held_follows_the_masters_period() {
+        let mut s = sender(0);
+        for (rate, period, frames) in [
+            (48000, 64, 64.0),
+            (48000, 1024, 1024.0),
+            (96000, 256, 128.0),
+        ] {
+            s.set_master(rate, period);
+            let want = (frames + s.adaptive.delay_frames() + 96.0).ceil();
+            assert_eq!(s.target(), want, "{rate} Hz, {period}");
+        }
+        s.set_master(48000, 64);
+        assert!(s.target() < 240.0, "{}", s.target());
     }
 
     #[test]
@@ -997,7 +1046,7 @@ mod tests {
         // The new tap comes while the packet at `mid` waits to be sent, and
         // the steps go on off the grid: a timeline anchored again would
         // start at the next whole millisecond and skip that packet.
-        s.set_rate(44100);
+        s.set_master(44100, 256);
         let mut master = Master::new(44100, 0.0, 256, mid, true);
         let end = mid + 2000 * MS;
         run(
@@ -1016,15 +1065,16 @@ mod tests {
         }
         // The new rate plays.
         assert!(out.last().unwrap()[12..].iter().any(|&b| b != 0));
-        assert!((s.measured() - HOLD).abs() < 48.0, "{}", s.measured());
+        assert!((s.measured() - s.target()).abs() < 48.0, "{}", s.measured());
     }
 
     #[test]
     fn the_drift_follows_the_card_against_ptp() {
-        // The master's period swings what waits by as much: up to 21 ms.
+        // Periods taken as they come, at the delay each period gives.
         for period in [256, 1024] {
             let mut s = sender(0);
-            let mut master = Master::new(48000, 20.0, period, P0, true);
+            s.set_master(48000, period);
+            let mut master = Master::new(48000, 20.0, period as usize, P0, true);
             // Steps off the packets' grid, as the thread wakes.
             let mut t = P0 + 370_000;
             let mut second = Vec::new();
@@ -1043,7 +1093,7 @@ mod tests {
             }
             assert_eq!(means.len(), 10);
             for mean in &means {
-                assert!((mean - HOLD).abs() <= 12.0, "{period}: {means:?}");
+                assert!((mean - s.target()).abs() <= 12.0, "{period}: {means:?}");
             }
             assert_eq!(s.padded(), 0, "{period}");
         }
