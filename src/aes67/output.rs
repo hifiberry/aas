@@ -73,6 +73,8 @@ const JUMP_NS: i128 = 50_000_000;
 const IDLE_NS: i128 = 20_000_000;
 /// Frames read from the tap at a time.
 const CHUNK: usize = 1024;
+/// How often the thread publishes its delay, ns.
+const STATUS_NS: i128 = 100_000_000;
 
 /// The output thread as the control thread sees it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +86,8 @@ pub struct OutputStatus {
     /// The group it sends to, the config's or the one made from the MAC.
     pub group: Ipv4Addr,
     pub port: u16,
+    /// The tap-to-send delay as the controller last read it, in µs.
+    pub delay_us: Option<i64>,
 }
 
 /// What the sender needs to know of the world at a step.
@@ -179,8 +183,13 @@ impl Sender {
         if over > 0 {
             self.drop_frames(over);
         }
-        self.pending = self.pending_now(local_ns) + frames.len() as f64;
-        self.pending_at = local_ns;
+        // Only the newest block is ahead of real time; what came before it
+        // is due. Summing the blocks would keep a backlog the tap gave at its
+        // start in the reading for good, and the path that long too.
+        if !frames.is_empty() {
+            self.pending = frames.len() as f64;
+            self.pending_at = local_ns;
+        }
         self.input.extend_from_slice(frames);
         let delay = self.delay(local_ns);
         if delay > TARGET + EXCESS {
@@ -432,6 +441,7 @@ pub fn start(
         sending: false,
         group,
         port: config.port,
+        delay_us: None,
     }));
     let stop = Arc::new(AtomicBool::new(false));
     let (taps, received) = mpsc::channel();
@@ -474,6 +484,7 @@ fn run(
     let mut told: Option<u64> = None;
     let mut failing = false;
     let mut sleep_failed = false;
+    let mut published = 0i128;
     while !stop.load(Ordering::Relaxed) {
         loop {
             match taps.try_recv() {
@@ -516,6 +527,12 @@ fn run(
             told = version;
             *lock(announce) = sender.announcement().cloned();
             lock(status).sending = version.is_some();
+        }
+        if (now.local_ns - published).abs() >= STATUS_NS {
+            published = now.local_ns;
+            let mut st = lock(status);
+            st.delay_us =
+                version.map(|_| (sender.measured() * 1e6 / f64::from(RATE)).round() as i64);
         }
         let idle = now.local_ns + IDLE_NS;
         let wake = match (sender.next_ptp(), ptp) {
@@ -711,6 +728,31 @@ mod tests {
     /// PTP time at the first whole millisecond from `t`.
     fn grid(t: i128) -> i128 {
         (t + MS - 1).div_euclid(MS) * MS
+    }
+
+    /// A tap that opens with a backlog hands it over at once, then a period
+    /// at a time in real time. The backlog plays out: the frames that wait
+    /// come back to the target, not the target plus the backlog.
+    #[test]
+    fn a_backlog_at_the_start_does_not_stay_in_the_delay() {
+        let mut s = sender(0);
+        // 50 ms of master frames made before the first step.
+        let mut master = Master::new(48000, 0.0, 256, G0 - 50 * MS, true);
+        let mut out = Vec::new();
+        run(
+            &mut s,
+            Some(&mut master),
+            (G0, G0 + 10_000 * MS, MS),
+            GM,
+            0,
+            &mut out,
+        );
+        let waiting = s.input.len() as f64 + s.adaptive.delay_frames();
+        assert!(
+            (waiting - HOLD).abs() < 256.0 + 48.0,
+            "frames waiting {waiting:.0}, want {HOLD} within a period"
+        );
+        assert!((s.measured() - HOLD).abs() < 48.0, "{}", s.measured());
     }
 
     #[test]

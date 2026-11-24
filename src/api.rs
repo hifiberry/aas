@@ -480,6 +480,23 @@ pub struct Aes67InputView {
     /// `"stopped"`, `"resumed"`, `"no stored packets"`, `"delay"` or
     /// `"timestamps"` (a stream in PTP mode that fell back to buffer mode).
     pub last_restart: Option<&'static str>,
+    /// In PTP mode, the delay the controller holds at `latency_ms`, by part.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delay: Option<Aes67DelayView>,
+}
+
+/// The delay of a stream in PTP mode, as the controller last read it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Aes67DelayView {
+    pub total_ms: f64,
+    /// From a frame's media-clock time to where the jitter buffer reads.
+    pub network_ms: f64,
+    /// The resampler's filter.
+    pub filter_ms: f64,
+    /// The ring to the engine.
+    pub ring_ms: f64,
+    /// The engine's delay after the ring: its card buffer and filters.
+    pub engine_ms: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -489,6 +506,10 @@ pub struct Aes67OutputView {
     /// The multicast group; absent while `"auto"` is not resolved.
     pub group: Option<String>,
     pub port: u16,
+    /// While sending, the delay from the master's tap to the network as
+    /// the controller last read it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delay_ms: Option<f64>,
 }
 
 /// An announced stream as `GET /aes67/streams` gives it.

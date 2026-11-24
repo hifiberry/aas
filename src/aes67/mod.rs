@@ -29,7 +29,8 @@ use std::os::fd::{AsFd, OwnedFd};
 
 use crate::airplay::output::TapReader;
 use crate::api::{
-    Aes67ClockView, Aes67InputView, Aes67OutputView, Aes67StreamView, Aes67View, ApiEvent,
+    Aes67ClockView, Aes67DelayView, Aes67InputView, Aes67OutputView, Aes67StreamView, Aes67View,
+    ApiEvent,
 };
 use crate::rate::ClientId;
 use crate::state::{Stored, StoredAes67};
@@ -427,6 +428,13 @@ impl Aes67 {
                 lost: status.lost,
                 restarts: status.restarts,
                 last_restart: status.last_restart,
+                delay: status.delay.map(|d| Aes67DelayView {
+                    total_ms: (d.network_us + d.filter_us + d.ring_us + d.engine_us) as f64 / 1e3,
+                    network_ms: d.network_us as f64 / 1e3,
+                    filter_ms: d.filter_us as f64 / 1e3,
+                    ring_ms: d.ring_us as f64 / 1e3,
+                    engine_ms: d.engine_us as f64 / 1e3,
+                }),
             },
             output: Aes67OutputView {
                 enabled: self.output_enabled,
@@ -437,6 +445,7 @@ impl Aes67 {
                     (None, Group::Auto) => None,
                 },
                 port: output.port,
+                delay_ms: sending.and_then(|s| s.delay_us).map(|us| us as f64 / 1e3),
             },
         }
     }
@@ -749,6 +758,7 @@ pub(crate) mod testing {
                     sending: false,
                     group: Ipv4Addr::new(239, 69, 0, 1),
                     port: 5004,
+                    delay_us: None,
                 })),
             }
         }

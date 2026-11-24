@@ -111,6 +111,20 @@ pub struct InputStatus {
     /// "no stored packets", "delay" (the error beyond what the controller
     /// takes) or "timestamps" (they do not follow the PTP clock).
     pub last_restart: Option<&'static str>,
+    /// The delay in PTP mode as the controller last read it, by part.
+    pub delay: Option<DelayParts>,
+}
+
+/// The parts of the delay a PTP-mode stream holds at its latency, in µs:
+/// from a frame's media-clock time to where the jitter buffer reads, the
+/// resampler's filter, the ring to the engine, and the engine's own delay
+/// after the ring.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DelayParts {
+    pub network_us: i64,
+    pub filter_us: i64,
+    pub ring_us: i64,
+    pub engine_us: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -268,6 +282,8 @@ pub struct Receiver {
     last_restart: Option<&'static str>,
     /// The ratio last set.
     ratio: f64,
+    /// The delay's parts at the last write in PTP mode.
+    parts: Option<DelayParts>,
     jitter: Jitter,
     adaptive: Adaptive,
     drift: Drift,
@@ -298,6 +314,7 @@ impl Receiver {
             skipping: 0,
             restarts: 0,
             last_restart: None,
+            parts: None,
             ratio: 1.0,
             jitter: Jitter::new(),
             adaptive,
@@ -450,17 +467,27 @@ impl Receiver {
     fn measure(&self, now: &Now, fill: usize) -> Option<f64> {
         match self.mode? {
             Mode::Ptp => {
-                let ptp = now.ptp.as_ref()?;
-                let offset = self.session.as_ref()?.mediaclk_offset;
-                let (ts, fraction) = media_now(ptp, now.local_ns, offset);
-                // The next frame out of the resampler is its filter's delay
-                // behind the jitter buffer's read position, and reaches the
-                // master after the ring and the engine.
-                let behind = f64::from(ts_diff(ts, self.jitter.read_ts())) + fraction;
-                Some(behind + self.adaptive.delay_frames() + fill as f64 + now.output_delay)
+                let [behind, filter, ring, engine] = self.ptp_parts(now, fill)?;
+                Some(behind + filter + ring + engine)
             }
             Mode::Buffer => Some(f64::from(self.jitter.depth()) + fill as f64),
         }
+    }
+
+    /// The PTP-mode delay by part, in frames: the next frame out of the
+    /// resampler is its filter's delay behind the jitter buffer's read
+    /// position, and reaches the master after the ring and the engine.
+    fn ptp_parts(&self, now: &Now, fill: usize) -> Option<[f64; 4]> {
+        let ptp = now.ptp.as_ref()?;
+        let offset = self.session.as_ref()?.mediaclk_offset;
+        let (ts, fraction) = media_now(ptp, now.local_ns, offset);
+        let behind = f64::from(ts_diff(ts, self.jitter.read_ts())) + fraction;
+        Some([
+            behind,
+            self.adaptive.delay_frames(),
+            fill as f64,
+            now.output_delay,
+        ])
     }
 
     /// Zeros ahead of the first frame until it is at its target delay, or
@@ -514,6 +541,15 @@ impl Receiver {
             let Some(delay) = self.measure(now, fill) else {
                 return;
             };
+            if self.mode == Some(Mode::Ptp) {
+                let us = |frames: f64| (frames * 1e6 / f64::from(RATE)).round() as i64;
+                self.parts = self.ptp_parts(now, fill).map(|[n, f, r, e]| DelayParts {
+                    network_us: us(n),
+                    filter_us: us(f),
+                    ring_us: us(r),
+                    engine_us: us(e),
+                });
+            }
             if (delay - target).abs() > RESTART_FRAMES {
                 self.restart(Restart::Hard, "delay");
                 return;
@@ -565,6 +601,10 @@ impl Receiver {
         (status.lost, status.late) = self.jitter.counts();
         status.restarts = self.restarts;
         status.last_restart = self.last_restart;
+        status.delay = match (self.phase, self.mode) {
+            (Phase::Playing, Some(Mode::Ptp)) => self.parts,
+            _ => None,
+        };
     }
 
     /// Starts over, silent until the next packet. `reason` is what the
