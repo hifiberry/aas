@@ -2074,7 +2074,7 @@ impl Control {
                 batch.push(Command::RemoveTap(old));
                 self.taps_len -= 1;
             }
-            let Some((id, reader)) = self.monitor_tap(rate, "an AirPlay receiver", batch) else {
+            let Some((id, reader, _)) = self.monitor_tap(rate, "an AirPlay receiver", batch) else {
                 continue;
             };
             self.airplay[i].give_tap(id, rate, reader);
@@ -2089,7 +2089,7 @@ impl Control {
         rate: u32,
         what: &str,
         batch: &mut Vec<Command>,
-    ) -> Option<(ClientId, Ring)> {
+    ) -> Option<(ClientId, Ring, Option<OwnedFd>)> {
         let made = Ring::create((rate / 2).max(4096)).and_then(|(ring, memfd)| {
             let reader = Ring::map(memfd.as_fd())?;
             Ok((ring, reader, eventfd()?))
@@ -2107,12 +2107,14 @@ impl Control {
             self.taps_capacity *= 2;
             batch.push(Command::GrowTaps(Vec::with_capacity(self.taps_capacity)));
         }
+        // The reader's copy of the eventfd, for one that waits for frames.
+        let theirs = wake.try_clone().ok();
         let mut tap = Tap::new(id, ring, wake);
         tap.monitor = true;
         tap.running = true;
         batch.push(Command::AddTap(Box::new(tap)));
         self.taps_len += 1;
-        Some((id, reader))
+        Some((id, reader, theirs))
     }
 
     /// Publishes each AirPlay receiver whose state changed.

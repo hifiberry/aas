@@ -36,6 +36,7 @@
 
 use std::io;
 use std::net::{Ipv4Addr, UdpSocket};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, TryRecvError};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -489,8 +490,11 @@ fn run(
         loop {
             match taps.try_recv() {
                 Ok(new) => {
-                    // The thread reads on its own timer and is never woken.
-                    new.ring.header().wake_at.store(u64::MAX, Ordering::SeqCst);
+                    // With the eventfd, the thread is woken after every
+                    // period and takes the frames as they come, so it knows
+                    // when they came; without, it reads on its own timer.
+                    let wake_at = if new.wake.is_some() { 0 } else { u64::MAX };
+                    new.ring.header().wake_at.store(wake_at, Ordering::SeqCst);
                     sender.set_rate(new.rate);
                     tap = Some(new);
                 }
@@ -542,7 +546,8 @@ fn run(
             }
             _ => idle,
         };
-        if let Err(e) = sleep_until(wake) {
+        let woken = tap.as_ref().and_then(|t| t.wake.as_ref());
+        if let Err(e) = wait_until(wake, woken) {
             // Never spin at real-time priority.
             if !std::mem::replace(&mut sleep_failed, true) {
                 eprintln!("aas: aes67: output: cannot sleep until the next packet: {e}");
@@ -553,6 +558,40 @@ fn run(
 }
 
 /// Sleeps until CLOCK_REALTIME reaches `ns`.
+/// Waits until `ns` of the real-time clock, or until `woken` is written
+/// first, and clears it.
+fn wait_until(ns: i128, woken: Option<&OwnedFd>) -> io::Result<()> {
+    let Some(fd) = woken else {
+        return sleep_until(ns);
+    };
+    let left = (ns - realtime_ns()).max(0);
+    let timeout = libc::timespec {
+        tv_sec: left.div_euclid(1_000_000_000) as libc::time_t,
+        tv_nsec: left.rem_euclid(1_000_000_000) as libc::c_long,
+    };
+    let mut poll = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one valid pollfd and a valid timeout; no signal mask.
+    let r = unsafe { libc::ppoll(&mut poll, 1, &timeout, std::ptr::null()) };
+    if r < 0 {
+        let e = io::Error::last_os_error();
+        return if e.kind() == io::ErrorKind::Interrupted {
+            Ok(())
+        } else {
+            Err(e)
+        };
+    }
+    if r > 0 {
+        let mut count = 0u64;
+        // SAFETY: a read of 8 bytes into a u64; the fd is non-blocking.
+        unsafe { libc::read(fd.as_raw_fd(), (&raw mut count).cast(), size_of::<u64>()) };
+    }
+    Ok(())
+}
+
 fn sleep_until(ns: i128) -> io::Result<()> {
     let ts = libc::timespec {
         tv_sec: ns.div_euclid(1_000_000_000) as libc::time_t,
@@ -675,6 +714,12 @@ mod tests {
 
         /// Hands the sender every period made by `ptp_ns`.
         fn feed(&mut self, s: &mut Sender, ptp_ns: i128) {
+            self.feed_with(s, ptp_ns, false);
+        }
+
+        /// Hands the sender every period made by `ptp_ns`, stamped with
+        /// when it was made if `when_made`, else with `ptp_ns`.
+        fn feed_with(&mut self, s: &mut Sender, ptp_ns: i128, when_made: bool) {
             let made = (ptp_ns - self.since) as f64
                 * 1e-9
                 * f64::from(self.rate)
@@ -693,7 +738,12 @@ mod tests {
                     };
                     *f = [v, v];
                 }
-                s.take(&self.buf, ptp_ns - P0 + L0);
+                let made_ns = self.since
+                    + ((self.given + self.period as u64) as f64
+                        / (f64::from(self.rate) * (1.0 + self.ppm * 1e-6))
+                        * 1e9) as i128;
+                let at = if when_made { made_ns } else { ptp_ns };
+                s.take(&self.buf, at - P0 + L0);
                 self.given += self.period as u64;
             }
         }
@@ -753,6 +803,50 @@ mod tests {
             "frames waiting {waiting:.0}, want {HOLD} within a period"
         );
         assert!((s.measured() - HOLD).abs() < 48.0, "{}", s.measured());
+    }
+
+    /// A card 16 ppm off PTP slides its periods of 64 frames by 1/3 ms
+    /// against the 1 ms packets every 21 s. Taken when they were made, the
+    /// delay the controller reads does not step as they slide; taken on
+    /// the packets' grid, it stepped by 16 frames each time, and the
+    /// controller answered with a burst of -120 ppm.
+    #[test]
+    fn periods_taken_when_made_keep_the_delay_steady() {
+        let mut s = sender(0);
+        let mut master = Master::new(48000, 16.0, 64, P0, true);
+        let mut t = P0 + 370_000;
+        let (mut low, mut high) = (f64::MAX, f64::MIN);
+        while t < P0 + 90_000 * MS {
+            master.feed_with(&mut s, t, true);
+            s.step(&at(t, GM, 1), &mut |_| {});
+            if t >= P0 + 30_000 * MS {
+                low = low.min(s.measured());
+                high = high.max(s.measured());
+            }
+            t += MS;
+        }
+        assert!(high - low < 4.0, "the delay swung {low:.1}..{high:.1}");
+        assert!((low - HOLD).abs() < 8.0, "{low:.1}");
+        assert_eq!(s.padded(), 0);
+    }
+
+    #[test]
+    fn a_write_to_the_tap_eventfd_ends_the_wait_and_is_cleared() {
+        let fd = crate::control::eventfd().unwrap();
+        let one = 1u64;
+        // SAFETY: a write of 8 bytes from a u64.
+        unsafe { libc::write(fd.as_raw_fd(), (&raw const one).cast(), 8) };
+        let start = realtime_ns();
+        wait_until(start + 1_000 * MS, Some(&fd)).unwrap();
+        assert!(realtime_ns() - start < 100 * MS, "woken at once");
+        let mut count = 0u64;
+        // SAFETY: a read of 8 bytes into a u64; the fd is non-blocking.
+        let r = unsafe { libc::read(fd.as_raw_fd(), (&raw mut count).cast(), 8) };
+        assert_eq!(r, -1, "the wake-up was read");
+        // Not written: the wait lasts until the time.
+        let start = realtime_ns();
+        wait_until(start + 5 * MS, Some(&fd)).unwrap();
+        assert!(realtime_ns() - start >= 5 * MS);
     }
 
     #[test]

@@ -578,10 +578,21 @@ impl Aes67 {
         self.take_output_tap()
     }
 
-    /// Hands the output thread the reading end of its new tap.
-    pub fn give_output_tap(&mut self, id: ClientId, rate: u32, reader: Ring) {
+    /// Hands the output thread the reading end of its new tap, and the
+    /// eventfd the engine writes after each period to it.
+    pub fn give_output_tap(
+        &mut self,
+        id: ClientId,
+        rate: u32,
+        reader: Ring,
+        wake: Option<OwnedFd>,
+    ) {
         if let Some(output) = &self.output {
-            output.give_tap(TapReader { ring: reader, rate });
+            output.give_tap(TapReader {
+                ring: reader,
+                rate,
+                wake,
+            });
             self.output_tap = Some((id, rate));
         }
     }
@@ -960,13 +971,13 @@ mod tests {
         aes67.with_output(output.clone());
         assert!(aes67.output_wants_tap(48000));
         let (_ring, fd) = Ring::create(4096).unwrap();
-        aes67.give_output_tap(7, 48000, Ring::map(fd.as_fd()).unwrap());
+        aes67.give_output_tap(7, 48000, Ring::map(fd.as_fd()).unwrap(), None);
         assert_eq!(*lock(&output.taps), [48000]);
         assert!(!aes67.output_wants_tap(48000));
         // A new rate: the old tap goes, a new one comes.
         assert!(aes67.output_wants_tap(44100));
         assert_eq!(aes67.take_output_tap(), Some(7));
-        aes67.give_output_tap(8, 44100, Ring::map(fd.as_fd()).unwrap());
+        aes67.give_output_tap(8, 44100, Ring::map(fd.as_fd()).unwrap(), None);
         assert_eq!(*lock(&output.taps), [48000, 44100]);
         // The view shows the group the output sends to.
         lock(&output.status).sending = true;
