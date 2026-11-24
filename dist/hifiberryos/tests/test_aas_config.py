@@ -25,6 +25,52 @@ def load(name):
         return json.load(f)
 
 
+def make_net(spec):
+    """spec: {name: [entries...]}; returns a temp /sys/class/net."""
+    root = tempfile.mkdtemp()
+    for name, entries in spec.items():
+        os.makedirs(os.path.join(root, name))
+        for e in entries:
+            os.makedirs(os.path.join(root, name, e))
+    return root
+
+
+class WiredInterface(unittest.TestCase):
+    def test_eth0_is_chosen(self):
+        net = make_net({"eth1": ["device"], "eth0": ["device"]})
+        self.assertEqual(mod.wired_interface(net), "eth0")
+
+    def test_first_wired_without_eth0(self):
+        net = make_net({"wlan0": ["device", "wireless"], "end0": ["device"],
+                        "lo": []})
+        self.assertEqual(mod.wired_interface(net), "end0")
+
+    def test_no_wired(self):
+        net = make_net({"wlan0": ["device", "wireless"], "lo": []})
+        self.assertIsNone(mod.wired_interface(net))
+
+    def test_missing_directory(self):
+        self.assertIsNone(mod.wired_interface("/nonexistent/net"))
+
+
+class Aes67Table(unittest.TestCase):
+    def test_aes67_table(self):
+        cfg = mod.config_from(load("dacplus-adc-pro"), wired="eth0")
+        self.assertEqual(cfg["aes67"], {
+            "interface": "eth0", "ptp": "listen",
+            "input": {"enabled": False}, "output": {"enabled": False}})
+
+    def test_no_aes67_table_without_wired(self):
+        self.assertNotIn("aes67", mod.config_from(load("dacplus-adc-pro")))
+
+    def test_local_aes67_merged_key_by_key(self):
+        merged = mod.merge(
+            mod.config_from(load("dacplus-adc-pro"), wired="eth0"),
+            {"aes67": {"input": {"enabled": True}}})
+        self.assertEqual(merged["aes67"]["input"], {"enabled": True})
+        self.assertEqual(merged["aes67"]["ptp"], "listen")
+
+
 class ConfigFrom(unittest.TestCase):
     def test_dacplus_adc_pro(self):
         c = mod.config_from(load("dacplus-adc-pro"))
@@ -118,10 +164,20 @@ class Main(unittest.TestCase):
         self.out = os.path.join(self.tmp.name, "aas.toml")
         self.local = os.path.join(self.tmp.name, "aas.local.toml")
         self.missing = os.path.join(self.tmp.name, "nope.json")
+        self.wired = None
+        real = mod.wired_interface
+        mod.wired_interface = lambda *a: self.wired
+        self.addCleanup(setattr, mod, "wired_interface", real)
 
     def run_main(self, info):
         self.assertEqual(mod.main(["--systeminfo", info, "--output", self.out,
                                    "--local", self.local]), 0)
+
+    def test_wired_device_gets_aes67_table(self):
+        self.wired = "eth0"
+        self.run_main(fixture_path("dacplus-adc-pro"))
+        self.assertEqual(tomllib.loads(self.read())["aes67"]["interface"],
+                         "eth0")
 
     def read(self):
         with open(self.out) as f:

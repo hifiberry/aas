@@ -393,8 +393,13 @@ AudioControl is installed. `GET /metadata` shows the current track.
 what the master plays as an AES67 stream of its own. Both need wired Ethernet
 and a switch that does IGMP snooping with a querier, or the multicast streams
 and the PTP time reach every port or none. Without an `[aes67]` table there is
-no AES67. On HiFiBerry OS the table goes in `/etc/aas/aas.local.toml`, which
-`aas-config` merges over the generated file at boot:
+no AES67. On HiFiBerry OS, `aas-config` writes the table at boot on a device
+with wired Ethernet, with `interface` set to `eth0` (or the first wired
+interface by name), `ptp = "listen"` and the input and output disabled, so the
+web UI can switch AES67 on through the API. A device without wired Ethernet
+gets no table. To change anything, or to turn it on at boot, put the keys in
+`/etc/aas/aas.local.toml`, which `aas-config` merges over the generated file,
+key by key:
 
 ```toml
 [aes67]

@@ -30,7 +30,25 @@ def log(msg):
     print("aas-config: " + msg, file=sys.stderr)
 
 
-def config_from(systeminfo, audiocontrol=False):
+def wired_interface(net_dir="/sys/class/net"):
+    """The wired Ethernet interface: eth0, else the first by name.
+
+    Wired means a device entry and no wireless entry; lo and the virtual
+    interfaces have no device entry.
+    """
+    try:
+        names = sorted(os.listdir(net_dir))
+    except OSError:
+        return None
+    wired = [n for n in names
+             if os.path.exists(os.path.join(net_dir, n, "device"))
+             and not os.path.exists(os.path.join(net_dir, n, "wireless"))]
+    if "eth0" in wired:
+        return "eth0"
+    return wired[0] if wired else None
+
+
+def config_from(systeminfo, audiocontrol=False, wired=None):
     card = systeminfo.get("soundcard") if isinstance(systeminfo, dict) else None
     if not isinstance(card, dict):
         card = {}
@@ -57,6 +75,10 @@ def config_from(systeminfo, audiocontrol=False):
     cfg["plugin"] = [{"place": "output", "type": "balance", "balance": 0}]
     if audiocontrol:
         cfg["metadata"] = {"source": "acr"}
+    if wired:
+        cfg["aes67"] = {"interface": wired, "ptp": "listen",
+                        "input": {"enabled": False},
+                        "output": {"enabled": False}}
     return cfg
 
 
@@ -209,7 +231,7 @@ def main(argv=None):
             log("keeping the existing %s" % args.output)
             return 0
         acr = os.path.exists(AUDIOCONTROL)
-        generated = config_from(info, acr) if info is not None else {}
+        generated = config_from(info, acr, wired_interface()) if info is not None else {}
         try:
             text = dump(merge(generated, read_local(args.local)))
         except Exception as e:
