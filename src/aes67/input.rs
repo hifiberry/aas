@@ -97,6 +97,10 @@ pub struct InputStatus {
     pub mode: Option<Mode>,
     pub receiving: bool,
     pub latency_ms: u32,
+    /// The least latency this board holds now, whole ms: the engine's
+    /// delay after the ring, about a period in the ring, and the filter.
+    /// A lower `latency_ms` is held at this. Known while a stream plays.
+    pub latency_floor_ms: Option<u32>,
     /// Frames played as silence because they never arrived.
     pub lost: u64,
     /// Packets dropped because they came after their play time.
@@ -184,6 +188,7 @@ pub fn start(
 ) -> io::Result<InputHandle> {
     let status = Arc::new(Mutex::new(InputStatus {
         latency_ms: DEFAULT_LATENCY_MS,
+        latency_floor_ms: None,
         ..InputStatus::default()
     }));
     let (commands, received) = mpsc::channel();
@@ -259,6 +264,14 @@ pub struct Receiver {
     session: Option<Session>,
     pick: [u8; 2],
     latency_ms: u32,
+    /// The latency held: `latency_ms`, or the floor where that is higher.
+    held_ms: u32,
+    /// The floor at the last start, whole ms.
+    floor_ms: Option<u32>,
+    /// The latency asked for and the one held, for the log, once per
+    /// latency set.
+    floor_told: Option<(u32, u32)>,
+    floor_warned: bool,
     phase: Phase,
     /// The mode of the last start.
     mode: Option<Mode>,
@@ -302,6 +315,10 @@ impl Receiver {
             session: None,
             pick: [1, 2],
             latency_ms,
+            held_ms: latency_ms,
+            floor_ms: None,
+            floor_told: None,
+            floor_warned: false,
             phase: Phase::Idle,
             mode: None,
             generation: None,
@@ -350,6 +367,8 @@ impl Receiver {
         }
         self.restart(Restart::Hard, "latency");
         self.latency_ms = latency_ms;
+        self.held_ms = latency_ms;
+        self.floor_warned = false;
         self.drift = drift(latency_ms);
     }
 
@@ -496,11 +515,11 @@ impl Receiver {
     /// has timestamps that do not follow the PTP time and its SDP offset:
     /// it plays in buffer mode for this start.
     fn prime(&mut self, now: &Now, out: &mut impl Output) {
-        let target = self.target();
+        self.hold_floor(now);
         let Some(mut delay) = self.measure(now, out.fill()) else {
             return;
         };
-        if self.mode == Some(Mode::Ptp) && (delay - target).abs() > RESTART_FRAMES {
+        if self.mode == Some(Mode::Ptp) && (delay - self.target()).abs() > RESTART_FRAMES {
             if !self.warned {
                 self.warned = true;
                 self.warning = Some(OFF_PTP);
@@ -508,11 +527,13 @@ impl Receiver {
             self.last_restart = Some("timestamps");
             self.mode = Some(Mode::Buffer);
             self.drift.reset();
+            self.hold_floor(now);
             let Some(buffered) = self.measure(now, out.fill()) else {
                 return;
             };
             delay = buffered;
         }
+        let target = self.target();
         if delay > target {
             // Due before it arrived: drop what is late, keep what is not.
             self.jitter.skip((delay - target).round() as u32);
@@ -586,6 +607,40 @@ impl Receiver {
         self.warning.take()
     }
 
+    /// The latency asked for and the higher one held, once per latency
+    /// set, for the log.
+    pub fn take_floor_warning(&mut self) -> Option<(u32, u32)> {
+        self.floor_told.take()
+    }
+
+    /// The least delay the mode of this start can hold, in frames. In PTP
+    /// mode a frame passes the resampler's filter, waits in the ring for
+    /// the engine, which takes a period at a time, and then the engine's
+    /// delay of two periods and its own filter: about one and a half times
+    /// that delay. In buffer mode the delay counts only the jitter buffer
+    /// and the ring: a period and a write.
+    fn floor_frames(&self, now: &Now) -> f64 {
+        match self.mode {
+            Some(Mode::Ptp) => 1.5 * now.output_delay + self.adaptive.delay_frames(),
+            _ => 0.5 * now.output_delay + FRAMES as f64,
+        }
+    }
+
+    /// Holds the latency at the floor where `latency_ms` is below it.
+    fn hold_floor(&mut self, now: &Now) {
+        let floor = (self.floor_frames(now) * 1000.0 / f64::from(RATE)).ceil() as u32;
+        self.floor_ms = Some(floor);
+        let held = self.latency_ms.max(floor);
+        if held != self.held_ms {
+            self.held_ms = held;
+            self.drift = drift(held);
+        }
+        if held > self.latency_ms && !self.floor_warned {
+            self.floor_warned = true;
+            self.floor_told = Some((self.latency_ms, held));
+        }
+    }
+
     /// Copies the state into `status`, the name only when it changed.
     pub fn publish(&self, status: &mut InputStatus) {
         let name = self.session.as_ref().map(|s| s.name.as_str());
@@ -598,6 +653,10 @@ impl Receiver {
         };
         status.receiving = self.receiving;
         status.latency_ms = self.latency_ms;
+        status.latency_floor_ms = match self.phase {
+            Phase::Priming | Phase::Playing => self.floor_ms,
+            Phase::Idle | Phase::Waiting => None,
+        };
         (status.lost, status.late) = self.jitter.counts();
         status.restarts = self.restarts;
         status.last_restart = self.last_restart;
@@ -628,7 +687,7 @@ impl Receiver {
     }
 
     fn target(&self) -> f64 {
-        f64::from(self.latency_ms * RATE / 1000)
+        f64::from(self.held_ms * RATE / 1000)
     }
 }
 
@@ -739,6 +798,12 @@ fn run(shared: Shared, mut out: RingOut, commands: mpsc::Receiver<InputCommand>)
         rx.step(&now, &packets[..count], &mut out);
         if let Some(warning) = rx.take_warning() {
             eprintln!("{warning}");
+        }
+        if let Some((asked, held)) = rx.take_floor_warning() {
+            eprintln!(
+                "aas: aes67: warning: a latency of {asked} ms is below what this board holds; \
+                 holding {held} ms"
+            );
         }
         if (now.local_ns - published).abs() >= STATUS_NS {
             let mut status = shared.status.lock().unwrap_or_else(|e| e.into_inner());
@@ -1214,6 +1279,33 @@ mod tests {
         assert_eq!(sim.status().mode, Some(Mode::Buffer));
         let tail = &sim.ring.played[sim.ring.played.len() - 480..];
         assert!(tail.iter().all(|f| f[0] != 0), "plays");
+    }
+
+    /// A latency below what the board holds is held at its floor, with one
+    /// warning, where the controller would otherwise sit at its clamp
+    /// with the delay above the target for good.
+    #[test]
+    fn a_latency_below_the_floor_is_held_at_the_floor() {
+        let mut sim = Sim::new(session(2, Some((MASTER, 0))), square, true);
+        sim.rx.set_latency(3);
+        sim.run(20.0);
+        let status = sim.status();
+        let floor = (1.5 * OUTPUT_DELAY + sim.rx.adaptive.delay_frames()) / 48.0;
+        assert_eq!(status.latency_floor_ms, Some(floor.ceil() as u32));
+        assert_eq!(status.latency_ms, 3);
+        assert_eq!(sim.rx.take_floor_warning(), Some((3, floor.ceil() as u32)));
+        assert_eq!(sim.rx.take_floor_warning(), None);
+        assert_eq!((status.mode, status.restarts), (Some(Mode::Ptp), 0));
+        assert!(
+            (sim.rx.ratio - 1.0).abs() < 50e-6,
+            "ratio {:.0} ppm",
+            (sim.rx.ratio - 1.0) * 1e6
+        );
+        // A latency above the floor is held as it is.
+        sim.rx.set_latency(20);
+        sim.run(5.0);
+        assert_eq!(sim.rx.take_floor_warning(), None);
+        assert_eq!(sim.rx.target(), TARGET);
     }
 
     /// A stream that starts before PTP time plays in buffer mode, and moves

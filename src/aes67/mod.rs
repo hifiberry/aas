@@ -424,6 +424,7 @@ impl Aes67 {
                 receiving: self.receiving_in(status),
                 latency_ms: self.latency_ms(),
                 latency_auto: self.latency == Latency::Auto,
+                latency_floor_ms: status.latency_floor_ms,
                 late: status.late,
                 lost: status.lost,
                 restarts: status.restarts,

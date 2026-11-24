@@ -485,8 +485,13 @@ While a stream plays in `ptp` mode, `input.delay` gives the delay the latency
 is held at, in parts: `network_ms` from a frame's timestamp to where the
 jitter buffer reads, `filter_ms` for the resampler, `ring_ms` to the engine,
 `engine_ms` for the engine and the card, and `total_ms`. The engine and the
-card take a share that a smaller latency cannot remove; a latency below it
-cannot be held.
+card take a share that a smaller latency cannot remove. While a stream plays,
+`input.latency_floor_ms` gives the least latency the board holds now: one and a
+half times the engine's delay after the ring, as the ring holds about a period
+for it, and the filter, rounded up to whole milliseconds. A lower `latency_ms`
+is held at the floor, with a warning in the log, and stays as set; on a CM5 at
+the default 64-frame periods the floor is 6 ms, on a Pi 3 at 256-frame periods
+18 ms.
 
 `input.receiving` says whether packets arrive now. The latency, the selection
 and `enabled` can be changed at run time with `PATCH /aes67/input`; the

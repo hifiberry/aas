@@ -470,6 +470,10 @@ pub struct Aes67InputView {
     pub latency_ms: u32,
     /// Whether the latency is the board's default.
     pub latency_auto: bool,
+    /// While a stream plays, the least latency the board holds now; a
+    /// lower `latency_ms` is held at this.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latency_floor_ms: Option<u32>,
     /// Packets that came after their play time.
     pub late: u64,
     /// Frames played as silence because they never came.
