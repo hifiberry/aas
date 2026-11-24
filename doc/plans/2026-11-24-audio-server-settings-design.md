@@ -10,7 +10,8 @@ offers to switch to aas (the switch that exists today). Once aas runs, the
 page changes its settings:
 
 - the latency of the card's buffer (`latency_ms`);
-- AES67 on or off, and which announced stream plays;
+- AES67 on or off, which announced stream plays, and the AES67 input's
+  latency;
 - a "Recommended for this board" button that puts these back to what aas
   picks for the Pi model;
 - a warning when the latency is set lower than the board handles well.
@@ -24,13 +25,13 @@ look like a bug, so the page says so before the user finds out by ear.
 - Goal: change the three settings from the web UI; they survive a reboot.
 - Goal: the user sees the recommended latency for the board and is warned
   below it.
-- Non-goal: every aas setting. Output volumes, AirPlay receivers, plugins,
-  the AES67 output and the AES67 input latency stay where they are (API,
-  config file, state file). The AES67 input latency stays `"auto"`.
+- Non-goal: every aas setting. Output volumes, AirPlay receivers, plugins
+  and the AES67 output stay where they are (API, config file, state file).
 - Non-goal: a new switch. The PipeWire/aas switch is the existing page's, as
   it is.
 - Anti-goal: a stream selection that cuts the sound for a restart. Choosing a
-  stream or turning AES67 on or off must not restart the daemon.
+  stream, turning AES67 on or off or changing its latency must not restart
+  the daemon.
 
 ## Approaches considered
 
@@ -78,6 +79,11 @@ look like a bug, so the page says so before the user finds out by ear.
    `input.enabled` only; the PTP listener and the stream list run whenever the
    table exists, so streams show before the input is on. A restart of aas for
    a new latency keeps the stream and the switch for the same reason.
+3. **`"auto"` never sits below the floor.** The input holds at least its
+   floor already (`latency_floor_ms`). With `latency_ms = "auto"` it does so
+   without the log warning, and `GET /aes67` gives the latency held: on a CM5
+   the automatic 5 ms is held at the 6 ms floor without a complaint, since the
+   user chose nothing. A number the user set below the floor still warns.
 
 ### Config server (repository `configurator`)
 
@@ -120,17 +126,20 @@ A route beside the existing `/audio-server`, `/audio-server/aas-settings`:
     - **AES67**: on/off (`PATCH /aes67/input` `enabled`), and a select of
       the streams from `GET /aes67/streams` that can be selected (`stream`).
       Hidden with a note when aas has no AES67 (`GET /aes67` 404).
+    - **AES67 latency**: "Automatic (N ms)" or a number of ms, 1 to 100,
+      through `PATCH /aes67/input` `latency_ms`; it applies at once, the
+      stream starts over at it. While a stream plays, `latency_floor_ms` is
+      the least it holds: a number below it shows an amber note, "this board
+      holds at least F ms; the stream plays at F ms", and the value stays as
+      set. Before a stream plays the floor is not known and there is no note.
+      The note explains that the AES67 latency includes the card's buffer, so
+      a lower card latency lowers the floor.
     - **Recommended for this board**: after a confirmation that names the
       values, first sets the AES67 input latency to `"auto"` through aas's
       API (kept in the state file), then the latency to `null` through the
       config server, which restarts aas. When the latency is `null` already,
-      there is no restart. The AES67 input latency is otherwise not on the
-      page; this button is the one place that changes it, as part of
-      "recommended".
-  - If the input's `latency_floor_ms` is above its `latency_ms` (set some
-    other way), the page shows aas's floor note: the latency is held at the
-    floor.
-
+      there is no restart.
+  
 ## Left to the builder
 
 - Layout and wording of the page beyond the notes above, in the style of the
@@ -149,10 +158,12 @@ with AES67 and a wired network connection".
 
 ## Calls made in this design (the owner can correct them)
 
-- The AES67 input latency is not on the page; it stays `"auto"`.
+- The AES67 latency warning uses the floor aas measures while a stream
+  plays; there is no warning before a stream plays.
+- `"auto"` holds the floor quietly where the board's automatic value is
+  below it (CM5: 5 ms held at 6 ms), instead of raising the automatic value.
 - The lowest safe values 3 ms (Pi 5/CM5) and 6 ms (others) come from the
   measurements; the Pi 4 gets the "others" values unmeasured.
 - The tile goes into Settings; the System Tools link stays.
-- "Recommended for this board" also sets the AES67 input latency to `"auto"`.
 - After a latency change the page waits 30 s for aas before showing an error.
 - Against an older aas the page shows no warnings rather than a built-in table.
