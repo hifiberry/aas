@@ -319,7 +319,12 @@ impl Estimator {
         self.suspects.clear();
         self.window.push((rx, offset));
         self.window.retain(|p| rx - p.0 <= WINDOW_NS);
+        let had = self.fit.is_some();
         self.fit = fit_window(&self.window);
+        // PTP time starts: a new timeline for whoever began without one.
+        if !had && self.fit.is_some() {
+            self.generation += 1;
+        }
     }
 }
 
@@ -689,7 +694,8 @@ mod tests {
             poor.step(&mut est, true, true);
             good.step(&mut est, true, true);
         }
-        assert_eq!(est.generation(), gen_good);
+        // Once more as time from the new master starts, and no more.
+        assert_eq!(est.generation(), gen_good + 1);
         assert_eq!(est.now(good.local_now()).unwrap().gm, MASTER);
 
         // The followed master falls silent; the other takes over after 3 intervals.
@@ -705,6 +711,31 @@ mod tests {
             poor.step(&mut est, true, true);
         }
         assert_eq!(est.now(poor.local_now()).unwrap().gm, OTHER);
+    }
+
+    /// PTP time starting is a new generation: a user that started without
+    /// it, as an input in buffer mode, sees the change and starts over in
+    /// PTP time. Choosing the master alone, before the first fit, is not
+    /// enough.
+    #[test]
+    fn ptp_time_coming_is_a_new_generation() {
+        let mut est = Estimator::new(0);
+        let mut sim = Sim::new(ADDR, MASTER);
+        let mut without = None;
+        for _ in 0..200 {
+            sim.step(&mut est, true, true);
+            match est.now(sim.local_now()) {
+                None => without = Some(est.generation()),
+                Some(_) => break,
+            }
+        }
+        let without = without.expect("a time without PTP time first");
+        assert!(est.now(sim.local_now()).is_some(), "PTP time came");
+        assert_ne!(est.generation(), without);
+        // The fit after it moves on in the same generation.
+        let with = est.generation();
+        sim.run(&mut est, 4);
+        assert_eq!(est.generation(), with);
     }
 
     #[test]
@@ -816,7 +847,8 @@ mod tests {
         sim.run(&mut est, 1);
         est.packet(ADDR, 320, &a, sim.local_now());
         sim.run(&mut est, 4);
-        assert_eq!(est.generation(), gen_after);
+        // Once more as the new time starts.
+        assert_eq!(est.generation(), gen_after + 1);
         assert_eq!(est.now(sim.local_now()).unwrap().gm, OTHER);
     }
 

@@ -1216,6 +1216,21 @@ mod tests {
         assert!(tail.iter().all(|f| f[0] != 0), "plays");
     }
 
+    /// A stream that starts before PTP time plays in buffer mode, and moves
+    /// to PTP mode when PTP time comes, which the clock gives as a new
+    /// generation.
+    #[test]
+    fn a_stream_started_before_ptp_time_moves_to_ptp_mode_when_it_comes() {
+        let mut sim = Sim::new(session(2, Some((MASTER, 0))), square, false);
+        sim.run(2.0);
+        assert_eq!(sim.status().mode, Some(Mode::Buffer));
+        sim.ptp_known = true;
+        sim.generation += 1;
+        sim.run(3.0);
+        assert_eq!(sim.status().mode, Some(Mode::Ptp));
+        assert_eq!(sim.status().last_restart, Some("grandmaster"));
+    }
+
     #[test]
     fn a_new_grandmaster_restarts_the_input() {
         let mut sim = Sim::new(session(2, Some((MASTER, 0))), square, true);

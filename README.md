@@ -470,8 +470,9 @@ that stays stable on a board is the lowest one with no restarts and no `late`
 or `lost` over a long run. The reasons are:
 
 - `selection`, `latency`: changed by the user.
-- `grandmaster`: a new PTP time, as the grandmaster changed or PTP time came
-  back.
+- `grandmaster`: a new PTP time, as PTP time started, the grandmaster changed
+  or PTP time came back. A stream that started in `buffer` mode before PTP
+  time moves to `ptp` mode this way.
 - `stopped`, `resumed`: the stream paused for 1 s and came back.
 - `no stored packets`: every packet came too late or too early to be kept.
 - `delay`: the delay from the stream to the output went more than 50 ms off its
