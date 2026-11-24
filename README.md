@@ -538,7 +538,9 @@ The Dante device and `aas` need the same PTP domain.
 `aas` tells AudioControl whether the input plays: the player `aes67` is
 `playing` while the selected stream's packets arrive, and `stopped` otherwise.
 The report goes out on its own thread; one that fails is logged and the next
-change of state is the next try.
+change of state is the next try. AudioControl knows the player from
+`/etc/audiocontrol/players.d/aes67.json`, which the package installs; it reads
+the file when it starts.
 
 ### Recording
 
