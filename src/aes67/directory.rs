@@ -71,7 +71,23 @@ impl Directory {
                 let own = self
                     .own_origin
                     .is_some_and(|a| a == session.origin || a == source);
-                match self.streams.get_mut(&(source, hash)) {
+                // The SDP origin names the session; a new version comes under
+                // a new SAP hash. The newest version is the one listed.
+                let key = (source, hash);
+                let same = |l: &Listed| {
+                    l.session.origin == session.origin && l.session.session_id == session.session_id
+                };
+                if self
+                    .streams
+                    .iter()
+                    .any(|(k, l)| *k != key && same(l) && l.session.version > session.version)
+                {
+                    return false;
+                }
+                let before = self.streams.len();
+                self.streams.retain(|k, l| *k == key || !same(l));
+                let replaced = self.streams.len() != before;
+                match self.streams.get_mut(&key) {
                     Some(listed) => {
                         listed.interval = now
                             .saturating_duration_since(listed.last_seen)
@@ -79,7 +95,7 @@ impl Directory {
                         listed.last_seen = now;
                         listed.own = own;
                         if listed.session == session {
-                            false
+                            replaced
                         } else {
                             listed.session = session;
                             true
@@ -134,21 +150,55 @@ mod tests {
     const SRC: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 10);
     const OTHER: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 20);
 
-    fn sdp_text(name: &str, version: u64, origin: Ipv4Addr) -> String {
+    fn sdp_text(name: &str, id: u64, version: u64, origin: Ipv4Addr) -> String {
         DANTE_SDP
             .replace(
                 "o=- 1311738121 1311738121 IN IP4 192.0.2.10",
-                &format!("o=- 1311738121 {version} IN IP4 {origin}"),
+                &format!("o=- {id} {version} IN IP4 {origin}"),
             )
             .replace("s=AU-U22-000001 : 1", &format!("s={name}"))
     }
 
+    /// An announcement whose SDP session id is the SAP hash, so that each
+    /// hash is a session of its own.
     fn announce(hash: u16, source: Ipv4Addr, name: &str, version: u64) -> SapMessage {
         SapMessage::Announce {
             hash,
             source,
-            sdp: sdp_text(name, version, source),
+            sdp: sdp_text(name, u64::from(hash), version, source),
         }
+    }
+
+    /// A new SDP version of a session comes with a new SAP hash, as SAP
+    /// requires. It replaces the entry of the old one, which would
+    /// otherwise stay for ten intervals beside it under the same name, and
+    /// a late copy of the old version does not bring that back.
+    #[test]
+    fn a_new_version_under_a_new_hash_replaces_the_session() {
+        let t = Instant::now();
+        let mut d = Directory::new(None);
+        let version = |hash, v| SapMessage::Announce {
+            hash,
+            source: SRC,
+            sdp: sdp_text("flow", 77, v, SRC),
+        };
+        d.message(version(1, 1), t);
+        assert!(d.message(version(2, 2), t + Duration::from_secs(5)));
+        assert_eq!(d.all().count(), 1);
+        assert_eq!(d.by_name("flow").unwrap().session.version, 2);
+        assert!(!d.message(version(1, 1), t + Duration::from_secs(6)));
+        assert_eq!(d.all().count(), 1);
+        assert_eq!(d.by_name("flow").unwrap().session.version, 2);
+        // Another session of the same origin stays beside it.
+        d.message(
+            SapMessage::Announce {
+                hash: 3,
+                source: SRC,
+                sdp: sdp_text("flow 2", 78, 1, SRC),
+            },
+            t + Duration::from_secs(7),
+        );
+        assert_eq!(d.all().count(), 2);
     }
 
     #[test]
@@ -268,7 +318,7 @@ mod tests {
         let by_origin = SapMessage::Announce {
             hash: 1,
             source: OTHER,
-            sdp: sdp_text("mine", 1, SRC),
+            sdp: sdp_text("mine", 5, 1, SRC),
         };
         d.message(by_origin, t);
         assert!(d.by_name("mine").unwrap().own);
@@ -276,7 +326,7 @@ mod tests {
         let by_source = SapMessage::Announce {
             hash: 2,
             source: SRC,
-            sdp: sdp_text("also mine", 1, OTHER),
+            sdp: sdp_text("also mine", 6, 1, OTHER),
         };
         d.message(by_source, t);
         assert!(d.by_name("also mine").unwrap().own);
