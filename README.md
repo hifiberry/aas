@@ -489,7 +489,8 @@ card take a share that a smaller latency cannot remove. While a stream plays,
 `input.latency_floor_ms` gives the least latency the board holds now: one and a
 half times the engine's delay after the ring, as the ring holds about a period
 for it, and the filter, rounded up to whole milliseconds. A lower `latency_ms`
-is held at the floor, with a warning in the log, and stays as set; on a CM5 at
+is held at the floor, with a warning in the log, and stays as set; with
+`"auto"` the floor is held without a warning; on a CM5 at
 the default 64-frame periods the floor is 6 ms, on a Pi 3 at 256-frame periods
 18 ms.
 

@@ -134,7 +134,12 @@ pub struct DelayParts {
 #[derive(Debug, Clone)]
 pub enum InputCommand {
     Select(Option<Session>),
-    Latency(u32),
+    /// The latency in ms, and whether it is the automatic one, which holds
+    /// the floor without a warning.
+    Latency {
+        ms: u32,
+        auto: bool,
+    },
     /// The two stream channels played as left and right, counted from 1.
     Channels([u8; 2]),
 }
@@ -272,6 +277,8 @@ pub struct Receiver {
     /// latency set.
     floor_told: Option<(u32, u32)>,
     floor_warned: bool,
+    /// The latency is the automatic one: the floor is held without a warning.
+    auto: bool,
     phase: Phase,
     /// The mode of the last start.
     mode: Option<Mode>,
@@ -318,6 +325,7 @@ impl Receiver {
             held_ms: latency_ms,
             floor_ms: None,
             floor_told: None,
+            auto: false,
             floor_warned: false,
             phase: Phase::Idle,
             mode: None,
@@ -361,7 +369,8 @@ impl Receiver {
     }
 
     /// A new latency starts the stream over at it.
-    pub fn set_latency(&mut self, latency_ms: u32) {
+    pub fn set_latency(&mut self, latency_ms: u32, auto: bool) {
+        self.auto = auto;
         if latency_ms == self.latency_ms {
             return;
         }
@@ -635,7 +644,7 @@ impl Receiver {
             self.held_ms = held;
             self.drift = drift(held);
         }
-        if held > self.latency_ms && !self.floor_warned {
+        if held > self.latency_ms && !self.auto && !self.floor_warned {
             self.floor_warned = true;
             self.floor_told = Some((self.latency_ms, held));
         }
@@ -843,7 +852,7 @@ fn apply(
             }
             rx.select(session);
         }
-        InputCommand::Latency(ms) => rx.set_latency(ms),
+        InputCommand::Latency { ms, auto } => rx.set_latency(ms, auto),
         InputCommand::Channels(pick) => rx.set_channels(pick),
     }
 }
@@ -1281,13 +1290,24 @@ mod tests {
         assert!(tail.iter().all(|f| f[0] != 0), "plays");
     }
 
+    #[test]
+    fn an_automatic_latency_below_the_floor_is_held_without_a_warning() {
+        let mut sim = Sim::new(session(2, Some((MASTER, 0))), square, true);
+        sim.rx.set_latency(3, true);
+        sim.run(10.0);
+        let floor = ((1.5 * OUTPUT_DELAY + sim.rx.adaptive.delay_frames()) / 48.0).ceil() as u32;
+        assert_eq!(sim.status().latency_floor_ms, Some(floor));
+        assert_eq!(sim.rx.take_floor_warning(), None);
+        assert_eq!(sim.status().restarts, 0);
+    }
+
     /// A latency below what the board holds is held at its floor, with one
     /// warning, where the controller would otherwise sit at its clamp
     /// with the delay above the target for good.
     #[test]
     fn a_latency_below_the_floor_is_held_at_the_floor() {
         let mut sim = Sim::new(session(2, Some((MASTER, 0))), square, true);
-        sim.rx.set_latency(3);
+        sim.rx.set_latency(3, false);
         sim.run(20.0);
         let status = sim.status();
         let floor = (1.5 * OUTPUT_DELAY + sim.rx.adaptive.delay_frames()) / 48.0;
@@ -1302,7 +1322,7 @@ mod tests {
             (sim.rx.ratio - 1.0) * 1e6
         );
         // A latency above the floor is held as it is.
-        sim.rx.set_latency(20);
+        sim.rx.set_latency(20, false);
         sim.run(5.0);
         assert_eq!(sim.rx.take_floor_warning(), None);
         assert_eq!(sim.rx.target(), TARGET);
@@ -1504,7 +1524,7 @@ mod tests {
             Arc::new(AtomicBool::new(true)),
         )
         .unwrap();
-        handle.command(InputCommand::Latency(7));
+        handle.command(InputCommand::Latency { ms: 7, auto: false });
         let mut status = handle.status();
         for _ in 0..50 {
             if status.latency_ms == 7 {

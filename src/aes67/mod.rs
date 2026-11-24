@@ -351,7 +351,10 @@ impl Aes67 {
     /// Takes the input thread: its channels, its latency, and the stream.
     fn attach(&mut self, input: Box<dyn InputPort>) {
         input.command(InputCommand::Channels(self.config.input.channels));
-        input.command(InputCommand::Latency(self.latency_ms()));
+        input.command(InputCommand::Latency {
+            ms: self.latency_ms(),
+            auto: self.latency == Latency::Auto,
+        });
         self.input = Some(input);
         self.playing = None;
         self.sync();
@@ -532,7 +535,10 @@ impl Aes67 {
             config: latency_code(self.config.input.latency),
         });
         if let Some(input) = &self.input {
-            input.command(InputCommand::Latency(self.latency_ms()));
+            input.command(InputCommand::Latency {
+                ms: self.latency_ms(),
+                auto: self.latency == Latency::Auto,
+            });
         }
     }
 
@@ -866,7 +872,7 @@ mod tests {
         {
             let commands = lock(&input.commands);
             assert!(matches!(commands[0], InputCommand::Channels([1, 2])));
-            assert!(matches!(commands[1], InputCommand::Latency(20)));
+            assert!(matches!(commands[1], InputCommand::Latency { ms: 20, .. }));
         }
         aes67.tick(now);
         assert!(input.selected().is_empty());
