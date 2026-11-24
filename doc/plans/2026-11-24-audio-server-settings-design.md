@@ -54,13 +54,15 @@ look like a bug, so the page says so before the user finds out by ear.
 
    | Board | Recommended | Lowest safe | Evidence |
    |---|---|---|---|
-   | Pi 5, CM5 | 4 | 3 | CM5 clean under full load down to 32-frame periods |
+   | Pi 5, CM5 | 5 | 3 | CM5 clean under full load down to 32-frame periods |
    | Any other | 12 | 6 | Pi 3: 128-frame periods clean under full load, with AES67; 64-frame periods had xruns |
 
    The Pi 4 falls under "any other" until it is measured (TODO.md already
    carries that). `latency_recommended_ms` is the default aas uses without a
-   `latency_ms` in the config. A `PATCH` naming either field is 422, as for
-   `format`.
+   `latency_ms` in the config. On a Pi 5 or CM5 that default rises from 4 to
+   5 ms (the owner's call); both give the same period at every rate (64
+   frames at 44.1 and 48 kHz, 128 at 96 kHz, 256 at 192 kHz), so playback
+   does not change. A `PATCH` naming either field is 422, as for `format`.
 2. **`aas-config` writes an `[aes67]` table** on a device with wired Ethernet:
    the interface, `ptp = "listen"`, `[aes67.input] enabled = false` and
    `[aes67.output] enabled = false`, all explicit. Without the table aas has
