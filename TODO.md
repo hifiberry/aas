@@ -7,6 +7,15 @@ The Pi 4 still needs a test board. Then run the same probes, confirm or reject 4
 and confirm that `high` resampling fits. Without a Pi 4, the design's 4 ms claim
 for it stays unconfirmed.
 
+Done without a loopback (2026-11-24): `aplay` of silence through aas, read from
+`/metrics`, on a Pi 4 at about 88 °C and throttled for heat, under 4 hashing jobs
+plus synchronous disk writes. 12 ms: no xrun in 10 min idle plus 50 min load,
+worst gap 7.1 ms. 6 ms: no xrun idle, 1 in 50 min load (20 ms gap). 3 ms: 3 xruns
+in 3 min load. So the Pi 4 keeps 12 ms recommended and, by the owner's call,
+gets 8 ms as its lowest safe latency (`Board::Pi4Class`); 4 ms is rejected.
+Still missing: the loopback probes, `high` resampling, and whether 8 ms holds
+under the same load.
+
 ## Shorten the outage after a late DMA interrupt on the CM5
 
 Found with `tone-probe` and `stall`, see "Late wake-ups and the tone" in

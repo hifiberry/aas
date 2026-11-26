@@ -719,7 +719,7 @@ disabled, nor can a plugin whose channel counts differ: both are 422.
 and `resampling`, which change only in the config: naming either in a `PATCH`
 is 422. It also gives `latency_recommended_ms` and `latency_min_ms`, read-only: the
 board's default latency (5 on a Pi 5 or CM5, 12 elsewhere) and the lowest it holds
-safely (3 and 6). A Pi 4 counts as "other" until it has been measured. Naming
+safely (3 on a Pi 5 or CM5, 8 on a Pi 4, Pi 400 or CM4, 6 elsewhere). Naming
 either in a `PATCH` is 422 unless it is the value it has. A change lasts until
 the next restart; it is not kept in the state file.
 A new `bit_perfect` applies at once, with no reopen: while something plays, the
