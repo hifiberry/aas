@@ -7,7 +7,9 @@ use std::fs;
 pub enum Board {
     /// Pi 5 and Compute Module 5.
     Pi5Class,
-    /// Everything else, including Pi 3, Pi 4 and unknown boards.
+    /// Pi 4, Pi 400 and Compute Module 4: the BCM2711.
+    Pi4Class,
+    /// Everything else, including Pi 3 and unknown boards.
     Other,
 }
 
@@ -18,6 +20,11 @@ pub fn parse_model(model: &str) -> Board {
     let model = model.trim_matches(|c: char| c == '\0' || c.is_whitespace());
     if model.starts_with("Raspberry Pi 5") || model.starts_with("Raspberry Pi Compute Module 5") {
         Board::Pi5Class
+    } else if model.starts_with("Raspberry Pi 4")
+        || model.starts_with("Raspberry Pi 400")
+        || model.starts_with("Raspberry Pi Compute Module 4")
+    {
+        Board::Pi4Class
     } else {
         Board::Other
     }
@@ -36,15 +43,17 @@ impl Board {
     pub fn default_latency_ms(self) -> f32 {
         match self {
             Board::Pi5Class => 5.0,
-            Board::Other => 12.0,
+            Board::Pi4Class | Board::Other => 12.0,
         }
     }
 
-    /// The lowest latency in milliseconds the board holds safely. A Pi 4 is
-    /// `Other` until it has been measured.
+    /// The lowest latency in milliseconds the board holds safely. A Pi 4 at
+    /// 6 ms lost one period in 50 minutes under load while throttled for heat,
+    /// so its floor is 8.
     pub fn min_latency_ms(self) -> f32 {
         match self {
             Board::Pi5Class => 3.0,
+            Board::Pi4Class => 8.0,
             Board::Other => 6.0,
         }
     }
@@ -67,14 +76,19 @@ mod tests {
     }
 
     #[test]
-    fn pi_3_and_pi_4_and_unknown_are_other() {
+    fn pi_4_pi_400_and_compute_module_4_are_pi4_class() {
         for m in [
-            "Raspberry Pi 3 Model B Plus Rev 1.3",
             "Raspberry Pi 4 Model B Rev 1.5",
+            "Raspberry Pi 400 Rev 1.0",
             "Raspberry Pi Compute Module 4 Rev 1.0",
-            "Something Else",
-            "",
         ] {
+            assert_eq!(parse_model(m), Board::Pi4Class, "{m}");
+        }
+    }
+
+    #[test]
+    fn pi_3_and_unknown_are_other() {
+        for m in ["Raspberry Pi 3 Model B Plus Rev 1.3", "Something Else", ""] {
             assert_eq!(parse_model(m), Board::Other, "{m}");
         }
     }
@@ -101,6 +115,8 @@ mod tests {
     fn the_latency_figures_by_board() {
         assert_eq!(Board::Pi5Class.default_latency_ms(), 5.0);
         assert_eq!(Board::Pi5Class.min_latency_ms(), 3.0);
+        assert_eq!(Board::Pi4Class.default_latency_ms(), 12.0);
+        assert_eq!(Board::Pi4Class.min_latency_ms(), 8.0);
         assert_eq!(Board::Other.default_latency_ms(), 12.0);
         assert_eq!(Board::Other.min_latency_ms(), 6.0);
     }
